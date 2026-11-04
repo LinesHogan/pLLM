@@ -54,6 +54,7 @@ from pllm.execution.torch_private import MemoryUsage
 from pllm.execution.trace import ExecutionTrace, TraceEvent, TraceEventKind
 
 if TYPE_CHECKING:
+    from pllm.execution.attention_methods import AttentionProgram
     from pllm.execution.model_sites import ResidualRewrite
     from pllm.execution.overlay_task import OverlayTransition
     from pllm.execution.post_sample import PostSampleOverlap
@@ -351,6 +352,11 @@ class StateMath(Protocol[InputContra, DataT, ResultCo]):
     @property
     def model_sites(self) -> tuple[ResidualRewrite, ...]:
         """The @pllm.custom_residual methods a model backend installs."""
+        ...
+
+    @property
+    def attention(self) -> AttentionProgram | None:
+        """Dense attention reads and their fact snapshot scratch."""
         ...
 
     def initialize(

@@ -44,6 +44,7 @@ from pllm.workloads.dola import DoLaWorkload
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.state_producers import FactorAdapterWorkload
 from pllm.workloads.video import VideoWorkload
+from test.workloads.attention_workloads import CoupledAttention, Monitor, Quest
 from test.workloads.kernel_workloads import Forward, Residual
 
 
@@ -166,6 +167,8 @@ class PromptMask(pllm.Workload):
         for workload in (
             DummyWorkload(),
             Residual(),
+            Monitor(),
+            Quest(),
             Forward(),
             TokenHistory(),
             Stack(),
@@ -196,6 +199,7 @@ class PromptMask(pllm.Workload):
         )
     ]
     + [
+        (CoupledAttention(), r"\[isolation\]"),
         (BatchMeanTrainer(), 'method `learn`.*couples RequestState.*reduction="state_mean"'),
         (BorrowedMutation(False), "method `change` mutates borrowed input `h`.*clone"),
         (BorrowedMutation(True), "method `change` mutates borrowed input `w`.*clone"),

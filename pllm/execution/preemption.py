@@ -24,7 +24,11 @@ def preemption_policy(attachment: BackendAttachment, sites: tuple[ResidualRewrit
     )
     return (
         "reset"
-        if attachment.spec.overlay_bindings or attachment.spec.activation_bindings or sites or adaptive
+        if attachment.spec.overlay_bindings
+        or attachment.spec.activation_bindings
+        or sites
+        or attachment.probe.custom_attention
+        or adaptive
         else "keep"
     )
 

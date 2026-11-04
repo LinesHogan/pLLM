@@ -15,6 +15,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from pllm.authoring import BackendDeployment, DataT, HostBatch, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
+from pllm.backends.vllm.custom_attention import CustomAttention
 from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_taps import HiddenTaps
 from pllm.backends.vllm.layer_logits import LayerLogits
@@ -151,6 +152,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if self._token_table is None
             else StepCapture(TaskResourceFact(TaskSymbol("input_tokens"), 0, self._token_table.numel() * 8), 1)
         )
+        attention = deployment.execution.math.attention
         model_sites = deployment.execution.math.model_sites
         self._sites = (
             ModelSites(
@@ -162,8 +164,16 @@ class VllmSession(Generic[DataT, ResultT]):
                 max_sampler_rows,
                 arena=deployment.execution.arena,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
+                attention_program=attention,
             )
-            if model_sites or (custom_forward_task is not None and taps is not None)
+            if model_sites
+            or (attention is not None and attention.methods)
+            or (custom_forward_task is not None and taps is not None)
+            else None
+        )
+        self._attention = (
+            CustomAttention(decoder, attention, self._sites)
+            if attention is not None and attention.methods and self._sites is not None
             else None
         )
         self._feed: FeedReceiver | None = None
@@ -421,6 +431,8 @@ class VllmSession(Generic[DataT, ResultT]):
             self._activation.prepare(rows.row_batch, context, execution.directory)
         if self._sites is not None:
             self._sites.prepare(rows.row_batch, context, execution.directory)
+        if self._attention is not None:
+            self._attention.prepare(rows.row_batch, rows)
         if self._custom_forward is not None:
             self._custom_forward.prepare(rows.row_batch, context)
 
@@ -475,7 +487,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 effect.clear()
 
     def _close_effects(self) -> None:
-        for effect in (self._overlay, self._sites, self._custom_forward):
+        for effect in (self._attention, self._overlay, self._sites, self._custom_forward):
             if effect is not None:
                 effect.close()
 

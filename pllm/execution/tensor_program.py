@@ -39,6 +39,7 @@ from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw, paged_adam
 from pllm.kernels.page_copy import copy_pages
 
 if TYPE_CHECKING:
+    from pllm.execution.attention_methods import AttentionProgram
     from pllm.execution.model_sites import ResidualRewrite
     from pllm.execution.overlay_task import OverlayTransition
 
@@ -247,6 +248,7 @@ class FunctionMath(Generic[I, D, R]):
     # The @pllm.custom_residual methods the backend installs on the model.
     model_sites: tuple[ResidualRewrite, ...] = ()
     parameter_overlay: OverlayTransition | None = None
+    attention: AttentionProgram | None = None
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:

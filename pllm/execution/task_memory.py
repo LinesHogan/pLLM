@@ -431,7 +431,7 @@ def _identity(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def _site_state(
+def site_state(
     binding: TensorBinding, source: StateInput, rows: int | None, seed: int | None
 ) -> torch.Tensor | ModuleCall:
     layout = next(item.layout for item in binding.layouts.layouts if item.resource == source.resource)
@@ -466,7 +466,7 @@ def site_arguments(
                         if rewrite.memory is not None and source == rewrite.memory.carry
                         else facts.max_admitted_lineages
                     )
-                    kwargs[key] = _site_state(binding, source, rows, seed)
+                    kwargs[key] = site_state(binding, source, rows, seed)
                 elif isinstance(source, ResultInput):
                     if seed is None:
                         kwargs[key] = meta(facts.max_admitted_lineages, *source.shape, dtype=source.dtype)

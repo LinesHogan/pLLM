@@ -19,6 +19,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.tensor_layout import TensorFieldSpec
 from pllm.cost_estimates import CostEstimate, OpCost, estimate_tasks
+from pllm.execution.attention_methods import AttentionCost
 from pllm.execution.preemption import preemption_policy
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 
@@ -131,6 +132,7 @@ class ExplainResult:
     escape_hatches: tuple[EscapeHatch, ...]
     limitations: tuple[str, ...]
     custom_ops: tuple[OpCost, ...]
+    attention: tuple[AttentionCost, ...]
 
     def __str__(self) -> str:
         forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
@@ -211,6 +213,11 @@ class ExplainResult:
                 f"op       {op.name}: {', '.join(op.call_sites)}; {flops} FLOP/row; "
                 f"{op.bytes_per_row:g} logical bytes/row [lower bound]; signature {op.signature}; "
                 f"CPU reference={op.cpu_reference}, autograd={op.autograd}; host syncs unverified (fake only)"
+            )
+        for read in self.attention:
+            lines.append(
+                f"attention layer {read.layer}: custom `{read.method}`; {', '.join(read.reads) or 'user kernels'}; "
+                f"{read.flops_per_token} FLOP/token, <= {read.kv_bytes_per_token} KV bytes/token [estimate at max_model_len; per-head budget upper bound; storage unchanged]"
             )
         return "\n".join(lines)
 
@@ -495,7 +502,8 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
         model_identity=shape.architecture,
         hidden_layouts=layouts,
         overlay_graph_bytes=model_capture_bytes(config, requirements)
-        if (requirements.parameter_targets or requirements.custom_residual) and not reason
+        if (requirements.parameter_targets or requirements.custom_residual or requirements.custom_attention)
+        and not reason
         else 0,
         memory_bytes=1 << 60,
     )
@@ -544,7 +552,9 @@ def explain_facts(
         (*specialization_errors, *errors),
         preemption_policy(attachment, tuple(binding.sites.rewrites)),
         plan.schedule.recompute_rejection,
-        None if plan.semantic_graph.trains_on_batch or binding.sites.rewrites or ops else 0,
+        None
+        if plan.semantic_graph.trains_on_batch or binding.sites.rewrites or binding.attention.methods or ops
+        else 0,
         tuple(attachment.spec.exports),
         _settings(binding, config, plan),
         (
@@ -556,4 +566,5 @@ def explain_facts(
             "Timing settings equal to defaults are labelled default; explicit use of the same value is indistinguishable.",
         ),
         ops,
+        binding.attention.costs,
     )

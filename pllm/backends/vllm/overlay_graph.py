@@ -66,7 +66,7 @@ class GraphOptions(TypedDict, total=False):
 
 def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
     """Announce model hooks before profiling; ordinary workloads keep vLLM's capture sizes."""
-    if not (requirements.parameter_targets or requirements.custom_residual):
+    if not (requirements.parameter_targets or requirements.custom_residual or requirements.custom_attention):
         return {}
     # Request memories and exact decode updates both capture only decode capacity.
     capacity = (

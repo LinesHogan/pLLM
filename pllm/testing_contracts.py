@@ -48,7 +48,7 @@ from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.token_program import TokenProgram
 from pllm.execution.trace import TraceEventKind
-from pllm.testing_forward import CheckForward
+from pllm.testing_forward import CheckAttention, CheckForward
 from pllm.testing_kernels import check_sites, compare_method, replay_cells
 from pllm.testing_timing import VersionChecks
 from pllm.usage import Workload, component_workloads
@@ -576,6 +576,13 @@ def _run(
         declaration.tensor_tasks = tasks
     execution = deployment.execution
     forward = None if declaration.custom_forward_programs is None else CheckForward(execution)
+    attention = (
+        CheckAttention(declaration, facts, device_equivalence=device_equivalence)
+        if declaration.attention.methods
+        else None
+    )
+    if forward is not None:
+        forward.attention = attention
     policy = preemption_policy(deployment.attachment, execution.math.model_sites)
     if (
         preempted != "none"
@@ -613,8 +620,13 @@ def _run(
                     hidden=None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch),
                 )
             site_step = None
-            if forward is not None or declaration.sites.rewrites:
+            if forward is not None or declaration.sites.rewrites or attention is not None:
                 tokens = _embeddings(value, shape.hidden_size, facts.probe.tensor_dtype.torch, perturbed)
+                if attention is not None:
+                    if forward is None:
+                        run.values.update(attention.step(value, tokens))
+                    else:
+                        attention.prepare(value)
                 if forward is not None:
                     forward.prepare(value, tokens)
                 if declaration.sites.rewrites:
@@ -716,7 +728,11 @@ def _compare(
             timing = " Check the method's tokens= selection and @pllm.on phase." if variant == "mixed" else ""
             failures.append(
                 f"[{variant}] request {name!r}, {output} at token {token}: {difference}. "
-                + _fault(reference, candidate, (name, token))
+                + (
+                    "custom attention mixes requests or reads future positions; keep selections and reductions request-local and causal."
+                    if output.startswith("attention ")
+                    else _fault(reference, candidate, (name, token))
+                )
                 + timing
             )
     return failures
@@ -1046,6 +1062,8 @@ def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool 
         for state in declaration.graph.states
     ):
         passed.append("imported rows / request isolation")
+    if declaration.attention.methods:
+        passed.append("custom-attention method math / CPU paged KV schedules")
     passed.extend(("row permutation", "request isolation", "mixed prefill/decode", "chunking / tokens="))
     if any(
         isinstance(source, StateSelectionInputSource)

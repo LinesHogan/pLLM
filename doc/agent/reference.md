@@ -361,6 +361,12 @@ with pllm.make_llm(GPU_CONFIG, workload=Steering()) as llm:
     print(repr(llm.diagnostics().eager_reason))  # activation patches run eagerly
 ```
 
+| Attention reads | |
+|---|---|
+| `@pllm.custom_attention(layers=...)` | Replace dense FA2 reads with `f(q, kv, ...markers)`, keeping projections and KV writes. Return q-shaped attention and optional `[rows, ...]` aux. TP=1; disable prefix caching. |
+| `pllm.model.PagedKV` | Read-only paged caches and metadata. `kv.attend(q, window=0, topk=None)` returns attention and FP32 LSE. Top-K logical positions `[rows, k]` or `[rows, heads, k]`, padded with -1, select reads without freeing storage. |
+| `pllm.attention(layer, "aux" / "lse")` | Same-token facts from an earlier layer inside attention; sampled rows in tensor methods. LSE describes the first `kv.attend` call. |
+
 ## Rewrite a residual site
 
 | Name | Meaning |
@@ -591,6 +597,10 @@ pllm.custom_forward(*, tokens: 'Tokens' = 'all', over: 'Over' = 'token') -> 'Cal
     Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
 pllm.custom_residual(*, site: 'Site', layers: 'tuple[int, ...] | Attr | None' = None, read: 'str' = '', streams: 'int | Attr' = 1, state: 'str' = '', chunk: 'int | Attr | None' = None) -> 'Callable[[F], F]'
     Own the residual update at `site` of `layers` (default: every layer) with this method.
+pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None) -> 'Callable[[F], F]'
+    Replace dense FlashAttention reads, retaining native projections and KV writes.
+pllm.attention(layer: 'int', fact: 'Fact') -> 'Attention'
+    Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers.
 pllm.depth() -> 'Any'
     Inside a @pllm.custom_residual method, the index of the place it runs at, a Python int: the layer, or 2 * layer (+ 1 for the MLP) with site="both".
 pllm.value(layer: 'int | Attr') -> 'Any'
@@ -685,6 +695,8 @@ pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count:
     Public model slices and position state used inside custom_forward methods.
 pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
     One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
+pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', positions: 'torch.Tensor', _read: 'AttentionRead')
+    Borrowed paged K/V, already including the current tokens; never changes cache storage.
 ```
 
 ### pllm.host

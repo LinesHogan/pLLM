@@ -1,6 +1,7 @@
 """The FlashAttention metadata fields and impl attributes shared by vLLM 0.27.1 and 0.32.0."""
 
 from dataclasses import dataclass
+
 import torch
 
 @dataclass
@@ -21,13 +22,36 @@ class FlashAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = ...
     max_num_splits: int = ...
     causal: bool | torch.Tensor = ...
+    use_cascade: bool = ...
     rswa_prefix_lens: torch.Tensor | None = ...
     rswa_window: int | None = ...
     rswa_window_tensor: torch.Tensor | None = ...
 
 class FlashAttentionImpl:
+    alibi_slopes: torch.Tensor | None
+    logits_soft_cap: float
+    sinks: torch.Tensor | None
     scale: float
     sliding_window: tuple[int, int]
     vllm_flash_attn_version: int | None
 
-    def do_kv_cache_update(self, layer: torch.nn.Module, key: torch.Tensor, value: torch.Tensor, kv_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None: ...
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None: ...
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata | None,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor: ...

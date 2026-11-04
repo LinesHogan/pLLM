@@ -14,6 +14,11 @@ def flash_attn_varlen_func(
     softmax_scale: float,
     causal: bool,
     block_table: torch.Tensor,
+    alibi_slopes: torch.Tensor | None = None,
+    window_size: list[int] | None = None,
+    softcap: float = 0.0,
+    scheduler_metadata: torch.Tensor | None = None,
+    num_splits: int = 0,
     return_softmax_lse: bool,
     fa_version: int,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...

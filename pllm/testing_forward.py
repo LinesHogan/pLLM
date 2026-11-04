@@ -5,6 +5,13 @@ It exercises real state bindings and token programs; its pointwise layers do not
 
 from collections.abc import Callable
 from dataclasses import replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pllm.execution.attention import DenseAttention, PagedKV
+    from pllm.execution.attention_methods import Argument
+    from pllm.execution.compile_facts import BackendCompileFacts
+    from pllm.execution.tensor_binding import TensorBinding
 
 import torch
 
@@ -28,6 +35,7 @@ class CheckForward(SerialCustomForward):
             execution.implementation(scheduled.implementation_id)
         )
         execution.rebind_implementation(replace(binding, primitive=self))
+        self.attention: CheckAttention | None = None
         self._rows: tuple[PackedPhaseRow, ...] = ()
         self.inputs = torch.empty(0)
         self.output = torch.empty(0)
@@ -53,6 +61,8 @@ class CheckForward(SerialCustomForward):
         kv: KV = "commit",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         stream = hidden if residual is None else hidden + residual
+        if self.attention is not None and ordinal in self.attention.program.methods:
+            return self.attention.layer((row,), ordinal, stream), torch.zeros_like(stream)
         return (stream.float() * 0.5 + (ordinal + 1) * 0.01).tanh().to(hidden.dtype), torch.zeros_like(hidden)
 
     def propagate(self, row: PackedPhaseRow, ordinal: int, positions: torch.Tensor, hidden: torch.Tensor) -> None:
@@ -66,3 +76,155 @@ class CheckForward(SerialCustomForward):
 
     def finish(self, outputs: tuple[torch.Tensor, ...]) -> None:
         self.output = torch.cat(outputs)
+
+
+class CheckAttention:
+    """Tiny dict-backed paged attention for CPU permutation, chunk and recompute checks."""
+
+    def __init__(
+        self, binding: "TensorBinding", facts: "BackendCompileFacts", *, device_equivalence: bool = False
+    ) -> None:
+        from pllm.execution.model_sites import StateInput
+        from pllm.execution.task_memory import site_state
+
+        self.program, self.probe = binding.attention, facts.probe
+        self.cache: dict[tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self.parameters = {
+            source: site_state(binding, source, None, facts.initialization_seed)
+            for method in self.program.methods.values()
+            for _, source in method.inputs
+            if isinstance(source, StateInput)
+        }
+        self.device_equivalence = device_equivalence
+
+    def prepare(self, value: StepInput) -> None:
+        """Stage sampled-to-packed indices for the fact snapshot tasks."""
+        from pllm.execution.cuda_stream import upload
+
+        mapping = tuple(
+            link.packed_row_index for link in sorted(value.sampler_rows.links, key=lambda link: link.sampler_row_index)
+        )
+        self.program.sample_rows[: len(mapping)].copy_(upload(mapping, torch.device("cpu")))
+
+    def step(self, value: StepInput, tokens: torch.Tensor) -> dict[tuple[str, int, str], torch.Tensor]:
+        """Replay scheduled queries against request prefixes, including same-step causal K/V."""
+        self.prepare(value)
+        outputs: dict[tuple[str, int, str], torch.Tensor] = {}
+        hidden = tokens
+        for layer in sorted(self.program.methods):
+            hidden = self.layer(value.rows.rows, layer, hidden)
+            for row, tensor in zip(value.rows.rows, hidden, strict=True):
+                outputs[row.identity.request_id, row.token_offset, f"attention {layer}"] = tensor.detach().clone()
+        return outputs
+
+    def paged(self, rows: tuple[PackedPhaseRow, ...], layer: int, q: torch.Tensor, read: "_CheckRead") -> "PagedKV":
+        """Stage request-local dictionaries as fixed-size pages, including all current K/V writes."""
+        from pllm.execution.attention import PagedKV
+
+        kv_heads, dim = self.probe.kv_heads, self.probe.head_dim
+        requests = tuple(dict.fromkeys(row.identity.request_id for row in rows))
+        groups = tuple(tuple(row for row in rows if row.identity.request_id == request) for request in requests)
+        lengths = tuple(max(row.token_offset for row in group) + 1 for group in groups)
+        starts = [0]
+        for group in groups:
+            starts.append(starts[-1] + len(group))
+        for row, query in zip(rows, q, strict=True):
+            key = query[:kv_heads].clone()
+            val = (key.float() * 0.7 + layer * 0.01).to(q.dtype)
+            self.cache[row.identity.request_id, layer, row.token_offset] = key, val
+        pages = (max(lengths) + 3) // 4
+        keys, values = (q.new_zeros((len(groups) * pages, 4, kv_heads, dim)) for _ in (0, 1))
+        for request, name in enumerate(requests):
+            for position in range(lengths[request]):
+                cached = self.cache.get((name, layer, position))
+                if cached is not None:
+                    block, offset = request * pages + position // 4, position % 4
+                    keys[block, offset], values[block, offset] = cached
+        return PagedKV(
+            keys,
+            values,
+            torch.arange(len(groups) * pages, dtype=torch.int32).reshape(len(groups), pages),
+            torch.tensor(lengths, dtype=torch.int32),
+            torch.tensor(starts, dtype=torch.int32),
+            torch.tensor(tuple(row.token_offset for row in rows)),
+            read,
+        )
+
+    def layer(self, rows: tuple[PackedPhaseRow, ...], layer: int, hidden: torch.Tensor) -> torch.Tensor:
+        """Execute the actual method over the whole scheduled batch, so cross-request reads fail isolation."""
+        from pllm.execution.attention import DenseAttention
+        from pllm.execution.model_sites import DepthInput, StateInput
+
+        heads, dim = self.probe.attention_heads, self.probe.head_dim
+        width = hidden.shape[-1]
+        q = hidden.repeat(1, (heads * dim + width - 1) // width)[:, : heads * dim].reshape(len(rows), heads, dim)
+        trace = _CheckRead()
+        kv = self.paged(rows, layer, q, trace)
+        trace.kernel = DenseAttention(kv, dim**-0.5)
+        method = self.program.methods[layer]
+        kwargs = {
+            arg: self.parameters[source]
+            if isinstance(source, StateInput)
+            else layer
+            if isinstance(source, DepthInput)
+            else self.program.facts[source][: len(rows)]
+            for arg, source in method.inputs
+        }
+        result = method.function(q, kv, **kwargs)
+        if self.device_equivalence:
+            _compare_attention_device(method.function, q, kv, kwargs, result)
+        out, aux = result if isinstance(result, tuple) else (result, None)
+        for source, target in self.program.facts.items():
+            if source.layer == layer:
+                tensor = trace.lse if source.fact == "lse" else aux
+                assert tensor is not None
+                target[: len(rows)].copy_(tensor)
+        return out.flatten(1)
+
+
+class _CheckRead:
+    """Retain the first native read's LSE for the check decoder's fact writer."""
+
+    def __init__(self) -> None:
+        self.kernel: "DenseAttention | None" = None
+        self.lse: torch.Tensor | None = None
+
+    def __call__(self, q: torch.Tensor, window: int, topk: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.kernel is not None
+        result = self.kernel(q, window, topk)
+        if self.lse is None:
+            self.lse = result[1]
+        return result
+
+
+def _compare_attention_device(
+    function: "Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]",
+    q: torch.Tensor,
+    kv: "PagedKV",
+    kwargs: "dict[str, Argument]",
+    expected: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Run user kernels on identical CPU/CUDA paged inputs, under sync-debug."""
+    from pllm.execution.attention import DenseAttention, PagedKV
+    from pllm.execution.module_graph import ModuleCall
+
+    fields = tuple(
+        value.to("cuda")
+        for value in (kv.key_cache, kv.value_cache, kv.block_table, kv.seq_lens, kv.query_start, kv.positions)
+    )
+    kernel = _CheckRead()
+    keys, values, table, lengths, starts, positions = fields
+    gpu = PagedKV(keys, values, table, lengths, starts, positions, kernel)
+    kernel.kernel = DenseAttention(gpu, q.shape[-1] ** -0.5)
+    arguments = {
+        name: value.to(torch.device("cuda")) if isinstance(value, (torch.Tensor, ModuleCall)) else value
+        for name, value in kwargs.items()
+    }
+    gpu_q = q.to("cuda")
+    mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        actual = function(gpu_q, gpu, **arguments)
+    finally:
+        torch.cuda.set_sync_debug_mode(mode)
+    torch.testing.assert_close(actual, expected, check_device=False)

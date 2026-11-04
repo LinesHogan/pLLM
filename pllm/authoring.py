@@ -80,6 +80,7 @@ class BackendRequirements:
     # Whether a @pllm.custom_residual rewrites sublayer adds or value rows.
     custom_residual: bool = False
     stateful_residual: bool = False
+    custom_attention: bool = False
     # Whether a pllm.model.Adapter reads an InstanceState; CUDA-graph overlays bind request state only.
     instance_adapter: bool = False
     causal_training: bool = False

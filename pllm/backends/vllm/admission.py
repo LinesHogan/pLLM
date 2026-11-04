@@ -43,7 +43,7 @@ def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> st
             "(custom_residual's TP support is deferred)"
         )
     compat.admit_parallel(config, requirements)
-    if requirements.custom_residual and config.enable_prefix_caching:
+    if (requirements.custom_residual or requirements.custom_attention) and config.enable_prefix_caching:
         raise ValueError(
             "disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV "
             "would not match"

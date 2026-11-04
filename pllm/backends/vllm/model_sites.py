@@ -24,6 +24,7 @@ from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, 
 from pllm.backends.vllm.hidden_taps import HiddenTaps, Tap
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
+from pllm.execution.attention_methods import AttentionProgram
 from pllm.execution.cuda_stream import upload
 from pllm.execution.model_sites import (
     EarlierInput,
@@ -72,6 +73,7 @@ class ModelSites:
         arena: PageBundleArena,
         *,
         graphs: bool = False,
+        attention_program: AttentionProgram | None = None,
     ) -> None:
         body = decoder.model.model
         count, weight = len(body.layers), body.norm.weight
@@ -96,6 +98,20 @@ class ModelSites:
                 if isinstance(source, StateInput) and source not in carries
             )
         )
+        if attention_program is not None:
+            self._sources = tuple(
+                dict.fromkeys(
+                    (
+                        *self._sources,
+                        *(
+                            source
+                            for method in attention_program.methods.values()
+                            for _, source in method.inputs
+                            if isinstance(source, StateInput)
+                        ),
+                    )
+                )
+            )
         self._memories = {
             rewrite.name: SiteMemorySchedule(rewrite, arena, requests, rows)
             for rewrite in rewrites
@@ -279,16 +295,24 @@ class ModelSites:
         assert self._activation is not None
         return self._activation.patch(source.resource, layer, self.rows, self.packed)
 
-    def keep(self, source: EarlierInput, values: Tensor) -> None:
-        """Copy the current rows' value at an earlier place for methods later in this forward."""
-        buffer = self._earlier[source]
+    def current_rows(self, values: Tensor) -> Tensor:
+        """Read the current whole-model or custom-forward rows."""
+        return self._rows_of(values)
+
+    def store_rows(self, buffer: Tensor, values: Tensor) -> None:
+        """Write current rows, preserving destinations of inactive custom-forward lanes."""
         shaped = values.reshape(len(values), *buffer.shape[1:])
         if self.rows is None:
             buffer[: len(shaped)].copy_(shaped)
         else:
             if self.active is not None:
-                shaped = torch.where(self.active, shaped, buffer.index_select(0, self.rows))
+                mask = self.active.reshape(len(values), *((1,) * (values.ndim - 1)))
+                shaped = torch.where(mask, shaped, buffer.index_select(0, self.rows))
             buffer.index_copy_(0, self.rows, shaped)
+
+    def keep(self, source: EarlierInput, values: Tensor) -> None:
+        """Copy the current rows' value at an earlier place for methods later in this forward."""
+        self.store_rows(self._earlier[source], values)
 
     def frozen(self, start: int, stop: int, hidden: Tensor) -> None:
         """Seed skipped layers' readouts with the frozen stream before computed rows overwrite them."""

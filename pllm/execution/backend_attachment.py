@@ -20,6 +20,7 @@ from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     HiddenInputSource,
     InputTokensInputSource,
+    PackedSamplerRowsInputSource,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticGraph,
@@ -195,8 +196,6 @@ def _check_attachment(attachment: BackendAttachment) -> None:
 
 def _check_exports(attachment: BackendAttachment) -> None:
     """Exports, and the helpers whose results they read, observe the step between publication and sampling."""
-    if not attachment.probe.hidden_resources and attachment.plan.semantic_graph.input_token_history < 0:
-        raise ValueError("exports need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
     tasks = {task.symbol: task for task in attachment.plan.semantic_graph.tasks}
     pending, seen = list(attachment.spec.exports), set[TaskSymbol]()
     while pending:
@@ -226,7 +225,8 @@ def _observes(task: SemanticTask, output: SemanticOutputKind) -> bool:
                 | InputTokensInputSource
                 | StepIdInputSource
                 | StateSelectionInputSource
-                | TaskResultInputSource,
+                | TaskResultInputSource
+                | PackedSamplerRowsInputSource,
             )
             for port in task.inputs
         )

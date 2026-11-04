@@ -258,6 +258,7 @@ class TensorBinding(Builder[TensorFrame]):
                 previous, step=incoming.step, rows=incoming.rows, plan=None, training=None
             ),
             model_sites=tuple(self.sites.rewrites),
+            attention=self.attention,
             parameter_overlay=self.overlay_math,
         )
 

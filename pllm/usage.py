@@ -56,6 +56,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import VisibilityKind
+from pllm.execution.attention_methods import AttentionFact, AttentionMethod, Fact
 from pllm.execution.binding_base import SGD as SGD, Field as Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, TrainingBatch, declare_batch_train
 from pllm.execution.checkpoint import PretrainedFile, initialize_checkpoint
@@ -235,6 +236,24 @@ class Hidden(_Source):
             return super().site_input(context)
         layer = _setting(self.layer, context.owner, int) % context.binding.dimensions.layer_count
         return EarlierInput("residual" if self.site is HiddenSite.RESIDUAL else "attention_residual", layer)
+
+
+@dataclass(frozen=True)
+class Attention(_Source):
+    layer: int
+    fact: Fact
+
+    def port(self, context: _Reflection) -> TensorPort:
+        return context.binding.attention.port(context.binding, AttentionFact(self.layer, self.fact))
+
+
+def attention(layer: int, fact: Fact) -> Attention:
+    """Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers."""
+    if type(layer) is not int or layer < 0 or fact not in ("aux", "lse"):
+        raise ValueError(
+            "pllm.attention needs a nonnegative layer and fact='aux' or 'lse'; DSA topk facts are deferred"
+        )
+    return Attention(layer, fact)
 
 
 @dataclass(frozen=True)
@@ -1621,6 +1640,61 @@ def _site_inputs(
 
 
 @dataclass(frozen=True, kw_only=True)
+class _CustomAttention(_Effect):
+    kind: ClassVar[str] = "custom_attention"
+    layers: tuple[int, ...] | Attr | None
+    phase: ClassVar[Phase | None] = Phase.IN_FORWARD
+    model_effect: ClassVar[bool] = True
+
+    def declare(self, operation: _Operation) -> None:
+        context, binding = operation.context, operation.context.binding
+        if binding.host or operation.gradient is not None or operation.rows or operation.phase is not Phase.IN_FORWARD:
+            raise ValueError(
+                "@pllm.custom_attention runs every model row; remove rows=, on and differentiate, and use make_llm"
+            )
+        count = binding.dimensions.layer_count
+        layers = tuple(range(count)) if self.layers is None else _setting(self.layers, context.owner, tuple)
+        if (
+            not layers
+            or any(type(layer) is not int or not 0 <= layer < count for layer in layers)
+            or tuple(sorted(set(layers))) != layers
+        ):
+            raise ValueError(f"@pllm.custom_attention needs sorted distinct layers in 0..{count - 1}")
+        parameters = tuple(signature(operation.function, eval_str=False).parameters.items())
+        if len(parameters) < 2 or any(p.default is not SignatureParameter.empty for _, p in parameters[:2]):
+            raise TypeError(f"{operation.name}: take q and kv first, without defaults, then markers")
+        inputs: list[tuple[str, StateInput | DepthInput | AttentionFact]] = []
+        for name, parameter in parameters[2:]:
+            source = _typed(parameter.default, _Source)
+            if source is None:
+                raise TypeError(f"{name}: give every attention input after q and kv a marker default")
+            if isinstance(source, Attention):
+                value = AttentionFact(source.layer, source.fact)
+            else:
+                value = source.qualify(context).site_input(context)
+                if not isinstance(value, (StateInput, DepthInput)):
+                    raise TypeError(
+                        "@pllm.custom_attention reads instance parameters, modules, depth and earlier attention facts"
+                    )
+            inputs.append((name, value))
+        binding.attention.add(AttentionMethod(operation.name, layers, freeze(operation.function), tuple(inputs)))
+        binding.model_reads(tuple(source.resource for _, source in inputs if isinstance(source, StateInput)))
+        context.signature.append((operation.name, boundary_digest(fingerprint(operation.function), self)))
+
+
+def custom_attention(*, layers: tuple[int, ...] | Attr | None = None) -> Callable[[F], F]:
+    """Replace dense FlashAttention reads, retaining native projections and KV writes.
+
+    The method receives post-RoPE q [rows, heads, head_dim] and pllm.model.PagedKV.
+    Return attention with q's shape/dtype, optionally paired with aux [rows, ...].
+    kv.attend returns (output, float32 LSE); window and per-head topk select reads
+    without freeing storage. Methods may call pure torch.library.custom_op kernels.
+    Requires TP=1, full unquantized FA2 attention and prefix caching disabled.
+    """
+    return _mark(effect=_CustomAttention(layers=layers))
+
+
+@dataclass(frozen=True, kw_only=True)
 class _CustomResidual(_Effect):
     kind: ClassVar[str] = "custom_residual"
 
@@ -2888,7 +2962,8 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             component.binding = b
             component.adapters = adapters
         context.declare_values()
-        for operation in context.operations:
+        ordered = sorted(context.operations, key=lambda operation: not isinstance(operation.effect, _CustomAttention))
+        for operation in ordered:
             description = operation.effect.description(operation.context.owner)
             if operation.phase_override:
                 description = replace(description, phase=operation.phase.name.lower())
@@ -2922,6 +2997,19 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         shape_site_results(b, facts)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
         b.causal = None
+        b.attention.plan(b, facts)
+        from pllm.execution.token_program import Segment
+
+        if any(
+            isinstance(step, Segment)
+            and step.kv == "peek"
+            and any(step.start <= layer < step.stop for layer in b.attention.methods)
+            for program in (b.custom_forward_programs or {}).values()
+            for step in program.steps
+        ):
+            raise ValueError(
+                "@pllm.custom_attention inside @pllm.custom_forward needs kv='commit'; kv='peek' is deferred"
+            )
         b.configure_scans(facts)
         return b
 
@@ -2936,7 +3024,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 targets += _targets(_setting(effect.targets, operation.context.owner, tuple))
                 continue
             # Custom residual methods read state and earlier values of the forward, never tapped rows.
-            if isinstance(effect, _CustomResidual) or (
+            if isinstance(effect, (_CustomResidual, _CustomAttention)) or (
                 isinstance(effect, _Sampler) and not effect.enabled(operation.context.owner)
             ):
                 continue
@@ -3001,6 +3089,8 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             ),
             position_states=context.position_states(),
             custom_forward=bool(context.custom_forwards),
+            custom_attention=any(isinstance(operation.effect, _CustomAttention) for operation in context.operations)
+            or any(isinstance(source, Attention) for source in inputs),
             custom_residual=any(isinstance(operation.effect, _CustomResidual) for operation in context.operations),
             stateful_residual=any(
                 isinstance(operation.effect, _CustomResidual) and bool(operation.effect.state)
@@ -3028,9 +3118,14 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             timeline = facts.timeline
         else:
             timeline = derive_resources(declaration, facts, options)
-        resident = declaration.template_bytes + facts.probe.max_packed_rows * sum(
-            prod(source.shape) * source.dtype.itemsize
-            for source in {source for rewrite in declaration.sites.rewrites for source in rewrite.results}
+        resident = (
+            declaration.template_bytes
+            + declaration.attention.storage_bytes
+            + facts.probe.max_packed_rows
+            * sum(
+                prod(source.shape) * source.dtype.itemsize
+                for source in {source for rewrite in declaration.sites.rewrites for source in rewrite.results}
+            )
         )
         return replace(
             timeline,
@@ -3043,6 +3138,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
     ) -> MathBinding[StepInput, TensorFrame, TensorOutput]:
         """Bind the planned declaration's tensor tasks to the implementations the plan selected."""
+        declaration.attention.bind(facts.device)
         operations = declaration.executables(facts, plan.timeline.task_resources)
         declaration.require_resident_side_tasks(plan, operations)
         return MathBinding(

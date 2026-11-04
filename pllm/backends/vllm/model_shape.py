@@ -73,6 +73,9 @@ class ModelShape:
     targets: tuple[ProjectionShape, ...]
     read_only_reason: str | None = None
     base_forward_flops_per_token_estimate: int | None = None
+    attention_heads: int = 0
+    kv_heads: int = 0
+    head_dim: int = 0
 
     @classmethod
     def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
@@ -101,6 +104,9 @@ class ModelShape:
             shape.projections(targets),
             read_only,
             shape.forward_flops(),
+            shape.num_attention_heads,
+            shape.num_key_value_heads or shape.num_attention_heads,
+            shape.head_dim or shape.hidden_size // shape.num_attention_heads,
         )
 
     @classmethod
@@ -111,6 +117,7 @@ class ModelShape:
         model = decoder.model
         layers = len(model.model.layers)
         shapes = inspect_parameter_targets(decoder, expand_targets(targets, layers), dtype)
+        config = structure(model.config.to_dict(), _ConfigShape)
         return cls(
             type(model).__name__,
             model.config.hidden_size,
@@ -119,5 +126,8 @@ class ModelShape:
             model.lm_head.num_embeddings_padded,
             shapes,
             decoder.read_only,
-            structure(model.config.to_dict(), _ConfigShape).forward_flops(),
+            config.forward_flops(),
+            config.num_attention_heads,
+            config.num_key_value_heads or config.num_attention_heads,
+            config.head_dim or config.hidden_size // config.num_attention_heads,
         )

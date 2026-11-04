@@ -96,6 +96,7 @@ def compile_facts(
                 f"class={model_identity}",
                 f"hidden_size={shape.hidden_size}",
                 f"layers={shape.layer_count}",
+                f"attention={shape.attention_heads}:{shape.kv_heads}:{shape.head_dim}",
                 f"vocab_size={shape.vocab_size}",
                 *(f"hidden={resource.binding.tap}" for resource in hidden_resources),
                 f"layer_logits={layer_logits}",
@@ -104,6 +105,10 @@ def compile_facts(
             )
         ),
         hidden_size=shape.hidden_size,
+        custom_attention=requirements.custom_attention,
+        attention_heads=shape.attention_heads,
+        kv_heads=shape.kv_heads,
+        head_dim=shape.head_dim,
         graph_mode=graph_mode(overlay_graph_bytes),
         device_kind=StateDeviceKind.CUDA,
         tensor_dtype=TensorDType(config.dtype),

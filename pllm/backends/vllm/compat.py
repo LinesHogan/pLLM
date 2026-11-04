@@ -31,6 +31,8 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
             raise ValueError(
                 f"pllm needs {name}=1; pipeline/data parallelism is deferred to M6; only tensor parallelism is supported"
             )
+    if requirements.custom_attention and config.tensor_parallel_size != 1:
+        raise ValueError("@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads")
     if config.tensor_parallel_size == 1:
         return
     if VLLM_027 or config.runner != "mrv2":
