@@ -522,7 +522,13 @@ class Builder(Generic[D]):
     def exports(self, call: Call) -> None:
         self.effects = replace(self.effects, exports=(*self.effects.exports, call.symbol))
 
-    def overlay(self, bindings: tuple[ParameterOverlayFieldBinding, ...], transition: Call | None = None) -> None:
+    def overlay(
+        self,
+        bindings: tuple[ParameterOverlayFieldBinding, ...],
+        transition: Call | None = None,
+        *,
+        phases: tuple[HiddenPhase, ...] = (),
+    ) -> None:
         """Correct the target projections from the bindings' states; `transition` trains one of them in forward."""
         if self.effects.in_forward is not None or (transition is not None and self.effects.overlay_bindings):
             raise ValueError(
@@ -534,6 +540,7 @@ class Builder(Generic[D]):
             self.effects,
             overlay_bindings=(*self.effects.overlay_bindings, *bindings),
             in_forward=self.effects.in_forward if transition is None else transition.symbol,
+            overlay_phases=phases,
         )
 
     def activation_patch(self, bindings: tuple[ActivationPatchBinding, ...]) -> None:

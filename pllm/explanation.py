@@ -447,7 +447,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
     Memory excludes base-model weights, KV cache and vLLM activations. GPU fit is decided by make_llm.
     A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.
     """
-    from pllm.backends.vllm.admission import admit_workload
+    from pllm.backends.vllm.admission import admit_workload, model_capture_bytes
     from pllm.backends.vllm.compile_facts import compile_facts
     from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
     from pllm.backends.vllm.model_shape import ModelShape
@@ -465,7 +465,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
         config,
         model_identity=shape.architecture,
         hidden_layouts=layouts,
-        overlay_graph_bytes=config.execution.model_capture_bytes
+        overlay_graph_bytes=model_capture_bytes(config, requirements)
         if (requirements.parameter_targets or requirements.custom_residual) and not reason
         else 0,
         memory_bytes=1 << 60,

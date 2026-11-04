@@ -40,6 +40,7 @@ from pllm.kernels.page_copy import copy_pages
 
 if TYPE_CHECKING:
     from pllm.execution.model_sites import ResidualRewrite
+    from pllm.execution.overlay_task import OverlayTransition
 
 I = TypeVar("I", bound=StepInput)
 D = TypeVar("D")
@@ -243,9 +244,14 @@ class FunctionMath(Generic[I, D, R]):
     prepare_data: Callable[[I, TensorBatch], D]
     output_data: Callable[[D, InvocationOutput], R]
     resume_data: Callable[[D, D], D] | None = None
-    parameter_phases: tuple[HiddenPhase, ...] = ()
     # The @pllm.custom_residual methods the backend installs on the model.
     model_sites: tuple[ResidualRewrite, ...] = ()
+    parameter_overlay: OverlayTransition | None = None
+
+    @property
+    def parameter_phases(self) -> tuple[HiddenPhase, ...]:
+        """Derive training phases from the declared overlay rather than retaining another copy."""
+        return () if self.parameter_overlay is None else self.parameter_overlay.phases
 
     def initialize(self, roots: Roots, addresses: tuple[StateAddress, ...]) -> None:
         resources = tuple(str(address.resource) for address in addresses)

@@ -53,6 +53,7 @@ from pllm.execution.trace import ExecutionTrace, TraceEvent, TraceEventKind
 
 if TYPE_CHECKING:
     from pllm.execution.model_sites import ResidualRewrite
+    from pllm.execution.overlay_task import OverlayTransition
     from pllm.execution.post_sample import PostSampleOverlap
     from pllm.execution.tensor_program import TensorBatch
 
@@ -333,6 +334,11 @@ class StateTaskContext(Generic[DataT]):
 
 class StateMath(Protocol[InputContra, DataT, ResultCo]):
     """Input validation and tensor mathematics, never invocation ownership."""
+
+    @property
+    def parameter_overlay(self) -> OverlayTransition | None:
+        """Declared chunk mathematics available to model graph ports."""
+        ...
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:

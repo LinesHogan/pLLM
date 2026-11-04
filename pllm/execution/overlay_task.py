@@ -34,7 +34,7 @@ from pllm.execution.scan import execute_scan, prepare_scan
 from pllm.execution.scan_analysis import chunk_readout
 from pllm.execution.scan_execution import PreparedScan, Step
 from pllm.execution.tensor_frame import OverlayEntry, OverlayTargetResult, TensorFrame, Tensors, UpdateOutput
-from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch
+from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch, read_batch
 from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.page_copy import chunk_capacity, prepend_rows
 
@@ -129,6 +129,16 @@ class ChunkUpdate:
             {"tail_rows": remaining},
         )
 
+    def readout(self, values: Tensors) -> Callable[..., torch.Tensor] | None:
+        """Prepare the chunk's unchanged read arithmetic for eager tails and captured selection."""
+        carry, *columns = self.arguments
+        samples = (
+            values[carry],
+            *(values[f"_pending_rows_{name}"] for name in columns),
+            *(values[name] for name in self.invariants),
+        )
+        return chunk_readout(self.step, tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples))
+
     def contiguous(self, values: Tensors, offset: int) -> UpdateOutput:
         """Use the scheduler's contiguous token frontier without reading a device counter.
 
@@ -142,8 +152,7 @@ class ChunkUpdate:
         pending = offset % self.chunk
         total = pending + len(rows[0])
         invariants = tuple(values[name] for name in self.invariants)
-        samples = (values[carry], *tails, *invariants)
-        readout = chunk_readout(self.step, tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples))
+        readout = self.readout(values)
         if readout is None:
             return self(**values)
         trained = total // self.chunk * self.chunk
@@ -325,6 +334,14 @@ class GradientUpdate:
 class ProjectionTransition(Protocol):
     """The output boundary consumed by a model projection."""
 
+    def prepare(self, math: OverlayTransition) -> TensorBatch: ...
+
+    def complete(
+        self,
+        operands: tuple[ProjectionOperands, ...],
+        updates: Mapping[tuple[RequestIdentity, Projection], UpdateOutput],
+    ) -> None: ...
+
     def run(
         self, operands: tuple[ProjectionOperands, ...], *, complete: bool = True
     ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]: ...
@@ -343,6 +360,29 @@ class ProjectionTask(Generic[DataT, ResultT]):
     ) -> None:
         self.execution, self.context, self.rows, self.task = execution, context, rows, task
         self.pending = set(targets)
+
+    def prepare(self, math: OverlayTransition) -> TensorBatch:
+        """Open the ordinary private transition before a captured model fills its tensor ports."""
+        selection = self.context.selection.for_resource(math.resource)
+        # Completion comes from carried device tails, so every carry needs a private destination.
+        self.context.prepare_owned_write(selection.refs, copy_fields=None)
+        return read_batch(self.context, "private", math.resource)
+
+    def complete(
+        self,
+        operands: tuple[ProjectionOperands, ...],
+        updates: Mapping[tuple[RequestIdentity, Projection], UpdateOutput],
+    ) -> None:
+        """Settle captured results through the same task, counters and publication as eager execution."""
+        from pllm.execution.step_input import StepInput
+
+        self.pending.clear()
+        self.execution.execute_part(
+            self.context,
+            StepInput(self.rows.row_batch, self.rows, operands=operands, overlay_updates=updates),
+            self.task,
+            complete=True,
+        )
 
     def run(
         self, operands: tuple[ProjectionOperands, ...], *, complete: bool = True
@@ -421,9 +461,17 @@ class OverlayTransition:
                         if name == target and (operand.phase in self.phases) == train
                     )
                     if group:
-                        results, counts = self.group(
-                            group, target_index, tuple(indices[o.identity] for o in group), batch
-                        )
+                        if data.step.overlay_updates:
+                            results = tuple(
+                                self.validate(data.step.overlay_updates[o.identity, target], o) for o in group
+                            )
+                            counts = torch.stack(
+                                tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)
+                            ).sum(0)
+                        else:
+                            results, counts = self.group(
+                                group, target_index, tuple(indices[o.identity] for o in group), batch
+                            )
                         counters.append(counts)
                         updates.update(((o.identity, target), result) for o, result in zip(group, results, strict=True))
         start = len(data.entries)

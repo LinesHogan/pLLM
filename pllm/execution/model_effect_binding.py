@@ -101,7 +101,6 @@ def declare_parameter_overlay(
     )
     targets = effect.targets
     b.overlay_targets = targets
-    b.parameter_phases = phases
     state = b.state(
         effect.state,
         layout,
@@ -198,7 +197,7 @@ def declare_parameter_overlay(
         reads_weight="weight" in arguments.values(),
         reads_embedding="embedding" in arguments.values(),
     )
-    b.overlay(views, transition)
+    b.overlay(views, transition, phases=phases)
 
 
 def declare_site_memory(b: TensorBinding, name: str, state: State) -> None:

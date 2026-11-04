@@ -13,6 +13,7 @@ from pllm.contracts.backend_attachment import (
     ModelProbe,
 )
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -59,6 +60,8 @@ def attachment_buffer_bytes(
     )
     if attachment.overlay_bindings and probe.device_kind is StateDeviceKind.CUDA and pinned:
         buffers += probe.blas_workspace_bytes
+    pinned_rows = min(rows, probe.causal_domain.requests) if graph.updates_in_forward and probe.causal_domain else rows
+    decode_updates = graph.updates_in_forward and HiddenPhase.DECODE in attachment.overlay_phases
     for binding in attachment.overlay_bindings:
         if binding.reads_embedding:
             buffers += rows * hidden * width
@@ -69,8 +72,8 @@ def attachment_buffer_bytes(
             operands = rows * (width * (inputs + hidden) + 8)
             buffers += rows * width * outputs
             if pinned or graph.custom_forward_task is not None:
-                buffers += operands
-            else:
+                buffers += pinned_rows * (width * (inputs + hidden) + 8)
+            if not pinned or graph.updates_in_forward:
                 # Exact projections consume each layer's operands immediately.
                 # The context retains the previous segment until the next replaces it.
                 projection_operands.append(operands)
@@ -84,7 +87,7 @@ def attachment_buffer_bytes(
             outputs = binding.fields[1].shape[0]
             buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
         if probe.causal_domain is not None and pinned:
-            blocks = projection_blocks(rows, probe.causal_domain.requests)
+            blocks = 1 if decode_updates else projection_blocks(pinned_rows, probe.causal_domain.requests)
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
             buffers += 2 * blocks * sum(prod(field.shape) * width for field in binding.fields)
             buffers += blocks * ROWS_PER_BLOCK * 2 * width * (inputs + outputs)

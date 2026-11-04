@@ -4,7 +4,7 @@ import operator
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, TypeVar
 
 import torch
 from torch._ops import OpOverload
@@ -14,6 +14,8 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.node import Argument, Target
 
 from pllm.execution.torch_private import disable_current_modes, fx_graph_cse
+
+ChunkResult = TypeVar("ChunkResult")
 
 Kind = Literal["scalar", "diagonal", "left", "right"]
 Coefficient = Node | float
@@ -467,11 +469,37 @@ def analyze(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs
     return _Extract(source, carry.meta["val"]).run()
 
 
+_READOUT_OPS = (
+    torch.ops.aten.mm.default,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.t.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.sub.Tensor,
+)
+
+_CHUNK_OPTIONS = {
+    "triton.cudagraphs": False,
+    "emulate_precision_casts": True,
+    "epilogue_fusion": False,
+    "max_autotune_gemm_backends": "ATEN",
+}
+
+
 @lru_cache(maxsize=128)
-def chunk_readout(
-    step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs
-) -> Callable[..., torch.Tensor] | None:
-    """Keep the exact readout arithmetic and shapes while dropping unused carry updates."""
+def chunk_step(
+    step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs, numerics: bool
+) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    """Compile the functional chunk only when the numerical policy permits transforms."""
+    source = functional_graph(step, specs)
+    if source is None:
+        return step
+    return compile_chunk(source) if numerics else source
+
+
+def readout_graph(step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs) -> GraphModule | None:
+    """Cut the returned readout from a functional chunk without retaining update work."""
     source = functional_graph(step, specs)
     if source is None:
         return None
@@ -483,33 +511,64 @@ def chunk_readout(
             return None
     source.graph.eliminate_dead_code()
     source.recompile()
-    return prepare_readout(source) if specs[0][3].type == "cuda" else source
+    return source
+
+
+@lru_cache(maxsize=128)
+def chunk_readout(
+    step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs
+) -> Callable[..., torch.Tensor] | None:
+    """Keep the exact readout arithmetic and shapes while dropping unused carry updates."""
+    source = readout_graph(step, specs)
+    return None if source is None else prepare_readout(source) if specs[0][3].type == "cuda" else source
+
+
+@lru_cache(maxsize=128)
+def row_readout(
+    step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs, columns: int
+) -> Callable[..., torch.Tensor] | None:
+    """Admit row-local casts, sums and right projections; contractions across arriving rows stay chunk-shaped."""
+    source = readout_graph(step, specs)
+    if source is None:
+        return None
+    inputs = tuple(node for node in source.graph.nodes if node.op == "placeholder")
+    rows = set(inputs[1 : 1 + columns])
+    for node in source.graph.nodes:
+        if node.op != "call_function" or not any(value in rows for value in node.all_input_nodes):
+            continue
+        if node.target == torch.ops.aten.mm.default:
+            if node.args[0] not in rows or node.args[1] in rows:
+                return None
+        elif node.target not in (torch.ops.aten._to_copy.default, torch.ops.aten.add.Tensor, torch.ops.aten.sub.Tensor):
+            return None
+        rows.add(node)
+    output = next(node for node in source.graph.nodes if node.op == "output")
+    if output.args[0] not in rows:
+        return None
+    with disable_current_modes(), FakeTensorMode(allow_non_fake_inputs=True):
+        samples = tuple(
+            torch.empty((1, *shape[1:]) if 1 <= index <= columns else shape, dtype=dtype, device=device)
+            for index, (shape, _, dtype, device) in enumerate(specs)
+        )
+        value: torch.Tensor = source(*samples)
+    return prepare_readout(source) if value.shape[0] == 1 else None
 
 
 def prepare_readout(source: GraphModule) -> Callable[..., torch.Tensor]:
     """Fuse casts and pointwise projection arithmetic without changing BLAS reductions."""
-    supported = (
-        torch.ops.aten.mm.default,
-        torch.ops.aten.permute.default,
-        torch.ops.aten.t.default,
-        torch.ops.aten.transpose.int,
-        torch.ops.aten._to_copy.default,
-        torch.ops.aten.add.Tensor,
-        torch.ops.aten.sub.Tensor,
-    )
     if any(
-        node.op == "call_function" and (node.target not in supported or node.kwargs.get("alpha", 1) != 1)
+        node.op == "call_function" and (node.target not in _READOUT_OPS or node.kwargs.get("alpha", 1) != 1)
         for node in source.graph.nodes
     ):
         return source
+    return compile_chunk(source)
+
+
+def compile_chunk(source: Callable[..., ChunkResult]) -> Callable[..., ChunkResult]:
+    """Fuse pointwise chunk arithmetic while retaining explicit casts and native BLAS reductions."""
     return torch.compile(  # pyright: ignore[reportUnknownMemberType]
         source,
         fullgraph=True,
         dynamic=False,
-        options={
-            "triton.cudagraphs": False,
-            "emulate_precision_casts": True,
-            "epilogue_fusion": False,
-            "max_autotune_gemm_backends": "ATEN",
-        },
+        options={**_CHUNK_OPTIONS},
     )

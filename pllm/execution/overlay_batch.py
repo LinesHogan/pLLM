@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
@@ -12,9 +13,15 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ProjectionOperands
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import TaskResourceFact
+from pllm.contracts.tensor_policy import TensorPolicy
+from pllm.execution.cuda_graph import device_branch
 from pllm.execution.cuda_stream import PinnedStaging
-from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate
+from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, save_tail
+from pllm.execution.scan import execute_scan
+from pllm.execution.scan_analysis import chunk_step, row_readout
+from pllm.execution.scan_execution import PreparedScan
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_frame import Tensors, UpdateOutput
 from pllm.execution.tensor_program import TensorBatch
@@ -329,3 +336,236 @@ class OverlayTile:
             )
             for i, o in enumerate(operands)
         ), counters
+
+
+class DecodeOverlay:
+    """Device-counted one-row transitions over private slots, with one update branch per request bucket."""
+
+    def __init__(
+        self,
+        math: OverlayTransition,
+        target: int,
+        pools: tuple[torch.Tensor, ...],
+        invariants: Tensors,
+        requests: int,
+        policy: TensorPolicy,
+        key_fields: tuple[RequestKeyField, ...],
+    ) -> None:
+        self.key_fields = key_fields
+        self.math, self.target, self.pools, self.policy = math, target, pools, policy
+        self.invariants = dict(invariants)
+        self.table = torch.zeros((len(pools) + 1, requests), device=pools[0].device, dtype=torch.long)
+        self.source = self.table.new_zeros((1,))
+        self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
+        self.host = np.empty(0, dtype=np.int64)
+        self.outputs: dict[int, tuple[UpdateOutput, ...]] = {}
+        self.plan: PreparedScan | None = None
+        self.read_full: Callable[..., torch.Tensor] | None = None
+        self.read_row: Callable[..., torch.Tensor] | None = None
+
+    @property
+    def buffers(self) -> list[torch.Tensor]:
+        """All mutable storage passed through the model's opaque projection op."""
+        return [*self.pools, self.table, *self.invariants.values()]
+
+    def reserve(self) -> None:
+        """Acquire the staging slot before the invocation opens private pages."""
+        self.host = self.staging.take(self.table.numel()).reshape(self.table.shape)
+
+    def prepare(self, batch: TensorBatch, identities: tuple[RequestIdentity, ...]) -> None:
+        """Upload the task's private slots; padded requests have no write destination."""
+        width = len(self.math.buffers)
+        batch = batch.for_resource(self.math.resource)
+        indices = {
+            row.identity: index for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
+        }
+        fields = tuple(batch.field_slots(self.target * width + i) for i in range(width))
+        self.host[-1, : len(identities)] = 1
+        for i, (_, slots) in enumerate(fields):
+            self.host[i, : len(identities)] = tuple(slots[indices[identity]] for identity in identities)
+        self.staging.copy_to(self.table)
+        for name, value in self.math.invariant_values(self.target, batch).items():
+            self.invariants[name].copy_(value)
+
+    def values(self, index: int) -> dict[str, torch.Tensor]:
+        """Gather one request without combining its source GEMMs with other requests."""
+        slots = self.table[:-1, index]
+        return {
+            name: pool.index_select(0, slots[i : i + 1])[0]
+            for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True))
+        }
+
+    def arguments(
+        self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
+    ) -> Tensors:
+        """Bind the same state and model operands for counted chunks and decode completion."""
+        inputs = {
+            **values,
+            **self.invariants,
+            "input": hidden,
+            "target": desired,
+            "embedding": embedding,
+            "weight": base,
+            "prompt_end": hidden.new_zeros((), dtype=torch.bool),
+        }
+        return {key: inputs[source] for key, source in self.math.arguments.items()}
+
+    def prepare_scan(self, arguments: Tensors) -> None:
+        """Cut readouts and prepare the ordinary scan before any capacity graph is captured."""
+        chunk = self.math.chunk
+        if self.plan is not None or not isinstance(chunk, ChunkUpdate):
+            return
+        carry, *columns = chunk.arguments
+        samples = (
+            arguments[carry],
+            *(arguments[f"_pending_rows_{name}"] for name in columns),
+            *(arguments[name] for name in chunk.invariants),
+        )
+        specs = tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples)
+        self.plan = PreparedScan(chunk_step(chunk.step, specs, self.policy.allow_numerical_transforms), chunk.chunk)
+        self.read_full = chunk.readout(arguments)
+        if self.policy.allow_numerical_transforms:
+            self.read_row = row_readout(chunk.step, specs, len(columns))
+
+    def store(self, index: int, values: Tensors, active: torch.Tensor) -> None:
+        """Write only issued destinations, leaving padding and inactive carries untouched."""
+        slots = self.table[:-1, index]
+        for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True)):
+            copy_pages(values[name].unsqueeze(0), pool, self.source, slots[i : i + 1].masked_fill(~active, -1))
+
+    def run(
+        self, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
+    ) -> torch.Tensor:
+        """Read incoming carries, append arriving rows, then update the device-selected completion bucket."""
+        if isinstance(self.math.chunk, ChunkUpdate) and self.plan is None:
+            arguments = self.arguments(self.values(0), hidden[:1], desired[:1], embedding[:1], base)
+            self.prepare_scan(arguments)
+        if self.read_full is None:
+            results = tuple(self.counted(index, hidden, desired, embedding, base) for index in range(len(hidden)))
+        else:
+            results_list: list[UpdateOutput] = []
+            local = RequestKeyField.REQUEST_ID in self.key_fields
+            for index in range(len(hidden)):
+                results_list.append(self.decode_row(index, hidden, desired, embedding, base))
+                if not local:
+                    # Shared keys retain read/update order between requests in the same forward.
+                    self.complete_bucket((index,), results_list, hidden[:0], desired[:0], embedding[:0], base)
+            if local:
+                self.complete_bucket(
+                    tuple(range(len(hidden))), results_list, hidden[:0], desired[:0], embedding[:0], base
+                )
+            results = tuple(results_list)
+        self.outputs[len(hidden)] = results
+        return torch.cat(tuple(result.output for result in results))
+
+    def complete_bucket(
+        self,
+        indices: tuple[int, ...],
+        results: list[UpdateOutput],
+        hidden: torch.Tensor,
+        desired: torch.Tensor,
+        embedding: torch.Tensor,
+        base: torch.Tensor,
+    ) -> None:
+        """Use the shared CUDA IF machinery once for requests whose updates can share temporary memory."""
+        with device_branch(torch.stack(tuple(results[index].changed for index in indices)).any()):
+            for index in indices:
+                self.complete_row(index, results[index].changed, hidden, desired, embedding, base)
+
+    def counted(
+        self, index: int, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
+    ) -> UpdateOutput:
+        """Keep opaque readouts and non-chunk updates on their ordinary tensor path."""
+        values, count = self.values(index), self.table[-1, index]
+        chunk = self.math.chunk
+        if chunk is not None:
+            values["_pending_length"].masked_fill_(count == 0, 0)
+        arguments = self.arguments(
+            values, hidden[index : index + 1], desired[index : index + 1], embedding[index : index + 1], base
+        )
+        if isinstance(chunk, ChunkUpdate):
+            assert self.plan is not None
+            result = chunk.counted(self.plan, count, arguments)
+        elif isinstance(chunk, GradientUpdate):
+            result = chunk.advance(arguments, count, batched=False)
+        else:
+            result = self.math.function(**arguments)
+        self.store(index, values, count > 0)
+        return result
+
+    def complete_row(
+        self,
+        index: int,
+        complete: torch.Tensor,
+        hidden: torch.Tensor,
+        desired: torch.Tensor,
+        embedding: torch.Tensor,
+        base: torch.Tensor,
+    ) -> None:
+        """Share one conditional allocator across requests while the scan masks each incomplete carry."""
+        chunk = self.math.chunk
+        assert isinstance(chunk, ChunkUpdate) and self.plan is not None
+        values = self.values(index)
+        arguments = self.arguments(values, hidden, desired, embedding, base)
+        carry, *columns = chunk.arguments
+        tails = tuple(arguments[f"_pending_rows_{name}"] for name in columns)
+        # The store supplies the per-request mask; a second full-matrix where inside
+        # the scan would retain another dense temporary in every conditional graph.
+        updated, _ = execute_scan(
+            self.plan, arguments[carry], tails, tuple(arguments[name] for name in chunk.invariants), None
+        )
+        values[self.math.arguments[carry]] = updated
+        length = values["_pending_length"]
+        full = length.new_full((), chunk.chunk)
+        save_tail(tails, tails, length, full, full)
+        self.store(index, values, complete)
+
+    def decode_row(
+        self, index: int, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
+    ) -> UpdateOutput:
+        """Append a device-indexed row and read its chunk's incoming carry at the permitted GEMM shape."""
+        chunk = self.math.chunk
+        assert isinstance(chunk, ChunkUpdate) and self.read_full is not None
+        carry, *columns = chunk.arguments
+        slots, count = self.table[:-1, index], self.table[-1, index]
+        fields = {name: i for i, name in enumerate(self.math.buffers)}
+        carry_field, length_field = fields[self.math.arguments[carry]], fields["_pending_length"]
+        state = self.pools[carry_field].index_select(0, slots[carry_field : carry_field + 1])[0]
+        length = (
+            self.pools[length_field]
+            .index_select(0, slots[length_field : length_field + 1])[0]
+            .masked_fill(count == 0, 0)
+        )
+        inputs = {
+            **self.invariants,
+            "input": hidden[index : index + 1],
+            "target": desired[index : index + 1],
+            "embedding": embedding[index : index + 1],
+            "weight": base,
+        }
+        rows = tuple(inputs[self.math.arguments[name]] for name in columns)
+        invariants = tuple(inputs[self.math.arguments[name]] for name in chunk.invariants)
+        for name, row in zip(columns, rows, strict=True):
+            field = fields[f"_pending_rows_{name}"]
+            destination = (slots[field] * chunk.chunk + length).reshape(1).masked_fill(count == 0, -1)
+            copy_pages(row, self.pools[field].flatten(0, 1), self.source, destination)
+        if self.read_row is None:
+            tails = tuple(
+                self.pools[fields[f"_pending_rows_{name}"]].index_select(
+                    0, slots[fields[f"_pending_rows_{name}"]].reshape(1)
+                )[0]
+                for name in columns
+            )
+            output = self.read_full(state, *tails, *invariants).index_select(0, length.reshape(1))
+        else:
+            output = self.read_row(state, *rows, *invariants)
+        valid = length + count
+        complete, remaining = (valid == chunk.chunk) & (count > 0), valid % chunk.chunk
+        copy_pages(
+            remaining.reshape(1),
+            self.pools[length_field],
+            self.source,
+            slots[length_field : length_field + 1].masked_fill(count == 0, -1),
+        )
+        updates = complete.to(torch.int64)
+        return UpdateOutput(output, complete, updates, updates * chunk.chunk, {"tail_rows": remaining})

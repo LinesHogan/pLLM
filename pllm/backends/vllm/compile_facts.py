@@ -146,7 +146,9 @@ def compile_facts(
         requirements.sampler_feedback,
     )
     required = tuple(value + overlay_graph_bytes for value in required)
-    capacity = version_capacity(config.max_num_seqs, publish_lag, exact_decode=requirements.exact_decode)
+    capacity = version_capacity(
+        config.max_num_seqs, publish_lag, exact_decode=HiddenPhase.DECODE in requirements.exact_phases
+    )
     facts = BackendCompileFacts(
         replace(probe, targets=shape.targets, position_states=requirements.position_states),
         replace(observed, reserved_bytes=required),

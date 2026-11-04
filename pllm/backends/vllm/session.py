@@ -110,10 +110,11 @@ class VllmSession(Generic[DataT, ResultT]):
                 probe.max_packed_rows,
                 max_sampler_rows,
                 buffers,
-                phases=deployment.execution.math.parameter_phases,
+                phases=attachment.spec.overlay_phases,
                 in_forward=plan.semantic_graph.updates_in_forward,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
                 in_program=program_overlay,
+                math=deployment.execution.math.parameter_overlay,
             )
             if overlay_bindings
             else None
@@ -179,7 +180,7 @@ class VllmSession(Generic[DataT, ResultT]):
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:
         """Authored update phases used by hybrid model dispatch."""
-        return self._deployment.execution.math.parameter_phases
+        return self.attachment.spec.overlay_phases
 
     def stage_input(
         self,

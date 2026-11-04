@@ -2859,12 +2859,15 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             checkpoint_names=tuple(
                 name for state in context.state_definitions.values() for name in state.checkpoint_names()
             ),
-            exact_decode=any(
-                isinstance(op.effect, _TrainInForward)
-                and _option(op.effect.visibility, op.context.owner, ("exact", "forward_pinned"), "visibility")
-                == "exact"
-                and _option(op.effect.tokens, op.context.owner, get_args(Tokens), "tokens") in ("all", "decode")
-                for op in context.operations
+            exact_phases=tuple(
+                dict.fromkeys(
+                    phase
+                    for op in context.operations
+                    if isinstance(op.effect, _TrainInForward)
+                    and _option(op.effect.visibility, op.context.owner, ("exact", "forward_pinned"), "visibility")
+                    == "exact"
+                    for phase in _TOKEN_PHASES[_option(op.effect.tokens, op.context.owner, get_args(Tokens), "tokens")]
+                )
             ),
             hidden_inputs=tuple(
                 dict.fromkeys(

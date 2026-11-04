@@ -4,14 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import torch
 
 from pllm.contracts.host_batch import HostBatch, map_host_batch
 from pllm.contracts.packed_hidden import HiddenRowBatch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.parameter_overlay import ProjectionOperands
+from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.cuda_stream import CudaStreamReadiness
+
+if TYPE_CHECKING:
+    from pllm.execution.tensor_frame import UpdateOutput
+
+
+_NO_UPDATES: Mapping[tuple[RequestIdentity, Projection], UpdateOutput] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +33,9 @@ class StepInput:
     hidden_readiness: CudaStreamReadiness | None = None
     batch_readiness: CudaStreamReadiness | None = None
     import_rows: Mapping[str, int] = field(default_factory=lambda: dict[str, int]())
+    overlay_updates: Mapping[tuple[RequestIdentity, Projection], UpdateOutput] = field(
+        default_factory=lambda: _NO_UPDATES
+    )
 
     def __post_init__(self) -> None:
         assert self.sampler_rows.row_batch is self.rows

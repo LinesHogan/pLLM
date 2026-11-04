@@ -128,7 +128,6 @@ class TensorBinding(Builder[TensorFrame]):
         self.causal: CausalBinder | None = None
         self.probe: ModelProbe | None = None
         self.overlay_targets: tuple[Projection, ...] = ()
-        self.parameter_phases: tuple[HiddenPhase, ...] = ()
         self.field_views: dict[tuple[str, str], FieldView] = {}
         self.imports: dict[str, tuple[FieldView, ...]] = {}
         self.position_states: tuple[tuple[str, float], ...] = ()
@@ -140,6 +139,11 @@ class TensorBinding(Builder[TensorFrame]):
         symbols = {task.symbol for task in self.graph.tasks}
         yield
         self.task_members.update((task.symbol, (name,)) for task in self.graph.tasks if task.symbol not in symbols)
+
+    @property
+    def parameter_phases(self) -> tuple[HiddenPhase, ...]:
+        """The overlay phases in the backend effect declaration."""
+        return self.effects.overlay_phases
 
     def retained_fields(self, resource: str) -> dict[int, TensorFieldSpec]:
         """Layout fields whose initial values admission copies; zero-start fields are left alone."""
@@ -234,8 +238,8 @@ class TensorBinding(Builder[TensorFrame]):
             lambda previous, incoming: replace(
                 previous, step=incoming.step, rows=incoming.rows, plan=None, training=None
             ),
-            parameter_phases=self.parameter_phases,
             model_sites=tuple(self.sites.rewrites),
+            parameter_overlay=self.overlay_math,
         )
 
     @property

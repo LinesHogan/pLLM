@@ -9,6 +9,7 @@ from typing import Generic, TypeVar
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import (
     CausalTrainBatch as CausalTrainBatch,
     HostBatch as HostBatch,
@@ -61,7 +62,7 @@ __all__ = [
 @dataclass(frozen=True, slots=True)
 class BackendRequirements:
     checkpoint_names: tuple[str, ...] = field(default=(), kw_only=True)
-    exact_decode: bool = field(default=False, kw_only=True)
+    exact_phases: tuple[HiddenPhase, ...] = field(default=(), kw_only=True)
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     # The layers pllm.layer_logits reads, as declared (negative from the end).
     layer_logits: tuple[int, ...] = ()

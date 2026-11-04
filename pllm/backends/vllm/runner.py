@@ -181,7 +181,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context)
 
     def _finish_model_binding(self) -> None:
-        self.finish_overlay_graphs(self.require_session().attachment, self.require_session().parameter_phases)
+        self.finish_overlay_graphs(self.require_session().attachment)
 
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture and warm up with no hidden-slot destinations, including deferred capture."""

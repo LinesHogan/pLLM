@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
-from contextlib import contextmanager
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -13,25 +11,13 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
 from pllm.backends.vllm.custom_forward_attention import BatchAttentionBuffers, attention_mode
+from pllm.execution.cuda_graph import device_branch
 from pllm.execution.token_program import KV, Segment
 from pllm.execution.token_program_executor import execute_segment
 
 if TYPE_CHECKING:
     from pllm.authoring import DataT, ResultT
     from pllm.backends.vllm.custom_forward import ProgramWave
-
-
-@contextmanager
-def device_branch(predicate: torch.Tensor) -> Generator[None]:
-    """Capture a CUDA IF node; cold warmup runs every branch without reading its predicate."""
-    graph = torch.cuda.CUDAGraph.get_currently_capturing_graph() if torch.cuda.is_current_stream_capturing() else None
-    if graph is not None:
-        graph.begin_capture_to_if_node(predicate)  # pyright: ignore[reportUnknownMemberType]
-    try:
-        yield
-    finally:
-        if graph is not None:
-            graph.end_capture_to_conditional_node()  # pyright: ignore[reportUnknownMemberType]
 
 
 def _store(

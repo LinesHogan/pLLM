@@ -27,8 +27,9 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from pllm.authoring import BackendRequirements
 from pllm.backends.vllm import compat
+from pllm.backends.vllm.admission import model_capture_bytes
 from pllm.backends.vllm.architecture import DecoderBody, bind_model
-from pllm.backends.vllm.parameter_overlay import capacities
+from pllm.backends.vllm.parameter_overlay import capacities, uniform_decode
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
@@ -67,21 +68,22 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
     """Announce model hooks before profiling; ordinary workloads keep vLLM's capture sizes."""
     if not (requirements.parameter_targets or requirements.custom_residual):
         return {}
-    # Request memories replicate a carry per scheduled request. Bound model graphs
-    # to the decode capacity; larger prefills use upstream's ordinary eager dispatch.
+    # Request memories and exact decode updates both capture only decode capacity.
     capacity = (
         min(config.max_num_batched_tokens, config.max_num_seqs)
-        if requirements.stateful_residual
+        if requirements.stateful_residual or requirements.exact_phases
         else config.max_num_batched_tokens
     )
+    # Conditional subgraphs own library scratch; all decode counts share one capacity.
+    sizes = (capacity,) if HiddenPhase.DECODE in requirements.exact_phases else capacities(capacity)
     return {
-        "additional_config": {_BUDGET: config.execution.model_capture_bytes},
+        "additional_config": {_BUDGET: model_capture_bytes(config, requirements)},
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
             backend="eager",
-            cudagraph_mode=_OVERLAY_GRAPHS,
-            cudagraph_capture_sizes=list(capacities(capacity)),
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if requirements.exact_phases else _OVERLAY_GRAPHS,
+            cudagraph_capture_sizes=list(sizes),
             max_cudagraph_capture_size=capacity,
         ),
     }
@@ -93,7 +95,7 @@ def graph_mode(budget: int) -> AttachmentGraphMode:
 
 
 class _HybridGraphManager(compat.CudaGraphManager):
-    """Keep upstream replay ownership; training batches use the unpadded source model."""
+    """Keep upstream decode replay ownership; prefill uses the unpadded source model."""
 
     def __init__(
         self,
@@ -101,10 +103,8 @@ class _HybridGraphManager(compat.CudaGraphManager):
         device: torch.device,
         mode: CUDAGraphMode,
         decode_query_len: int,
-        phases: tuple[HiddenPhase, ...],
     ) -> None:
         super().__init__(config, device, mode, decode_query_len)
-        self.phases = phases
         self.eager = False
 
     def dispatch(
@@ -116,7 +116,7 @@ class _HybridGraphManager(compat.CudaGraphManager):
         max_query_len: int | None = None,
         num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
-        """Use an unpadded source batch whenever an authored phase trains."""
+        """Use an unpadded source batch during prefill."""
         if self.eager:
             return BatchExecutionDescriptor(CUDAGraphMode.NONE, num_tokens, num_reqs)
         return super().dispatch(
@@ -171,16 +171,14 @@ class OverlayGraphRunner(compat.ModelRunner):
                 (self.req_states.req_id_to_index[key] for key in scheduler_output.num_scheduled_tokens), np.int64
             )
             start = self.req_states.num_computed_tokens_np[indices]
-            end = start + np.fromiter(scheduler_output.num_scheduled_tokens.values(), np.int64)
             prompt = self.req_states.prompt_len.np[indices]
-            manager.eager = bool(
-                (HiddenPhase.PREFILL in manager.phases and (start < prompt).any())
-                or (HiddenPhase.DECODE in manager.phases and (end > prompt).any())
+            manager.eager = not uniform_decode(
+                bool((start < prompt).any()), tuple(scheduler_output.num_scheduled_tokens.values())
             )
             assert self.projection_model is not None
             self.projection_model.do_not_compile = manager.eager
 
-    def finish_overlay_graphs(self, attachment: BackendAttachment, phases: tuple[HiddenPhase, ...]) -> None:
+    def finish_overlay_graphs(self, attachment: BackendAttachment) -> None:
         """Capture only the bound model; dummy tables have no request ownership or live destinations."""
         if self.projection_model is None:
             return
@@ -191,14 +189,15 @@ class OverlayGraphRunner(compat.ModelRunner):
         }
         manager = self.cudagraph_manager
         assert manager is not None
-        if manager.cudagraph_mode != _OVERLAY_GRAPHS:
+        mode = CUDAGraphMode.FULL_DECODE_ONLY if attachment.plan.semantic_graph.updates_in_forward else _OVERLAY_GRAPHS
+        if manager.cudagraph_mode != mode:
             raise ValueError(
-                f"vLLM resolved overlay CUDA graphs to {manager.cudagraph_mode.name}, not {_OVERLAY_GRAPHS.name}; "
+                f"vLLM resolved overlay CUDA graphs to {manager.cudagraph_mode.name}, not {mode.name}; "
                 "use FlashAttention2 or set ModelConfig(cuda_graphs=False)"
             )
         if attachment.plan.semantic_graph.updates_in_forward:
             self.cudagraph_manager = _HybridGraphManager(
-                self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len, phases
+                self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len
             )
         self.projection_model.do_not_compile = False
         pool = current_platform.get_global_graph_pool()
