@@ -273,3 +273,24 @@ def test_counted_gated_tail_keeps_inactive_chunks_and_never_reads_device_counts(
         patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("host stream wait")),
     ):
         run(state=weights, hidden=hidden, _pending_rows_hidden=tail, _pending_length=length)
+
+
+@pytest.mark.parametrize("read", ("local", "coupled", "broadcast"))
+def test_decode_readout_narrows_only_independent_rows(read):
+    """A mean over rows and a row-shaped constant must retain full-chunk execution."""
+    from pllm.execution.scan_analysis import row_readout
+
+    def step(carry, inputs):
+        output = inputs @ carry
+        if read == "coupled":
+            output = output + inputs.mean(0)
+        elif read == "broadcast":
+            output = output + carry
+        return carry, output
+
+    carry, inputs = torch.randn(4, 4), torch.randn(4, 4)
+    specs = tuple((value.shape, value.stride(), value.dtype, value.device) for value in (carry, inputs))
+    selected = row_readout(step, specs, 1)
+    assert (selected is not None) == (read == "local")
+    if selected is not None:
+        torch.testing.assert_close(selected(carry, inputs[-1:]), step(carry, inputs)[1][-1:])

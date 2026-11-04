@@ -99,5 +99,6 @@ def test_inplace_neutral_contract(tmp_path):
     result = check_on_gpu(
         InPlaceTTTWorkload(options), config, neutral=InPlaceTTTWorkload(replace(options, learning_rate=0))
     )
+    assert "exact decode: eager terminal request state on fixed per-token inputs" in result.passed
     assert "neutral: greedy and seeded sampling bitwise" in result.passed
     print(result)

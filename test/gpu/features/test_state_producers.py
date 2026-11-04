@@ -59,9 +59,9 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
         def intercept(reader, index):
             emit = reader.emit
 
-            def compare(hidden, pools, table, output, captured):
+            def compare(hidden, desired, pools, table, output, captured, desired_capture):
                 base = output.clone()
-                emit(hidden, pools, table, output, captured)
+                emit(hidden, desired, pools, table, output, captured, desired_capture)
                 context = session._step.context
                 rows = session._step.rows.row_batch.rows
                 phases.add(frozenset(row.phase for row in rows))

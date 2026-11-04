@@ -172,6 +172,11 @@ def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
     return outputs
 
 
+def _projection_output(reader, hidden):
+    """Run the model site's producer so projection operands exist during capture."""
+    return reader.forward(hidden)[0] if reader.mlp is None else reader.forward_mlp(hidden)
+
+
 def _check_cancelled_projection(handle):
     """A captured real projection retains its pinned page through cancellation."""
     from pllm.contracts.hidden_locator import HiddenPhase
@@ -191,11 +196,12 @@ def _check_cancelled_projection(handle):
     invocation = execution.begin(rows.rows, stream)
     overlay.reserve()
     overlay.prepare(rows, invocation, execution.directory)
-    hidden = reader.captured.new_ones((1, reader.captured.shape[1]))
-    reader.forward(hidden)
+    features = reader.captured.shape[1] if reader.mlp is None else reader.width
+    hidden = reader.captured.new_ones((1, features))
+    _projection_output(reader, hidden)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = reader.forward(hidden)[0]
+        output = _projection_output(reader, hidden)
     slot = execution.arena.field_slots((invocation.pin,), StateRefs.of((ref,)), reader.binding.fields[0].field)[1][0]
     address = reader.pools[0][slot].data_ptr()
     stream.synchronize()
@@ -247,7 +253,7 @@ def _check_graph(handle):
 
 
 def _check_hybrid(handle):
-    """Exact eligibility selects source execution; inactive decode never calls Python projections."""
+    """Prefill selects source execution; decode replays the bound projection kernels."""
     from vllm.config import CUDAGraphMode
 
     from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay, _ProjectionReader
@@ -274,10 +280,8 @@ def _check_hybrid(handle):
         texts(handle.generate(["Hi"], SAMPLING))  # One-token prefill must also use Exact, even at C=0.
     assert all(mode is CUDAGraphMode.NONE if training else mode is CUDAGraphMode.FULL for training, mode in modes)
     assert any(training for training, _ in modes)
-    if HiddenPhase.DECODE in overlay.phases:
-        assert all(training for training, _ in modes)
-    else:
-        assert any(not training for training, _ in modes)
+    assert any(not training for training, _ in modes)
+    if HiddenPhase.DECODE not in overlay.phases:
         _check_cancelled_projection(handle)
     diagnostics = handle.diagnostics()
     assert diagnostics.update_count > 0 and diagnostics.active_states == diagnostics.pending_state_releases == 0
@@ -391,7 +395,7 @@ def checkpoint_ttt() -> None:
                 max_num_seqs=2,
                 max_model_len=32,
                 max_num_batched_tokens=32,
-                execution=pllm.ExecutionOptions(allow_numerical_transforms=False),
+                execution=pllm.ExecutionOptions(allow_numerical_transforms=False, capture_memory_bytes=512 << 20),
             )
             with (
                 patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=32 << 20)),
@@ -406,7 +410,7 @@ def checkpoint_ttt() -> None:
                 diagnostics = handle.diagnostics()
                 assert diagnostics.update_count == 12 and diagnostics.trained_rows == 48
                 assert diagnostics.active_states == 1 and diagnostics.pending_state_releases == 0
-                assert "exact" in diagnostics.eager_reason
+                assert not diagnostics.eager_reason
 
 
 def community_t2(checkpoint: str) -> None:
@@ -720,10 +724,10 @@ def preemption_replays():
         session = handle.runner.require_session()
         with patch.object(session, "_preempt", wraps=session._preempt) as preempt:
             outputs = handle.generate(
-                ["The number is"] * 8, SamplingParams(max_tokens=48, temperature=0, ignore_eos=True)
+                ["The number is"] * 8, SamplingParams(max_tokens=80, temperature=0, ignore_eos=True)
             )
         assert any(call.args[0] for call in preempt.call_args_list)
-        assert all(len(output.outputs[0].token_ids) == 48 for output in outputs)
+        assert all(len(output.outputs[0].token_ids) == 80 for output in outputs)
         assert handle.diagnostics().active_states == 0
 
 

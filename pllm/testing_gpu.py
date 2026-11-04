@@ -32,11 +32,13 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.overlay_task import ProjectionTransition
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_binding import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
+from pllm.execution.tensor_program import read_batch
 from pllm.explanation import explain, explain_facts
 from pllm.testing_contracts import CheckResult, CheckSkip, ContractError
 from pllm.usage import Workload
@@ -83,6 +85,7 @@ class _SyncCheck:
         session = handle.runner.require_session()
         execution = session._deployment.execution
         self.prepare_sites = None if session._sites is None else session._sites.prepare
+        self.prepare_overlay = None if session._forward_overlay is None else session._forward_overlay.prepare
         self.execute = execution.execute_anchor
         self.execute_part = execution.execute_part
         self.steps: dict[int, set[int]] = {}
@@ -118,6 +121,18 @@ class _SyncCheck:
         assert self.prepare_sites is not None
         with self.scope(context):
             self.prepare_sites(rows, context, directory)
+
+    def overlay(
+        self,
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[TensorFrame],
+        directory: RequestStateDirectory,
+        transition: ProjectionTransition | None = None,
+    ) -> None:
+        """Include graph port and private-page staging in steady decode sync checks."""
+        assert self.prepare_overlay is not None
+        with self.scope(context):
+            self.prepare_overlay(rows, context, directory, transition)
 
     def anchor(self, context: StateTaskContext[TensorFrame], anchor: AnchorId) -> None:
         with self.scope(context):
@@ -192,26 +207,28 @@ class _Generation:
             hidden_readiness=CudaStreamReadiness(torch.cuda.current_stream()),
         )
 
-    def compare(self, replayed: _Generation) -> None:
+    def compare(self, replayed: _Generation, contract: str = "preempted") -> None:
         if self.tokens != replayed.tokens:
             raise ContractError(
                 (
-                    f"[preempted] greedy tokens changed after KV eviction: {self.tokens} -> {replayed.tokens}; "
+                    f"[{contract}] greedy tokens changed: {self.tokens} -> {replayed.tokens}; "
                     "rerun with VLLM_BATCH_INVARIANT=1 to exclude batch-width rounding, "
                     "then report a pllm recompute bug if they still differ",
                 )
             )
+        self.compare_states(replayed, contract)
+
+    def compare_states(self, replayed: _Generation, contract: str) -> None:
+        """Compare fixed-input state with dtype tolerances; floating transforms may change greedy tokens."""
         if self.states.keys() != replayed.states.keys():
-            raise ContractError(
-                ("[preempted] request states disappeared after KV eviction; report a pllm retirement bug",)
-            )
+            raise ContractError((f"[{contract}] request states disappeared; report a pllm retirement bug",))
         for request, fields in self.states.items():
             for index, (expected, actual) in enumerate(zip(fields, replayed.states[request], strict=True)):
                 try:
                     torch.testing.assert_close(actual, expected)
                 except AssertionError as error:
                     raise ContractError(
-                        (f"[preempted] request {request}, field {index}: {error}; report a pllm recompute bug",)
+                        (f"[{contract}] request {request}, field {index}: {error}; report a pllm recompute bug",)
                     ) from error
 
 
@@ -234,6 +251,20 @@ def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Genera
     def part(
         context: StateTaskContext[TensorFrame], value: StepInput, task: TaskId, *, complete: bool
     ) -> ProjectionResiduals:
+        if value.overlay_updates and reference is not None:
+            # Captured math has already run. Replay the fixed diagnostic operands from the
+            # input pages, just as eager projection interception does before the authored step.
+            math = execution.math.parameter_overlay
+            assert math is not None
+            before = read_batch(context, "input", math.resource).for_resource(math.resource)
+            private = read_batch(context, "private", math.resource).for_resource(math.resource)
+            for field in range(len(math.buffers) * len(math.targets)):
+                pool, sources = before.field_slots(field)
+                _, destinations = private.field_slots(field)
+                for source, destination in zip(sources, destinations, strict=True):
+                    if source != destination:
+                        pool[destination].copy_(pool[source])
+            value = replace(value, overlay_updates={})
         return execute_part(context, result.operands(value, reference), task, complete=complete)
 
     with patch.object(execution, "retire", snapshot), patch.object(execution, "execute_part", part):
@@ -382,12 +413,14 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             failures.extend(error.failures)
         sync = _SyncCheck(handle)
         sites = handle.runner.require_session()._sites
+        overlay = handle.runner.require_session()._forward_overlay
         execution = handle.runner.require_session()._deployment.execution
         try:
             with (
                 patch.object(execution, "execute_anchor", sync.anchor),
                 patch.object(execution, "execute_part", sync.part),
                 patch.object(sites, "prepare", sync.prepare) if sites is not None else nullcontext(),
+                patch.object(overlay, "prepare", sync.overlay) if overlay is not None else nullcontext(),
             ):
                 baseline = _state_tokens(handle)
             if len(sync.checked) < 8:
@@ -415,6 +448,18 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
                     passed.append("preempted: fixed per-token inputs, token IDs and terminal request state")
             except (RuntimeError, ContractError) as error:
                 failures.append(f"[preempted] {error}")
+    if (
+        HiddenPhase.DECODE in workload.backend_requirements().exact_phases
+        and not report.eager_reason
+        and baseline is not None
+    ):
+        _release_models()
+        try:
+            with pllm.make_llm(replace(config, cuda_graphs=False), workload=workload) as eager:
+                baseline.compare_states(_state_tokens(eager, baseline), "exact decode")
+            passed.append("exact decode: eager terminal request state on fixed per-token inputs")
+        except (RuntimeError, ContractError) as error:
+            failures.append(f"[exact decode] {error}")
     if failures:
         raise ContractError(tuple(failures))
     return CheckResult(tuple(passed), tuple(skipped))
