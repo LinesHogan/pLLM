@@ -31,6 +31,7 @@ from pllm.workloads import (
 )
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.video import VideoWorkload
+from test.workloads.kernel_workloads import Forward, Residual
 
 
 @pytest.fixture
@@ -63,6 +64,9 @@ def model_config(tmp_path, monkeypatch):
     "workload",
     (
         DummyWorkload(),
+        Residual(),
+        Forward(),
+        Forward(constant=True),
         DoLaWorkload(layers=(0, 2, 4)),
         ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
         PromptFactorsWorkload(),
@@ -88,6 +92,10 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
     assert report.peak_memory_bytes >= sum(state.reserved_bytes for state in report.states)
     assert report.members and not report.budget_errors
     assert "[exact]" in str(report)
+    if isinstance(workload, (Residual, Forward)):
+        add, scale = report.custom_ops
+        assert add.flops_per_row == 8 and scale.flops_per_row is None
+        assert add.cpu_reference and "unknown [no flop formula, counted 0]" in str(report)
     if isinstance(workload, (StepLoopWorkload, PrefillAdaptersWorkload)):
         tokens = tuple(item for item in report.escape_hatches if item.setting == "tokens")
         assert tokens and all(item.is_default for item in tokens)

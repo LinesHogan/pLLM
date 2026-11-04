@@ -44,6 +44,7 @@ from pllm.workloads.dola import DoLaWorkload
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.state_producers import FactorAdapterWorkload
 from pllm.workloads.video import VideoWorkload
+from test.workloads.kernel_workloads import Forward, Residual
 
 
 class PrefillTrainer(pllm.Workload):
@@ -149,6 +150,8 @@ class PromptMask(pllm.Workload):
         (workload, "")
         for workload in (
             DummyWorkload(),
+            Residual(),
+            Forward(),
             Stack(),
             PositionStack(),
             PrefillTrainer(),

@@ -19,8 +19,90 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.task_memory import example, producers_first, task_example
+from pllm.execution.freeze import fingerprint
+from pllm.execution.task_memory import example, producers_first, site_arguments, task_example
 from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.token_program import Cell
+from pllm.execution.torch_private import CustomOpDef, CustomOpTrace, FakeTensorMode, custom_op, tensor_node_metadata
+
+
+@dataclass(frozen=True)
+class OpCost:
+    """One opaque operator's declared arithmetic and lower-bound logical traffic per row."""
+
+    name: str
+    call_sites: tuple[str, ...]
+    flops_per_row: float | None
+    bytes_per_row: float
+    signature: str
+    cpu_reference: bool
+    autograd: bool
+
+
+# Entries retain each call site; role programs are alternatives, so the per-call bound is their maximum.
+OpCalls = dict[str, list[tuple[str, float | None, float, CustomOpDef]]]
+
+
+def _append_calls(calls: OpCalls, trace: CustomOpTrace, site: str, rows: int) -> None:
+    for definition, flops, size in trace.calls:
+        op = custom_op(definition)
+        assert op is not None
+        calls.setdefault(op.name, []).append((site, None if flops is None else flops / rows, size / rows, definition))
+
+
+def _op_cost(name: str, entries: list[tuple[str, float | None, float, CustomOpDef]]) -> OpCost:
+    definition = entries[0][3]
+    op = custom_op(definition)
+    assert op is not None
+    return OpCost(
+        name,
+        tuple(dict.fromkeys(entry[0] for entry in entries)),
+        None if any(entry[1] is None for entry in entries) else max(entry[1] or 0 for entry in entries),
+        max(entry[2] for entry in entries),
+        fingerprint(definition),
+        op.cpu,
+        op.autograd,
+    )
+
+
+def _estimate_ops(binding: TensorBinding, facts: BackendCompileFacts, calls: OpCalls) -> tuple[OpCost, ...]:
+    """Add model-site math that task tracing leaves to the native model driver."""
+    kwargs = site_arguments(binding, facts)
+    for rewrite in binding.sites.rewrites:
+        rows = facts.max_admitted_lineages if rewrite.memory is None else rewrite.memory.chunk
+        x = torch.empty((rows, facts.probe.hidden_size), dtype=facts.probe.tensor_dtype.torch, device="meta")
+        stream = x if rewrite.streams == 1 else x.unsqueeze(1).expand(-1, rewrite.streams, -1)
+        for name, function, args in (
+            (rewrite.name, rewrite.write, (stream,) if rewrite.site in ("value", "final") else (stream, x)),
+            (rewrite.name + ".read", rewrite.read, (stream,)),
+        ):
+            if function is not None:
+                with CustomOpTrace() as trace:
+                    function(*args, **kwargs[name])
+                _append_calls(calls, trace, name, rows)
+    task = binding.graph.custom_forward_task
+    for role, program in (binding.custom_forward_programs or {}).items():
+        for cell in (step for step in program.steps if isinstance(step, Cell)):
+            with FakeTensorMode(), CustomOpTrace() as trace:
+                args = tuple(
+                    torch.empty(tuple(int(n) for n in value.shape), dtype=value.dtype, device=value.device)
+                    for node in cell.graph.graph.nodes
+                    if node.op == "placeholder"
+                    for value in (tensor_node_metadata(node),)
+                    if value is not None
+                )
+                cell.graph(*args)
+            invariants = {name for name, _ in program.parameters}
+            rows = next(
+                (
+                    int(value.shape[0])
+                    for name, value in zip(cell.inputs, args, strict=True)
+                    if value.ndim and name not in invariants
+                ),
+                1,
+            )
+            _append_calls(calls, trace, f"{task.symbol if task else 'forward'} [{role}]", rows)
+    return tuple(_op_cost(name, entries) for name, entries in sorted(calls.items()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +162,7 @@ def _traffic(binding: TensorBinding, facts: BackendCompileFacts, symbol: TaskSym
 
 def estimate_tasks(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions, *, padded_vocab_size: int
-) -> dict[str, CostEstimate]:
+) -> tuple[dict[str, CostEstimate], tuple[OpCost, ...]]:
     """Trace the production shape-only operation, including training backward and optimizer work."""
     # Decode has one row per request even for stateless layer-logit readers.
     facts = replace(facts, probe=replace(facts.probe, max_packed_rows=facts.max_admitted_lineages))
@@ -88,6 +170,7 @@ def estimate_tasks(
     executables = binding.executables(facts, facts.timeline.task_resources)
     operations = {**executables, **binding.publications}
     estimates: dict[str, CostEstimate] = {}
+    calls: OpCalls = {}
     projected: set[int] = set()
     for symbol in producers_first(binding.graph, tuple(operations)):
         operation = operations[symbol]
@@ -100,8 +183,9 @@ def estimate_tasks(
         ):
             continue  # A missing host batch bypasses its body; zero would misreport untraced model math.
         data = task_example(data, None if task is None else task.phase)
-        with FlopCounterMode(display=False) as counter:
+        with FlopCounterMode(display=False) as counter, CustomOpTrace() as trace:
             operation.memory(data, batch)
+        _append_calls(calls, trace, str(symbol), facts.max_admitted_lineages)
         reads, writes = _traffic(binding, facts, symbol)
         projection = sampler = 0
         if task is not None:
@@ -138,4 +222,4 @@ def estimate_tasks(
             else 0,
             sampler,
         )
-    return estimates
+    return estimates, _estimate_ops(binding, facts, calls)

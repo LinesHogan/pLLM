@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from inspect import getclosurevars, unwrap
 from pathlib import Path
+from types import FunctionType
 from typing import TypedDict
 from uuid import UUID
 
 import torch
 from torch import _decomp
 from torch._functorch import compile_utils
-from torch._ops import OpOverload
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._library.custom_ops import CustomOpDef as CustomOpDef, _maybe_get_opdef  # pyright: ignore[reportPrivateUsage]
+from torch._ops import OpOverload, OpOverloadPacket, _OpNamespace, _Ops  # pyright: ignore[reportPrivateUsage]
+from torch._subclasses.fake_tensor import DynamicOutputShapeException, FakeTensor, FakeTensorMode as FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils import _python_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
+from torch.utils.flop_counter import flop_registry
 
 fork_rng: Callable[[list[int]], AbstractContextManager[None]] = torch.random.fork_rng  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 manual_seed: Callable[[int], torch.Generator] = torch.manual_seed  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
@@ -27,6 +31,117 @@ fx_graph_cse: Callable[[torch.fx.Graph], torch.fx.Graph] = compile_utils.fx_grap
 
 CudaPoolHandle = torch.cuda._POOL_HANDLE  # pyright: ignore[reportPrivateUsage]
 disable_current_modes = _python_dispatch._disable_current_modes  # pyright: ignore[reportPrivateUsage]
+
+
+@dataclass(frozen=True)
+class CustomOp:
+    """Torch's registered author functions, decoded for signing and diagnostics."""
+
+    name: str
+    schema: str
+    functions: tuple[tuple[str, object], ...]
+    cpu: bool
+    autograd: bool
+    vmap: bool
+
+
+def custom_op(value: object) -> CustomOp | None:
+    """Read CustomOpDef internals only at this Torch boundary; require pure, shape-known math."""
+    if not isinstance(value, CustomOpDef):
+        return None
+    schema = value._opoverload._schema  # pyright: ignore[reportPrivateUsage]
+    name = value._qualname  # pyright: ignore[reportPrivateUsage]
+    mutated = tuple(arg.name for arg in schema.arguments if arg.alias_info is not None and arg.alias_info.is_write)
+    if mutated:
+        raise ValueError(
+            f"{name} mutates {', '.join(mutated)}; kernels called from workload math must return new tensors "
+            "(mutates_args=()); change state only through pllm effects"
+        )
+    attributes: dict[str, object] = vars(value)
+    if attributes["_abstract_fn"] is None:
+        raise ValueError(f"{name} has no fake implementation; add @{name.split('::')[-1]}.register_fake")
+    kernels: dict[str | None, Callable[..., object]] = value.__dict__["_backend_fns"]
+    registrations = (
+        ("implementation", attributes["_init_fn"]),
+        ("fake", attributes["_abstract_fn"]),
+        ("backward", attributes["_backward_fn"]),
+        ("setup_context", attributes["_setup_context_fn"]),
+        ("vmap", attributes["_vmap_fn"]),
+    )
+    functions = [(key, function) for key, function in registrations if function is not None]
+    for device, wrapper in kernels.items():
+        function = unwrap(wrapper)
+        assert isinstance(function, FunctionType)
+        functions.append((f"kernel:{device}", getclosurevars(function).nonlocals["fn"]))
+    return CustomOp(
+        name,
+        str(schema),
+        tuple(functions),
+        "cpu" in kernels or None in kernels,
+        any(key == "backward" for key, _ in functions),
+        any(key == "vmap" for key, _ in functions),
+    )
+
+
+def custom_op_definition(target: object) -> CustomOpDef | None:
+    """Resolve a traced operator through Torch's own definitions, without a pllm registry."""
+    return _maybe_get_opdef(target.name()) if isinstance(target, OpOverload) else None
+
+
+def dispatcher_namespace(value: object) -> str | None:
+    """Distinguish Torch dispatcher handles from ordinary imported modules and callables."""
+    if isinstance(value, _Ops):
+        return ""
+    if isinstance(value, _OpNamespace):
+        return value.name
+    if isinstance(value, OpOverload):
+        return value.namespace
+    if isinstance(value, OpOverloadPacket):
+        return value._qualified_op_name.split("::")[0]  # pyright: ignore[reportPrivateUsage]
+    return None
+
+
+@contextmanager
+def fixed_shapes() -> Generator[None]:
+    """Explain why data-dependent custom-op outputs cannot be planned or captured."""
+    try:
+        yield
+    except (RuntimeError, DynamicOutputShapeException) as error:
+        if isinstance(error, DynamicOutputShapeException) or "dynamic" in str(error).lower() or "get_ctx" in str(error):
+            raise ValueError(
+                "methods run inside CUDA graphs, so outputs need shapes fixed by the inputs; "
+                "return a fixed-size tensor and a tensor mask instead of ctx.new_dynamic_size()"
+            ) from error
+        raise
+
+
+class CustomOpTrace(TorchDispatchMode):
+    """Collect opaque calls during shape tracing; their fake bodies cannot prove host-sync freedom."""
+
+    def __init__(self) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        self.calls: list[tuple[CustomOpDef, int | None, int]] = []
+
+    def __torch_dispatch__(
+        self,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        definition = custom_op_definition(func)
+        with fixed_shapes():
+            result = func(*args, **(kwargs or {}))
+        if definition is not None and isinstance(func, OpOverload) and func.namespace != "pllm":
+            formula = flop_registry.get(func.overloadpacket)
+            flops = None if formula is None else int(formula(*args, **(kwargs or {}), out_val=result))
+            size = sum(
+                value.numel() * value.element_size()
+                for value in tree_leaves((args, kwargs, result))
+                if isinstance(value, torch.Tensor)
+            )
+            self.calls.append((definition, flops, size))
+        return result
 
 
 def register_gradient_hook(tensor: torch.Tensor, hook: Callable[[torch.Tensor], torch.Tensor]) -> None:
@@ -41,7 +156,17 @@ def tensor_decompositions(operators: tuple[OpOverload, ...]) -> dict[OpOverload,
     }
 
 
-def check_functional_aten(target: object) -> None:
+def check_functional_aten(target: object, *, per_token: bool = False) -> None:
+    definition = custom_op_definition(target)
+    if definition is not None:
+        op = custom_op(definition)
+        assert op is not None
+        if per_token and not op.vmap:
+            raise ValueError(
+                f"{op.name} runs in a per-token cell under torch.vmap; register a batching rule "
+                '(register_vmap) or call it with over="span"'
+            )
+        return
     if (
         not isinstance(target, OpOverload)
         or target.namespace != "aten"

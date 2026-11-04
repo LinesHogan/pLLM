@@ -35,6 +35,10 @@ class ModuleCall:
     def __call__(self, *args: torch.Tensor) -> torch.Tensor:
         return self._run(self._module, "", args)
 
+    def to(self, device: torch.device) -> "ModuleCall":
+        """Copy parameter values for a device replay while retaining the declared module code."""
+        return ModuleCall(self._module, self._flat.to(device), self._per_row)
+
     def __getattr__(self, method: str) -> Callable[..., torch.Tensor]:
         if method.startswith("_"):
             raise AttributeError(method)

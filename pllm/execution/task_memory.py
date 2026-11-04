@@ -7,6 +7,7 @@ specialization (usage.py) calls it before planning.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -36,11 +37,14 @@ from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call
 from pllm.execution.host_runtime import HostConfig, measured_timeline
+from pllm.execution.model_sites import EarlierInput, PatchInput, StateInput
+from pllm.execution.module_graph import ModuleCall
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import MemoryOperation, TensorBatch
+from pllm.execution.torch_private import fixed_shapes
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
@@ -255,8 +259,15 @@ def derive_resources(
         phase = None if task is None else task.phase
         data = task_example(data, phase)
         try:
-            usage = operation.memory(data, batch)
+            with fixed_shapes():
+                usage = operation.memory(data, batch)
         except (RuntimeError, ValueError, TypeError) as error:
+            if "no autograd" in str(error):
+                op = str(error).split("through ", 1)[-1].split()[0]
+                name = op.split(".")[-2]
+                raise ValueError(
+                    f"{symbol} trains through {op}, which has no autograd formula; add {name}.register_autograd(...)"
+                ) from error
             error.add_note(
                 f"while shape tracing method {symbol!r}; methods run inside CUDA graphs: "
                 "use tensor operations such as torch.where, not .item() or Python branches on tensor values"
@@ -342,3 +353,59 @@ def derive_host_resources(binding: TensorBinding, config: HostConfig) -> Schedul
         tensor.numel() * tensor.element_size() for tensor in (host_batch.hidden, host_batch.targets, host_batch.weights)
     )
     return measured_timeline(config, held, costs, ((rows, config.hidden_size),))
+
+
+SiteArgument = torch.Tensor | int | ModuleCall | Callable[[torch.Tensor], torch.Tensor]
+
+
+def _identity(value: torch.Tensor) -> torch.Tensor:
+    return value
+
+
+def _site_state(
+    binding: TensorBinding, source: StateInput, rows: int | None, seed: int | None
+) -> torch.Tensor | ModuleCall:
+    layout = next(item.layout for item in binding.layouts.layouts if item.resource == source.resource)
+    root = tuple(
+        torch.zeros(field.shape, dtype=field.dtype.torch, device="meta" if seed is None else "cpu")
+        for field in layout.fields
+    )
+    if seed is not None:
+        binding.initializer(str(source.resource), torch.device("cpu"), seed)((root,), (None,))
+    value = source.view.read(root[source.view.field])
+    if source.request and rows is not None:
+        value = value.unsqueeze(0).expand(rows, *value.shape)
+    return value if source.module is None else ModuleCall(source.module, value, source.request)
+
+
+def site_arguments(
+    binding: TensorBinding,
+    facts: BackendCompileFacts,
+    *,
+    seed: int | None = None,
+) -> dict[str, dict[str, SiteArgument]]:
+    """Build residual method examples from declared views, on meta or seeded CPU storage."""
+    arguments: dict[str, dict[str, SiteArgument]] = {}
+    for rewrite in binding.sites.rewrites:
+        for name, sources in ((rewrite.name, rewrite.inputs), (rewrite.name + ".read", rewrite.read_inputs)):
+            kwargs: dict[str, SiteArgument] = {}
+            for key, source in sources:
+                if isinstance(source, StateInput):
+                    rows = (
+                        None
+                        if rewrite.memory is not None and source == rewrite.memory.carry
+                        else facts.max_admitted_lineages
+                    )
+                    kwargs[key] = _site_state(binding, source, rows, seed)
+                elif isinstance(source, EarlierInput):
+                    kwargs[key] = torch.zeros(
+                        (facts.max_admitted_lineages, facts.probe.hidden_size),
+                        dtype=facts.probe.tensor_dtype.torch,
+                        device="meta" if seed is None else "cpu",
+                    )
+                elif isinstance(source, PatchInput):
+                    kwargs[key] = _identity
+                else:
+                    kwargs[key] = rewrite.depth(rewrite.places[0])
+            arguments[name] = kwargs
+    return arguments

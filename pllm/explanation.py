@@ -18,7 +18,7 @@ from pllm.contracts.semantic_graph import (
     TaskResourceFact,
 )
 from pllm.contracts.tensor_layout import TensorFieldSpec
-from pllm.cost_estimates import CostEstimate, estimate_tasks
+from pllm.cost_estimates import CostEstimate, OpCost, estimate_tasks
 from pllm.execution.preemption import preemption_policy
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
 
@@ -126,6 +126,7 @@ class ExplainResult:
     exports: tuple[str, ...]
     escape_hatches: tuple[EscapeHatch, ...]
     limitations: tuple[str, ...]
+    custom_ops: tuple[OpCost, ...]
 
     def __str__(self) -> str:
         forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
@@ -195,6 +196,17 @@ class ExplainResult:
         if self.model.read_only_reason:
             lines.append(f"model    read-only: {self.model.read_only_reason}")
         lines.extend(f"note     {note}" for note in self.limitations)
+        for op in self.custom_ops:
+            flops = (
+                f"{op.flops_per_row:g} [declared]"
+                if op.flops_per_row is not None
+                else "unknown [no flop formula, counted 0]"
+            )
+            lines.append(
+                f"op       {op.name}: {', '.join(op.call_sites)}; {flops} FLOP/row; "
+                f"{op.bytes_per_row:g} logical bytes/row [lower bound]; signature {op.signature}; "
+                f"CPU reference={op.cpu_reference}, autograd={op.autograd}; host syncs unverified (fake only)"
+            )
         return "\n".join(lines)
 
 
@@ -492,9 +504,8 @@ def explain_facts(
     facts, binding, specialization_errors = _specialize(workload, facts, config)
     attachment, threshold, inline_peak, errors = _plans(workload, facts, binding, config)
     plan = attachment.plan
-    costs = _task_costs(
-        plan, estimate_tasks(binding, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
-    )
+    estimates, ops = estimate_tasks(binding, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
+    costs = _task_costs(plan, estimates)
     return ExplainResult(
         shape,
         config.dtype,
@@ -516,7 +527,7 @@ def explain_facts(
         (*specialization_errors, *errors),
         preemption_policy(attachment, tuple(binding.sites.rewrites)),
         plan.schedule.recompute_rejection,
-        None if plan.semantic_graph.trains_on_batch or binding.sites.rewrites else 0,
+        None if plan.semantic_graph.trains_on_batch or binding.sites.rewrites or ops else 0,
         tuple(attachment.spec.exports),
         _settings(binding, config, plan),
         (
@@ -527,4 +538,5 @@ def explain_facts(
             "Host sync count covers shape-traced workload math; model-site math and framework syncs need GPU verification.",
             "Timing settings equal to defaults are labelled default; explicit use of the same value is indistinguishable.",
         ),
+        ops,
     )

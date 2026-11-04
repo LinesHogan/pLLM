@@ -14,7 +14,12 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from pllm.execution.model_sites import StateInput
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.position_state import position_save
-from pllm.execution.torch_private import check_functional_aten, tensor_decompositions, tensor_node_metadata
+from pllm.execution.torch_private import (
+    check_functional_aten,
+    fixed_shapes,
+    tensor_decompositions,
+    tensor_node_metadata,
+)
 
 Tokens = Literal["prefill", "decode", "all"]
 Over = Literal["token", "span"]
@@ -227,6 +232,8 @@ def _cell(nodes: list[torch.fx.Node], over: Over, invariants: tuple[str, ...]) -
     )
     graph = torch.fx.Graph()
     mapped = {node: graph.placeholder(node.name) for node in inputs}
+    for node in inputs:
+        mapped[node].meta = node.meta.copy()
     for node in nodes:
         mapped[node] = graph.node_copy(node, mapped.__getitem__)
     graph.output(tuple(mapped[node] for node in outputs))
@@ -234,7 +241,7 @@ def _cell(nodes: list[torch.fx.Node], over: Over, invariants: tuple[str, ...]) -
         assert node.op == "call_function"
         # Module parameters are unpacked by split followed by tuple indexing.
         if node.target is not getitem:
-            check_functional_aten(node.target)
+            check_functional_aten(node.target, per_token=over == "token")
     module = torch.fx.GraphModule({}, graph)
     input_rows = tuple(
         node.name not in invariants and bool(_tensor(node).ndim and _tensor(node).shape[0] == 1) for node in inputs
@@ -321,7 +328,7 @@ class TokenProgram:
             if over == "span"
             else tensor.shape[0]
         )
-        with FakeTensorMode(shape_env=shapes):
+        with FakeTensorMode(shape_env=shapes), fixed_shapes():
             shape = (rows, *tensor.shape[1:])
             seed = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
             position = torch.empty((shape[0], 1), dtype=torch.int64, device=tensor.device)

@@ -15,16 +15,21 @@ from dataclasses import fields, is_dataclass
 from dis import Instruction, get_instructions, hasjabs, hasjrel, stack_effect
 from enum import Enum
 from hashlib import sha256
+from importlib.machinery import EXTENSION_SUFFIXES
+from importlib.metadata import version
 from inspect import getclosurevars
 from itertools import pairwise
 from marshal import dumps
-from sys import version_info
+from pathlib import Path
+from sys import modules, version_info
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 from typing import TypeGuard, TypeVar, cast
 
 import torch
+from triton.runtime import JITFunction
 
 from pllm.contracts.codec import boundary_digest
+from pllm.execution.torch_private import CustomOpDef, custom_op, dispatcher_namespace
 
 G = TypeVar("G", bound=Callable[..., object])
 C = TypeVar("C")
@@ -33,9 +38,23 @@ _PYTHON_MODULES = ("typing", "collections.abc", "builtins")
 
 def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     """Sign cold code/config dependencies, never eval annotations or execute code to trace it."""
+    op = custom_op(value)
+    if id(value) in seen and op is not None:
+        return boundary_digest(op.name, op.schema)
     if id(value) in seen:
         raise ValueError(f"{type(value).__name__}: workload methods cannot depend on a value that contains itself")
     seen = seen | {id(value)}
+    if op is not None:
+        return boundary_digest(
+            op.name, op.schema, tuple((key, fingerprint(function, seen)) for key, function in op.functions)
+        )
+    if isinstance(value, JITFunction):
+        return boundary_digest(value.cache_key, version("triton"))
+    namespace = dispatcher_namespace(value)
+    if namespace is not None:
+        if namespace not in ("", "aten", "prims"):
+            raise ValueError(_OP_ACCESS)
+        return boundary_digest(str(value), torch.__version__)
     module = getattr(value, "__module__", None)
     name = getattr(value, "__qualname__", None)
     if module in _PYTHON_MODULES and isinstance(name, str):
@@ -44,6 +63,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return fingerprint(value.__func__, seen)
     if isinstance(value, FunctionType):
         closure = getclosurevars(value)
+        _check_op_access(value.__code__, {**value.__globals__, **closure.nonlocals})
         globals_used = _global_names(value.__code__)
         imports = _builtin_dependencies(value)
         dependencies = {
@@ -59,17 +79,29 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             imports,
         )
     if isinstance(value, ModuleType):
+        path = vars(value).get("__file__")
+        if isinstance(path, str) and any(path.endswith(suffix) for suffix in EXTENSION_SUFFIXES):
+            return boundary_digest(value.__name__, sha256(Path(path).read_bytes()).hexdigest())
         if value.__name__ in _PYTHON_MODULES:
             return boundary_digest(value.__name__, version_info[:3])
+        if value.__name__ == "triton" or value.__name__.startswith("triton."):
+            return boundary_digest(value.__name__, version("triton"))
         if value.__name__ != "pllm" and not value.__name__.startswith(("torch", "math")):
             raise ValueError(
-                f"{value.__name__}: workload methods may use only torch, math, pllm, typing, collections.abc "
+                f"{value.__name__}: workload methods may use only torch, math, pllm, triton, typing, collections.abc "
                 "and builtins modules; "
                 "compute other values outside the workload and pass them in its config"
             )
         return boundary_digest(value.__name__, torch.__version__)
     if isinstance(value, torch.dtype):
         return str(value)
+    dependency = modules.get(module) if isinstance(module, str) else None
+    if (
+        dependency is not None
+        and isinstance(path := vars(dependency).get("__file__"), str)
+        and any(path.endswith(suffix) for suffix in EXTENSION_SUFFIXES)
+    ):
+        return boundary_digest(name, fingerprint(dependency, seen))
     if isinstance(value, Enum):
         return boundary_digest(type(value).__qualname__, fingerprint(value.value, seen))
     if _is_class(value):
@@ -147,6 +179,55 @@ def _global_names(code: CodeType) -> set[str]:
         if isinstance(value, CodeType):
             names.update(_global_names(value))
     return names
+
+
+_OP_ACCESS = (
+    "call the op object you defined with torch.library.custom_op (from mykernels import gated_add), "
+    "not torch.ops.<namespace>.<op>, so pllm can sign its source; use torch.ops.aten or torch.ops.prims "
+    "only for built-in operators"
+)
+
+
+def _builtin_op_access(instructions: tuple[Instruction, ...]) -> bool:
+    return bool(
+        instructions
+        and instructions[0].opname in ("LOAD_ATTR", "LOAD_METHOD")
+        and instructions[0].argval in ("aten", "prims")
+    )
+
+
+def _check_op_access(code: CodeType, globals_used: dict[str, object]) -> None:
+    """Reject dispatcher lookups whose implementation a module version cannot identify."""
+    instructions = tuple(get_instructions(code))
+    aliases: dict[str, object] = {}
+    imported = ""
+    for index, item in enumerate(instructions):
+        tail = instructions[index + 1 :]
+        if item.opname == "IMPORT_NAME":
+            imported = str(item.argval)
+            if imported == "torch" and tail and tail[0].opname == "STORE_FAST":
+                aliases[str(tail[0].argval)] = torch
+        if item.opname == "IMPORT_FROM" and item.argval == "ops" and imported == "torch":
+            raise ValueError(_OP_ACCESS)
+        dependency = (
+            globals_used.get(str(item.argval))
+            if item.opname in ("LOAD_GLOBAL", "LOAD_DEREF")
+            else aliases.get(str(item.argval))
+            if item.opname == "LOAD_FAST"
+            else None
+        )
+        if dependency is torch and tail:
+            if tail[0].opname == "STORE_FAST":
+                aliases[str(tail[0].argval)] = torch
+            if tail[0].argval == "ops" and not _builtin_op_access(tail[1:]):
+                raise ValueError(_OP_ACCESS)
+            if tail[0].argval in ("__dict__", "_ops"):
+                raise ValueError(_OP_ACCESS)
+        if dependency is torch.ops and not _builtin_op_access(tail):
+            raise ValueError(_OP_ACCESS)
+    for value in code.co_consts:
+        if isinstance(value, CodeType):
+            _check_op_access(value, globals_used)
 
 
 _REJECTED_BUILTINS = {
@@ -279,6 +360,11 @@ def reachable_functions(candidates: Mapping[str, FunctionType], seeds: tuple[Fun
     return frozenset(reachable)
 
 
+def _borrowed(value: object) -> bool:
+    """Dispatcher and JIT objects are process-owned code handles, like imported modules."""
+    return isinstance(value, (ModuleType, type, CustomOpDef, JITFunction)) or dispatcher_namespace(value) is not None
+
+
 def freeze(function: G) -> G:
     if isinstance(function, MethodType):
         return cast(G, MethodType(freeze(function.__func__), function.__self__))
@@ -289,9 +375,7 @@ def freeze(function: G) -> G:
     for key in globals_used & global_values.keys():
         value = global_values[key]
         global_values[key] = (
-            freeze(value)
-            if isinstance(value, FunctionType)
-            else (value if isinstance(value, (ModuleType, type)) else deepcopy(value))
+            freeze(value) if isinstance(value, FunctionType) else (value if _borrowed(value) else deepcopy(value))
         )
     copied = FunctionType(
         function.__code__,
@@ -304,6 +388,8 @@ def freeze(function: G) -> G:
             CellType(
                 freeze(cell.cell_contents)
                 if isinstance(cell.cell_contents, FunctionType)
+                else cell.cell_contents
+                if _borrowed(cell.cell_contents)
                 else deepcopy(cell.cell_contents)
             )
             for cell in function.__closure__

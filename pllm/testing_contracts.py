@@ -48,6 +48,7 @@ from pllm.execution.tensor_task import TensorTask
 from pllm.execution.token_program import TokenProgram
 from pllm.execution.trace import TraceEventKind
 from pllm.testing_forward import CheckForward
+from pllm.testing_kernels import check_sites, compare_method, replay_cells
 from pllm.testing_timing import VersionChecks
 from pllm.usage import Workload, component_workloads
 
@@ -100,6 +101,7 @@ Values = dict[tuple[str, int, str], torch.Tensor]
 
 @dataclass
 class _Run:
+    device_equivalence: bool = False
     timing: VersionChecks = field(default_factory=VersionChecks)
     preemption_skip: str | None = None
     values: Values = field(default_factory=lambda: {})
@@ -118,6 +120,9 @@ class _Run:
         *,
         rowwise: bool,
     ) -> None:
+        if self.device_equivalence:
+            expected = outputs if task.tuple_output else outputs[0]
+            compare_method(task, inputs, expected)
         # Global results have no request axis; their state and export effects are still compared.
         if not rowwise:
             return
@@ -484,6 +489,31 @@ def _imported_batch(
     return StateImport(values)
 
 
+def _embeddings(value: StepInput, width: int, dtype: torch.dtype, perturbed: int | None) -> torch.Tensor:
+    return torch.cat(
+        tuple(
+            _token_values(row.identity.prompt_index, range(row.token_offset, row.token_offset + 1), width, 0, perturbed)
+            for row in value.rows.rows
+        )
+    ).to(dtype)
+
+
+def _site_step(
+    binding: TensorBinding, facts: BackendCompileFacts, value: StepInput, tokens: torch.Tensor, run: _Run
+) -> None:
+    outputs = check_sites(
+        binding,
+        replace(facts, max_admitted_lineages=len(tokens)),
+        tokens,
+        tokens * 0.5,
+        seed=facts.initialization_seed,
+        device_equivalence=run.device_equivalence,
+    )
+    for name, output in outputs.items():
+        for row, tensor in zip(value.rows.rows, output, strict=True):
+            run.values[row.identity.request_id, row.token_offset, f"custom_residual {name}"] = tensor.detach().clone()
+
+
 def _run(
     workload: Workload,
     facts: BackendCompileFacts,
@@ -494,8 +524,9 @@ def _run(
     mixed: bool = False,
     perturbed: int | None = None,
     preempted: Literal["none", "full", "chunked"] = "none",
+    device_equivalence: bool = False,
 ) -> _Run:
-    run = _Run(shared_resources=_shared_resources(declaration))
+    run = _Run(device_equivalence=device_equivalence, shared_resources=_shared_resources(declaration))
     tasks = declaration.tensor_tasks
     declaration.tensor_tasks = {
         symbol: replace(task, observe=partial(run.record, task, rowwise=reads_rows(task, tasks)))
@@ -545,22 +576,12 @@ def _run(
                     sampler_rows=sampler,
                     hidden=None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch),
                 )
-            if forward is not None:
-                forward.prepare(
-                    value,
-                    torch.cat(
-                        tuple(
-                            _token_values(
-                                row.identity.prompt_index,
-                                range(row.token_offset, row.token_offset + 1),
-                                shape.hidden_size,
-                                0,
-                                perturbed,
-                            )
-                            for row in value.rows.rows
-                        )
-                    ).to(facts.probe.tensor_dtype.torch),
-                )
+            if forward is not None or declaration.sites.rewrites:
+                tokens = _embeddings(value, shape.hidden_size, facts.probe.tensor_dtype.torch, perturbed)
+                if forward is not None:
+                    forward.prepare(value, tokens)
+                if declaration.sites.rewrites:
+                    _site_step(declaration, facts, value, tokens, run)
             _execute_step(execution, value, _feedback(value, shape, perturbed), run)
             if forward is not None:
                 run.values.update(
@@ -698,13 +719,16 @@ def _variants(
     shape: ModelShape,
     exports: frozenset[str],
     skipped: list[CheckSkip],
+    *,
+    device_equivalence: bool = False,
 ) -> list[str]:
+    _run_checked = partial(_run, device_equivalence=device_equivalence)
     failures: list[str] = []
     shared = bool(_shared_resources(declaration))
-    together = _run(workload, facts, declaration, shape, (0, 1, 2))
+    together = _run_checked(workload, facts, declaration, shape, (0, 1, 2))
     alone = _Run()
     for index in range(3):
-        single = _run(workload, facts, declaration, shape, (index,))
+        single = _run_checked(workload, facts, declaration, shape, (index,))
         failures.extend(f"[alone] {failure}" for failure in single.failures)
         alone.values.update(single.values)
         alone.operations.update(single.operations)
@@ -712,13 +736,13 @@ def _variants(
         alone.timing.values.update(single.timing.values)
     failures.extend(_compare(alone, together, "row permutation", shared=bool(shared), exports=exports))
     failures.extend(
-        _compare(together, _run(workload, facts, declaration, shape, (2, 1, 0)), "reversed", exports=exports)
+        _compare(together, _run_checked(workload, facts, declaration, shape, (2, 1, 0)), "reversed", exports=exports)
     )
     for index, identity in enumerate(_IDS):
         failures.extend(
             _compare(
                 together,
-                _run(workload, facts, declaration, shape, (0, 1, 2), perturbed=index),
+                _run_checked(workload, facts, declaration, shape, (0, 1, 2), perturbed=index),
                 "isolation",
                 request=identity.request_id,
                 shared=bool(shared),
@@ -728,14 +752,14 @@ def _variants(
     failures.extend(
         _compare(
             alone,
-            _run(workload, facts, declaration, shape, (0, 1, 2), mixed=True),
+            _run_checked(workload, facts, declaration, shape, (0, 1, 2), mixed=True),
             "mixed",
             shared=bool(shared),
             exports=exports,
         )
     )
     for replay in ("full", "chunked"):
-        preempted = _run(workload, facts, declaration, shape, (0, 1, 2), preempted=replay)
+        preempted = _run_checked(workload, facts, declaration, shape, (0, 1, 2), preempted=replay)
         if preempted.preemption_skip is not None:
             skipped.append(CheckSkip("preempted", preempted.preemption_skip))
             break
@@ -810,7 +834,7 @@ def _initial_parameters(
     return {source: source.view.read(roots[source.resource][source.view.field]) for source in sources}
 
 
-def _check(workload: Workload, config: ModelConfig) -> CheckResult:
+def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool = False) -> CheckResult:
     """Check request schedules, replay and state visibility on CPU, without loading a model.
 
     Uses fixed per-token inputs, real planner/executor paths and the runners' row labeller.
@@ -834,6 +858,20 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
     except (ValueError, RuntimeError, TypeError) as error:
         raise ContractError((f"[compile] {''.join(format_exception_only(error)).strip()}",)) from error
     passed.append("compile")
+    from pllm.cost_estimates import estimate_tasks
+
+    _, ops = estimate_tasks(declaration, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
+    missing = tuple(op.name for op in ops if not op.cpu_reference)
+    if missing:
+        return CheckResult(
+            tuple(passed),
+            tuple(
+                CheckSkip(
+                    "CPU schedules", f'no CPU kernel for {name}: add {name.split("::")[-1]}.register_kernel("cpu", ...)'
+                )
+                for name in missing
+            ),
+        )
     for task in declaration.tensor_tasks.values():
         if (
             task.training is not None
@@ -846,6 +884,14 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
             )
     if failures:
         raise ContractError(tuple(failures))
+    if device_equivalence and declaration.custom_forward_programs:
+        _, gpu = workload.specialize(
+            replace(facts, probe=replace(facts.probe, device_kind=StateDeviceKind.CUDA)), config.execution
+        )
+        assert gpu.custom_forward_programs is not None
+        declaration.custom_forward_programs = replay_cells(
+            declaration.custom_forward_programs, gpu.custom_forward_programs
+        )
     programs = tuple((declaration.custom_forward_programs or {}).values())
     if any(program.adaptive for program in programs):
         from pllm.testing_depth import check_depth, check_never_exit
@@ -872,6 +918,18 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
         if parameters:
             passed.append("custom-forward instance reads / CPU decoder")
         skipped.append(CheckSkip("model arithmetic", "CPU fake decoder; native kernels need GPU"))
+    if (
+        ops
+        and requirements.custom_residual
+        and not programs
+        and all(rewrite.memory is None for rewrite in declaration.sites.rewrites)
+    ):
+        failures.extend(
+            _variants(workload, facts, declaration, shape, frozenset(), skipped, device_equivalence=device_equivalence)
+        )
+        if failures:
+            raise ContractError(tuple(failures))
+        passed.append("custom-residual method math / CPU schedules")
     if (
         requirements.custom_residual
         or programs
@@ -938,7 +996,9 @@ def _check(workload: Workload, config: ModelConfig) -> CheckResult:
                 "publish_lag counts engine steps: mixed/preempted values reading different permitted versions are not compared; every version read is checked",
             )
         )
-    failures.extend(_variants(workload, facts, declaration, shape, exports, skipped))
+    failures.extend(
+        _variants(workload, facts, declaration, shape, exports, skipped, device_equivalence=device_equivalence)
+    )
     if any(
         state.resource in declaration.imports and state.scope is StateScope.REQUEST
         for state in declaration.graph.states

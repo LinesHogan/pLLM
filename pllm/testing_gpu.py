@@ -40,7 +40,7 @@ from pllm.execution.tensor_binding import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import read_batch
 from pllm.explanation import explain, explain_facts
-from pllm.testing_contracts import CheckResult, CheckSkip, ContractError
+from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, _check
 from pllm.usage import Workload
 
 _Allocation = ParamSpec("_Allocation")
@@ -474,6 +474,8 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     regenerate their readouts. Untrained early exits may need VLLM_BATCH_INVARIANT=1 to exclude
     batch-width rounding during eviction. Causal batches also check that permuting sequences and
     weights preserves an AdamW update.
+    Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
+    with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
     Declared replay rejections are reported as explicit skips.
     Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
     """
@@ -487,6 +489,19 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     passed: list[str] = []
     skipped: list[CheckSkip] = []
     failures: list[str] = []
+    if explain(workload, config).custom_ops:
+        try:
+            replay = _check(workload, config, device_equivalence=True)
+            unexecuted = {"CPU schedules", "adaptive decoder"}
+            if "custom-residual method math / CPU schedules" not in replay.passed:
+                unexecuted.add("model-site execution")
+            missing = tuple(skip for skip in replay.skipped if skip.property in unexecuted)
+            if missing:
+                skipped.extend(CheckSkip("device equivalence", skip.reason) for skip in missing)
+            else:
+                passed.append("device equivalence: CPU check script method outputs replayed on CUDA")
+        except (AssertionError, RuntimeError, ValueError, TypeError) as error:
+            failures.append(f"[device equivalence] {error}")
     _release_models()
     try:
         result = _workload_checks(workload, config)

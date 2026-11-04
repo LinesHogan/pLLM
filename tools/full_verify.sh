@@ -88,7 +88,7 @@ run_stage() {
     enginecore-capture) smoke enginecore_smoke --captured-only ;;
     enginecore-io) smoke enginecore_smoke --gpu-io-only ;;
     adaptive) pytest_gpu test/gpu/features/test_adaptive_depth.py ;;
-    residual) pytest_gpu test/gpu/features/test_custom_residual.py ;;
+    residual) pytest_gpu test/gpu/features/test_custom_residual.py test/gpu/features/test_custom_kernels.py ;;
     producers) pytest_gpu test/gpu/features/test_state_producers.py ;;
     routes)
       pytest_gpu test/gpu/features/test_composed_model_sites.py || rc=1
