@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from pllm.contracts.semantic_graph import PackedSamplerRowsInputSource, TaskResultInputSource, TaskSymbol
-from pllm.execution.attention import PagedKV
+from pllm.contracts.state_representation import StateDeviceKind
+from pllm.execution.attention import CHECK_PAGE_SIZE, PAGE_SIZE, PagedKV
 from pllm.execution.model_sites import DepthInput, StateInput
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, result_port
@@ -232,8 +233,9 @@ def attention_example(
 
     probe = facts.probe
     q = torch.empty((rows, probe.attention_heads, probe.head_dim), dtype=probe.tensor_dtype.torch, device="meta")
-    pages = (trace.context + 15) // 16
-    cache = q.new_empty((rows * pages, 16, probe.kv_heads, probe.head_dim))
+    size = CHECK_PAGE_SIZE if probe.device_kind is StateDeviceKind.CPU else PAGE_SIZE
+    pages = (trace.context + size - 1) // size
+    cache = q.new_empty((rows * pages, size, probe.kv_heads, probe.head_dim))
     integer = torch.empty(rows, dtype=torch.int32, device="meta")
     kv = PagedKV(cache, cache, integer.new_empty((rows, pages)), integer, integer.new_empty(rows + 1), integer, trace)
     arguments = {

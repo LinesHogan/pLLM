@@ -44,7 +44,7 @@ from pllm.workloads.dola import DoLaWorkload
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.state_producers import FactorAdapterWorkload
 from pllm.workloads.video import VideoWorkload
-from test.workloads.attention_workloads import CoupledAttention, InstanceAttention, Monitor, Quest
+from test.workloads.attention_workloads import CacheLayout, CoupledAttention, InstanceAttention, Monitor, Quest
 from test.workloads.kernel_workloads import Forward, Residual
 
 
@@ -170,6 +170,7 @@ class PromptMask(pllm.Workload):
             Monitor(),
             Quest(),
             InstanceAttention(),
+            CacheLayout(),
             Forward(),
             TokenHistory(),
             Stack(),

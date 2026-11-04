@@ -161,3 +161,19 @@ class InstanceAttention(pllm.Workload):
     @pllm.custom_attention(layers=(0,))
     def read(self, q, kv, weights=pllm.parameter("pool", "weights")):
         return (kv.attend(q)[0].float() + weights.reshape(128).sum() * 0).to(q.dtype)
+
+
+@dataclass(frozen=True)
+class CacheLayout(pllm.Workload):
+    """Selection exports have fixed width from the paged layout, including during CPU checks."""
+
+    @pllm.custom_attention(layers=(0,))
+    def read(self, q, kv):
+        pages = (-torch.arange(kv.block_table.shape[1], device=q.device)).topk(2).indices
+        chosen = pages[:, None] * kv.key_cache.shape[1] + torch.arange(kv.key_cache.shape[1], device=q.device)
+        chosen = chosen.flatten().expand(len(q), -1)
+        return kv.attend(q, topk=chosen)[0], chosen
+
+    @pllm.export(max_rows=4, max_cols=64)
+    def report(self, chosen: torch.Tensor = pllm.attention(0, "aux")) -> torch.Tensor:
+        return chosen

@@ -7,6 +7,10 @@ from typing import Protocol
 
 import torch
 
+# Planning uses FA2 pages; the tiny CPU decoder crosses boundaries with shorter pages.
+PAGE_SIZE = 16
+CHECK_PAGE_SIZE = 4
+
 
 class AttentionRead(Protocol):
     """The backend's attention kernel, including its float32 log normalizer."""

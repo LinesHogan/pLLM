@@ -119,7 +119,7 @@ class CheckAttention:
 
     def paged(self, rows: tuple[PackedPhaseRow, ...], layer: int, q: torch.Tensor, read: "_CheckRead") -> "PagedKV":
         """Stage request-local dictionaries as fixed-size pages, including all current K/V writes."""
-        from pllm.execution.attention import PagedKV
+        from pllm.execution.attention import CHECK_PAGE_SIZE, PagedKV
 
         kv_heads, dim = self.probe.kv_heads, self.probe.head_dim
         requests = tuple(dict.fromkeys(row.identity.request_id for row in rows))
@@ -132,13 +132,15 @@ class CheckAttention:
             key = query[:kv_heads].clone()
             val = (key.float() * 0.7 + layer * 0.01).to(q.dtype)
             self.cache[row.identity.request_id, layer, row.token_offset] = key, val
-        pages = (max(lengths) + 3) // 4
-        keys, values = (q.new_zeros((len(groups) * pages, 4, kv_heads, dim)) for _ in (0, 1))
+        domain = self.probe.causal_domain
+        assert domain is not None
+        pages = (domain.positions + CHECK_PAGE_SIZE - 1) // CHECK_PAGE_SIZE
+        keys, values = (q.new_zeros((len(groups) * pages, CHECK_PAGE_SIZE, kv_heads, dim)) for _ in (0, 1))
         for request, name in enumerate(requests):
             for position in range(lengths[request]):
                 cached = self.cache.get((name, layer, position))
                 if cached is not None:
-                    block, offset = request * pages + position // 4, position % 4
+                    block, offset = request * pages + position // CHECK_PAGE_SIZE, position % CHECK_PAGE_SIZE
                     keys[block, offset], values[block, offset] = cached
         return PagedKV(
             keys,
