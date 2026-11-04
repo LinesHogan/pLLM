@@ -44,7 +44,9 @@ class Steering(pllm.Workload):
         (Steering(), Steering()),
         (DoLaWorkload(layers=(0, 2)), None),
         (PromptFactorsWorkload(), None),
-        (Exit("mixed"), None),
+        # The pretrained LM head needs late-layer features. Midpoint exits produce near-tied junk tokens,
+        # whose argmax changes with GEMM width after eviction even when recompute is correct.
+        (Exit("mixed", exit_layer=22), Exit("all")),
     ],
     ids=("esamp", "output_lora", "adapter", "caa", "dola", "prompt_factors", "adaptive"),
 )

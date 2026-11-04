@@ -196,7 +196,9 @@ class _Generation:
         if self.tokens != replayed.tokens:
             raise ContractError(
                 (
-                    f"[preempted] greedy tokens changed after KV eviction: {self.tokens} -> {replayed.tokens}; report a pllm recompute bug",
+                    f"[preempted] greedy tokens changed after KV eviction: {self.tokens} -> {replayed.tokens}; "
+                    "rerun with VLLM_BATCH_INVARIANT=1 to exclude batch-width rounding, "
+                    "then report a pllm recompute bug if they still differ",
                 )
             )
         if self.states.keys() != replayed.states.keys():
@@ -424,8 +426,9 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
     Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
     and replayed per token, as in the CPU script, to exclude base-model rounding differences; custom forwards
-    regenerate their readouts. Causal
-    batches also check that permuting sequences and weights preserves an AdamW update.
+    regenerate their readouts. Untrained early exits may need VLLM_BATCH_INVARIANT=1 to exclude
+    batch-width rounding during eviction. Causal batches also check that permuting sequences and
+    weights preserves an AdamW update.
     Declared replay rejections are reported as explicit skips.
     Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
     """
