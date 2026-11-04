@@ -247,7 +247,7 @@ class Attention(_Source):
         return context.binding.attention.port(context.binding, AttentionFact(self.layer, self.fact))
 
 
-def attention(layer: int, fact: Fact) -> Attention:
+def attention(layer: int, fact: Fact) -> Any:
     """Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers."""
     if type(layer) is not int or layer < 0 or fact not in ("aux", "lse"):
         raise ValueError(

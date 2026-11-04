@@ -599,7 +599,7 @@ pllm.custom_residual(*, site: 'Site', layers: 'tuple[int, ...] | Attr | None' = 
     Own the residual update at `site` of `layers` (default: every layer) with this method.
 pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None) -> 'Callable[[F], F]'
     Replace dense FlashAttention reads, retaining native projections and KV writes.
-pllm.attention(layer: 'int', fact: 'Fact') -> 'Attention'
+pllm.attention(layer: 'int', fact: 'Fact') -> 'Any'
     Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers.
 pllm.depth() -> 'Any'
     Inside a @pllm.custom_residual method, the index of the place it runs at, a Python int: the layer, or 2 * layer (+ 1 for the MLP) with site="both".
