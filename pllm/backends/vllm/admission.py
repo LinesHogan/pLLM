@@ -50,6 +50,13 @@ def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> st
         )
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState and @pllm.custom_forward need runner="mrv2"')
+    if any(layout.keep != "all" for layout in requirements.kv_layouts):
+        if config.runner != "mrv2":
+            raise ValueError('static KV layouts need runner="mrv2"')
+        if requirements.custom_forward or requirements.position_states:
+            raise ValueError(
+                "static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)"
+            )
     reason = next((reason for _, reason in eager_reasons(config, requirements)), "")
     if config.cuda_graphs is True and reason:
         raise ValueError(f'{reason}; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False')

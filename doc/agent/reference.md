@@ -597,7 +597,7 @@ pllm.custom_forward(*, tokens: 'Tokens' = 'all', over: 'Over' = 'token') -> 'Cal
     Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
 pllm.custom_residual(*, site: 'Site', layers: 'tuple[int, ...] | Attr | None' = None, read: 'str' = '', streams: 'int | Attr' = 1, state: 'str' = '', chunk: 'int | Attr | None' = None) -> 'Callable[[F], F]'
     Own the residual update at `site` of `layers` (default: every layer) with this method.
-pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None) -> 'Callable[[F], F]'
+pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None, keep: 'Keep' = 'all', window: 'int' = 0, source: 'int' = 0, sink: 'bool' = False) -> 'Callable[[F], F]'
     Replace dense FlashAttention reads, retaining native projections and KV writes.
 pllm.attention(layer: 'int', fact: 'Fact') -> 'Any'
     Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers.
@@ -695,7 +695,7 @@ pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count:
     Public model slices and position state used inside custom_forward methods.
 pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
     One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
-pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', positions: 'torch.Tensor', _read: 'AttentionRead')
+pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', positions: 'torch.Tensor', _read: 'AttentionRead', storage_window: 'int' = 0, sink_lens: 'torch.Tensor | None' = None)
     Borrowed paged K/V, already including the current tokens; never changes cache storage.
 ```
 

@@ -177,3 +177,32 @@ class CacheLayout(pllm.Workload):
     @pllm.export(max_rows=4, max_cols=64)
     def report(self, chosen: torch.Tensor = pllm.attention(0, "aux")) -> torch.Tensor:
         return chosen
+
+
+@dataclass(frozen=True)
+class WindowAttention(pllm.Workload):
+    """vLLM owns and recycles sliding-window blocks."""
+
+    @pllm.custom_attention(layers=(0, 1), keep="window", window=4)
+    def read(self, q, kv):
+        return kv.attend(q)[0]
+
+
+@dataclass(frozen=True)
+class SinkAttention(pllm.Workload):
+    """Keep prompt K/V and a recent generated tail using native R-SWA storage."""
+
+    @pllm.custom_attention(layers=(0, 1), keep="window", window=4, sink=True)
+    def read(self, q, kv):
+        return kv.attend(q)[0]
+
+
+@dataclass(frozen=True)
+class SharedAttention(pllm.Workload):
+    """Each odd layer reads the preceding layer's cache, with no cache of its own."""
+
+    layers: tuple[int, ...] = (1, 3, 5, 7, 9)
+
+    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="none", source=1)
+    def read(self, q, kv):
+        return kv.attend(q)[0]

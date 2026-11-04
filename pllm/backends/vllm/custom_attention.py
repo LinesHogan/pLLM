@@ -17,6 +17,7 @@ from vllm.vllm_flash_attn import flash_attn_varlen_func
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.compat import VLLM_027
 from pllm.backends.vllm.model_sites import ModelSites
+from pllm.contracts.kv_layout import storage_layout
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.execution.attention import PagedKV, selected_attention
 from pllm.execution.attention_methods import AttentionFact, AttentionProgram
@@ -35,6 +36,8 @@ class FlashRead:
 
     def __call__(self, q: torch.Tensor, window: int, topk: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.kv is not None
+        if self.kv.sink_lens is not None and topk is None:
+            topk = torch.arange(self.metadata.max_seq_len, device=q.device)[None, :].expand(len(q), -1)
         if topk is not None:
             result = selected_attention(self.kv, q, self.impl.scale, window, topk)
         else:
@@ -77,14 +80,13 @@ class CustomAttention:
                 raise ValueError(
                     "@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2"
                 )
-            if (
-                impl.sliding_window != (-1, -1)
-                or attention.kv_sharing_target_layer_name is not None
-                or attention.kv_cache_dtype != "auto"
-            ):
-                raise ValueError(
-                    "@pllm.custom_attention needs full attention with its own unquantized KV cache; choose another layer or model"
-                )
+            layout = storage_layout(program.layouts, layer)
+            sharing = any(item.layer == layer and item.keep == "none" for item in program.layouts)
+            window = layout.window if layout.keep == "window" and not layout.sink else None
+            if attention.sliding_window != window or (attention.kv_sharing_target_layer_name is not None) != sharing:
+                raise ValueError("custom_attention needs full attention or a layout declared with keep/window/source")
+            if attention.kv_cache_dtype != "auto":
+                raise ValueError("@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto")
             if impl.alibi_slopes is not None or impl.logits_soft_cap != 0 or impl.sinks is not None:
                 raise ValueError("@pllm.custom_attention needs ordinary RoPE attention without ALiBi, softcap or sinks")
             self.installed.append((impl, impl.forward))
@@ -92,6 +94,10 @@ class CustomAttention:
 
     def prepare(self, rows: PackedPhaseRowBatch, sampler: PackedSamplerRowBatch) -> None:
         """Stage sampled-to-packed indices before model and fact-snapshot tasks run."""
+        if self.program.prompt_lens.numel():
+            self.program.prompt_lens[: len(rows.rows)].copy_(
+                upload(tuple(row.prompt_length for row in rows.rows), self.program.prompt_lens.device)
+            )
         mapping = tuple(
             link.packed_row_index for link in sorted(sampler.links, key=lambda link: link.sampler_row_index)
         )
@@ -134,7 +140,6 @@ class AttentionHook:
             and metadata.use_cascade
             or metadata.causal is not True
             or metadata.max_dcp_context_kv_len not in (None, 0)
-            or metadata.rswa_prefix_lens is not None
         ):
             raise ValueError(
                 "@pllm.custom_attention needs ordinary causal FlashAttention metadata; disable cascade, DCP and prefix caching"
@@ -146,11 +151,22 @@ class AttentionHook:
         requests = (rows[:, None] >= metadata.query_start_loc[1:][None, :]).sum(-1)
         lengths = metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]
         positions = metadata.seq_lens[requests] - lengths[requests] + rows - metadata.query_start_loc[requests]
+        self.owner.sites.count = count
         read = FlashRead(self.impl, metadata)
-        kv = PagedKV(keys, values, metadata.block_table, metadata.seq_lens, metadata.query_start_loc, positions, read)
+        layout = storage_layout(self.owner.program.layouts, self.layer)
+        kv = PagedKV(
+            keys,
+            values,
+            metadata.block_table,
+            metadata.seq_lens,
+            metadata.query_start_loc,
+            positions,
+            read,
+            layout.window,
+            self.owner.sites.current_rows(self.owner.program.prompt_lens)[:count] if layout.sink else None,
+        )
         read.kv = kv
         program, sites = self.owner.program, self.owner.sites
-        sites.count = count
         method = program.methods[self.layer]
         kwargs = {
             name: source.value(sites, self.layer)

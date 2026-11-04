@@ -37,6 +37,17 @@ class PagedKV:
     query_start: torch.Tensor
     positions: torch.Tensor
     _read: AttentionRead
+    storage_window: int = 0
+    sink_lens: torch.Tensor | None = None
+
+    @property
+    def window_start(self) -> torch.Tensor:
+        """First retained tail position per query; sink_lens also preserves prompt positions."""
+        return (
+            (self.positions + 1 - self.storage_window).clamp_min(0)
+            if self.storage_window
+            else torch.zeros_like(self.positions)
+        )
 
     def attend(
         self, q: torch.Tensor, *, window: int = 0, topk: torch.Tensor | None = None
@@ -47,6 +58,8 @@ class PagedKV:
         intersect causality and the optional window; an empty read returns zero
         output and negative-infinity LSE. Indices must be distinct within a head.
         """
+        if self.storage_window and self.sink_lens is None:
+            window = min(window, self.storage_window) if window else self.storage_window
         return self._read(q, window, topk)
 
 
@@ -58,14 +71,21 @@ def selected_attention(
     requests = (rows[:, None] >= kv.query_start[1:][None, :]).sum(-1)
     chosen = topk[:, None, :].expand(-1, q.shape[1], -1) if topk.ndim == 2 else topk
     valid = (chosen >= 0) & (chosen <= kv.positions[:, None, None])
+    if kv.storage_window:
+        retained = chosen >= kv.window_start[:, None, None]
+        if kv.sink_lens is not None:
+            retained = retained | (chosen < kv.sink_lens[:, None, None])
+        valid = valid & retained
     if window:
         valid = valid & (chosen > kv.positions[:, None, None] - window)
     size = kv.key_cache.shape[1]
-    safe = chosen.clamp(0, kv.block_table.shape[1] * size - 1).long()
-    blocks = kv.block_table[requests[:, None, None], safe // size].long()
+    # Never dereference reclaimed pages, even for masked lanes of a gather.
+    safe = torch.where(valid, chosen.clamp(0, kv.block_table.shape[1] * size - 1), 0).long()
+    blocks = torch.where(valid, kv.block_table[requests[:, None, None], safe // size], 0).long()
     heads = torch.arange(q.shape[1], device=q.device) // (q.shape[1] // kv.key_cache.shape[2])
     keys = kv.key_cache[blocks, safe % size, heads[None, :, None]].float()
     values = kv.value_cache[blocks, safe % size, heads[None, :, None]].float()
+    keys = keys.masked_fill(~valid[..., None], 0)
     values = values.masked_fill(~valid[..., None], 0)
     scores = (q.float()[:, :, None, :] * keys).sum(-1) * scale
     scores = scores.masked_fill(~valid, -float("inf"))

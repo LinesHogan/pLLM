@@ -26,6 +26,7 @@ from pllm.contracts.codec import boundary_digest
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch, validate_host_batch
+from pllm.contracts.kv_layout import Keep, KVLayout, expand_layouts
 from pllm.contracts.member import MemberDeclaration
 from pllm.contracts.parameter_overlay import (
     FieldView,
@@ -1643,8 +1644,33 @@ def _site_inputs(
 class _CustomAttention(_Effect):
     kind: ClassVar[str] = "custom_attention"
     layers: tuple[int, ...] | Attr | None
+    keep: Keep
+    window: int
+    source: int
+    sink: bool
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
+
+    def layouts(self, context: _Reflection) -> tuple[KVLayout, ...]:
+        """Resolve layer settings and validate storage declarations at the authoring boundary."""
+        layers = (-1,) if self.layers is None else _setting(self.layers, context.owner, tuple)
+        if self.keep not in ("all", "window", "none"):
+            raise ValueError('custom_attention keep must be "all", "window" or "none"')
+        if type(self.window) is not int or type(self.source) is not int or type(self.sink) is not bool:
+            raise ValueError("custom_attention needs integer window/source and boolean sink")
+        if self.keep == "window":
+            if self.window < 1 or self.source:
+                raise ValueError('keep="window" needs window > 0 and source=0')
+        elif self.window or self.sink:
+            raise ValueError('window and sink need keep="window"')
+        if self.keep == "none":
+            if self.source < 1 or not layers or any(layer < self.source for layer in layers):
+                raise ValueError(
+                    'keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources'
+                )
+        elif self.source:
+            raise ValueError('source needs keep="none"')
+        return tuple(KVLayout(layer, self.keep, self.window, self.source, self.sink) for layer in layers)
 
     def declare(self, operation: _Operation) -> None:
         context, binding = operation.context, operation.context.binding
@@ -1678,20 +1704,35 @@ class _CustomAttention(_Effect):
                     )
             inputs.append((name, value))
         binding.attention.add(AttentionMethod(operation.name, layers, freeze(operation.function), tuple(inputs)))
+        binding.attention.layouts += expand_layouts(self.layouts(context), count)
         binding.model_reads(tuple(source.resource for _, source in inputs if isinstance(source, StateInput)))
         context.signature.append((operation.name, boundary_digest(fingerprint(operation.function), self)))
 
 
-def custom_attention(*, layers: tuple[int, ...] | Attr | None = None) -> Callable[[F], F]:
+def custom_attention(
+    *,
+    layers: tuple[int, ...] | Attr | None = None,
+    keep: Keep = "all",
+    window: int = 0,
+    source: int = 0,
+    sink: bool = False,
+) -> Callable[[F], F]:
     """Replace dense FlashAttention reads, retaining native projections and KV writes.
 
     The method receives post-RoPE q [rows, heads, head_dim] and pllm.model.PagedKV.
     Return attention with q's shape/dtype, optionally paired with aux [rows, ...].
     kv.attend returns (output, float32 LSE); window and per-head topk select reads
     without freeing storage. Methods may call pure torch.library.custom_op kernels.
-    Requires TP=1, full unquantized FA2 attention and prefix caching disabled.
+    keep="window", window=N frees old blocks through vLLM's SlidingWindowSpec.
+    sink=True retains the entire prompt plus that window (vLLM RSWASpec).
+    keep="none", source=k allocates no cache and reads the layer k below.
+    Layouts restrict every read, including topk; window_start marks the retained tail.
+    Requires TP=1, unquantized FA2 attention and prefix caching disabled.
+    Static layouts need MRv2 and cannot accompany PositionState or custom forwards.
+    The prompt-sink FA2 read uses a gathered FP32 softmax; storage and reclamation
+    are owned by vLLM's RSWAManager. Score-based memory eviction is unsupported.
     """
-    return _mark(effect=_CustomAttention(layers=layers))
+    return _mark(effect=_CustomAttention(layers=layers, keep=keep, window=window, source=source, sink=sink))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -3088,6 +3129,12 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 default=None,
             ),
             position_states=context.position_states(),
+            kv_layouts=tuple(
+                layout
+                for operation in context.operations
+                if isinstance(operation.effect, _CustomAttention)
+                for layout in operation.effect.layouts(operation.context)
+            ),
             custom_forward=bool(context.custom_forwards),
             custom_attention=any(isinstance(operation.effect, _CustomAttention) for operation in context.operations)
             or any(isinstance(source, Attention) for source in inputs),

@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+from pllm.backends.vllm.kv_layout import layout_capacity
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch
+from pllm.contracts.kv_layout import KVCapacity
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     HostServiceInputSource,
@@ -133,6 +135,7 @@ class ExplainResult:
     limitations: tuple[str, ...]
     custom_ops: tuple[OpCost, ...]
     attention: tuple[AttentionCost, ...]
+    kv_capacity: tuple[KVCapacity, ...]
 
     def __str__(self) -> str:
         forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
@@ -217,7 +220,14 @@ class ExplainResult:
         for read in self.attention:
             lines.append(
                 f"attention layer {read.layer}: custom `{read.method}`; {', '.join(read.reads) or 'user kernels'}; "
-                f"{read.flops_per_token} FLOP/token, <= {read.kv_bytes_per_token} KV bytes/token [estimate at max_model_len; per-head budget upper bound; storage unchanged]"
+                f"{read.flops_per_token} FLOP/token, <= {read.kv_bytes_per_token} KV bytes/token [estimate at max_model_len; per-head budget upper bound]"
+            )
+        for capacity in self.kv_capacity:
+            lines.append(
+                f"KV layer {capacity.layout.layer}: {capacity.layout.description}; "
+                f"<= {capacity.blocks} blocks, {capacity.bytes} KV bytes/request "
+                f"[native admission bound, block size {capacity.block_size}, includes in-flight tokens; "
+                "prompt sink worst case]; prefix caching disabled"
             )
         return "\n".join(lines)
 
@@ -567,4 +577,5 @@ def explain_facts(
         ),
         ops,
         binding.attention.costs,
+        layout_capacity(shape, config, workload.backend_requirements().kv_layouts) if binding.attention.methods else (),
     )

@@ -21,6 +21,7 @@ from pllm.contracts.host_batch import (
     WeightedRowBatch as WeightedRowBatch,
     map_host_batch as map_host_batch,
 )
+from pllm.contracts.kv_layout import KVLayout
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import AnchorId, HiddenInputSource, SchedulerTimeline, StateScope
@@ -81,6 +82,7 @@ class BackendRequirements:
     custom_residual: bool = False
     stateful_residual: bool = False
     custom_attention: bool = False
+    kv_layouts: tuple[KVLayout, ...] = ()
     # Whether a pllm.model.Adapter reads an InstanceState; CUDA-graph overlays bind request state only.
     instance_adapter: bool = False
     causal_training: bool = False

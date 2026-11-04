@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.config import CacheConfig, ModelConfig as VllmModelConfig
+from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -34,6 +34,7 @@ from pllm.backends.vllm.hidden_taps import (
     HiddenTapLayout,
     HiddenTaps,
 )
+from pllm.backends.vllm.kv_layout import LAYOUT_ENV, install_layouts
 from pllm.backends.vllm.overlay_graph import (
     OverlayGraphRunner,
 )
@@ -44,6 +45,7 @@ from pllm.backends.vllm.sampler import GuidedSampler, SamplerGuidance
 from pllm.backends.vllm.session import VllmSession
 from pllm.config import RunnerName
 from pllm.contracts.codec import decode_boundary
+from pllm.contracts.kv_layout import KVLayout
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.ptts.slot_pools import SlotPools
 from pllm.execution.state_execution import StateDiagnostics
@@ -57,6 +59,7 @@ class Runner:
     model: torch.nn.Module
     cache_config: CacheConfig
     model_config: VllmModelConfig
+    vllm_config: VllmConfig
     device: torch.device
     max_num_tokens: int
     runner_kind: RunnerName
@@ -74,6 +77,7 @@ class Runner:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
         model = self.decoder.model
         model.compute_logits = self._compute_logits
+        install_layouts(self.decoder, decode_boundary(os.environ.get(LAYOUT_ENV, "[]"), tuple[KVLayout, ...]))
         announcement = decode_boundary(os.environ.get(TAPS_ENV, "{}"), HiddenTapAnnouncement)
         hidden_size = model.lm_head.weight.shape[1]
         self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size, model.config.vocab_size)

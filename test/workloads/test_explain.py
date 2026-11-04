@@ -31,6 +31,7 @@ from pllm.workloads import (
 )
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.video import VideoWorkload
+from test.workloads.attention_workloads import SharedAttention, SinkAttention, WindowAttention
 from test.workloads.kernel_workloads import Forward, Residual
 
 
@@ -64,6 +65,9 @@ def model_config(tmp_path, monkeypatch):
     "workload",
     (
         DummyWorkload(),
+        WindowAttention(),
+        SinkAttention(),
+        SharedAttention(),
         Residual(),
         Forward(),
         Forward(constant=True),
@@ -92,6 +96,15 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
     assert report.peak_memory_bytes >= sum(state.reserved_bytes for state in report.states)
     assert report.members and not report.budget_errors
     assert "[exact]" in str(report)
+    if isinstance(workload, (WindowAttention, SinkAttention, SharedAttention)):
+        assert len(report.kv_capacity) == 10 and "KV bytes/request" in str(report)
+        full = report.kv_capacity[2].bytes
+        if isinstance(workload, WindowAttention):
+            assert report.kv_capacity[0].bytes < full
+        elif isinstance(workload, SharedAttention):
+            assert sum(row.bytes for row in report.kv_capacity) == 5 * full
+        with pytest.raises(ValueError, match="disable prefix caching"):
+            pllm.explain(workload, replace(model_config, enable_prefix_caching=True))
     if isinstance(workload, (Residual, Forward)):
         add, scale = report.custom_ops
         assert add.flops_per_row == 8 and scale.flops_per_row is None

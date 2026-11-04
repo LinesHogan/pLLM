@@ -1,6 +1,7 @@
 """Native LSE bitwise parity, captured monitors and scored dense read selection."""
 
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -10,7 +11,15 @@ import pllm
 from pllm.execution.attention import DenseAttention, PagedKV
 from pllm.execution.attention_methods import TraceRead
 from pllm.testing import check_on_gpu
-from test.workloads.attention_workloads import InstanceAttention, Monitor, Quest, page_bounds
+from test.workloads.attention_workloads import (
+    InstanceAttention,
+    Monitor,
+    Quest,
+    SharedAttention,
+    SinkAttention,
+    WindowAttention,
+    page_bounds,
+)
 
 CONFIG = pllm.ModelConfig(
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -23,8 +32,12 @@ CONFIG = pllm.ModelConfig(
 )
 
 
-@pytest.mark.parametrize("workload", (Monitor(), Quest(), InstanceAttention()))
-def test_attention_contracts(workload):
+@pytest.mark.parametrize(
+    "workload", (Monitor(), Quest(), InstanceAttention(), WindowAttention(), SinkAttention(), SharedAttention())
+)
+def test_attention_contracts(workload, monkeypatch):
+    if isinstance(workload, SharedAttention):
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     result = check_on_gpu(workload, CONFIG, neutral=workload if isinstance(workload, Monitor) else None)
     assert any("host syncs" in name for name in result.passed)
     if isinstance(workload, Monitor):
@@ -98,3 +111,106 @@ def test_native_lse_and_selected_oracle():
             captured_selected, _ = Quest().select(q, kv, layer=0)
         graph.replay()
         assert torch.equal(selected, captured_selected)
+
+
+def _layout_read(read, errors, kernel, q, window, topk):
+    """Compare native reads with a dense FP32 oracle while pages are being recycled."""
+    mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        out, lse = read(kernel, q, window, topk)
+    finally:
+        torch.cuda.set_sync_debug_mode(mode)
+    if kernel.metadata.max_query_len > 1 or kernel.metadata.max_seq_len > 96:
+        kv = kernel.kv
+        # Independent FP32 softmax over logical positions. No production masking/gather helper.
+        for row in range(len(q)):
+            request = sum(row >= int(start) for start in kv.query_start[1:])
+            position = int(kv.positions[row])
+            chosen = torch.arange(position + 1, device=q.device)
+            keep = torch.ones_like(chosen, dtype=torch.bool)
+            if kv.storage_window:
+                keep = chosen > position - kv.storage_window
+                if kv.sink_lens is not None:
+                    keep |= chosen < kv.sink_lens[row]
+            if window:
+                keep &= chosen > position - window
+            chosen = chosen[keep]
+            blocks = kv.block_table[request, chosen // kv.key_cache.shape[1]].long()
+            k, v = (
+                cache[blocks, chosen % cache.shape[1]]
+                .float()
+                .repeat_interleave(q.shape[1] // cache.shape[2], 1)
+                .transpose(0, 1)
+                for cache in (kv.key_cache, kv.value_cache)
+            )
+            scores = (q[row].float()[:, None] @ k.transpose(1, 2)).squeeze(1) * q.shape[-1] ** -0.5
+            expected = (scores.softmax(-1)[:, None] @ v).squeeze(1)
+            torch.testing.assert_close(out[row].float(), expected, atol=0.016, rtol=0.016)
+            errors.append(float((out[row].float() - expected).abs().max()))
+    return out, lse
+
+
+@pytest.mark.parametrize("workload", (WindowAttention(), SinkAttention(), SharedAttention(tuple(range(1, 24, 2)))))
+def test_layout_oracle_and_reclaimed_blocks(workload):
+    from vllm import SamplingParams
+
+    from pllm.backends.vllm.custom_attention import FlashRead
+    from pllm.contracts.kv_layout import storage_layout
+
+    config = replace(CONFIG, cuda_graphs=False)
+    errors = []
+    read = FlashRead.__call__
+
+    def oracle(kernel, q, window, topk):
+        return _layout_read(read, errors, kernel, q, window, topk)
+
+    with pllm.make_llm(config, workload=workload) as engine:
+        runner = engine.runner
+        model = runner.decoder.kv_writable("layout oracle")
+        program = runner.require_session()._deployment.execution.math.attention
+        # The native cache tensors alias exactly; the consumer's K/V write is skipped by vLLM.
+        for layout in workload.backend_requirements().kv_layouts:
+            if layout.keep == "none":
+                target = storage_layout(program.layouts, layout.layer).layer
+                assert (
+                    model.model.layers[layout.layer].self_attn.attn.kv_cache.data_ptr()
+                    == model.model.layers[target].self_attn.attn.kv_cache.data_ptr()
+                )
+        manager = engine._require_open().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
+        allocated = manager.allocate_slots
+        measurements = []
+
+        def allocate(request, *args, **kwargs):
+            result = allocated(request, *args, **kwargs)
+            if request.num_computed_tokens >= 112:
+                for group, native in zip(
+                    manager.kv_cache_config.kv_cache_groups, manager.coordinator.single_type_managers
+                ):
+                    blocks = native.req_to_blocks[request.request_id]
+                    held = sum(block.block_id != 0 for block in blocks)
+                    measurements.append((group.layer_names, held, len(blocks)))
+            return result
+
+        with patch.object(FlashRead, "__call__", oracle), patch.object(manager, "allocate_slots", allocate):
+            engine.generate(
+                [{"prompt_token_ids": [15, 16, 17, 18, 19, 20, 21, 22]}],
+                SamplingParams(max_tokens=112, temperature=0, ignore_eos=True),
+            )
+        assert errors and measurements
+        if isinstance(workload, (WindowAttention, SinkAttention)):
+            layers = {model.model.layers[index].self_attn.attn.layer_name for index in (0, 1)}
+            retained = [(held, full) for names, held, full in measurements if layers.intersection(names)]
+            assert retained and all(held < full for held, full in retained)
+            print(type(workload).__name__, "allocated/full blocks:", retained[-1], "oracle max error:", max(errors))
+        else:
+            owned = sum(len(group.layer_names) for group in manager.kv_cache_config.kv_cache_groups)
+            assert owned * 2 == len(model.model.layers)
+            print(
+                "SharedAttention allocated layers:",
+                owned,
+                "of",
+                len(model.model.layers),
+                "oracle max error:",
+                max(errors),
+            )

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from pllm.contracts.kv_layout import KVLayout, storage_layout
 from pllm.contracts.semantic_graph import PackedSamplerRowsInputSource, TaskResultInputSource, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.attention import CHECK_PAGE_SIZE, PAGE_SIZE, PagedKV
@@ -67,6 +68,7 @@ class TraceRead:
         self.tokens = 0
         self.head_tokens = 0
         self.shared_tokens = 0
+        self.sink = False
 
     def __call__(self, q: torch.Tensor, window: int, topk: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         if window < 0:
@@ -89,7 +91,13 @@ class TraceRead:
         else:
             self.shared_tokens += count
         self.reads.append(
-            f"topk <= {count}/head" if topk is not None else f"window {window}" if window else "all positions natively"
+            f"topk <= {count}/head"
+            if topk is not None
+            else f"window {window}"
+            if window
+            else "prompt sink + window (gathered)"
+            if self.sink
+            else "all positions natively"
         )
         return torch.empty_like(q), torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
 
@@ -111,7 +119,9 @@ class AttentionProgram:
         self.methods: dict[int, AttentionMethod] = {}
         self.facts: dict[AttentionFact, torch.Tensor] = {}
         self.costs: tuple[AttentionCost, ...] = ()
+        self.layouts: tuple[KVLayout, ...] = ()
         self.sample_rows = torch.empty(0, dtype=torch.long, device="meta")
+        self.prompt_lens = torch.empty(0, dtype=torch.long, device="meta")
 
     def add(self, method: AttentionMethod) -> None:
         """Reject overlapping owners and forward references at the authoring boundary."""
@@ -206,11 +216,16 @@ class AttentionProgram:
             )
         self.costs = tuple(costs)
         self.sample_rows = torch.empty(rows, dtype=torch.long, device="meta")
+        self.prompt_lens = torch.empty(
+            rows if any(layout.sink for layout in self.layouts) else 0, dtype=torch.long, device="meta"
+        )
 
     @property
     def storage_bytes(self) -> int:
         """Persistent fact and sampled-index scratch, charged before planning."""
-        return sum(value.numel() * value.element_size() for value in (*self.facts.values(), self.sample_rows))
+        return sum(
+            value.numel() * value.element_size() for value in (*self.facts.values(), self.sample_rows, self.prompt_lens)
+        )
 
     def bind(self, device: torch.device) -> None:
         """Allocate scratch once; fact snapshots are retained by ordinary task results."""
@@ -218,6 +233,7 @@ class AttentionProgram:
             source: torch.zeros(value.shape, dtype=value.dtype, device=device) for source, value in self.facts.items()
         }
         self.sample_rows = torch.zeros(self.sample_rows.shape, dtype=torch.long, device=device)
+        self.prompt_lens = torch.zeros(self.prompt_lens.shape, dtype=torch.long, device=device)
 
 
 def attention_example(
@@ -237,7 +253,19 @@ def attention_example(
     pages = (trace.context + size - 1) // size
     cache = q.new_empty((rows * pages, size, probe.kv_heads, probe.head_dim))
     integer = torch.empty(rows, dtype=torch.int32, device="meta")
-    kv = PagedKV(cache, cache, integer.new_empty((rows, pages)), integer, integer.new_empty(rows + 1), integer, trace)
+    layout = storage_layout(program.layouts, layer)
+    trace.sink = layout.sink
+    kv = PagedKV(
+        cache,
+        cache,
+        integer.new_empty((rows, pages)),
+        integer,
+        integer.new_empty(rows + 1),
+        integer,
+        trace,
+        layout.window,
+        integer if layout.sink else None,
+    )
     arguments = {
         name: site_state(binding, source, None, None)
         if isinstance(source, StateInput)

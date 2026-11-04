@@ -26,7 +26,7 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.packed_rows import PackedPhaseRowBatch
+from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskId
@@ -63,6 +63,20 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
     failures: list[str] = []
     if expected != actual:
         failures.append("[explain/probe] config and loaded-model costs differ; report a pllm planning bug")
+    if expected.kv_capacity:
+        model = runner.decoder.kv_writable("attention capacity checks")
+        for capacity in expected.kv_capacity:
+            attention = model.model.layers[capacity.layout.layer].self_attn.attn
+            if capacity.layout.keep == "none":
+                assert attention.kv_sharing_target_layer_name is not None
+                continue
+            spec = attention.get_kv_cache_spec(runner.vllm_config)
+            assert spec is not None
+            blocks = spec.max_memory_usage_bytes(runner.vllm_config) // spec.page_size_bytes
+            if abs(blocks - capacity.blocks) > 1:
+                failures.append(
+                    f"[explain/KV] layer {capacity.layout.layer}: {capacity.blocks} predicted blocks vs {blocks} native blocks"
+                )
     if expected.eager_reason != handle.diagnostics().eager_reason:
         failures.append("[explain/graphs] engine graph mode differs from explain; report a pllm admission bug")
     if sum(state.reserved_bytes for state in actual.states) != handle.attachment.plan.states.reserved_bytes:
@@ -85,6 +99,7 @@ class _SyncCheck:
         session = handle.runner.require_session()
         execution = session._deployment.execution
         self.prepare_tokens = session.prepare_tokens
+        self.prepare_attention = None if session._attention is None else session._attention.prepare
         self.token_checked = 0
         self.prepare_sites = None if session._sites is None else session._sites.prepare
         self.prepare_overlay = None if session._forward_overlay is None else session._forward_overlay.prepare
@@ -136,6 +151,21 @@ class _SyncCheck:
         assert self.prepare_sites is not None
         with self.scope(context):
             self.prepare_sites(rows, context, directory)
+
+    def attention(self, rows: PackedPhaseRowBatch, sampler: PackedSamplerRowBatch) -> None:
+        """Cover sampled indices and prompt-sink uploads before model graph replay."""
+        assert self.prepare_attention is not None
+        mode = torch.cuda.get_sync_debug_mode()
+        try:
+            if (
+                rows.rows
+                and all(row.role is HiddenPhase.DECODE for row in rows.rows)
+                and len(self.steps.get(len(rows.rows), set())) > 2
+            ):
+                torch.cuda.set_sync_debug_mode("error")
+            self.prepare_attention(rows, sampler)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
 
     def overlay(
         self,
@@ -429,6 +459,7 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
         sync = _SyncCheck(handle)
         sites = handle.runner.require_session()._sites
         overlay = handle.runner.require_session()._forward_overlay
+        attention = handle.runner.require_session()._attention
         execution = handle.runner.require_session()._deployment.execution
         try:
             with (
@@ -437,6 +468,7 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
                 patch.object(handle.runner.require_session(), "prepare_tokens", sync.tokens),
                 patch.object(sites, "prepare", sync.prepare) if sites is not None else nullcontext(),
                 patch.object(overlay, "prepare", sync.overlay) if overlay is not None else nullcontext(),
+                patch.object(attention, "prepare", sync.attention) if attention is not None else nullcontext(),
             ):
                 baseline = _state_tokens(handle)
             if (

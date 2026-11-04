@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.mrv1 import Mrv1Runner
 
 
+from pllm.backends.vllm.kv_layout import LAYOUT_ENV
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
@@ -680,6 +681,7 @@ def create_vllm_llm(
             )
         ),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
+        LAYOUT_ENV: encode_boundary(requirements.kv_layouts),
     }
     if config.multiprocessing or config.tensor_parallel_size > 1:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -687,7 +689,7 @@ def create_vllm_llm(
     # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
     # forward must enter that key, or an engine loads a model compiled for another workload. pllm's entries are
     # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
-    forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV]).encode()).hexdigest()
+    forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV]).encode()).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
     llm = vllm_engine(
         config,

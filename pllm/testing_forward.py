@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 import torch
 
+from pllm.contracts.kv_layout import storage_layout
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.custom_forward import CustomForwardTask, SerialCustomForward
 from pllm.execution.state_execution import StateExecution
@@ -111,7 +112,7 @@ class CheckAttention:
         self.prepare(value)
         outputs: dict[tuple[str, int, str], torch.Tensor] = {}
         hidden = tokens
-        for layer in sorted(self.program.methods):
+        for layer in range(max(self.program.methods) + 1):
             hidden = self.layer(value.rows.rows, layer, hidden)
             for row, tensor in zip(value.rows.rows, hidden, strict=True):
                 outputs[row.identity.request_id, row.token_offset, f"attention {layer}"] = tensor.detach().clone()
@@ -128,7 +129,10 @@ class CheckAttention:
         starts = [0]
         for group in groups:
             starts.append(starts[-1] + len(group))
+        layout = storage_layout(self.program.layouts, layer)
         for row, query in zip(rows, q, strict=True):
+            if layout.layer != layer:
+                continue
             key = query[:kv_heads].clone()
             val = (key.float() * 0.7 + layer * 0.01).to(q.dtype)
             self.cache[row.identity.request_id, layer, row.token_offset] = key, val
@@ -138,7 +142,7 @@ class CheckAttention:
         keys, values = (q.new_zeros((len(groups) * pages, CHECK_PAGE_SIZE, kv_heads, dim)) for _ in (0, 1))
         for request, name in enumerate(requests):
             for position in range(lengths[request]):
-                cached = self.cache.get((name, layer, position))
+                cached = self.cache.get((name, layout.layer, position))
                 if cached is not None:
                     block, offset = request * pages + position // CHECK_PAGE_SIZE, position % CHECK_PAGE_SIZE
                     keys[block, offset], values[block, offset] = cached
@@ -150,6 +154,8 @@ class CheckAttention:
             torch.tensor(starts, dtype=torch.int32),
             torch.tensor(tuple(row.token_offset for row in rows)),
             read,
+            layout.window,
+            torch.tensor(tuple(row.prompt_length for row in rows)) if layout.sink else None,
         )
 
     def layer(self, rows: tuple[PackedPhaseRow, ...], layer: int, hidden: torch.Tensor) -> torch.Tensor:
@@ -163,7 +169,11 @@ class CheckAttention:
         trace = _CheckRead()
         kv = self.paged(rows, layer, q, trace)
         trace.kernel = DenseAttention(kv, dim**-0.5, int(kv.seq_lens.max()))
-        method = self.program.methods[layer]
+        method = self.program.methods.get(layer)
+        if method is None:
+            out = kv.attend(q)[0].flatten(1)
+            trace.kernel = None
+            return out
         kwargs = {
             arg: self.parameters[source]
             if isinstance(source, StateInput)
@@ -219,7 +229,17 @@ def _compare_attention_device(
     )
     kernel = _CheckRead()
     keys, values, table, lengths, starts, positions = fields
-    gpu = PagedKV(keys, values, table, lengths, starts, positions, kernel)
+    gpu = PagedKV(
+        keys,
+        values,
+        table,
+        lengths,
+        starts,
+        positions,
+        kernel,
+        kv.storage_window,
+        kv.sink_lens.to("cuda") if kv.sink_lens is not None else None,
+    )
     kernel.kernel = DenseAttention(gpu, q.shape[-1] ** -0.5, int(kv.seq_lens.max()))
     arguments = {
         name: value.to(torch.device("cuda")) if isinstance(value, (torch.Tensor, ModuleCall)) else value
