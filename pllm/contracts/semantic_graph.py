@@ -51,6 +51,13 @@ class HiddenInputSource:
 
 
 @dataclass(frozen=True, slots=True)
+class InputTokensInputSource:
+    """Current and preceding request ids, available before the model forward."""
+
+    history: int
+
+
+@dataclass(frozen=True, slots=True)
 class StepIdInputSource:
     pass
 
@@ -92,6 +99,7 @@ class TaskResultInputSource:
 
 SemanticInputSource = (
     HiddenInputSource
+    | InputTokensInputSource
     | StepIdInputSource
     | PackedRowsInputSource
     | PackedSamplerRowsInputSource
@@ -228,6 +236,19 @@ class SemanticGraph:
     model_reads: tuple[StateResource, ...] = ()
     training_mode: TrainingMode | None = None
 
+    @property
+    def input_token_history(self) -> int:
+        """Largest token lookback (-1 when the graph does not read token ids)."""
+        return max(
+            (
+                port.source.history
+                for task in self.tasks
+                for port in task.inputs
+                if isinstance(port.source, InputTokensInputSource)
+            ),
+            default=-1,
+        )
+
     def host_state(self, schema: str) -> SemanticState | None:
         """The state replaced by a host input schema, or None when no such input is declared."""
         resources = {
@@ -317,6 +338,7 @@ __all__ = [
     "AnchorId",
     "AnchorSymbol",
     "HiddenInputSource",
+    "InputTokensInputSource",
     "HostServiceId",
     "HostServiceInputSource",
     "HostServicePort",

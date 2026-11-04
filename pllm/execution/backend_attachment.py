@@ -19,6 +19,7 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     HiddenInputSource,
+    InputTokensInputSource,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
     SemanticGraph,
@@ -51,7 +52,12 @@ def attachment_buffer_bytes(
     width = 8 if probe.tensor_dtype is TensorDType.FLOAT64 else 4
     overlaid = {binding.resource for binding in attachment.overlay_bindings}
     fields = tuple(field for layout in layouts.layouts if layout.resource in overlaid for field in layout.layout.fields)
-    buffers = 1024 if attachment.overlay_bindings else 0
+    # Current rows and two retained writer handoffs share the same bounded token shape.
+    buffers = 3 * rows * (graph.input_token_history + 1) * 8
+    if graph.input_token_history >= 0:
+        requests = rows if probe.causal_domain is None else probe.causal_domain.requests
+        buffers += (requests + 2) * 8
+    buffers += 1024 if attachment.overlay_bindings else 0
     projection_operands: list[int] = []
     if any(binding.reads_embedding for binding in attachment.overlay_bindings):
         buffers += rows * hidden * width
@@ -189,7 +195,7 @@ def _check_attachment(attachment: BackendAttachment) -> None:
 
 def _check_exports(attachment: BackendAttachment) -> None:
     """Exports, and the helpers whose results they read, observe the step between publication and sampling."""
-    if not attachment.probe.hidden_resources:
+    if not attachment.probe.hidden_resources and attachment.plan.semantic_graph.input_token_history < 0:
         raise ValueError("exports need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
     tasks = {task.symbol: task for task in attachment.plan.semantic_graph.tasks}
     pending, seen = list(attachment.spec.exports), set[TaskSymbol]()
@@ -216,7 +222,11 @@ def _observes(task: SemanticTask, output: SemanticOutputKind) -> bool:
         and all(
             isinstance(
                 port.source,
-                HiddenInputSource | StepIdInputSource | StateSelectionInputSource | TaskResultInputSource,
+                HiddenInputSource
+                | InputTokensInputSource
+                | StepIdInputSource
+                | StateSelectionInputSource
+                | TaskResultInputSource,
             )
             for port in task.inputs
         )

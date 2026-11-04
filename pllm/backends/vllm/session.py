@@ -37,9 +37,11 @@ from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     SamplerFeedbackInputSource,
     StateScope,
+    TaskResourceFact,
+    TaskSymbol,
 )
 from pllm.execution.backend_attachment import attachment_buffer_bytes
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.preemption import preemption_policy, retained_rows
@@ -51,7 +53,8 @@ from pllm.execution.state_feed import (
     ReadonlyStepEnd,
     ReadonlyStepInput,
 )
-from pllm.execution.step_input import StepInput
+from pllm.execution.step_capture import StepCapture
+from pllm.execution.step_input import StepInput, gather_input_tokens
 
 
 @dataclass(slots=True)
@@ -130,6 +133,23 @@ class VllmSession(Generic[DataT, ResultT]):
             )
             if attachment.spec.activation_bindings
             else None
+        )
+        history = plan.semantic_graph.input_token_history
+        self.input_tokens = (
+            torch.empty(
+                (probe.max_packed_rows, history + 1),
+                dtype=torch.long,
+                device=decoder.model.lm_head.weight.device,
+            )
+            if history >= 0
+            else None
+        )
+        self._token_staging = PinnedStaging()
+        self._token_table = None if self.input_tokens is None else self.input_tokens.new_empty(max_sampler_rows + 2)
+        self._token_capture = (
+            None
+            if self._token_table is None
+            else StepCapture(TaskResourceFact(TaskSymbol("input_tokens"), 0, self._token_table.numel() * 8), 1)
         )
         model_sites = deployment.execution.math.model_sites
         self._sites = (
@@ -303,6 +323,24 @@ class VllmSession(Generic[DataT, ResultT]):
     def next_step_id(self) -> int:
         return self._next_step_id
 
+    def prepare_tokens(
+        self, history: torch.Tensor, indices: tuple[int, ...], starts: torch.Tensor, positions: torch.Tensor, rows: int
+    ) -> None:
+        """Gather native request histories in one captured kernel using persistent step metadata."""
+        table, capture, output = self._token_table, self._token_capture, self.input_tokens
+        assert table is not None and capture is not None and output is not None
+        capture.order(torch.cuda.current_stream(table.device))
+        with self._token_staging.fill(table) as host:
+            host[:2] = len(indices), rows
+            host[2 : len(indices) + 2] = indices
+        capture.run(
+            lambda: gather_input_tokens(history, table, starts, positions, output),
+            table,
+            table[:0],
+            (history.data_ptr(), starts.data_ptr(), positions.data_ptr(), output.data_ptr()),
+            lambda: self._token_staging.copy_to(table),
+        )
+
     @torch.inference_mode(False)
     @torch.enable_grad()
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
@@ -336,7 +374,13 @@ class VllmSession(Generic[DataT, ResultT]):
         stream = torch.cuda.current_stream(execution.device)
         if not self._in_forward_overlay:
             held_input = self._receive_readonly(rows, stream)
-            value = StepInput(rows.row_batch, rows, batch=self._host_batch, import_rows=self._import_rows)
+            value = StepInput(
+                rows.row_batch,
+                rows,
+                batch=self._host_batch,
+                import_rows=self._import_rows,
+                input_tokens=self.input_tokens,
+            )
             context = execution.start_step(value, stream, held_input=held_input, retain_gradients=False)
             instance_states = bool(execution.directory.instance_states)
             imported_state = self.attachment.plan.semantic_graph.host_state(StateImport.schema)
@@ -391,13 +435,19 @@ class VllmSession(Generic[DataT, ResultT]):
         stream = torch.cuda.current_stream(execution.device)
         operands = () if self._overlay is None else self._overlay.take_operands()
         value = StepInput(
-            step.rows.row_batch, step.rows, operands=operands, batch=self._host_batch, import_rows=self._import_rows
+            step.rows.row_batch,
+            step.rows,
+            operands=operands,
+            batch=self._host_batch,
+            import_rows=self._import_rows,
+            input_tokens=self.input_tokens,
         )
         if self._taps is not None and self._hidden_resources:
             value = self._taps.publish(value, self._hidden_resources)
         if (
             step.context is None
             and not operands
+            and self.input_tokens is None
             and not any(row.phase in self._hidden_phases for row in step.rows.row_batch.rows)
         ):
             self._finish_effects()

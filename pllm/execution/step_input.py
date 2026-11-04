@@ -1,4 +1,4 @@
-"""The packed rows, hidden taps and projection operands one engine step hands to a compiled workload."""
+"""The packed rows, token history, hidden taps and projection operands one engine step hands to a compiled workload."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
+import triton
 
 from pllm.contracts.host_batch import HostBatch, map_host_batch
 from pllm.contracts.packed_hidden import HiddenRowBatch
@@ -15,6 +16,7 @@ from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatc
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.kernels.input_tokens import input_token_rows
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_frame import UpdateOutput
@@ -30,6 +32,7 @@ class StepInput:
     hidden: HiddenRowBatch | None = None
     operands: tuple[ProjectionOperands, ...] = ()
     batch: HostBatch[torch.Tensor] | None = None
+    input_tokens: torch.Tensor | None = None
     hidden_readiness: CudaStreamReadiness | None = None
     batch_readiness: CudaStreamReadiness | None = None
     import_rows: Mapping[str, int] = field(default_factory=lambda: dict[str, int]())
@@ -69,3 +72,24 @@ class StepInput:
             for tap in self.hidden.taps:
                 tap.storage.record_stream(stream)
         return self.hidden
+
+
+def gather_input_tokens(
+    history: torch.Tensor,
+    requests: torch.Tensor,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Write ids without host reads; requests holds [request count, row count, native slots...]."""
+    input_token_rows[(len(output),)](
+        history,
+        requests,
+        starts,
+        positions,
+        output,
+        history.stride(0),
+        output.shape[1],
+        triton.next_power_of_2(len(requests) - 2),
+        triton.next_power_of_2(output.shape[1]),
+    )

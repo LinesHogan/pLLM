@@ -64,6 +64,7 @@ class BackendRequirements:
     checkpoint_names: tuple[str, ...] = field(default=(), kw_only=True)
     exact_phases: tuple[HiddenPhase, ...] = field(default=(), kw_only=True)
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
+    input_token_history: int = -1
     # The layers pllm.layer_logits reads, as declared (negative from the end).
     layer_logits: tuple[int, ...] = ()
     parameter_targets: tuple[Projection, ...] = ()

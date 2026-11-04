@@ -52,21 +52,21 @@ _cuda_gather: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = torch.compi
 class TableLayout:
     """One resource's segments in the shared int64 table, uploaded in one copy per step.
 
-    rows          [5, R]   per row: sampler row, sample index, state (S: padding sink), version, active
+    rows          [6, R]   per row: sampler row, sample index, state (S: padding sink), version, packed row, active
     sources       [F, S+1] source page slot per field and state (-1: none)
     destinations  [F, S]   destination page slot per field and state (-1: do not write)
-    feedback      [K, 3]   address and strides of each sampler-feedback tensor
+    row inputs    [K, 3]   address and strides of each token or sampler tensor
     """
 
     rows: int
     states: int
     fields: int
-    feedback: int
+    row_inputs: int
 
     @property
     def shapes(self) -> tuple[tuple[int, ...], ...]:
         rows, states, fields = self.rows, self.states, self.fields
-        return ((5, rows), (fields, states + 1), (fields, states), (self.feedback, 3))
+        return ((6, rows), (fields, states + 1), (fields, states), (self.row_inputs, 3))
 
     @property
     def size(self) -> int:
@@ -105,6 +105,7 @@ class TensorExecutor:
     capture: StepCapture | None = None
     device: torch.device = torch.device("cpu")
     filter_rows: bool = True
+    all_rows: bool = False
     table: torch.Tensor | None = None
     pools: tuple[torch.Tensor, ...] = ()
     results: tuple[torch.Tensor, ...] = ()
@@ -122,8 +123,8 @@ class TensorExecutor:
     active_states: int = 0
     updated: tuple[int, ...] = ()
     read_fields: frozenset[int] = frozenset()
-    feedback_names: tuple[str, ...] = ()
-    feedback_values: tuple[torch.Tensor, ...] = ()
+    row_input_names: tuple[str, ...] = ()
+    row_input_values: tuple[torch.Tensor, ...] = ()
     resource_pools: dict[StateResource, tuple[torch.Tensor, ...]] = dataclass_field(
         default_factory=lambda: dict[StateResource, tuple[torch.Tensor, ...]]()
     )
@@ -153,10 +154,10 @@ class TensorExecutor:
         if parameters:
             self.read_fields |= {0}
         self.differentiates = self.optimizer is not None or parameters
-        self.feedback_names = tuple(
-            sorted({port.feedback for task in dependencies for port in task.ports.values() if port.feedback})
+        self.row_input_names = tuple(
+            sorted({port.row_input for task in dependencies for port in task.ports.values() if port.row_input})
         )
-        assert self.capture is None or 8 * (5 * self.rows + self.state_count + 1) <= self.capture.budget.resident_bytes
+        assert self.capture is None or 8 * (6 * self.rows + self.state_count + 1) <= self.capture.budget.resident_bytes
 
     @property
     def rows(self) -> int:
@@ -177,20 +178,22 @@ class TensorExecutor:
         return sum(layout.size for layout in self.layouts.values()) + len(self.hidden_inputs or {}) * self.rows
 
     def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan, layout: TableLayout) -> None:
-        """Stage a RowPlan and feedback addresses into the zeroed fixed table."""
-        rows, sources, destinations, feedback = layout.split(host)
+        """Stage a RowPlan and row-input addresses into the zeroed fixed table."""
+        rows, sources, destinations, inputs = layout.split(host)
         count = len(plan.packed)
-        assert not layout.feedback or -1 not in plan.sampler
+        assert (
+            all(name == "input_tokens" for name in self.row_input_names[: layout.row_inputs]) or -1 not in plan.sampler
+        )
         rows[2] = layout.states
-        rows[:4, :count] = plan.columns
+        rows[:5, :count] = plan.columns
         rows[0, :count] = np.maximum(rows[0, :count], 0)
-        rows[4, :count] = 1
+        rows[5, :count] = 1
         sources[:] = destinations[:] = -1
         sources[:, : len(plan.sources)] = plan.sources.T
         if plan.writes is not None:
             updated, slots = plan.writes
             destinations[:, list(updated)] = slots.T
-        for row, value in zip(feedback, self.feedback_values[: layout.feedback], strict=True):
+        for row, value in zip(inputs, self.row_input_values[: layout.row_inputs], strict=True):
             row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
 
     def _split(self) -> None:
@@ -202,11 +205,11 @@ class TensorExecutor:
             offset += layout.size
         self.hidden_slots = self.table[offset:].view(-1, self.rows)
 
-    def _feedback(self, rows: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _row_inputs(self, columns: torch.Tensor) -> dict[str, torch.Tensor]:
         locations = self.views[self.task.resource][3]
         return {
-            name: gather_rows(location, rows, value)
-            for name, location, value in zip(self.feedback_names, locations, self.feedback_values, strict=True)
+            name: gather_rows(location, columns[4] if name == "input_tokens" else columns[0], value)
+            for name, location, value in zip(self.row_input_names, locations, self.row_input_values, strict=True)
         }
 
     def _frame(self, data: TensorFrame, batch: TensorBatch) -> tuple[TensorFrame, TensorBatch]:
@@ -254,14 +257,14 @@ class TensorExecutor:
         rows = FixedRows(
             fields,
             layout.states,
-            RowIndex(*columns[:4]),
-            columns[4] > 0,
+            RowIndex(*columns[:5]),
+            columns[5] > 0,
             {
                 key: (pool, slots)
                 for (key, pool), slots in zip((self.hidden_inputs or {}).items(), self.hidden_slots, strict=True)
             },
-            self._feedback(columns[0]),
-            fields[0].detach().to(torch.promote_types(fields[0].dtype, torch.float32)).requires_grad_(True)
+            self._row_inputs(columns),
+            leaf=fields[0].detach().to(torch.promote_types(fields[0].dtype, torch.float32)).requires_grad_(True)
             if self.differentiates
             else None,
         )
@@ -343,7 +346,13 @@ class TensorExecutor:
             batch = batch.state_free()
         elif any(group.resource == self.task.resource for group in batch.selection.groups):
             batch = batch.for_resource(self.task.resource)
-        rows = data.producer_rows(self.task.phase) if self.filter_rows else data.rows
+        rows = (
+            data.step.rows.rows
+            if self.all_rows
+            else data.producer_rows(self.task.phase)
+            if self.filter_rows
+            else data.rows
+        )
         if rows != data.rows or batch.selection is not parent.selection:
             data = replace(data, rows=rows, plan=None)
         if not data.rows and self.task.phase is not None:
@@ -416,7 +425,7 @@ class TensorExecutor:
                     states = 1 if selected.selection.keys == (None,) else self.rows
                 self.resource_pools[resource] = pools
                 self.layouts[resource] = TableLayout(
-                    self.rows, states, len(pools), len(self.feedback_names) if resource == self.task.resource else 0
+                    self.rows, states, len(pools), len(self.row_input_names) if resource == self.task.resource else 0
                 )
             self.pools = self.resource_pools[self.task.resource]
         taps = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).taps
@@ -424,19 +433,22 @@ class TensorExecutor:
         if self.hidden_inputs is None or self.addresses != addresses:
             self.hidden_inputs = {item.resource.locator_key: item.storage for item in taps}
         self.addresses = addresses
-        if self.feedback_names:
-            assert batch.feedback is not None
-            self.feedback_values = tuple(
-                batch.feedback.base_logits if name == "base_logits" else batch.feedback.sampled_tokens
-                for name in self.feedback_names
-            )
-            if batch.stream is not None:
-                for value in self.feedback_values:
-                    value.record_stream(batch.stream)
+        self.row_input_values = tuple(self._row_input(name, data, batch) for name in self.row_input_names)
+        if batch.stream is not None:
+            for value in self.row_input_values:
+                value.record_stream(batch.stream)
         return addresses
 
+    @staticmethod
+    def _row_input(name: str, data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        if name == "input_tokens":
+            assert data.step.input_tokens is not None
+            return data.step.input_tokens
+        assert batch.feedback is not None
+        return batch.feedback.base_logits if name == "base_logits" else batch.feedback.sampled_tokens
+
     def _prepare(self, plan: RowPlan, data: TensorFrame, batch: TensorBatch) -> None:
-        device = next(iter(self.hidden_inputs.values())).device if self.hidden_inputs else self.pools[0].device
+        device = next(iter(self.hidden_inputs.values())).device if self.hidden_inputs else self.device
         size = self.table_size
         if self.table is None or self.table.numel() != size:
             self.table = torch.empty(size, dtype=torch.long, device=device)

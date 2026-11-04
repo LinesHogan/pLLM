@@ -495,3 +495,42 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
                     )
     finally:
         execution.close()
+
+
+def test_input_tokens_match_request_history() -> None:
+    from unittest.mock import patch
+
+    from test.workloads.test_contracts import TokenHistory
+
+    config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=8, enable_chunked_prefill=True)
+    with pllm.make_llm(config, workload=TokenHistory()) as llm:
+        session = llm.runner.require_session()
+        prepare = session.prepare_input
+        seen = []
+
+        def record(rows):
+            seen.extend(
+                zip(rows.row_batch.rows, session.input_tokens[: rows.row_batch.total_rows].cpu().tolist(), strict=True)
+            )
+            buffer = session.input_tokens
+            session.input_tokens = buffer.clone()
+            prepare(rows)
+            for value in session._sites._results.values():
+                torch.testing.assert_close(
+                    value[: rows.row_batch.total_rows], session.input_tokens[: rows.row_batch.total_rows]
+                )
+            session.input_tokens = buffer
+
+        with patch.object(session, "prepare_input", record):
+            outputs = llm.generate(list(PROMPTS), SAMPLING)
+        histories = [list(output.prompt_token_ids) + list(output.outputs[0].token_ids) for output in outputs]
+        for row, ids in seen:
+            tokens = histories[row.identity.prompt_index]
+            assert ids == [tokens[row.token_offset - j] if row.token_offset >= j else -1 for j in range(3)]
+        assert any(row.token_offset > 0 and row.phase.value == "prefill" for row, _ in seen)
+        assert any(row.phase.value == "decode" for row, _ in seen)
+        assert session._token_capture.graph is not None
+    assert (
+        "host syncs: eight steady decode steps"
+        in check_on_gpu(TokenHistory(), replace(config, max_num_batched_tokens=128)).passed
+    )

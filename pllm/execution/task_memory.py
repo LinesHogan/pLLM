@@ -7,7 +7,7 @@ specialization (usage.py) calls it before planning.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -37,7 +37,7 @@ from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call
 from pllm.execution.host_runtime import HostConfig, measured_timeline
-from pllm.execution.model_sites import EarlierInput, PatchInput, StateInput
+from pllm.execution.model_sites import EarlierInput, PatchInput, ResultInput, SiteInput, StateInput
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
 from pllm.execution.ptts.state_refs import StateRefs
@@ -183,7 +183,16 @@ def example(
         for target in facts.probe.targets
     )
     data = TensorFrame(
-        StepInput(packed, sampler, hidden, operands=operands, batch=host_batch),
+        StepInput(
+            packed,
+            sampler,
+            hidden,
+            operands=operands,
+            batch=host_batch,
+            input_tokens=meta(count, binding.graph.input_token_history + 1, dtype=torch.long)
+            if binding.graph.input_token_history >= 0
+            else None,
+        ),
         rows[::-1],
         replacements=tuple(
             (
@@ -236,14 +245,62 @@ def task_example(data: TensorFrame, phase: HiddenPhase | None) -> TensorFrame:
     )
 
 
+def _site_input_shapes(
+    inputs: tuple[tuple[str, SiteInput], ...], batch: TensorBatch
+) -> tuple[tuple[str, SiteInput], ...]:
+    """Resolve hook buffer shapes from the method outputs already traced for planning."""
+    return tuple(
+        (
+            name,
+            replace(
+                source,
+                shape=tuple(batch.results[source.task, "value"].shape[1:]),
+                dtype=batch.results[source.task, "value"].dtype,
+            )
+            if isinstance(source, ResultInput)
+            else source,
+        )
+        for name, source in inputs
+    )
+
+
+def shape_site_results(binding: TensorBinding, facts: BackendCompileFacts) -> None:
+    """Trace pre-forward result metadata before backends allocate captured hook buffers."""
+    if not binding.model_site_tasks:
+        return
+    data, batch = example(binding, facts, ExecutionOptions())
+    operations = binding.executables(facts, ())
+    for symbol in producers_first(binding.graph, tuple(binding.model_site_tasks)):
+        with fixed_shapes():
+            operations[symbol].memory(data, batch)
+    binding.sites.rewrites = [
+        replace(
+            rewrite,
+            inputs=_site_input_shapes(rewrite.inputs, batch),
+            read_inputs=_site_input_shapes(rewrite.read_inputs, batch),
+        )
+        for rewrite in binding.sites.rewrites
+    ]
+
+
 def derive_resources(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> SchedulerTimeline:
     """Ask the executable operations for their memory; framework plumbing is funded separately."""
     # Shape-only steps do not allocate a capture pool or consume its eventual budget.
-    shape = ((facts.max_admitted_lineages, facts.probe.hidden_size),)
     resources = tuple(
-        TaskResourceFact(symbol, 0, 1 << 60, shape) for symbol in (*binding.operations, *binding.tensor_tasks)
+        TaskResourceFact(
+            symbol,
+            0,
+            1 << 60,
+            (
+                (
+                    facts.probe.max_packed_rows if symbol in binding.model_site_tasks else facts.max_admitted_lineages,
+                    facts.probe.hidden_size,
+                ),
+            ),
+        )
+        for symbol in (*binding.operations, *binding.tensor_tasks)
     )
     data, batch = example(binding, facts, options)
     tasks: list[TaskResourceFact] = []
@@ -287,7 +344,7 @@ def derive_resources(
         required_capture = max(required_capture, required)
         resident = operation.resident(options.capture_memory_bytes or required or options.model_capture_bytes)
         shapes = operation.input_shapes(
-            len(data.rows),
+            facts.probe.max_packed_rows if symbol in binding.model_site_tasks else len(data.rows),
             facts.probe.hidden_size,
             (
                 (len(batch.roots), options.max_training_rows, facts.probe.hidden_size),
@@ -383,6 +440,7 @@ def site_arguments(
     facts: BackendCompileFacts,
     *,
     seed: int | None = None,
+    results: Mapping[tuple[TaskSymbol, str], torch.Tensor] | None = None,
 ) -> dict[str, dict[str, SiteArgument]]:
     """Build residual method examples from declared views, on meta or seeded CPU storage."""
     arguments: dict[str, dict[str, SiteArgument]] = {}
@@ -397,6 +455,12 @@ def site_arguments(
                         else facts.max_admitted_lineages
                     )
                     kwargs[key] = _site_state(binding, source, rows, seed)
+                elif isinstance(source, ResultInput):
+                    if seed is None:
+                        kwargs[key] = meta(facts.max_admitted_lineages, *source.shape, dtype=source.dtype)
+                    else:
+                        assert results is not None
+                        kwargs[key] = results[source.task, "value"]
                 elif isinstance(source, EarlierInput):
                     kwargs[key] = torch.zeros(
                         (facts.max_admitted_lineages, facts.probe.hidden_size),

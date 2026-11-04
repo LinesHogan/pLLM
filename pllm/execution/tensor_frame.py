@@ -20,6 +20,7 @@ from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
+    InputTokensInputSource,
     PackedSamplerRowsInputSource,
     SamplerFeedbackInputSource,
     SemanticInputSource,
@@ -132,7 +133,7 @@ class TensorPort:
     read: TensorReader
     rowwise: bool = True
     field: int | None = None
-    feedback: str = ""
+    row_input: str = ""
     adapt: Callable[[torch.Tensor], torch.Tensor | ModuleCall] = lambda value: value
 
 
@@ -150,7 +151,7 @@ def take_rows(values: torch.Tensor, rows: Sequence[int]) -> torch.Tensor:
 class RowPlan:
     """Host row facts and authorized slots that TensorExecutor stages into its fixed table.
 
-    Columns serialize in sampler/samples/states/versions order; sources are [state, field] slots. Writes pair the
+    Columns serialize in sampler/samples/states/versions/packed order; sources are [state, field] slots. Writes pair the
     update-state positions with their issued destination slots.
     """
 
@@ -182,7 +183,7 @@ class RowPlan:
     @property
     def columns(self) -> tuple[tuple[int, ...], ...]:
         """Serialize named fields only at the device-table boundary."""
-        return self.sampler, self.samples, self.states, self.versions
+        return self.sampler, self.samples, self.states, self.versions, tuple(self.packed.tolist())
 
     @property
     def last(self) -> dict[int, int]:
@@ -191,12 +192,13 @@ class RowPlan:
 
 
 class RowIndex(NamedTuple):
-    """An invocation's four fixed device row columns (padding rows point at the sink state)."""
+    """An invocation's fixed device row columns (padding rows point at the sink state)."""
 
     sampler: torch.Tensor
     samples: torch.Tensor
     states: torch.Tensor
     versions: torch.Tensor
+    packed: torch.Tensor
 
 
 def row_plan(data: "TensorFrame", batch: TensorBatch) -> RowPlan:
@@ -290,9 +292,9 @@ class FixedRows:
 
     `fields` hold each field's pages for the `states` states and the padding sink at index `states`,
     `index` the device row columns,
-    `active` marks real rows (padding rows are False), `hidden` the hidden slots per locator and `feedback`
-    the sampler feedback rows. `leaf` is the differentiable copy of the flat parameter field when the body
-    differentiates parameters; `resources` are the tables of other resources the task reads.
+    `active` marks real rows (padding rows are False), `hidden` the hidden slots per locator and `row_inputs`
+    the indirectly addressed token and sampler rows. `leaf` is the differentiable copy of the flat parameter
+    field when the body differentiates parameters; `resources` are the tables of other resources the task reads.
     """
 
     fields: tuple[torch.Tensor, ...]
@@ -300,7 +302,7 @@ class FixedRows:
     index: RowIndex
     active: torch.Tensor
     hidden: Mapping[tuple[str, str, str], tuple[torch.Tensor, torch.Tensor]]
-    feedback: Mapping[str, torch.Tensor]
+    row_inputs: Mapping[str, torch.Tensor]
     leaf: torch.Tensor | None = None
     resources: Mapping[StateResource, FixedRows] = field(default_factory=lambda: dict[StateResource, "FixedRows"]())
 
@@ -345,7 +347,7 @@ class TensorFrame:
 
 
 def feedback_port(name: Literal["base_logits", "sampled_tokens"]) -> TensorPort:
-    return TensorPort(SamplerFeedbackInputSource(), lambda data, batch: data.table.feedback[name], feedback=name)
+    return TensorPort(SamplerFeedbackInputSource(), lambda data, batch: data.table.row_inputs[name], row_input=name)
 
 
 def training_observations(
@@ -393,6 +395,15 @@ def sample_index_port(source: PackedSamplerRowsInputSource) -> TensorPort:
     """Read packed sample indices for the invocation rows."""
 
     return TensorPort(source, lambda data, batch: data.table.index.samples)
+
+
+def input_tokens_port(history: int) -> TensorPort:
+    """Read the invocation's current token and lookbacks, in row order."""
+
+    def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        return data.table.row_inputs["input_tokens"][:, : history + 1]
+
+    return TensorPort(InputTokensInputSource(history), read, row_input="input_tokens")
 
 
 def result_port(source: TaskResultInputSource) -> TensorPort:

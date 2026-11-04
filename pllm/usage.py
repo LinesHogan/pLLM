@@ -8,6 +8,7 @@ from dataclasses import KW_ONLY, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from functools import partial
 from inspect import Parameter as SignatureParameter, signature
+from math import prod
 from types import FunctionType, MethodType
 from typing import Any, ClassVar, Literal, TypeVar, get_args
 
@@ -83,6 +84,7 @@ from pllm.execution.model_sites import (
     PatchInput,
     Place,
     ResidualRewrite,
+    ResultInput,
     Site,
     SiteInput,
     SiteMemory,
@@ -110,7 +112,7 @@ from pllm.execution.row_task_binding import (
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import StepInput
-from pllm.execution.task_memory import derive_host_resources, derive_resources
+from pllm.execution.task_memory import derive_host_resources, derive_resources, shape_site_results
 from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import (
     TensorFrame,
@@ -119,6 +121,7 @@ from pllm.execution.tensor_frame import (
     UpdateOutput as UpdateOutput,
     feedback_port,
     hidden_port,
+    input_tokens_port,
     layer_logits_port,
     result_port,
     sample_index_port,
@@ -185,7 +188,7 @@ class _Source:
 
     def site_input(self, context: _Reflection) -> SiteInput:
         raise TypeError(
-            "@pllm.custom_residual methods read pllm.parameter, pllm.module, pllm.depth, pllm.value and pllm.residual"
+            "@pllm.custom_residual methods read pllm.parameter, pllm.module, pllm.depth, pllm.value, pllm.residual and pre-forward pllm.result"
         )
 
 
@@ -431,6 +434,23 @@ class Result(_Source):
     def port(self, context: _Reflection) -> TensorPort:
         return result_port(TaskResultInputSource(TaskSymbol(self.operation), "value"))
 
+    def site_input(self, context: _Reflection) -> SiteInput:
+        operation = next(op for op in context.operations if op.name == self.operation)
+        if operation.phase is not Phase.BEFORE_FORWARD or type(operation.effect) is not _Effect:
+            raise ValueError(f"{self.operation}: custom residuals read results of read-only BEFORE_FORWARD methods")
+        return ResultInput(TaskSymbol(self.operation))
+
+
+@dataclass(frozen=True)
+class InputTokens(_Source):
+    """The request token ids read by each row, with a fixed number of lookbacks."""
+
+    history: int = 0
+    differentiable: ClassVar[bool] = False
+
+    def port(self, context: _Reflection) -> TensorPort:
+        return input_tokens_port(self.history)
+
 
 @dataclass(frozen=True)
 class Depth(_Source):
@@ -583,6 +603,17 @@ def value(layer: int | Attr) -> Any:
 def base_logits() -> Any:
     """The model's logits before any workload adjustment."""
     return BaseLogits()
+
+
+def input_tokens(*, history: int = 0) -> Any:
+    """Int64 [rows, history + 1] token ids: current token first, then lookbacks; -1 before the request starts.
+
+    Results consumed by custom_residual use every scheduled token; other methods use sampled rows.
+    Requires runner="mrv2".
+    """
+    if type(history) is not int or history < 0:
+        raise ValueError("pllm.input_tokens(history=) needs a nonnegative integer")
+    return InputTokens(history)
 
 
 def sampled_tokens() -> Any:
@@ -1642,7 +1673,7 @@ class _CustomResidual(_Effect):
         if memory is not None and (
             rewrite.read is not None
             or any(
-                isinstance(source, (EarlierInput, PatchInput)) or source.request and source != memory.carry
+                isinstance(source, (EarlierInput, PatchInput, ResultInput)) or source.request and source != memory.carry
                 for _, source in rewrite.inputs
                 if not isinstance(source, DepthInput)
             )
@@ -2267,6 +2298,7 @@ class _Reflection:
                     function := _typed(state.initialize if method is None else method.__func__, FunctionType)
                 ) is not None:
                     seeds.append(function)
+        context.declare_result_helpers(candidates, seeds)
         context.freeze_helpers(candidates, seeds)
         context.bindings = tuple(
             (key, fingerprint(value)) for key, value in sorted(values.items()) if not isinstance(value, Workload)
@@ -2443,6 +2475,30 @@ class _Reflection:
             )
         except AttributeError:
             raise ValueError(f"{name!r} names no method of {type(self.owner).__name__}") from None
+
+    def declare_result_helpers(self, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:
+        """Declare implicit result producers, giving model-site consumers the pre-forward row domain."""
+        pending = [(op.function, op.phase) for op in self.operations if not isinstance(op.effect, _CustomResidual)]
+        pending.extend(
+            (op.function, Phase.BEFORE_FORWARD) for op in self.operations if isinstance(op.effect, _CustomResidual)
+        )
+        pending.extend(
+            (self.method(op.effect.read), Phase.BEFORE_FORWARD)
+            for op in self.operations
+            if isinstance(op.effect, _CustomResidual) and op.effect.read
+        )
+        declared = {op.name for op in self.operations}
+        while pending:
+            function, phase = pending.pop()
+            for parameter in signature(function).parameters.values():
+                source = parameter.default
+                if not isinstance(source, Result) or source.operation in declared:
+                    continue
+                helper = self.method(source.operation)
+                self.operations.append(_Operation(self, source.operation, phase, _Effect(), None, ""))
+                declared.add(source.operation)
+                seeds.append(candidates[source.operation])
+                pending.append((helper, phase))
 
     def freeze_helpers(self, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:
         """Freeze only helpers reachable from operations, state properties or markers."""
@@ -2682,13 +2738,17 @@ class _Reflection:
             raise ValueError(
                 f"StateImport supplies one imported resource per workload; {', '.join(b.imports)} are imported"
             )
-        if not b.graph.tasks and b.graph.model_reads:
+        results = tuple(dict.fromkeys(source.task for rewrite in b.sites.rewrites for source in rewrite.results))
+        if results or not b.graph.tasks and b.graph.model_reads:
             states = tuple(self.states[str(resource)] for resource in b.graph.model_reads)
             b.compute(
                 "model.read",
-                inputs={str(state.declaration.resource): state.read() for state in states},
+                inputs={
+                    **{str(state.declaration.resource): state.read() for state in states},
+                    **{str(task): TaskResultInputSource(task, "value") for task in results},
+                },
                 reads=tuple(state.version() for state in states),
-                when=When.IN_FORWARD,
+                when=When.AFTER_FORWARD if results else When.IN_FORWARD,
                 function=lambda data, batch: TaskOutput(),
             )
 
@@ -2828,6 +2888,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         b.checkpoint = facts.checkpoint
         b.causal = causal
         self._declare(b, capabilities=facts.timeline.capabilities)
+        shape_site_results(b, facts)
         # Executable ports retain their dependencies; an unused factory must not pin the decoder.
         b.causal = None
         b.configure_scans(facts)
@@ -2856,6 +2917,9 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         owned_inputs = tuple(source for name in sorted(sources) for source in sources[name])
         inputs = tuple(source for source, _ in owned_inputs)
         return BackendRequirements(
+            input_token_history=max(
+                (source.history for source in inputs if isinstance(source, InputTokens)), default=-1
+            ),
             checkpoint_names=tuple(
                 name for state in context.state_definitions.values() for name in state.checkpoint_names()
             ),
@@ -2933,7 +2997,10 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             timeline = facts.timeline
         else:
             timeline = derive_resources(declaration, facts, options)
-        resident = declaration.template_bytes
+        resident = declaration.template_bytes + facts.probe.max_packed_rows * sum(
+            prod(source.shape) * source.dtype.itemsize
+            for source in {source for rewrite in declaration.sites.rewrites for source in rewrite.results}
+        )
         return replace(
             timeline,
             reserved_bytes=tuple(

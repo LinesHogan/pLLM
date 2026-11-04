@@ -63,7 +63,7 @@ def _gather_rows(
 
 @torch.library.custom_op("pllm::gather_rows", mutates_args=())
 def gather_rows(descriptor: torch.Tensor, rows: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-    """Read a sampler tensor whose current address travels in the packed step table."""
+    """Read a row tensor whose current address travels in the packed step table."""
     if not source.is_cuda:
         return source.index_select(0, rows)
     output = source.new_empty((len(rows), *source.shape[1:]))

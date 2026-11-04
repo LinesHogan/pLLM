@@ -197,6 +197,14 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         """
         session = self._workload_session
         if session is not None:
+            if session.input_tokens is not None:
+                session.prepare_tokens(
+                    self.req_states.all_token_ids.gpu,
+                    tuple(int(index) for index in input_batch.idx_mapping_np),
+                    input_batch.query_start_loc,
+                    input_batch.positions,
+                    input_batch.num_tokens,
+                )
             session.prepare_input(
                 encode_mrv2_rows(
                     input_batch,

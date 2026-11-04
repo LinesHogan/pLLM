@@ -44,6 +44,8 @@ CONFIG = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8)
 row per request whose prompt just finished prefilling: its last prompt token. All four inputs run inside
 CUDA graphs. A reading method needs an effect (usually `@pllm.export`, next section) or nothing schedules it.
 
+`pllm.input_tokens(history=n)` reads int64 `[rows, n + 1]` current and preceding request token IDs, with `-1` before position zero; MRv2 is required. Helpers consumed by `@pllm.custom_residual` use every scheduled row through `pllm.result`; other readers use sampled rows.
+
 ```python
 class Lens(pllm.Workload):
     @pllm.export(name="lens", max_rows=8, max_cols=3)
@@ -635,6 +637,8 @@ pllm.version(state: 'str') -> 'Any'
     How many updates each row's state has received (0 before the first update).
 pllm.index(state: 'str') -> 'Any'
     Each row's slot in the state pool, for indexing pooled tensors.
+pllm.input_tokens(*, history: 'int' = 0) -> 'Any'
+    Int64 [rows, history + 1] token ids: current token first, then lookbacks; -1 before the request starts.
 pllm.sample_index(limit: 'int | Attr | None' = None) -> 'Any'
     The sample index of each row's request: 0 for a prompt's first sample.
 pllm.result(operation: 'str') -> 'Any'
@@ -690,7 +694,7 @@ pllm.host.make_host(config: 'HostConfig', workload: 'Workload') -> 'StateExecuti
     Compile `workload` without a model; each `step(StepInput.of_batch(batch))` trains on one host batch and returns a StepResult.
 pllm.host.HostConfig(device: 'torch.device', hidden_size: 'int' = 0, target_shape: 'tuple[int, ...]' = (), seed: 'int' = 0, state_memory_bytes: 'int' = 67108864, max_input_rows: 'int | None' = None, memory_budget_bytes: 'int | None' = None)
     What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches and the shape of each row's target (() for one value per row), the seed of initial state values, and the state and per-step memory limits (max_input_rows bounds a batch).
-pllm.host.StepInput(rows: 'PackedPhaseRowBatch', sampler_rows: 'PackedSamplerRowBatch', hidden: 'HiddenRowBatch | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), batch: 'HostBatch[torch.Tensor] | None' = None, hidden_readiness: 'CudaStreamReadiness | None' = None, batch_readiness: 'CudaStreamReadiness | None' = None, import_rows: 'Mapping[str, int]' = <factory>, overlay_updates: 'Mapping[tuple[RequestIdentity, Projection], UpdateOutput]' = <factory>)
+pllm.host.StepInput(rows: 'PackedPhaseRowBatch', sampler_rows: 'PackedSamplerRowBatch', hidden: 'HiddenRowBatch | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), batch: 'HostBatch[torch.Tensor] | None' = None, input_tokens: 'torch.Tensor | None' = None, hidden_readiness: 'CudaStreamReadiness | None' = None, batch_readiness: 'CudaStreamReadiness | None' = None, import_rows: 'Mapping[str, int]' = <factory>, overlay_updates: 'Mapping[tuple[RequestIdentity, Projection], UpdateOutput]' = <factory>)
 pllm.host.StepResult(value: 'torch.Tensor | None', invocation: 'InvocationOutput', entries: 'tuple[OverlayEntry, ...]' = (), input_gradients: 'Mapping[tuple[str, str], torch.Tensor]' = <factory>, parameter_gradient_fields: 'Mapping[StateRef, tuple[torch.Tensor, ...]]' = <factory>, metrics: 'Mapping[str, torch.Tensor]' = <factory>, parameters: 'Mapping[str, torch.Tensor]' = <factory>)
 pllm.host.CompletionInput(completions: 'CompletionBatch', hidden: 'torch.Tensor', readiness: 'CudaStreamReadiness | None' = None)
     One owned completion/hidden boundary, shared by host consumers.

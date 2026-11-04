@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
 from math import lcm, prod
@@ -129,10 +129,7 @@ class _Run:
         rows = (
             data.rows
             if data.fixed is None
-            else tuple(
-                data.step.rows.rows[data.step.sampler_rows.links[int(index)].packed_row_index]
-                for index in data.fixed.index.sampler
-            )
+            else tuple(data.step.rows.rows[int(index)] for index in data.fixed.index.packed)
         )
         self.timing.record(task, data, rows)
         for index, row in enumerate(rows):
@@ -183,6 +180,7 @@ class _Run:
 
 _IDS = tuple(RequestIdentity(name, index, index) for index, name in enumerate(("r2", "r0", "r1")))
 _PROMPTS = (5, 1, 9)
+_LOGITS_CHANNEL = 90
 
 
 def _schedule(
@@ -238,7 +236,7 @@ def _hidden_values(
                             i,
                             range(done, done + n),
                             shape.vocab_size,
-                            90 if layer == shape.layer_count - 1 else 120 + layer,
+                            _LOGITS_CHANNEL if layer == shape.layer_count - 1 else 120 + layer,
                             perturbed,
                         )
                         for layer in facts.probe.layer_logits
@@ -294,6 +292,7 @@ def _step(
     step: int,
     perturbed: int | None,
     identities: tuple[RequestIdentity, ...],
+    history: int = -1,
 ) -> StepInput:
     dtype = facts.probe.tensor_dtype.torch
     hidden = {
@@ -323,7 +322,7 @@ def _step(
         if start < end
         for offsets in (range(start, end),)
     )
-    return scheduled_step(
+    value = scheduled_step(
         tuple(identities[i] for i, _, _ in counts),
         [n for _, n, _ in counts],
         [_PROMPTS[i] for i, _, _ in counts],
@@ -332,6 +331,29 @@ def _step(
         step_id=step,
         operands=operands,
     )
+
+    return replace(value, input_tokens=_input_token_rows(shape, counts, history, perturbed))
+
+
+def _input_token_rows(
+    shape: ModelShape, counts: tuple[tuple[int, int, int], ...], history: int, perturbed: int | None
+) -> torch.Tensor | None:
+    """Seed complete request histories independently of scheduler chunk boundaries."""
+    if history < 0:
+        return None
+    rows: list[torch.Tensor] = []
+    for index, count, done in counts:
+        seed = index + (1_000_000 if perturbed is not None and index != perturbed else 0)
+        prompt = _PROMPTS[index]
+        ids = torch.randint(shape.vocab_size, (prompt,), generator=torch.Generator().manual_seed(seed))
+        if done + count > prompt:
+            generated = _token_values(
+                index, range(prompt - 1, done + count - 1), shape.vocab_size, _LOGITS_CHANNEL, perturbed
+            ).argmax(-1)
+            ids = torch.cat((ids, generated))
+        positions = torch.arange(done, done + count)[:, None] - torch.arange(history + 1)[None, :]
+        rows.append(ids[positions.clamp_min(0)].masked_fill(positions < 0, -1))
+    return torch.cat(rows)
 
 
 def _feedback(value: StepInput, shape: ModelShape, perturbed: int | None) -> SamplerFeedback:
@@ -342,7 +364,7 @@ def _feedback(value: StepInput, shape: ModelShape, perturbed: int | None) -> Sam
                 row.identity.prompt_index,
                 range(row.token_offset, row.token_offset + 1),
                 shape.vocab_size,
-                90,
+                _LOGITS_CHANNEL,
                 perturbed,
             )
             for row in rows
@@ -426,6 +448,7 @@ def _execute_step(
     value: StepInput,
     feedback: SamplerFeedback,
     run: _Run,
+    before_forward: Callable[[StateTaskContext[TensorFrame]], None] | None = None,
 ) -> None:
     run.timing.begin(execution, value)
     overlap = execution.post_sample
@@ -438,6 +461,8 @@ def _execute_step(
         if anchor.symbol == "model.execute" and execution.arena.plan.semantic_graph.updates_in_forward:
             _projection_step(execution, context, value, run)
         execution.advance_to(context, anchor.symbol)
+        if anchor.symbol == "request.prepare" and before_forward is not None:
+            before_forward(context)
         if anchor.ordinal == execution.sampler_anchor_id:
             guidance = context.guidance
             for stage in guidance:
@@ -499,7 +524,12 @@ def _embeddings(value: StepInput, width: int, dtype: torch.dtype, perturbed: int
 
 
 def _site_step(
-    binding: TensorBinding, facts: BackendCompileFacts, value: StepInput, tokens: torch.Tensor, run: _Run
+    binding: TensorBinding,
+    facts: BackendCompileFacts,
+    value: StepInput,
+    tokens: torch.Tensor,
+    run: _Run,
+    context: StateTaskContext[TensorFrame],
 ) -> None:
     outputs = check_sites(
         binding,
@@ -508,6 +538,7 @@ def _site_step(
         tokens * 0.5,
         seed=facts.initialization_seed,
         device_equivalence=run.device_equivalence,
+        results=context.results,
     )
     for name, output in outputs.items():
         for row, tensor in zip(value.rows.rows, output, strict=True):
@@ -564,7 +595,7 @@ def _run(
                 execution.retire((script[1],), wait=True)
                 execution.admit((script[1],))
             value = replace(
-                _step(shape, facts, counts, step * stride, perturbed, script),
+                _step(shape, facts, counts, step * stride, perturbed, script, declaration.graph.input_token_history),
                 batch=imports,
                 import_rows=import_rows,
             )
@@ -576,13 +607,14 @@ def _run(
                     sampler_rows=sampler,
                     hidden=None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch),
                 )
+            site_step = None
             if forward is not None or declaration.sites.rewrites:
                 tokens = _embeddings(value, shape.hidden_size, facts.probe.tensor_dtype.torch, perturbed)
                 if forward is not None:
                     forward.prepare(value, tokens)
                 if declaration.sites.rewrites:
-                    _site_step(declaration, facts, value, tokens, run)
-            _execute_step(execution, value, _feedback(value, shape, perturbed), run)
+                    site_step = partial(_site_step, declaration, facts, value, tokens, run)
+            _execute_step(execution, value, _feedback(value, shape, perturbed), run, site_step)
             if forward is not None:
                 run.values.update(
                     ((row.identity.request_id, row.token_offset, "custom_forward"), output.detach().clone())
@@ -932,6 +964,7 @@ def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool 
         passed.append("custom-residual method math / CPU schedules")
     if (
         requirements.custom_residual
+        and not declaration.model_site_tasks
         or programs
         and (
             requirements.parameter_targets
@@ -969,6 +1002,10 @@ def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool 
             return CheckResult(
                 tuple(passed), (CheckSkip("CPU schedules", "host-batch-only workload; no request computation"),)
             )
+    if requirements.custom_residual:
+        skipped.append(
+            CheckSkip("residual arithmetic", "CPU schedules check pre-forward results; residual hooks need GPU")
+        )
     shared = _shared_resources(declaration)
     if shared:
         skipped.append(

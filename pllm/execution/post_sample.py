@@ -82,9 +82,9 @@ class PostSampleOverlap:
         context.move_slots()
 
     def _copy_inputs(self, context: StateTaskContext[_DataT]) -> None:
-        """Own sampler feedback and results before the writer consumes them.
+        """Own token rows, sampler feedback and results before the writer consumes them.
 
-        Hidden rows stay in held slots. Only copies of reusable feedback and result
+        Hidden rows stay in held slots. Copies of reusable token, feedback and result
         tensors fence the main stream; writer execution follows on its serial lane.
         """
         if self.stream is None:
@@ -102,6 +102,8 @@ class PostSampleOverlap:
                 # Worker-local device copies of external inputs can be dropped at
                 # the host commit while their side-stream consumers are still running.
                 map_host_batch(value.batch, self._record_input)
+            if value.input_tokens is not None:
+                value = replace(value, input_tokens=value.input_tokens.clone())
             feedback = context.sampler_feedback
             if feedback is not None:
                 context.sampler_feedback = replace(
@@ -113,7 +115,7 @@ class PostSampleOverlap:
                 # Captured results may be overwritten on the next reader invocation.
                 context.results[key] = result.clone()
                 result.record_stream(self.stream)
-            if feedback is not None or context.results:
+            if feedback is not None or context.results or value.input_tokens is not None:
                 main.wait_stream(self.stream)
             # Cached row versions belong to the reader's selection.
             context.value = replace(data, step=value, plan=None)

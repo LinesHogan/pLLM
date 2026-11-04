@@ -30,6 +30,7 @@ from pllm.execution.model_sites import (
     PatchInput,
     Place,
     ResidualRewrite,
+    ResultInput,
     StateInput,
     position,
 )
@@ -99,6 +100,11 @@ class ModelSites:
             rewrite.name: SiteMemorySchedule(rewrite, arena, requests, rows)
             for rewrite in rewrites
             if rewrite.memory is not None
+        }
+        self._result_sources = tuple(dict.fromkeys(source for rewrite in rewrites for source in rewrite.results))
+        self._results = {
+            source: torch.zeros((rows, *source.shape), device=weight.device, dtype=source.dtype)
+            for source in self._result_sources
         }
         self._states: dict[StateInput, Tensor] = {}
         for source in self._sources:
@@ -187,6 +193,7 @@ class ModelSites:
         return [
             self._requests_of,
             *self._states.values(),
+            *self._results.values(),
             *self._earlier.values(),
             *(buffer for memory in self._memories.values() for buffer in memory.buffers),
         ]
@@ -207,6 +214,9 @@ class ModelSites:
         Request state is read at each request's version; instance state at the step's newest version, the one value
         every row of the forward reads.
         """
+        for source in self._result_sources:
+            value = context.results[source.task, "value"]
+            self._results[source][: len(value)].copy_(value)
         requests = tuple(dict.fromkeys(row.identity for row in rows.rows))
         # Each packed row's index into `requests`, the order request state is staged in below.
         index = {identity: position for position, identity in enumerate(requests)}
@@ -237,6 +247,9 @@ class ModelSites:
     def state(self, source: StateInput) -> Tensor:
         staged = self._states[source]
         return staged.index_select(0, self._rows_of(self._requests_of)) if source.request else staged
+
+    def result(self, source: ResultInput) -> Tensor:
+        return self._rows_of(self._results[source])
 
     def earlier(self, source: EarlierInput) -> Tensor:
         return self._rows_of(self._earlier[source])

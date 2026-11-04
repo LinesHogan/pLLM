@@ -15,6 +15,7 @@ from cattrs.strategies import configure_tagged_union
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     HostServiceInputSource,
+    InputTokensInputSource,
     PackedRowsInputSource,
     PackedSamplerRowsInputSource,
     SamplerFeedbackInputSource,
@@ -32,6 +33,7 @@ _converter.register_unstructure_hook(IntEnum, lambda value: value.value)
 
 _input_tags: dict[type[object], str] = {
     HiddenInputSource: "hidden",
+    InputTokensInputSource: "input_tokens",
     StepIdInputSource: "step_id",
     PackedRowsInputSource: "packed_rows",
     PackedSamplerRowsInputSource: "packed_sampler_rows",

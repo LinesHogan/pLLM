@@ -84,6 +84,8 @@ class _SyncCheck:
     def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
         session = handle.runner.require_session()
         execution = session._deployment.execution
+        self.prepare_tokens = session.prepare_tokens
+        self.token_checked = 0
         self.prepare_sites = None if session._sites is None else session._sites.prepare
         self.prepare_overlay = None if session._forward_overlay is None else session._forward_overlay.prepare
         self.execute = execution.execute_anchor
@@ -111,6 +113,19 @@ class _SyncCheck:
                 f"{frame.filename}:{frame.lineno} ({frame.name})" for frame in extract_tb(error.__traceback__)[-5:]
             )
             raise RuntimeError(f"{error}; {locations}") from error
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+    def tokens(
+        self, history: torch.Tensor, indices: tuple[int, ...], starts: torch.Tensor, positions: torch.Tensor, rows: int
+    ) -> None:
+        """Include the native history gather in the existing steady-decode sync check."""
+        mode = torch.cuda.get_sync_debug_mode()
+        try:
+            if rows == len(indices) and len(self.steps.get(rows, set())) > 2:
+                torch.cuda.set_sync_debug_mode("error")
+                self.token_checked += 1
+            self.prepare_tokens(history, indices, starts, positions, rows)
         finally:
             torch.cuda.set_sync_debug_mode(mode)
 
@@ -419,11 +434,16 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             with (
                 patch.object(execution, "execute_anchor", sync.anchor),
                 patch.object(execution, "execute_part", sync.part),
+                patch.object(handle.runner.require_session(), "prepare_tokens", sync.tokens),
                 patch.object(sites, "prepare", sync.prepare) if sites is not None else nullcontext(),
                 patch.object(overlay, "prepare", sync.overlay) if overlay is not None else nullcontext(),
             ):
                 baseline = _state_tokens(handle)
-            if len(sync.checked) < 8:
+            if (
+                len(sync.checked) < 8
+                or workload.backend_requirements().input_token_history >= 0
+                and sync.token_checked < 8
+            ):
                 raise ContractError(("[host syncs] fewer than eight steady decode steps; report a pllm checker bug",))
             passed.append("host syncs: eight steady decode steps")
         except (RuntimeError, ContractError) as error:

@@ -102,6 +102,21 @@ class BorrowedMutation(pllm.Workload):
         return h + w
 
 
+class TokenHistory(pllm.Workload):
+    """Consume every scheduled token before a neutral residual and export the sampled rows."""
+
+    def lookup(self, ids=pllm.input_tokens(history=2)):
+        return ids
+
+    @pllm.custom_residual(site="attention", layers=(0,))
+    def add(self, x, y, ids=pllm.result("lookup")):
+        return x + y + (ids.sum(-1, keepdim=True) * 0).to(x.dtype)
+
+    @pllm.export(max_rows=3, max_cols=3)
+    def observe(self, ids=pllm.input_tokens(history=2)):
+        return ids
+
+
 class BadLogits(pllm.Workload):
     """Hidden width is not vocabulary width."""
 
@@ -152,6 +167,7 @@ class PromptMask(pllm.Workload):
             DummyWorkload(),
             Residual(),
             Forward(),
+            TokenHistory(),
             Stack(),
             PositionStack(),
             PrefillTrainer(),
@@ -440,3 +456,20 @@ def test_import_shape_boundary_and_first_export(per_request):
         execution.retire(identities, wait=True)
         execution.retire((), wait=True)
         execution.close()
+
+
+def test_check_detects_chunk_local_token_history(model_config):
+    from pllm import testing_contracts
+
+    step = testing_contracts._step
+
+    def shifted(*args, **kwargs):
+        value = step(*args, **kwargs)
+        if value.rows.total_rows > len(value.rows.request_rows) and any(
+            row.token_offset > 0 for row in value.rows.rows
+        ):
+            value.input_tokens[:, 1:] = value.input_tokens[:, :-1].clone()
+        return value
+
+    with patch.object(testing_contracts, "_step", shifted), pytest.raises(testing.ContractError, match="mixed"):
+        testing.check(TokenHistory(), model_config)

@@ -320,6 +320,7 @@ class TensorBinding(Builder[TensorFrame]):
                 capture=step_capture,
                 device=torch.device("cpu") if facts is None else facts.device,
                 filter_rows=task.phase is not None and task.phase is not self.row_phase(),
+                all_rows=task.symbol in self.model_site_tasks,
             )
             if task.writer is None
             else FieldWriteExecutor(task.writer, step_capture)
@@ -380,6 +381,16 @@ class TensorBinding(Builder[TensorFrame]):
         data.replacements = tuple(replacements)
 
     @property
+    def model_site_tasks(self) -> frozenset[TaskSymbol]:
+        """The method closure that produces values for every scheduled model row."""
+        return frozenset(
+            task.symbol
+            for rewrite in self.sites.rewrites
+            for source in rewrite.results
+            for task in self.tensor_tasks[source.task].dependencies(self.tensor_tasks)
+        )
+
+    @property
     def uses_sampler_rows(self) -> bool:
         """Additive sampler frames include completed prompt endings as well as decode rows."""
         sampler = self.effects.sampler
@@ -389,6 +400,7 @@ class TensorBinding(Builder[TensorFrame]):
         """The frame's preselected phase; None keeps every request's final row for model effects or prefill."""
         if (
             self.uses_sampler_rows
+            or self.graph.input_token_history >= 0
             or self.imports
             or self.overlay_targets
             or self.effects.activation_bindings

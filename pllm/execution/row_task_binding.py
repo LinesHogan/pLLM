@@ -23,6 +23,7 @@ from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     MathContract,
     PackedSamplerRowsInputSource,
+    SamplerFeedbackInputSource,
     SemanticEffect,
     SemanticInput,
     SemanticInputSource,
@@ -580,9 +581,9 @@ def declare_logits(b: TensorBinding, prediction: Call, *, stage: SamplerStage) -
         raise ValueError("@pllm.add_logits needs the model's vocabulary size; compile this workload with make_llm")
     for task in b.tensor_tasks[prediction.symbol].dependencies(b.tensor_tasks):
         for name, port in task.ports.items():
-            if port.feedback:
+            if isinstance(port.source, SamplerFeedbackInputSource):
                 raise ValueError(
-                    f"sampler method `{prediction.symbol}` reads pllm.{port.feedback}() through `{task.symbol}.{name}`, "
+                    f"sampler method `{prediction.symbol}` reads pllm.{port.row_input}() through `{task.symbol}.{name}`, "
                     "which is available only in Phase.AFTER_SAMPLE. Read feedback in @pllm.train or a read-only "
                     "helper feeding it beside @pllm.add_logits; before sampling, use pllm.layer_logits((-1,)) "
                     "for logits or pllm.final_hidden() for hidden states."

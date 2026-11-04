@@ -10,6 +10,7 @@ use std::fmt::Write;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum InputSource {
     Hidden,
+    InputTokens,
     StepId,
     HostService {
         service: String,

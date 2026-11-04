@@ -14,7 +14,7 @@ from typing import Literal, Protocol
 import torch
 
 from pllm.contracts.parameter_overlay import FieldView
-from pllm.contracts.semantic_graph import StateResource
+from pllm.contracts.semantic_graph import StateResource, TaskSymbol
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.overlay_task import ChunkUpdate
 
@@ -31,6 +31,7 @@ class SiteValues(Protocol):
 
     def state(self, source: StateInput) -> torch.Tensor: ...
     def earlier(self, source: EarlierInput) -> torch.Tensor: ...
+    def result(self, source: ResultInput) -> torch.Tensor: ...
     def patch(self, source: PatchInput, layer: int) -> Callable[[torch.Tensor], torch.Tensor]: ...
 
 
@@ -95,7 +96,19 @@ def activation_write(x: torch.Tensor, y: torch.Tensor, patch: Callable[[torch.Te
     return x + patch(y)
 
 
-SiteInput = StateInput | DepthInput | EarlierInput | PatchInput
+@dataclass(frozen=True, slots=True)
+class ResultInput:
+    """A read-only method's pre-forward result, aligned to the model's scheduled rows."""
+
+    task: TaskSymbol
+    shape: tuple[int, ...] = ()
+    dtype: torch.dtype = torch.float32
+
+    def value(self, values: SiteValues, depth: int) -> torch.Tensor:
+        return values.result(self)
+
+
+SiteInput = StateInput | DepthInput | EarlierInput | PatchInput | ResultInput
 
 
 def position(place: Place, *, read: bool = False) -> int:
@@ -147,6 +160,11 @@ class ResidualRewrite:
         assert self.read is not None
         depth = self.depth(place)
         return self.read(stream, **{name: source.value(values, depth) for name, source in self.read_inputs})
+
+    @property
+    def results(self) -> tuple[ResultInput, ...]:
+        """The pre-forward values the write or read method consumes."""
+        return tuple(source for _, source in (*self.inputs, *self.read_inputs) if isinstance(source, ResultInput))
 
     @property
     def earlier(self) -> tuple[EarlierInput, ...]:
@@ -227,6 +245,9 @@ class _ChunkValues:
 
     def earlier(self, source: EarlierInput) -> torch.Tensor:
         raise AssertionError("stateful custom residuals read no earlier values")
+
+    def result(self, source: ResultInput) -> torch.Tensor:
+        raise AssertionError("stateful custom residuals read no method results")
 
     def patch(self, source: PatchInput, layer: int) -> Callable[[torch.Tensor], torch.Tensor]:
         raise AssertionError("stateful custom residuals apply no activation patch")
