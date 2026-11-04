@@ -25,7 +25,7 @@ def _finish(
     heads: tl.constexpr,
     stride: tl.constexpr,
 ) -> None:
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, padded)
     total = tl.load(denominator + row)
     values = tl.load(partial + row * padded + columns, columns < dim, other=0)
@@ -37,6 +37,7 @@ def window_attention(
     kv: PagedKV, q: torch.Tensor, scale: float, window: int, output: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Read native window/R-SWA pages with an unsplit softmax and float32 LSE."""
+    q = q.contiguous() if q.stride(-1) != 1 else q
     rows, heads, dim = q.shape
     padded = triton.next_power_of_2(dim)
     partial = torch.empty((rows, heads, padded), dtype=torch.float32, device=q.device)

@@ -41,14 +41,18 @@ class FlashRead:
         output = (
             self.output
             if self.lse is None and q.shape == self.output.shape and q.dtype == self.output.dtype
-            else torch.empty_like(q)
+            else torch.empty_like(q, memory_format=torch.contiguous_format)
         )
-        if self.kv.prompt_lens is not None and window > self.kv.storage_window and topk is None:
-            # Native R-SWA expresses a union, not its intersection with a wider authored window.
+        if (
+            self.kv.prompt_lens is not None
+            and topk is None
+            and (window > self.kv.storage_window or q.dtype != self.kv.key_cache.dtype)
+        ):
+            # Native R-SWA does not express a wider-window intersection or mixed query/cache precision.
             topk = torch.arange(self.metadata.max_seq_len, device=q.device)[None, :].expand(len(q), -1)
         if topk is not None:
             result = selected_attention(self.kv, q, self.impl.scale, window, topk)
-        elif window or self.kv.prompt_lens is not None:
+        elif (window or self.kv.prompt_lens is not None) and q.dtype == self.kv.key_cache.dtype:
             result = window_attention(self.kv, q, self.impl.scale, window, output)
         else:
             out, lse = flash_attn_varlen_func(

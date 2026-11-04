@@ -75,7 +75,21 @@ class PagedKV:
         With no selection this uses the backend's native causal kernel. Selections
         intersect causality and the optional window; an empty read returns zero
         output and negative-infinity LSE. Indices must be distinct within a head.
+        Queries keep the packed row count and head_dim; their head count must
+        be a positive multiple of the cache's KV heads.
         """
+        if (
+            q.ndim != 3
+            or q.shape[0] != self.query_count
+            or q.shape[-1] != self.key_cache.shape[-1]
+            or q.shape[1] < 1
+            or q.shape[1] % self.key_cache.shape[2] != 0
+            or q.device != self.key_cache.device
+        ):
+            raise ValueError(
+                "kv.attend needs queries [packed rows, heads, head_dim] on the cache device; "
+                "keep packed rows and head_dim unchanged and use a multiple of the KV heads"
+            )
         if self.storage_window and self.prompt_lens is None:
             window = min(window, self.storage_window) if window else self.storage_window
         return self._read(q, window, topk)

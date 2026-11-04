@@ -98,6 +98,9 @@ def test_native_lse_and_selected_oracle():
         )
         kv = PagedKV(keys, values, table, lengths, starts, len(q), TraceRead(128))
         kv = replace(kv, _read=DenseAttention(kv, dim**-0.5))
+        for invalid in (q.repeat_interleave(2, dim=-1), q[:, :1], q[:1]):
+            with pytest.raises(ValueError, match="keep packed rows and head_dim unchanged"):
+                kv.attend(invalid)
         scores = page_bounds(q, keys, table, starts, positions)
         torch.testing.assert_close(
             scores, page_bounds(q.cpu(), keys.cpu(), table.cpu(), starts.cpu(), positions.cpu()), check_device=False
@@ -123,13 +126,15 @@ def test_native_lse_and_selected_oracle():
         assert torch.equal(selected, captured_selected)
         from pllm.backends.vllm.window_attention import window_attention
 
+        strided = q.new_empty((*q.shape[:-1], dim * 2))[..., ::2]
+        strided.copy_(q)
         for prompt_lens in (None, torch.tensor([90, 79], device="cuda", dtype=torch.int32)):
             local = replace(kv, storage_window=4, prompt_lens=prompt_lens)
             window = 4 if prompt_lens is None else 0
             expected, expected_lse = DenseAttention(local, dim**-0.5)(q, window, None)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out, lse = window_attention(local, q, dim**-0.5, window, torch.empty_like(q))
+                out, lse = window_attention(local, strided, dim**-0.5, window, torch.empty_like(q))
             graph.replay()
             torch.testing.assert_close(out, expected, atol=0.008, rtol=0.008)
             torch.testing.assert_close(lse, expected_lse, atol=0.0001, rtol=0.0001)
