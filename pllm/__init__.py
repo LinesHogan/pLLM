@@ -82,10 +82,8 @@ def make_llm(config: ModelConfig, *, workload: None = None) -> VllmLlm[None, Non
 def make_llm(
     config: ModelConfig, *, workload: BackendWorkload[D, R] | None = None
 ) -> VllmLlm[D, R] | VllmLlm[None, None]:
-    """A context-managed vLLM engine for `config`, optionally running `workload` inside it."""
+    """A context-managed vLLM engine; execution options apply when a workload is installed."""
     if workload is None:
-        if config.execution != ExecutionOptions():
-            raise ValueError("workload execution options require a workload")
         from pllm.backends.vllm.compat import admit_parallel
         from pllm.backends.vllm.runtime import VllmLlm, vllm_engine
 

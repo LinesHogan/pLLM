@@ -76,6 +76,7 @@ class ModelShape:
     attention_heads: int = 0
     kv_heads: int = 0
     head_dim: int = 0
+    intermediate_size: int = 0
 
     @classmethod
     def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
@@ -107,6 +108,7 @@ class ModelShape:
             shape.num_attention_heads,
             shape.num_key_value_heads or shape.num_attention_heads,
             shape.head_dim or shape.hidden_size // shape.num_attention_heads,
+            shape.intermediate_size,
         )
 
     @classmethod
@@ -130,4 +132,5 @@ class ModelShape:
             config.num_attention_heads,
             config.num_key_value_heads or config.num_attention_heads,
             config.head_dim or config.hidden_size // config.num_attention_heads,
+            config.intermediate_size,
         )

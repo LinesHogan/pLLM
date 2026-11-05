@@ -860,23 +860,21 @@ class InstanceState:
                 for key, value in _fields(self).items()
             )
         consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
-        shapes = {key: spec for key, spec in self.fields.items() if not isinstance(spec, Field)}
-        if consumer is None and len(shapes) == len(self.fields):
-            return tuple(
-                LayoutField(key, shape, context.field_dtype(name, key, self.dtype), self.alignment)
-                for key, shape in shapes.items()
-            )
-        fields = _fields(self)
         if consumer is None:
             return tuple(
                 layout_field(
                     key, value, lambda m: (m.hidden_size, m.hidden_size), context.field_dtype(name, key, value.dtype)
                 )
-                for key, value in fields.items()
+                if isinstance(value, Field)
+                else LayoutField(key, value, context.field_dtype(name, key, self.dtype), self.alignment)
+                for key, value in self.fields.items()
             )
         context.binding.overlay_targets = consumer.targets
         return overlay_fields(
-            fields, consumer, context.binding.dimensions, lambda key, value: context.field_dtype(name, key, value.dtype)
+            _fields(self),
+            consumer,
+            context.binding.dimensions,
+            lambda key, value: context.field_dtype(name, key, value.dtype),
         )
 
 
@@ -1645,32 +1643,35 @@ class _CustomAttention(_Effect):
     kind: ClassVar[str] = "custom_attention"
     layers: tuple[int, ...] | Attr | None
     keep: Keep
-    window: int
-    source: int
-    sink: bool
+    window: int | Attr
+    source: int | Attr
+    sink: bool | Attr
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
 
     def layouts(self, context: _Reflection) -> tuple[KVLayout, ...]:
         """Resolve layer settings and validate storage declarations at the authoring boundary."""
         layers = (-1,) if self.layers is None else _setting(self.layers, context.owner, tuple)
+        window = _setting(self.window, context.owner, int)
+        source = _setting(self.source, context.owner, int)
+        sink = _setting(self.sink, context.owner, bool)
         if self.keep not in ("all", "window", "none"):
             raise ValueError('custom_attention keep must be "all", "window" or "none"')
-        if type(self.window) is not int or type(self.source) is not int or type(self.sink) is not bool:
+        if type(window) is not int or type(source) is not int or type(sink) is not bool:
             raise ValueError("custom_attention needs integer window/source and boolean sink")
         if self.keep == "window":
-            if self.window < 1 or self.source:
+            if window < 1 or source:
                 raise ValueError('keep="window" needs window > 0 and source=0')
-        elif self.window or self.sink:
+        elif window or sink:
             raise ValueError('window and sink need keep="window"')
         if self.keep == "none":
-            if self.source < 1 or not layers or any(layer < self.source for layer in layers):
+            if source < 1 or not layers or any(layer < source for layer in layers):
                 raise ValueError(
                     'keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources'
                 )
-        elif self.source:
+        elif source:
             raise ValueError('source needs keep="none"')
-        return tuple(KVLayout(layer, self.keep, self.window, self.source, self.sink) for layer in layers)
+        return tuple(KVLayout(layer, self.keep, window, source, sink) for layer in layers)
 
     def declare(self, operation: _Operation) -> None:
         context, binding = operation.context, operation.context.binding
@@ -1713,9 +1714,9 @@ def custom_attention(
     *,
     layers: tuple[int, ...] | Attr | None = None,
     keep: Keep = "all",
-    window: int = 0,
-    source: int = 0,
-    sink: bool = False,
+    window: int | Attr = 0,
+    source: int | Attr = 0,
+    sink: bool | Attr = False,
 ) -> Callable[[F], F]:
     """Replace dense FlashAttention reads, retaining native projections and KV writes.
 
@@ -2625,7 +2626,15 @@ class _Reflection:
                 if not isinstance(source, Result) or source.operation in declared:
                     continue
                 helper = self.method(source.operation)
-                self.operations.append(_Operation(self, source.operation, phase, _Effect(), None, ""))
+                arguments = tuple(parameter.default for parameter in signature(helper).parameters.values())
+                helper_phase = (
+                    Phase.AUTOMATIC
+                    if phase is not Phase.BEFORE_FORWARD
+                    and any(isinstance(arg, InputTokens) for arg in arguments)
+                    and all(isinstance(arg, (InputTokens, Parameter)) for arg in arguments)
+                    else phase
+                )
+                self.operations.append(_Operation(self, source.operation, helper_phase, _Effect(), None, ""))
                 declared.add(source.operation)
                 seeds.append(candidates[source.operation])
                 pending.append((helper, phase))

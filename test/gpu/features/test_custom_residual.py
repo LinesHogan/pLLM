@@ -515,10 +515,12 @@ def _check_request_token_history(config: pllm.ModelConfig) -> None:
             buffer = session.input_tokens
             session.input_tokens = buffer.clone()
             prepare(rows)
-            for value in session._sites._results.values():
-                torch.testing.assert_close(
-                    value[: rows.row_batch.total_rows], session.input_tokens[: rows.row_batch.total_rows]
-                )
+            # Inspect private buffers on their producer lane, before a model consumer waits on its event.
+            with torch.cuda.stream(session._deployment.execution.side_stream):
+                for value in session._sites._results.values():
+                    torch.testing.assert_close(
+                        value[: rows.row_batch.total_rows], session.input_tokens[: rows.row_batch.total_rows]
+                    )
             session.input_tokens = buffer
 
         with patch.object(session, "prepare_input", record):

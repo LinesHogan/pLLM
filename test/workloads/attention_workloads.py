@@ -184,8 +184,9 @@ class WindowAttention(pllm.Workload):
     """vLLM owns and recycles sliding-window blocks."""
 
     layers: tuple[int, ...] = (0, 1)
+    window: int = 4
 
-    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="window", window=4)
+    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="window", window=pllm.Attr("window"))
     def read(self, q, kv):
         return kv.attend(q)[0]
 
@@ -194,7 +195,9 @@ class WindowAttention(pllm.Workload):
 class SinkAttention(pllm.Workload):
     """Keep prompt K/V and a recent generated tail using native R-SWA storage."""
 
-    @pllm.custom_attention(layers=(2, 3), keep="window", window=4, sink=True)
+    sink: bool = True
+
+    @pllm.custom_attention(layers=(2, 3), keep="window", window=4, sink=pllm.Attr("sink"))
     def read(self, q, kv):
         return kv.attend(q)[0]
 
@@ -204,8 +207,9 @@ class SharedAttention(pllm.Workload):
     """Each odd layer reads the preceding layer's cache, with no cache of its own."""
 
     layers: tuple[int, ...] = (1, 3, 5, 7, 9)
+    source: int = 1
 
-    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="none", source=1)
+    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="none", source=pllm.Attr("source"))
     def read(self, q, kv):
         return kv.attend(q)[0]
 

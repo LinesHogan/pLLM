@@ -57,6 +57,29 @@ class ModuleProbe(pllm.Workload):
         return torch.sigmoid(probe(h))
 
 
+@dataclass(frozen=True)
+class LogitLookup(pllm.Workload):
+    """A token-only wide table lookup feeding an ordinary sampler adapter."""
+
+    path: str
+    buckets: int = 8
+    placement: str = "host"
+    gate: float = 1.0
+
+    @property
+    def memory(self) -> pllm.InstanceState:
+        return pllm.InstanceState(
+            {"table": lambda m: (self.buckets, m.vocab_size)}, pretrained=self.path, placement=self.placement
+        )
+
+    def lookup(self, ids=pllm.input_tokens(history=1), table=pllm.parameter("memory", "table")):
+        return table[(ids[:, 0] + ids[:, 1]).remainder(self.buckets)].float() * self.gate
+
+    @pllm.add_logits()
+    def add(self, value=pllm.result("lookup")):
+        return value * 1.0
+
+
 @pytest.mark.parametrize("state_type", (pllm.InstanceState, pllm.RequestState))
 @pytest.mark.parametrize("optimizer", (None, pllm.AdamW(lr=1e-3)))
 @pytest.mark.parametrize("module", (False, True))
@@ -75,7 +98,12 @@ def test_pretrained_equals_initialize_and_signs_file_bytes(tmp_path, state_type,
         state = state_type(module=lambda m: MetaProbe(m.hidden_size), pretrained=str(path), optimizer=optimizer)
         workload = ModuleProbe(state)
     else:
-        state = state_type({"w": (4,), "b": (1,)}, pretrained=str(path), optimizer=optimizer, carry=carry)
+        state = state_type(
+            {"w": lambda m: (m.hidden_size,), "b": pllm.Field((1,))},
+            pretrained=str(path),
+            optimizer=optimizer,
+            carry=carry,
+        )
         workload = FieldProbe(state)
     reference = FieldProbe(state_type({"w": (4,), "b": (1,)}, initialize=fill_probe, optimizer=optimizer, carry=carry))
     tap = testing.final_hidden_binding(1)

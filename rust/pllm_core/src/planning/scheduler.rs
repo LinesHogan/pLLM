@@ -270,7 +270,17 @@ fn select_prefetch(graph: &SemanticGraph, tasks: &mut [PhysicalTask]) {
     // on the side lane. Mutable state must still follow the ordinary version rules.
     for task in tasks {
         let semantic = &graph.tasks[task.task_id as usize];
-        if graph.model_results.contains(&semantic.symbol)
+        let token_lookup = semantic
+            .inputs
+            .iter()
+            .any(|input| matches!(input.source, InputSource::InputTokens))
+            && semantic.inputs.iter().all(|input| {
+                matches!(
+                    input.source,
+                    InputSource::InputTokens | InputSource::StateSelection { .. }
+                )
+            });
+        if (graph.model_results.contains(&semantic.symbol) || token_lookup)
             && semantic.effects.iter().all(|effect| {
                 effect.kind == StateEffectKind::Read
                     && graph
@@ -601,10 +611,7 @@ pub(super) fn compile(
 
 // Torch transitions are assumed deterministic. Initialization and execution support are separate
 // from this structural eligibility fact; it does not enable preemption or prefix-cache hits.
-fn recompute_rejection(
-    graph: &SemanticGraph,
-    planned: &[PhysicalTask],
-) -> Option<&'static str> {
+fn recompute_rejection(graph: &SemanticGraph, planned: &[PhysicalTask]) -> Option<&'static str> {
     if graph.states.iter().any(|state| match state.scope {
         StateScope::Request => !state.key_fields.contains(&RequestKeyField::RequestId),
         StateScope::Instance => !state.immutable,
@@ -636,7 +643,11 @@ fn recompute_rejection(
                 _ => {}
             }
         }
-        if task.custom_forward.as_ref().is_some_and(|program| program.span) {
+        if task
+            .custom_forward
+            .as_ref()
+            .is_some_and(|program| program.span)
+        {
             return Some("use over=\"token\" in @pllm.custom_forward instead of over=\"span\"");
         }
     }
@@ -644,13 +655,13 @@ fn recompute_rejection(
         .tasks
         .iter()
         .filter_map(|task| task.visibility.as_ref())
-        .any(|visibility| {
-            visibility.lag != 0 || visibility.policy == VisibilityKind::ForwardPinned
-        })
+        .any(|visibility| visibility.lag != 0 || visibility.policy == VisibilityKind::ForwardPinned)
         || planned.iter().any(|task| task.read_distance != 0)
         || graph.edges.iter().any(|edge| edge.step_distance != 0)
     {
-        return Some("use visibility=\"exact\" with zero publish lag and no cross-step dependencies");
+        return Some(
+            "use visibility=\"exact\" with zero publish lag and no cross-step dependencies",
+        );
     }
     if graph.tasks.iter().any(|task| {
         task.visibility.is_none()

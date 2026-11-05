@@ -25,3 +25,5 @@ def test_explain_matches_loaded_probe(monkeypatch):
             capacity.setattr(torch.cuda, "mem_get_info", lambda device=None: (1, 1))
             check_probe(workload, config, handle)
         assert report == pllm.explain(workload, config)
+        diagnostics = handle.diagnostics()
+        assert diagnostics.kv_cache_blocks > 0 and diagnostics.kv_cache_max_concurrency > 0

@@ -26,11 +26,13 @@ from pllm.execution.tensor_frame import (
     RowIndex,
     RowPlan,
     TensorFrame,
+    TensorMath,
     row_plan,
     training_observations,
 )
 from pllm.execution.tensor_program import ADAM, PageUpdate, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import FieldWriter, TensorTask
+from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.page_copy import copy_pages, gather_rows
 
 Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
@@ -106,6 +108,8 @@ class TensorExecutor:
     device: torch.device = torch.device("cpu")
     filter_rows: bool = True
     all_rows: bool = False
+    compiled: TensorMath | None = None
+    reuse_results: bool = False
     table: torch.Tensor | None = None
     pools: tuple[torch.Tensor, ...] = ()
     results: tuple[torch.Tensor, ...] = ()
@@ -275,8 +279,13 @@ class TensorExecutor:
         return 0 if self.capture is None else capture_bytes
 
     def _body(self, data: TensorFrame, batch: TensorBatch) -> None:
+        task = (
+            replace(self.task, function=self.compiled)
+            if self.compiled is not None and MemoryTrace.active.get() is None
+            else self.task
+        )
         if not self.rowwise:
-            self.task.evaluate(data, batch)
+            task.evaluate(data, batch)
             self.results = tuple(batch.results[self.task.symbol, name] for name in self.task.outputs)
             return
         frame, operands = self._frame(data, batch)
@@ -284,7 +293,7 @@ class TensorExecutor:
         for dependency in self.task.dependencies(self.tasks)[:-1]:
             sources |= dependency.evaluate(frame, operands)
         if self.optimizer is None:
-            self.task.evaluate(frame, operands)
+            task.evaluate(frame, operands)
             self.forward_weights = (
                 self.task.ports[self.task.policy.forward_rows].read(frame, operands)
                 if self.task.policy.forward_rows
@@ -362,12 +371,16 @@ class TensorExecutor:
         if prepared is None:
             return TaskOutput()
         data = prepared
+        if self.rowwise and not data.rows:
+            return TaskOutput()
+        if self.reuse_results:
+            self.task.evaluate(data, batch)
+            self.results = tuple(batch.results[self.task.symbol, name] for name in self.task.outputs)
+            return self.write_outputs(data, batch, source_rows)
         addresses: tuple[int, ...] = ()
         if self.capture is not None and context is not None:
             self.capture.order(batch.stream)
         if self.rowwise:
-            if not data.rows:
-                return TaskOutput()
             addresses = self._inputs(data, batch)
             plan = row_plan(data, batch)
             self.updated = () if self.optimizer is None else tuple(sorted(plan.last))
@@ -473,7 +486,11 @@ class TensorExecutor:
         count = len(batch.roots) if self.optimizer is not None and state_mean else len(data.rows)
         # Results without row inputs have no row axis to trim.
         values = tuple(
-            retain_rows(result, count, copy=self.capture is not None or not self.task.differentiable)
+            retain_rows(
+                result,
+                count,
+                copy=self.capture is not None or not (self.task.differentiable or self.reuse_results),
+            )
             if self.rowwise
             else result
             for result in self.results

@@ -7,6 +7,7 @@ from vllm.config import CacheConfig, LoRAConfig, ModelConfig, ParallelConfig, Sp
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput, SamplerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -17,6 +18,7 @@ class ExecuteModelState:
 
 
 class GPUModelRunner:
+    kv_cache_config: KVCacheConfig
     model: torch.nn.Module
     sampler: Sampler
     model_config: ModelConfig

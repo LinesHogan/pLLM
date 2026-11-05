@@ -89,7 +89,7 @@ class ContractError(AssertionError):
 
 @dataclass(frozen=True, slots=True)
 class OperationResult:
-    """Owned per-request method inputs and outputs; mappings cannot change during comparison."""
+    """Owned per-request observations; immutable tables are compared through their row outputs."""
 
     inputs: Mapping[str, torch.Tensor]
     outputs: Mapping[str, torch.Tensor]
@@ -110,6 +110,7 @@ class _Run:
 
     failures: list[str] = field(default_factory=lambda: [])
     shared_resources: frozenset[str] = frozenset()
+    immutable_resources: frozenset[str] = frozenset()
     shared_values: set[tuple[str, int, str]] = field(default_factory=lambda: set())
 
     def record(
@@ -143,6 +144,10 @@ class _Run:
             arguments = {
                 name: (value[index] if task.ports[name].rowwise else value).detach().clone()
                 for name, value in inputs.items()
+                if not (
+                    isinstance(source := task.sources[name], StateSelectionInputSource)
+                    and str(source.resource) in self.immutable_resources
+                )
             }
             results = {
                 name: (value[index] if value.ndim and len(value) == len(rows) else value).detach().clone()
@@ -385,9 +390,11 @@ def _state_values(
     execution: StateExecution[StepInput, TensorFrame, TensorOutput], row: PackedPhaseRow, declaration: TensorBinding
 ) -> dict[str, torch.Tensor]:
     selection = execution.directory.select((row,))
+    immutable = {state.resource for state in declaration.graph.states if state.immutable}
     return {
         f"state {group.resource}.{_field_name(declaration, str(group.resource), index)}": value.detach().clone()
         for group in selection.groups
+        if group.resource not in immutable
         for ref in group.refs
         for index, value in enumerate(execution.snapshot(ref))
     }
@@ -560,7 +567,11 @@ def _run(
     preempted: Literal["none", "full", "chunked"] = "none",
     device_equivalence: bool = False,
 ) -> _Run:
-    run = _Run(device_equivalence=device_equivalence, shared_resources=_shared_resources(declaration))
+    run = _Run(
+        device_equivalence=device_equivalence,
+        shared_resources=_shared_resources(declaration),
+        immutable_resources=frozenset(str(state.resource) for state in declaration.graph.states if state.immutable),
+    )
     tasks = declaration.tensor_tasks
     declaration.tensor_tasks = {
         symbol: replace(task, observe=partial(run.record, task, rowwise=reads_rows(task, tasks)))
@@ -660,7 +671,7 @@ def _run(
 
 def _difference(left: torch.Tensor, right: torch.Tensor) -> str:
     try:
-        torch.testing.assert_close(left.float(), right.float())
+        torch.testing.assert_close(left, right)
         return ""
     except AssertionError:
         if left.shape != right.shape:

@@ -59,6 +59,7 @@ class ModelProbe:
     attention_heads: int = 0
     kv_heads: int = 0
     head_dim: int = 0
+    intermediate_size: int = 0
     blas_workspace_bytes: int = 0
     # Shape-only planning selects an ordinal without querying CUDA; workers use their current device.
     device_index: int | None = None

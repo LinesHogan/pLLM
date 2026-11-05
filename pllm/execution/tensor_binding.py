@@ -26,10 +26,12 @@ from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
+    InputTokensInputSource,
     StateEffectKind,
     StateResource,
     StateScope,
     TaskResourceFact,
+    TaskResultInputSource,
     TaskSymbol,
 )
 from pllm.contracts.state_feed import FeedBinding
@@ -46,6 +48,7 @@ from pllm.execution.tensor_executor import FieldWriteExecutor, TensorExecutor, r
 from pllm.execution.tensor_frame import (
     OverlayEntry,
     TensorFrame,
+    TensorMath,
     field_values,
     flat_gradient,
 )
@@ -101,6 +104,29 @@ class StepResult:
 
 
 TensorOutput = StepResult | torch.Tensor | None
+
+
+def _tensor_math(function: TensorMath, **inputs: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    # Dynamo installs bytecode globals in this module, rather than a frozen
+    # workload function's private snapshot of its author's globals.
+    return function(**inputs)
+
+
+def _lookup_math(task: TensorTask, facts: BackendCompileFacts | None) -> TensorMath | None:
+    """Let Inductor fuse token lookups, casts and pointwise math into one table read."""
+    if (
+        facts is None
+        or facts.device.type != "cuda"
+        or not facts.timeline.tensor_policy.allow_numerical_transforms
+        or task.differentiable
+        or task.training is not None
+        or task.writer is not None
+        or not any(isinstance(source, InputTokensInputSource) for source in task.sources.values())
+    ):
+        return None
+    return torch.compile(  # pyright: ignore[reportUnknownMemberType]
+        partial(_tensor_math, task.function), fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
+    )
 
 
 class TensorBinding(Builder[TensorFrame]):
@@ -341,6 +367,8 @@ class TensorBinding(Builder[TensorFrame]):
                 device=torch.device("cpu") if facts is None else facts.device,
                 filter_rows=task.phase is not None and task.phase is not self.row_phase(),
                 all_rows=task.symbol in self.model_site_tasks,
+                compiled=_lookup_math(task, facts),
+                reuse_results=self.reuses_results(task),
             )
             if task.writer is None
             else FieldWriteExecutor(task.writer, step_capture)
@@ -367,13 +395,27 @@ class TensorBinding(Builder[TensorFrame]):
         """Capture a funded writer or row-reading task; exports run eagerly."""
         if facts is None or task.symbol not in limits or task.export is not None:
             return None
-        if task.writer is None and not reads_rows(task, self.tensor_tasks):
+        if self.reuses_results(task) or task.writer is None and not reads_rows(task, self.tensor_tasks):
             return None
         # A task without its own resource reads every state of the invocation.
         request = any(
             task.resource in ("", state.resource) and state.scope is StateScope.REQUEST for state in self.graph.states
         )
         return StepCapture(limits[task.symbol], facts.max_admitted_lineages if request else 1)
+
+    def reuses_results(self, task: TensorTask) -> bool:
+        """A sampler can reuse results whose producers used its invocation row domain."""
+        return (
+            task.sampler_stage is not None
+            and not task.differentiable
+            and not task.policy.forward_rows
+            and task.phase is None
+            and bool(task.sources)
+            and all(
+                isinstance(source, TaskResultInputSource) and source.task not in self.model_site_tasks
+                for source in task.sources.values()
+            )
+        )
 
     def prepare_import(self, update: StateImport[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
         """Convert validated fields to storage precision and select their private roots."""

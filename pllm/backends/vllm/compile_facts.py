@@ -109,6 +109,7 @@ def compile_facts(
         attention_heads=shape.attention_heads,
         kv_heads=shape.kv_heads,
         head_dim=shape.head_dim,
+        intermediate_size=shape.intermediate_size,
         graph_mode=graph_mode(overlay_graph_bytes),
         device_kind=StateDeviceKind.CUDA,
         tensor_dtype=TensorDType(config.dtype),

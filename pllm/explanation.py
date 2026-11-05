@@ -154,6 +154,10 @@ class ExplainResult:
                     f"{'captured' if task.captured else 'eager'}  "
                     f"{', '.join(task.reads) or '-'} ({task.read_origin}, {task.read_distance})"
                 )
+                if task.capture_resident_bytes:
+                    lines.append(
+                        f"  capture reservation: {task.capture_resident_bytes} bytes [workload estimate or explicit budget]"
+                    )
                 if task.estimate is not None:
                     estimate = task.estimate
                     lines.append(

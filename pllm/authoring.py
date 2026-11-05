@@ -226,6 +226,8 @@ def _fund_attachment(
     declaration: TensorBinding, probe: ModelProbe, timeline: SchedulerTimeline, options: ExecutionOptions
 ) -> SchedulerTimeline:
     """Reserve the attachment's effect buffers and fund the custom-forward task."""
+    from pllm.execution.task_memory import custom_forward_capture_bytes
+
     graph, layouts, attachment = declaration.finish()
     buffers = attachment_buffer_bytes(probe, graph, layouts, attachment)
     if buffers:
@@ -235,4 +237,5 @@ def _fund_attachment(
                 value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
             ),
         )
-    return derive_attachment_resources(probe, graph, timeline, capture_memory_bytes=options.model_capture_bytes)
+    capture = options.capture_memory_bytes or custom_forward_capture_bytes(declaration, probe)
+    return derive_attachment_resources(probe, graph, timeline, capture_memory_bytes=capture)

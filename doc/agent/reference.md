@@ -594,7 +594,7 @@ execution.retire(rows, wait=True)
 
 ```text
 pllm.make_llm(config: 'ModelConfig', *, workload: 'BackendWorkload[D, R] | None' = None) -> 'VllmLlm[D, R] | VllmLlm[None, None]'
-    A context-managed vLLM engine for `config`, optionally running `workload` inside it.
+    A context-managed vLLM engine; execution options apply when a workload is installed.
 pllm.explain(workload: 'Workload', config: 'ModelConfig') -> 'ExplainResult'
     Plan using config.json and shape-only tensor tracing; never load base-model weights or allocate CUDA storage.
 pllm.scan(step: collections.abc.Callable[..., tuple[torch.Tensor, torch.Tensor]], *, carry: torch.Tensor, over: tuple[torch.Tensor, ...], chunk: int, invariants: tuple[torch.Tensor, ...] = (), valid_rows: torch.Tensor | None = None) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]
@@ -603,7 +603,7 @@ pllm.custom_forward(*, tokens: 'Tokens' = 'all', over: 'Over' = 'token') -> 'Cal
     Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
 pllm.custom_residual(*, site: 'Site', layers: 'tuple[int, ...] | Attr | None' = None, read: 'str' = '', streams: 'int | Attr' = 1, state: 'str' = '', chunk: 'int | Attr | None' = None) -> 'Callable[[F], F]'
     Own the residual update at `site` of `layers` (default: every layer) with this method.
-pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None, keep: 'Keep' = 'all', window: 'int' = 0, source: 'int' = 0, sink: 'bool' = False) -> 'Callable[[F], F]'
+pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None, keep: 'Keep' = 'all', window: 'int | Attr' = 0, source: 'int | Attr' = 0, sink: 'bool | Attr' = False) -> 'Callable[[F], F]'
     Replace dense FlashAttention reads, retaining native projections and KV writes.
 pllm.attention(layer: 'int', fact: 'Fact') -> 'Any'
     Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers.

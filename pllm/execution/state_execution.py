@@ -29,6 +29,7 @@ from pllm.contracts.semantic_graph import (
     ScheduleDecision,
     StateResource,
     TaskId,
+    TaskResultInputSource,
     TaskSymbol,
 )
 from pllm.contracts.state_feed import FeedBinding
@@ -456,6 +457,9 @@ class StateDiagnostics:
     # Why the model runs without CUDA graphs (ModelConfig.cuda_graphs); empty when it uses them.
     eager_reason: str = ""
     numeric_health: tuple[FieldNumericHealth, ...] = ()
+    # Actual vLLM allocation and concurrency at max_model_len, per TP rank.
+    kv_cache_blocks: int = 0
+    kv_cache_max_concurrency: float = 0.0
 
     def logical_counts(self) -> tuple[int, ...]:
         """Rank-invariant progress, excluding allocator/event timing and device identities."""
@@ -508,6 +512,19 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             torch.cuda.Stream(device=self.device)
             if self.device.type == "cuda" and any(task.lane == "side" for task in self.plan.tasks)
             else None
+        )
+        prefetched = {
+            self.arena.plan.semantic_graph.tasks[task.task_id].symbol
+            for task in self.plan.tasks
+            if task.lane == "side" and task.read_origin != "latest"
+        }
+        self._prefetch_consumers = frozenset(
+            TaskId(index)
+            for index, task in enumerate(self.arena.plan.semantic_graph.tasks)
+            if any(
+                isinstance(port.source, TaskResultInputSource) and port.source.task in prefetched
+                for port in task.inputs
+            )
         )
         self.post_sample = self._post_sample_overlap()
         self._pending_borrows: tuple[BorrowedStateRoot, ...] | None = None
@@ -773,6 +790,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context.prefetch_stream = stream
             assert stream is not None
             stream.wait_stream(torch.cuda.current_stream(self.device))
+        elif stream is not None and task.task_id in self._prefetch_consumers and context.prefetch_stream is not None:
+            stream.wait_stream(context.prefetch_stream)
         with nullcontext() if stream is None else torch.cuda.stream(stream):
             pin = context.pin
             if prefetch:

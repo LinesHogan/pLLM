@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from pllm.config import ExecutionOptions
+from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHiddenResourceBinding
@@ -44,10 +45,43 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import MemoryOperation, TensorBatch
+from pllm.execution.token_program import Segment
 from pllm.execution.torch_private import GatherTrace, fixed_shapes
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_binding import TensorBinding
+
+
+def custom_forward_capture_bytes(binding: TensorBinding, probe: ModelProbe) -> int:
+    """Estimate native wave graphs from model widths and the workload's traced layer visits.
+
+    Source operators use a no-reuse activation envelope. Each adaptive bucket
+    owns library scratch on its conditional stream (64 MiB unless measured larger).
+    This is a reservation estimate, not a prediction of allocator residency;
+    unusual wave-width/patch combinations can need an explicit capture budget.
+    """
+    if binding.custom_forward_programs is None:
+        return 0
+    programs, domain = binding.custom_forward_programs, probe.causal_domain
+    assert domain is not None
+    rows = domain.requests
+    channels = 12 * probe.hidden_size + 6 * probe.intermediate_size
+    channels += 4 * (probe.attention_heads + probe.kv_heads) * probe.head_dim
+    activation = rows * channels * probe.tensor_dtype.itemsize
+    scratch = max(64 << 20, probe.blas_workspace_bytes)
+    reservations: list[int] = []
+    for program in programs.values():
+        if program.over == "span":
+            continue
+        visits = branches = 0
+        for step in program.steps:
+            if isinstance(step, Segment):
+                visits += step.stop - step.start
+                if step.active is not None:
+                    branches += rows.bit_length() + 2
+                    visits += 2 * (step.stop - step.start)
+        reservations.append(2 * activation * visits + scratch * (branches + 1))
+    return max(reservations, default=0)
 
 
 def meta(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:

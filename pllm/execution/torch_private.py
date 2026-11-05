@@ -15,6 +15,8 @@ from uuid import UUID
 
 import torch
 from torch import _decomp
+from torch._dynamo.convert_frame import _bytecode_hooks  # pyright: ignore[reportPrivateUsage]
+from torch._dynamo.utils import CleanupManager
 from torch._functorch import compile_utils
 from torch._library.custom_ops import CustomOpDef as CustomOpDef, _maybe_get_opdef  # pyright: ignore[reportPrivateUsage]
 from torch._ops import OpOverload, OpOverloadPacket, _OpNamespace, _Ops  # pyright: ignore[reportPrivateUsage]
@@ -31,6 +33,39 @@ fx_graph_cse: Callable[[torch.fx.Graph], torch.fx.Graph] = compile_utils.fx_grap
 
 CudaPoolHandle = torch.cuda._POOL_HANDLE  # pyright: ignore[reportPrivateUsage]
 disable_current_modes = _python_dispatch._disable_current_modes  # pyright: ignore[reportPrivateUsage]
+
+
+def bytecode_hooks() -> set[int]:
+    """Snapshot Dynamo hook handles so a backend can own every decorator's registration."""
+    return set(_bytecode_hooks)
+
+
+def compilation_cleanups() -> set[int]:
+    """Snapshot Torch's compiled-code cleanup records without retaining code or tensors."""
+    return set(CleanupManager.instance.values)
+
+
+def release_compilation(hooks: tuple[int, ...], cleanups: tuple[int, ...]) -> None:
+    """Release one engine's hooks and module globals using Torch's cleanup records."""
+    for key in hooks:
+        _bytecode_hooks.pop(key, None)
+    for key in cleanups:
+        if key in CleanupManager.instance.values:
+            CleanupManager.instance._remove_id(key)  # pyright: ignore[reportPrivateUsage]
+
+
+def release_graph_pool_scope(pool: CudaPoolHandle) -> None:
+    """Balance the reference taken when a conditional node reopens its graph's allocation pool."""
+    torch._C._cuda_releasePool(torch.cuda.current_device(), pool)  # pyright: ignore[reportPrivateUsage]
+
+
+def clear_blas_workspaces() -> None:
+    """Drop Torch's workspace cache after an engine's streams and graphs have stopped.
+
+    Conditional nodes use child streams; CUDAGraph.reset clears only the root
+    stream's scratch. A cached child workspace can keep a released pool alive.
+    """
+    torch._C._cuda_clearCublasWorkspaces()  # pyright: ignore[reportPrivateUsage]
 
 
 @dataclass(frozen=True)

@@ -214,15 +214,20 @@ class FieldNumericHealth:
 
     @classmethod
     def read(cls, resource: str, ref: StateRef, field: LayoutFieldId, value: torch.Tensor) -> FieldNumericHealth:
-        """Reduce a device snapshot, then read its scalars only for an explicit diagnostic query."""
-        value = value.detach().double().flatten()
-        stats = torch.stack(
-            (
-                value.square().sum().sqrt(),
-                value.abs().amax() if value.numel() else value.new_zeros(()),
-                (~value.isfinite()).sum(),
-            )
-        ).cpu()
+        """Read the L2 norm, absolute maximum and nonfinite count, including nonfinite values.
+
+        FP64 reductions use bounded chunks; NaN/Inf norms and maxima become None.
+        Empty fields have zero norm/maximum. Chunking may change FP64 rounding.
+        """
+        value = value.detach().flatten()
+        stats = torch.zeros(3, dtype=torch.float64, device=value.device)
+        for offset in range(0, value.numel(), 1 << 20):
+            chunk = value[offset : offset + (1 << 20)].double()
+            stats[0] += chunk.square().sum()
+            stats[1] = torch.maximum(stats[1], chunk.abs().amax())
+            stats[2] += (~chunk.isfinite()).sum()
+        stats[0] = stats[0].sqrt()
+        stats = stats.cpu()
         norm, maximum, count = (float(stat.item()) for stat in stats)
         return cls(
             resource, ref, field, norm if isfinite(norm) else None, maximum if isfinite(maximum) else None, int(count)

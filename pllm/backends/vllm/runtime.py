@@ -65,7 +65,7 @@ from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
-from pllm.execution.torch_private import blas_workspace_bytes
+from pllm.execution.torch_private import blas_workspace_bytes, clear_blas_workspaces
 from pllm.execution.trace import TraceSelection, TraceSnapshot
 
 if TYPE_CHECKING:
@@ -216,6 +216,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         return self.runner.require_session().feed(name)
 
     def diagnostics(self) -> StateDiagnostics:
+        """Read exact workload health and vLLM's allocated KV blocks/max-length concurrency."""
         self._require_open()
         return replace(self._worker_state().diagnostics, eager_reason=self._eager_reason)
 
@@ -277,6 +278,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         # runner. Collect model/session cycles only after dropping those owners.
         gc.collect()
         if torch.cuda.is_initialized():
+            clear_blas_workspaces()
             torch.cuda.empty_cache()
 
     def generate_feedback(

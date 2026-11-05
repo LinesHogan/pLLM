@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from functools import partial
 
 import torch
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_host_batch
 from pllm.backends.vllm import compat
@@ -103,7 +105,14 @@ class GPUWorker(compat.Worker):
                     session.abort_active()
                     session.retire_all()
                 case BackendCommand.DIAGNOSTICS:
-                    return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
+                    diagnostics = replace(
+                        runner.require_session().diagnostics(),
+                        kv_cache_blocks=runner.kv_cache_config.num_blocks,
+                        kv_cache_max_concurrency=get_max_concurrency_for_kv_cache_config(
+                            runner.vllm_config, runner.kv_cache_config
+                        ),
+                    )
+                    return encode_boundary(BackendWorkerState(os.getpid(), diagnostics))
                 case BackendCommand.TRACE:
                     return encode_boundary(runner.require_session().trace.snapshot())
                 case BackendCommand.PROFILE:

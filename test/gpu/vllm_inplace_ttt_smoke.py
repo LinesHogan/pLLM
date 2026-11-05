@@ -645,6 +645,7 @@ def main() -> int:
     results: dict[str, tuple[str, ...]] = {}
     dense_cache = None
     for name, open_handle, check in scenarios:
+        allocated = torch.cuda.memory_allocated()
         handle = open_handle()
         try:
             cache = handle.runner.kv_cache_config
@@ -691,6 +692,7 @@ def main() -> int:
                 )
         finally:
             handle.close()
+        assert torch.cuda.memory_allocated() - allocated < 256 << 20, f"{name}: closed engine retains GPU storage"
     print(results)
     return 0
 

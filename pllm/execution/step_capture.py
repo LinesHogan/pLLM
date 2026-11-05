@@ -14,6 +14,7 @@ from typing import TypeVar
 import torch
 
 from pllm.contracts.semantic_graph import TaskResourceFact
+from pllm.execution.cuda_graph import conditional_graph_pool
 from pllm.execution.torch_private import CudaPoolHandle, cuda_graph_pool_bytes
 
 R = TypeVar("R")
@@ -52,7 +53,8 @@ def capture_graph(
             restore()
         # Cyclic collection can release tensors from another CUDA stream and invalidate capture.
         # Torch's context collects before starting; postpone automatic collection until capture ends.
-        with torch.cuda.graph(graph, stream=stream, pool=torch.cuda.graph_pool_handle() if pool is None else pool):
+        pool = torch.cuda.graph_pool_handle() if pool is None else pool
+        with conditional_graph_pool(pool), torch.cuda.graph(graph, stream=stream, pool=pool):
             prepare()
             result = body()
     finally:
