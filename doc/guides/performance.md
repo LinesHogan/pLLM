@@ -631,7 +631,8 @@ class SkipMiddle(pllm.Workload):
   * 整批全部跳过（落入 bucket 0）：原生图吞吐的 **102%**。
 
 > **实用建议与限制**
-> * `active=` 仅支持 `@pllm.custom_forward(tokens="decode")`；prompt 按原模型前向运行，如需自定义 prompt 的层循环，请为 `tokens="prefill"` 单独写一个不带 `active=` 的方法。跳层不会释放被跳层的 KV 显存。
+> * `active=` 仅支持 `@pllm.custom_forward(tokens="decode")`，跳层不会释放被跳层的 KV 显存。
+> * **为什么 `active=` 只用于生成的 token？** 一个 token 跳过某些层时，pllm 用它“停下时”的隐藏状态补算这些层的 K/V。这些 K/V 只是近似值，后面的 token 读到的就是这份近似。对生成的 token，这份近似只影响同一请求接下来的几个 token，而且它跳层的前提是“已经算够了”（CALM、LayerSkip 等早退方法也只让生成的 token 退出）。prompt token 不一样：它不需要输出任何东西，唯一的作用就是给后面所有 token 提供 K/V；它的深层 K/V 被近似之后，影响的是整段回答，还会通过 prefix cache 和 n 个样本扩散出去。Ouro 论文的实测也是：prefill 阶段的 K/V 用近似值会掉 10 个以上的 GSM8K 点，decode 阶段却几乎不掉。另外，prompt 是整块并行计算的，被压紧后的行位置不连续，原生的 FlashAttention 无法直接计算它们，省下的矩阵乘大多会被额外的 attention 开销抵消。所以 prompt 默认按原模型完整深度运行，你不需要为它另写方法；只有当你要改变 prompt 的计算方式（例如固定的层循环）时，才写一个不带 `active=` 的 `tokens="prefill"` 方法，并优先用 `over="span"`（逐 token 的程序在 prefill 上会按位置串行执行）。
 > * 使用 `@pllm.custom_forward` 时，同一个 workload 内不能再声明读取 `pllm.hidden` / `pllm.final_hidden` 的方法（请改用 `pllm.residual` 或 `pllm.layer_logits`），也不能用 `pllm.model.Adapter`。按层切片的图可能需要调大 `ExecutionOptions(capture_memory_bytes=...)`（例如 0.5B 模型在 32 并发下捕获池约需 $748\text{ MiB}$，128 并发约需 $1,392\text{ MiB}$）；`explain` 不估算这部分，预算不够时报错信息会给出所需字节数。
 
 ---
