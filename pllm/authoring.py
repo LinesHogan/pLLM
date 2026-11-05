@@ -153,7 +153,12 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
 
     @abstractmethod
     def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
+        self,
+        facts: BackendCompileFacts,
+        plan: PlanBundle,
+        declaration: TensorBinding,
+        *,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> MathBinding[StepInput, DataT, ResultT]:
         """Bind the planned declaration to selected implementations; no storage or execution ownership."""
         ...
@@ -168,7 +173,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> BackendDeployment[DataT, ResultT]:
         plan = attachment.plan
-        math = self.bind_math(facts, plan, declaration)
+        math = self.bind_math(facts, plan, declaration, map_host=map_host)
         if not is_output_rank:
             math = replace(math, on_export=None)
         arena = PageBundleArena(

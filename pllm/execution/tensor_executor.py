@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field as dataclass_field, replace
+from functools import partial
 from typing import TypeVar
 
 import numpy as np
@@ -32,10 +33,49 @@ from pllm.execution.tensor_frame import (
 )
 from pllm.execution.tensor_program import ADAM, PageUpdate, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import FieldWriter, TensorTask
-from pllm.execution.torch_private import MemoryTrace
+from pllm.execution.torch_private import MemoryTrace, disable_current_modes, measure
 from pllm.kernels.page_copy import copy_pages, gather_rows
 
 Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
+
+
+def _tensor_argument(value: torch.Tensor) -> torch.Tensor:
+    return value
+
+
+def _warm_lookup(
+    function: TensorMath,
+    task: TensorTask,
+    device: torch.device,
+    host_inputs: frozenset[str],
+    map_host: Callable[[torch.Tensor], torch.Tensor] | None,
+    **inputs: torch.Tensor,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Compile on device samples while keeping the planning invocation shape-only."""
+    try:
+        with disable_current_modes():
+            samples: dict[str, torch.Tensor] = {}
+            host_samples: list[torch.Tensor] = []
+            for name, value in inputs.items():
+                host = name in host_inputs
+                sample = torch.empty_strided(
+                    value.shape, value.stride(), dtype=value.dtype, device="cpu" if host else device, pin_memory=host
+                ).zero_()
+                if host:
+                    assert map_host is not None
+                    # UVA views borrow their CPU storage until the device run completes.
+                    host_samples.append(sample)
+                    sample = map_host(sample)
+                samples[name] = sample
+            function(**task.arguments(samples))
+            torch.cuda.current_stream(device).synchronize()
+    except Exception as error:
+        raise ValueError(
+            f"lookup method `{task.symbol}` cannot compile as one full graph: {error}\n"
+            "Use traceable tensor operations (and fake/meta implementations for custom ops), "
+            "or set ExecutionOptions(allow_numerical_transforms=False) to opt out of lookup fusion."
+        ) from error
+    return task.function(**task.arguments(inputs))
 
 
 def _gather_field(pool: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
@@ -277,6 +317,26 @@ class TensorExecutor:
     def resident(self, capture_bytes: int) -> int:
         """Reserve graph residency for a captured body."""
         return 0 if self.capture is None else capture_bytes
+
+    def warmup(
+        self,
+        data: TensorFrame,
+        batch: TensorBatch,
+        *,
+        host_inputs: frozenset[str],
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None,
+    ) -> None:
+        """Exercise lookup compilation at binding using the planner's representative inputs."""
+        task = self.task
+        if self.compiled is not None:
+            # Materialize raw tensors before adapting module parameters into callable arguments.
+            task = replace(
+                task,
+                function=partial(_warm_lookup, self.compiled, task, self.device, host_inputs, map_host),
+                ports={name: replace(port, adapt=_tensor_argument) for name, port in task.ports.items()},
+            )
+        executor = replace(self, task=task, compiled=None, resource_pools={}, layouts={}, views={})
+        measure(partial(executor, data, batch))
 
     def _body(self, data: TensorFrame, batch: TensorBatch) -> None:
         task = (

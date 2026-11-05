@@ -3191,11 +3191,16 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         )
 
     def bind_math(
-        self, facts: BackendCompileFacts, plan: PlanBundle, declaration: TensorBinding
+        self,
+        facts: BackendCompileFacts,
+        plan: PlanBundle,
+        declaration: TensorBinding,
+        *,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> MathBinding[StepInput, TensorFrame, TensorOutput]:
         """Bind the planned declaration's tensor tasks to the implementations the plan selected."""
         declaration.attention.bind(facts.device)
-        operations = declaration.executables(facts, plan.timeline.task_resources)
+        operations = declaration.executables(facts, plan.timeline.task_resources, warmup=True, map_host=map_host)
         declaration.require_resident_side_tasks(plan, operations)
         return MathBinding(
             declaration.function_math(facts.device, facts.initialization_seed),

@@ -1,6 +1,6 @@
 """Explicit host lookup matches device lookup, neutral residuals and the bounded-memory large-table case."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +14,23 @@ from pllm.testing import check_on_gpu
 from pllm.testing_gpu import _release_models
 from test.gpu.features.test_custom_residual import CONFIG, Observe, _generate
 from test.workloads.test_pretrained import LogitLookup
+
+
+@dataclass(frozen=True)
+class UntraceableLookup(pllm.Workload):
+    """Valid eager tensor math containing a builtin that Dynamo cannot trace."""
+
+    @pllm.export(max_cols=1)
+    def lookup(self, ids=pllm.input_tokens()):
+        return ids[:, :1].float() + memoryview(b"\x01")[0]
+
+
+def test_lookup_compile_failure_at_startup():
+    _release_models()
+    message = r"(?s)lookup method `[^`]*lookup` cannot compile as one full graph:.*memoryview.*allow_numerical_transforms=False"
+    with pytest.raises(ValueError, match=message):
+        with pllm.make_llm(CONFIG, workload=UntraceableLookup()):
+            pass
 
 
 def generation(workload, config):

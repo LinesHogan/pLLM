@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -30,6 +31,7 @@ from pllm.contracts.semantic_graph import (
     StateEffectKind,
     StateResource,
     StateScope,
+    StateSelectionInputSource,
     TaskResourceFact,
     TaskResultInputSource,
     TaskSymbol,
@@ -44,6 +46,7 @@ from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.scan import ScanContext
 from pllm.execution.step_capture import StepCapture
+from pllm.execution.task_memory import example, producers_first, task_example
 from pllm.execution.tensor_executor import FieldWriteExecutor, TensorExecutor, reads_rows
 from pllm.execution.tensor_frame import (
     OverlayEntry,
@@ -115,13 +118,13 @@ def _tensor_math(function: TensorMath, **inputs: torch.Tensor) -> torch.Tensor |
 def _lookup_math(task: TensorTask, facts: BackendCompileFacts | None) -> TensorMath | None:
     """Let Inductor fuse token lookups, casts and pointwise math into one table read."""
     if (
-        facts is None
-        or facts.device.type != "cuda"
-        or not facts.timeline.tensor_policy.allow_numerical_transforms
-        or task.differentiable
-        or task.training is not None
-        or task.writer is not None
-        or not any(isinstance(source, InputTokensInputSource) for source in task.sources.values())
+        facts is None  # Host execution has no backend numerical policy.
+        or facts.device.type != "cuda"  # CPU execution supplies the untransformed reference math.
+        or not facts.timeline.tensor_policy.allow_numerical_transforms  # Fusion can change rounding.
+        or task.differentiable  # Task boundaries must retain the authored graph for differentiation.
+        or not any(  # Only token lookups use this table-read fusion.
+            isinstance(source, InputTokensInputSource) for source in task.sources.values()
+        )
     ):
         return None
     return torch.compile(  # pyright: ignore[reportUnknownMemberType]
@@ -310,7 +313,12 @@ class TensorBinding(Builder[TensorFrame]):
             self.overlay_math = math if math.chunk is None else replace(math, executor=OverlayBatch(math))
 
     def executables(
-        self, facts: BackendCompileFacts | None, resources: tuple[TaskResourceFact, ...]
+        self,
+        facts: BackendCompileFacts | None,
+        resources: tuple[TaskResourceFact, ...],
+        *,
+        warmup: bool = False,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> dict[TaskSymbol, TensorOperation[TensorFrame]]:
         """Build each tensor operation once, with the same scan scope for eager and captured math."""
         capture = facts is not None and "compute/cuda_graph@1" in facts.timeline.capabilities
@@ -320,22 +328,39 @@ class TensorBinding(Builder[TensorFrame]):
             for symbol in self.operations
             if symbol not in self.tensor_tasks
         }
-        operations.update(
-            (symbol, self._tensor_operation(task, facts, limits if capture else {}))
-            for symbol, task in self.tensor_tasks.items()
-        )
-        if facts is None:
-            return operations
-        scans = ScanContext(
-            facts.timeline.tensor_policy,
-            facts.probe.max_packed_rows,
-            facts.device,
+        scans = (
             None
-            if facts.timeline.memory_budget_bytes is None
-            else facts.timeline.memory_budget_bytes // max(1, facts.max_admitted_lineages),
-            replay=capture,
-            blas_workspace_bytes=facts.probe.blas_workspace_bytes,
+            if facts is None
+            else ScanContext(
+                facts.timeline.tensor_policy,
+                facts.probe.max_packed_rows,
+                facts.device,
+                None
+                if facts.timeline.memory_budget_bytes is None
+                else facts.timeline.memory_budget_bytes // max(1, facts.max_admitted_lineages),
+                replay=capture,
+                blas_workspace_bytes=facts.probe.blas_workspace_bytes,
+            )
         )
+        compiled = {symbol: _lookup_math(task, facts) for symbol, task in self.tensor_tasks.items()}
+        warmed = {
+            dependency.symbol
+            for symbol, function in compiled.items()
+            if warmup and function is not None
+            for dependency in self.tensor_tasks[symbol].dependencies(self.tensor_tasks)
+        }
+        sample = example(self, facts, ExecutionOptions()) if warmed and facts is not None else None
+        for symbol in producers_first(self.graph, tuple(self.tensor_tasks)):
+            task = self.tensor_tasks[symbol]
+            values = (
+                None if sample is None or symbol not in warmed else (task_example(sample[0], task.phase), sample[1])
+            )
+            build = partial(
+                self._tensor_operation, task, facts, limits if capture else {}, compiled[symbol], values, map_host
+            )
+            operations[symbol] = build() if scans is None else scans.bind(build)()
+        if scans is None:
+            return operations
         return {symbol: replace(operation, body=scans.bind(operation.body)) for symbol, operation in operations.items()}
 
     def _operation(
@@ -351,15 +376,22 @@ class TensorBinding(Builder[TensorFrame]):
         )
 
     def _tensor_operation(
-        self, task: TensorTask, facts: BackendCompileFacts | None, limits: Mapping[TaskSymbol, TaskResourceFact]
+        self,
+        task: TensorTask,
+        facts: BackendCompileFacts | None,
+        limits: Mapping[TaskSymbol, TaskResourceFact],
+        compiled: TensorMath | None,
+        sample: tuple[TensorFrame, TensorBatch] | None = None,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> TensorOperation[TensorFrame]:
         """A tensor task's executor: a field writer or a body over masked tables, captured when `limits` funds it."""
         declaration = next(item for item in self.graph.tasks if item.symbol == task.symbol)
         state = task.training
         optimizer = None if state is None else state.page_update()
         step_capture = self._step_capture(task, facts, limits)
-        executor = (
-            TensorExecutor(
+        executor: TensorExecutor | FieldWriteExecutor
+        if task.writer is None:
+            executor = TensorExecutor(
                 task,
                 self.tensor_tasks,
                 optimizer,
@@ -367,12 +399,19 @@ class TensorBinding(Builder[TensorFrame]):
                 device=torch.device("cpu") if facts is None else facts.device,
                 filter_rows=task.phase is not None and task.phase is not self.row_phase(),
                 all_rows=task.symbol in self.model_site_tasks,
-                compiled=_lookup_math(task, facts),
+                compiled=compiled,
                 reuse_results=self.reuses_results(task),
             )
-            if task.writer is None
-            else FieldWriteExecutor(task.writer, step_capture)
-        )
+            if sample is not None:
+                host_states = {state.resource for state in self.graph.states if state.placement == "host"}
+                host_inputs = frozenset(
+                    name
+                    for name, source in task.sources.items()
+                    if isinstance(source, StateSelectionInputSource) and source.resource in host_states
+                )
+                executor.warmup(*sample, host_inputs=host_inputs, map_host=map_host)
+        else:
+            executor = FieldWriteExecutor(task.writer, step_capture)
         return TensorOperation(
             declaration.implementations[0].implementation_id,
             executor,
