@@ -6,12 +6,15 @@ is reclaimed only after the reader's ACK proves its queued work finished.
 
 import multiprocessing as mp
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
 import triton
 import triton.language as tl
 
+import pllm
+from pllm import testing
 from pllm.config import ExecutionOptions
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
@@ -24,6 +27,7 @@ from pllm.execution.ptts.page_borrow import receive_field
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.runtime_facts import model_timeline
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.testing import backend_facts
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
@@ -229,8 +233,6 @@ def _wait_for_gate(gate, expired, budget):
 
 def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits():
     """Busy host storage backpressures admission; a device snapshot never exposes partial counters."""
-    from unittest.mock import patch
-
     from pllm.execution.admission import WindowBackpressure
     from pllm.execution.cuda_stream import DeviceCounters, PinnedStaging
 
@@ -267,3 +269,67 @@ def test_bounded_staging_and_diagnostics_wait_for_completion_without_host_waits(
     torch.testing.assert_close(destination, torch.full_like(destination, 23))
     assert staging.take(8).ctypes.data == address
     assert counters.read() == (3, 17)
+
+
+HEALTH_ELEMENTS = 5 * (1 << 20) + 17
+
+
+def _initialize_health(fields, generator):
+    fields["finite"].copy_(fields["finite"].new_tensor([3, -4, 0, 0]))
+    fields["mixed"].copy_(fields["mixed"].new_tensor([1, float("nan"), float("inf"), -float("inf")]))
+    fields["large"].fill_(1)
+
+
+class HealthState(pllm.Workload):
+    """Publish controlled values so diagnostics can be checked without a model."""
+
+    values = pllm.InstanceState(
+        {"finite": (4,), "mixed": (4,), "empty": (0,), "large": (HEALTH_ELEMENTS,)}, initialize=_initialize_health
+    )
+
+    @pllm.custom_residual(site="mlp", layers=(0,))
+    def read(self, x, y, finite=pllm.parameter("values", "finite")):
+        return x + y + finite
+
+    @pllm.write(state="values", fields=("finite",))
+    def publish(self, finite=pllm.parameter("values", "finite")):
+        return (finite * 2,)
+
+
+def test_numeric_health_is_explicit_and_uses_bounded_device_scratch():
+    device = torch.device("cuda", 0)
+    stream = torch.cuda.current_stream(device)
+    facts = backend_facts(
+        4,
+        timeline=model_timeline(device, ("transition/full_root@1",)),
+        provider=PageBundleProviderFacts("test.health@1", 6, StateDeviceKind.CUDA),
+        memory_bytes=512 << 20,
+        layer_count=1,
+    )
+    execution = testing.compile_execution(HealthState(), facts, stream)
+    step = testing.step_input((), sampler_order=())
+    # Warm compilation and allocator setup before inspecting the ordinary step.
+    execution.step(step, stream)
+    with (
+        patch.object(torch.cuda, "synchronize", side_effect=AssertionError("per-step host sync")),
+        patch.object(torch.cuda.Stream, "synchronize", side_effect=AssertionError("per-step host sync")),
+        patch.object(torch.cuda.Event, "synchronize", side_effect=AssertionError("per-step host sync")),
+    ):
+        sync_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            execution.step(step, stream)
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_mode)
+    torch.cuda.reset_peak_memory_stats()
+    baseline = torch.cuda.memory_allocated()
+    health = execution.diagnostics().numeric_health
+    # One exact snapshot is allowed; FP64 reduction scratch must stay bounded to a chunk.
+    assert torch.cuda.max_memory_allocated() - baseline < 4 * HEALTH_ELEMENTS + (32 << 20)
+    assert [(item.norm, item.max_abs, item.nonfinite_count) for item in health] == [
+        (20.0, 16.0, 0),
+        (None, None, 3),
+        (0.0, 0.0, 0),
+        (pytest.approx(HEALTH_ELEMENTS**0.5), 1.0, 0),
+    ]
+    execution.retire(())

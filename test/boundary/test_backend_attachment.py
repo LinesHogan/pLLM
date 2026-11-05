@@ -29,6 +29,7 @@ from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
+from pllm.workloads import DummyWorkload
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from test.dense_update import (
     DenseUpdate,
@@ -168,3 +169,11 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
     with pytest.raises(OSError):
         os.fstat(shared.descriptor)
     handle.close()
+
+
+@pytest.mark.parametrize("workload", (ESampWorkload(), DummyWorkload()))
+def test_ordinary_workloads_keep_vllm_capture_sizes(workload):
+    from pllm.backends.vllm.overlay_graph import graph_options
+
+    config = pllm.ModelConfig("unused-local-model", max_num_seqs=8, max_num_batched_tokens=4096)
+    assert graph_options(config, workload.backend_requirements()) == {}

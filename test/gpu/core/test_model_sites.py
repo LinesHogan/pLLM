@@ -158,3 +158,25 @@ def test_dola_greedy_tokens_follow_fp32_oracle():
     print(f"DoLa: {exact}/{len(PROMPTS) * 8} greedy tokens equal the FP32 oracle's; worst score gap {worst:.4f}")
     # bf16 may flip a near-tie or the premature layer the divergence picks, never choose an implausible token.
     assert math.isfinite(worst) and exact >= len(PROMPTS) * 8 - 2
+
+
+@pytest.mark.parametrize("bits,group", ((4, -1), (4, 32), (8, -1), (8, 32)))
+def test_marlin_inverse_matches_dense_quantized_weight(bits, group):
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_permute_scales
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import get_weight_perm, marlin_weights
+    from vllm.model_executor.layers.quantization.utils.quant_utils import quantize_weights
+    from vllm.scalar_type import scalar_types
+
+    from pllm.backends.vllm.marlin import dequantize
+
+    generator = torch.Generator(device="cuda").manual_seed(71)
+    weight = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16, generator=generator)
+    quant_type = scalar_types.uint4b8 if bits == 4 else scalar_types.uint8b128
+    dense, quantized, scales, _ = quantize_weights(weight, quant_type, group)
+    packed = marlin_weights(quantized, *weight.shape, bits, get_weight_perm(bits))
+    scales = marlin_permute_scales(scales, *weight.shape, group)
+    actual = dequantize(packed, scales, None, tuple(weight.shape), quant_type, group)
+    torch.testing.assert_close(actual, dense.T, rtol=torch.finfo(weight.dtype).eps, atol=0)
+    # A later read reconstructs from the quantized storage instead of retaining a dense cache.
+    scales.mul_(2)
+    torch.testing.assert_close(dequantize(packed, scales, None, tuple(weight.shape), quant_type, group), 2 * dense.T)

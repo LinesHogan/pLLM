@@ -1,12 +1,15 @@
 """CPU explanation contracts: built-in coverage, cost attribution and budget fallback without CUDA or weights."""
 
 import json
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
+from typing import Literal
 
 import pytest
 import torch
 
 import pllm
+from pllm import testing
+from pllm.contracts.tensor_layout import TensorDType
 from pllm.workloads import (
     DoLaWorkload,
     DummyWorkload,
@@ -174,7 +177,6 @@ def test_declared_flop_estimates(model_config):
         for task in member.tasks
     )
     assert "estimate / step" in str(report)
-    assert all(field.dtype for state in report.states for field in state.fields)
 
 
 @pytest.mark.parametrize("workload", (StepLoopWorkload(), RecirculationWorkload()))
@@ -195,3 +197,58 @@ def test_tp_route_reports_and_cpu_check(workload, model_config):
     checked = testing.check(workload, config)
     assert "tensor_parallel_size=2: admission" in checked.passed
     assert any(item.property == "TP rank equality" for item in checked.skipped)
+
+
+@dataclass(frozen=True)
+class PrecisionRoles(pllm.Workload):
+    """Exercise role inference within a state as well as optimizer and chunk state."""
+
+    dtype: torch.dtype | Literal["auto"] = "auto"
+
+    @property
+    def values(self) -> pllm.InstanceState:
+        return pllm.InstanceState({name: (8,) for name in ("read", "update", "write")}, dtype=self.dtype)
+
+    @property
+    def imported(self) -> pllm.InstanceState:
+        return pllm.InstanceState({"w": (8,)}, imported=True, dtype=self.dtype)
+
+    @property
+    def trained(self) -> pllm.RequestState:
+        return pllm.RequestState({"w": (8,)}, optimizer=pllm.AdamW(lr=0.01), dtype=self.dtype)
+
+    @property
+    def memory(self) -> pllm.RequestState:
+        return pllm.RequestState({"carry": (8,)}, dtype=self.dtype)
+
+    @pllm.write(state="values", fields=("update", "write"))
+    def publish(self, read=pllm.parameter("values", "read"), update=pllm.parameter("values", "update")):
+        return update + read, read * 2
+
+    @pllm.train(state="trained")
+    def loss(self, hidden=pllm.hidden(0), w=pllm.parameter("trained", "w"), target=pllm.parameter("imported", "w")):
+        return (hidden - w - target).square().mean(-1)
+
+    @pllm.custom_residual(site="mlp", layers=(0,), state="memory", chunk=4)
+    def remember(self, x, y, carry=pllm.parameter("memory", "carry")):
+        return x + y + carry.to(x), carry + x.float().sum(0)
+
+
+@pytest.mark.parametrize("dtype", ("auto", torch.float16, torch.float32))
+@pytest.mark.parametrize("model_dtype", ("bfloat16", "float16"))
+def test_storage_precision_follows_declared_role(dtype, model_dtype, model_config):
+    declaration = PrecisionRoles(dtype).build(
+        testing.backend_facts(8, (testing.hidden_binding(0, 10),), dtype=TensorDType(model_dtype), layer_count=10)
+    )
+    expected = {
+        ("values", "read"): model_dtype,
+        ("values", "update"): "float32",
+        ("values", "write"): model_dtype,
+        ("imported", "w"): model_dtype,
+        ("trained", "w"): "float32",
+        ("memory", "carry"): "float32",
+    }
+    layouts = {entry.resource: entry.layout for entry in declaration.layouts.layouts}
+    assert {key: layouts[key[0]].fields[declaration.field_views[key].field].dtype.value for key in expected} == {
+        key: value if dtype == "auto" else str(dtype).removeprefix("torch.") for key, value in expected.items()
+    }

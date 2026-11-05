@@ -8,7 +8,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.backends.vllm import compat, sampler
-from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerStages
+from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerStages, _reweight
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload
 
 pytestmark = pytest.mark.gpu
@@ -58,7 +58,6 @@ def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
             expected[row, support] = (1 + beta) * logits[row, support] - beta * stage.pred_dense_logits[index, support]
         actual = reweight(logits, stage)
         torch.testing.assert_close(actual, expected)
-        assert torch.equal(actual.isfinite(), logits.isfinite())
         assert (logits.isfinite().sum(-1) <= 7).all()
         checks["guide"] += 1
         checks["trained"] += int(weights.count_nonzero())
@@ -113,3 +112,16 @@ def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
         assert len(outputs) == 2 and all(len(output.outputs[0].token_ids) == 5 for output in outputs)
         assert all(checks.values())
         assert handle.diagnostics().update_count == 8
+
+
+@pytest.mark.parametrize("prediction_dtype", (torch.float32, torch.bfloat16))
+def test_reweight_matches_unfused_arithmetic(prediction_dtype):
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    logits = torch.randn(3, 259, device="cuda", generator=generator)
+    logits[:, ::7] = -torch.inf
+    prediction = torch.randn(3, 259, device="cuda", dtype=prediction_dtype, generator=generator)
+    prediction[:, ::7] = torch.nan
+    beta = logits.new_tensor([0, 0.25, 1.5])[:, None]
+    expected = torch.where(torch.isfinite(logits), (1 + beta) * logits - beta * prediction.float(), logits)
+    actual = _reweight(logits, prediction, beta)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
