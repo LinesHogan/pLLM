@@ -62,6 +62,7 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("test/boundary/test_tensor_borrow.py", ("residual",)),
     ("test/boundary/*", ()),
     ("test/gpu/core/test_sampler_composition.py", ()),
+    ("test/gpu/core/test_guided_sampling.py", ()),
     ("test/gpu/core/*", ()),
     ("test/gpu/esamp_cuda_graph_replay_smoke.py", ()),
     ("doc/*", ()),

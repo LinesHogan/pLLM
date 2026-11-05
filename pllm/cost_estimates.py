@@ -204,12 +204,12 @@ def estimate_tasks(
                 projected_tokens = padded_vocab_size if capacity is None else min(capacity, facts.vocab_size)
                 projection += 2 * facts.max_admitted_lineages * facts.probe.hidden_size * projected_tokens
                 width = facts.probe.tensor_dtype.itemsize
-                # Bounded figures are capacity upper bounds, including indirect weight reads and
-                # scratch. Dense reweight reads FP32 survivors and native predictions, writes FP32.
+                # Bounded figures include indirect weights, scratch and the full-row mask write
+                # on the peaked branch. Dense reweight reads survivors and predictions, writes logits.
                 sampler = facts.max_admitted_lineages * (
                     facts.vocab_size * (8 + width)
                     if capacity is None
-                    else 4 * facts.vocab_size
+                    else 8 * facts.vocab_size
                     + projected_tokens * (facts.probe.hidden_size * width + 20)
                     + facts.probe.hidden_size * width
                     + 16
