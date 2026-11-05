@@ -47,7 +47,7 @@ class PagedKV:
         CUDA-graph padding rows past the last query map to the last request; their outputs are discarded.
         """
         rows = torch.arange(self.query_count, device=self.query_start.device)
-        return (rows[:, None] >= self.query_start[1:][None, :]).sum(-1).clamp(max=len(self.seq_lens) - 1)
+        return torch.searchsorted(self.query_start[1:], rows, right=True).clamp(max=len(self.seq_lens) - 1)
 
     @property
     def positions(self) -> torch.Tensor:
