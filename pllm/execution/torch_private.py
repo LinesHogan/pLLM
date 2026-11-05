@@ -31,6 +31,12 @@ fork_rng: Callable[[list[int]], AbstractContextManager[None]] = torch.random.for
 manual_seed: Callable[[int], torch.Generator] = torch.manual_seed  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 fx_graph_cse: Callable[[torch.fx.Graph], torch.fx.Graph] = compile_utils.fx_graph_cse  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
+
+def vector_norm(value: torch.Tensor) -> torch.Tensor:
+    """Call torch's vector norm through its untyped docstring binding."""
+    return torch.linalg.vector_norm(value)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+
+
 CudaPoolHandle = torch.cuda._POOL_HANDLE  # pyright: ignore[reportPrivateUsage]
 disable_current_modes = _python_dispatch._disable_current_modes  # pyright: ignore[reportPrivateUsage]
 

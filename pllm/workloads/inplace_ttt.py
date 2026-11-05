@@ -10,6 +10,7 @@ import torch
 from cattrs import structure
 
 import pllm
+from pllm.execution.torch_private import vector_norm
 from pllm.model import Projection
 
 
@@ -138,7 +139,7 @@ class InPlaceTTTWorkload(pllm.Workload):
         )
         update = values.T @ inputs if self.dtype is torch.bfloat16 else values.float().T @ inputs.float()
         if self.config.track == "T2":
-            norm = update.float().square().sum().sqrt()
+            norm = vector_norm(update.float())
             update = update * (1e-5 / norm.clamp_min(1e-5)).to(update.dtype)
         update = update * self.config.learning_rate
         if self.dtype is torch.bfloat16:

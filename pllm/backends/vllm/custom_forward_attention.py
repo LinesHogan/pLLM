@@ -14,6 +14,7 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl, FlashAttentionMetadata
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from pllm.contracts.packed_rows import PackedPhaseRow
@@ -214,12 +215,11 @@ def merge_diagonal(
     """Merge strictly earlier cached attention with each query's fresh diagonal K/V."""
     grouped = q.float().reshape(q.shape[0], k.shape[1], -1, q.shape[-1])
     diagonal = (grouped * k.float().unsqueeze(2)).sum(-1).reshape(q.shape[:2]) * scale
-    earlier = lse.T.masked_fill(positions[:, None] == 0, -float("inf"))
-    total = torch.logaddexp(earlier, diagonal)
-    fresh = v.float().repeat_interleave(q.shape[1] // k.shape[1], dim=1)
-    return (torch.exp(earlier - total)[..., None] * off.float() + torch.exp(diagonal - total)[..., None] * fresh).to(
-        q.dtype
-    )
+    earlier = lse.masked_fill(positions[None, :] == 0, -float("inf")).contiguous()
+    fresh = v.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+    output = torch.empty_like(q)
+    merge_attn_states(output, off, earlier, fresh, diagonal.T.contiguous())
+    return output
 
 
 def peek_attention(

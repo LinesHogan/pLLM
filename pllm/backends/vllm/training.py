@@ -52,15 +52,10 @@ def frozen_projection(hidden: torch.Tensor, projection: LinearBase) -> torch.Ten
 
 
 def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
-    """RMSNorm as vLLM's CUDA kernel computes it: FP32 through the weight multiply, one rounding.
-
-    vLLM's native ATen body rounds before the weight multiply; it disagrees with the inference kernel on
-    about a quarter of elements and roughly doubles training-vs-inference logit error.
-    """
-    value = hidden.float()
-    variance = value if module.variance_size_override is None else value[..., : module.variance_size_override]
-    value = value * torch.rsqrt(variance.square().mean(dim=-1, keepdim=True) + module.variance_epsilon)
-    return (value * module.weight.float()).to(hidden.dtype)
+    """Normalize the dense families' full hidden width in FP32, rounding once to the model dtype."""
+    return F.rms_norm(hidden.float(), (hidden.shape[-1],), module.weight.float(), module.variance_epsilon).to(
+        hidden.dtype
+    )
 
 
 def add_norm(module: RMSNorm, hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -105,9 +100,11 @@ def attention_forward(
     query = query.view(batch_size, length, attention.num_heads, attention.head_dim).transpose(1, 2)
     key = key.view(batch_size, length, attention.num_kv_heads, attention.head_dim).transpose(1, 2)
     value = value.view(batch_size, length, attention.num_kv_heads, attention.head_dim).transpose(1, 2)
-    groups = attention.num_heads // attention.num_kv_heads
-    key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
-    hidden = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, is_causal=mask is None)
+    if mask is not None:
+        # Native GQA with an explicit mask falls back to the slower math backend.
+        groups = attention.num_heads // attention.num_kv_heads
+        key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
+    hidden = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, is_causal=mask is None, enable_gqa=True)
     hidden = hidden.transpose(1, 2).reshape(batch_size, length, attention.q_size)
     return project(attention.o_proj, hidden)
 

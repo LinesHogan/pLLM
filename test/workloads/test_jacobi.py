@@ -63,11 +63,12 @@ def test_span_cells_keep_packed_tensor_semantics(width):
     torch.testing.assert_close(saved, output)
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("start,length", ((0, 1), (0, 7), (3, 5), (16, 4)))
 def test_peek_dense_reference_and_unchanged_cache(start, length):
     torch.manual_seed(7)
-    q, k, v = torch.randn(length, 4, 8), torch.randn(length, 2, 8), torch.randn(length, 2, 8)
-    cache = torch.randn(start + length, 2, 8, 16)
+    q, k, v = (torch.randn(length, heads, 8, device="cuda") for heads in (4, 2, 2))
+    cache = torch.randn(start + length, 2, 8, 16, device="cuda")
     before = cache.clone()
     impl = object.__new__(FlashAttentionImpl)
     impl.scale = 8**-0.5
@@ -79,17 +80,19 @@ def test_peek_dense_reference_and_unchanged_cache(start, length):
         max_seq_len=start + length,
         block_table=None,
     )
-    positions = torch.arange(start, start + length)
+    positions = torch.arange(start, start + length, device="cuda")
     keys, values = (part[:, :, 0].repeat_interleave(2, dim=1) for part in cache.chunk(2, -1))
     scores = torch.einsum("mhd,nhd->hmn", q, keys) * impl.scale
-    earlier = scores.masked_fill(torch.arange(start + length)[None, None, :] >= positions[None, :, None], -torch.inf)
-    off = torch.einsum("hmn,nhd->mhd", earlier.softmax(-1).nan_to_num(), values)
-    scores[:, torch.arange(length), positions] = (q * k.repeat_interleave(2, 1)).sum(-1).T * impl.scale
+    earlier = scores.masked_fill(
+        torch.arange(start + length, device="cuda")[None, None, :] >= positions[None, :, None], -torch.inf
+    )
+    off = torch.einsum("hmn,nhd->mhd", earlier.softmax(-1).nan_to_num(), values).contiguous()
+    scores[:, torch.arange(length, device="cuda"), positions] = (q * k.repeat_interleave(2, 1)).sum(-1).T * impl.scale
     probabilities = scores.masked_fill(
-        torch.arange(start + length)[None, None, :] > positions[None, :, None], -torch.inf
+        torch.arange(start + length, device="cuda")[None, None, :] > positions[None, :, None], -torch.inf
     ).softmax(-1)
-    diagonal = probabilities[:, torch.arange(length), positions].T.clone()
-    probabilities[:, torch.arange(length), positions] = 0
+    diagonal = probabilities[:, torch.arange(length, device="cuda"), positions].T.clone()
+    probabilities[:, torch.arange(length, device="cuda"), positions] = 0
     expected = torch.einsum("hmn,nhd->mhd", probabilities, values) + diagonal[..., None] * v.repeat_interleave(2, 1)
     with (
         patch.object(attention, "attention_metadata", return_value=(metadata, cache, None)),
