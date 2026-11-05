@@ -197,6 +197,16 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
             self.hidden_taps.clear()
         return super().capture_model(profile_only=profile_only)
 
+    def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Bind interned identities to vLLM slots only when requests enter its persistent state."""
+        super().add_requests(scheduler_output)
+        session = self._workload_session
+        if session is not None:
+            for request in scheduler_output.scheduled_new_reqs:
+                session.row_labeler.bind(
+                    request.req_id, self.req_states.req_id_to_index[request.req_id], self.req_states.max_num_reqs
+                )
+
     def prepare_attn(self, input_batch: InputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Publish the step's rows to the session.
 
@@ -217,8 +227,9 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
                 encode_mrv2_rows(
                     input_batch,
                     self.req_states.prompt_len.np[input_batch.idx_mapping_np],
-                    tuple(session.identity(request_id) for request_id in input_batch.req_ids),
+                    session.row_labeler,
                     step_id=session.next_step_id,
+                    keep=session.keep_replayed_state,
                 )
             )
         return super().prepare_attn(input_batch)

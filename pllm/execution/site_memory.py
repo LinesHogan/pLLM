@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -26,13 +27,14 @@ _FIELDS = ("carry", "_pending_rows_x", "_pending_rows_y", "_pending_length")
 
 
 def _request_spans(rows: PackedPhaseRowBatch) -> tuple[tuple[int, int], ...]:
-    spans: list[tuple[int, int]] = []
-    for index, row in enumerate(rows.rows):
-        if spans and rows.rows[spans[-1][0]].identity == row.identity:
-            spans[-1] = spans[-1][0], index + 1
-        else:
-            spans.append((index, index + 1))
-    return tuple(spans)
+    if not rows.total_rows:
+        return ()
+    identities = rows.columns[4]
+    starts = np.append(0, np.flatnonzero(identities[1:] != identities[:-1]) + 1)
+    stops = np.append(starts[1:], rows.total_rows)
+    first: list[int] = starts.tolist()
+    last: list[int] = stops.tolist()
+    return tuple(zip(first, last, strict=True))
 
 
 class SiteMemorySchedule:
@@ -69,7 +71,7 @@ class SiteMemorySchedule:
         spans = _request_spans(rows)
         packed: dict[StateRef, list[int]] = {}
         for start, end in spans:
-            ref = selection.refs[indices[rows.rows[start].identity]]
+            ref = selection.refs[indices[rows.identity(start)]]
             packed.setdefault(ref, []).extend(range(start, end))
         positions = write.before_refs.positions(StateRefs.of(tuple(packed)))
         _, slots = context.arena.slot_matrix(write, write.after_refs)

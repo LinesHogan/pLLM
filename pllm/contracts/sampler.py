@@ -38,7 +38,7 @@ class PackedSamplerGuidanceBatch:
 
     @property
     def total_rows(self) -> int:
-        return len(self.sampler_rows.links)
+        return len(self.sampler_rows.packed_indices)
 
 
 __all__ = ["PackedSamplerGuidanceBatch", "SamplerStage", "SamplerFeedback"]

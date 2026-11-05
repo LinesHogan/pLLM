@@ -145,12 +145,12 @@ def test_stateful_custom_residual_matches_serial_chunk_oracle(chunk: int) -> Non
                 phase = HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE
                 rows.append(PackedPhaseRow(len(rows), request, offset, phase, identities[request], length))
                 inputs.append(prompts[request][offset] if offset < length else decoded[offset - length, request])
-        batch = PackedPhaseRowBatch(step_id, len(rows), tuple(rows))
+        batch = PackedPhaseRowBatch.from_rows(step_id, len(rows), tuple(rows))
         links = tuple(
             PackedSamplerRowLink(request, max(row.packed_row_index for row in rows if row.request_ordinal == request))
             for request in (0, 1)
         )
-        context = execution.start_step(StepInput(batch, PackedSamplerRowBatch(batch, links)))
+        context = execution.start_step(StepInput(batch, PackedSamplerRowBatch.from_links(batch, links)))
         execution.advance_to(context, "request.prepare")
         sites.prepare(batch, context, execution.directory)
         result = body(torch.stack(inputs))

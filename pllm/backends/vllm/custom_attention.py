@@ -112,16 +112,14 @@ class CustomAttention:
     def prepare(self, rows: PackedPhaseRowBatch, sampler: PackedSamplerRowBatch) -> None:
         """Stage sampled-to-packed indices before model and fact-snapshot tasks run."""
         if self.program.prompt_lens.numel():
-            self.program.prompt_lens[: len(rows.request_rows)].copy_(
+            self.program.prompt_lens[: len(rows.request_indices)].copy_(
                 upload(
-                    tuple(row.prompt_length for row in rows.request_rows),
+                    rows.columns[5, rows.request_indices],
                     self.program.prompt_lens.device,
                 )
             )
         if self.program.sample_rows.numel():
-            mapping = tuple(
-                link.packed_row_index for link in sorted(sampler.links, key=lambda link: link.sampler_row_index)
-            )
+            mapping = sampler.packed_indices
             self.program.sample_rows[: len(mapping)].copy_(upload(mapping, self.program.sample_rows.device))
 
     def close(self) -> None:

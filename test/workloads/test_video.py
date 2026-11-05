@@ -239,7 +239,7 @@ def _step_rows(step, identities):
             (b, 3, HiddenPhase.PREFILL),
         )
     )
-    rows = PackedPhaseRowBatch(
+    rows = PackedPhaseRowBatch.from_rows(
         step,
         4,
         tuple(
@@ -247,7 +247,9 @@ def _step_rows(step, identities):
             for i, (identity, offset, phase) in enumerate(cells)
         ),
     )
-    return PackedSamplerRowBatch(rows, (PackedSamplerRowLink(0, 2 if step == 0 else 0), PackedSamplerRowLink(1, 3)))
+    return PackedSamplerRowBatch.from_links(
+        rows, (PackedSamplerRowLink(0, 2 if step == 0 else 0), PackedSamplerRowLink(1, 3))
+    )
 
 
 def _decode_steps_keep_exact_publications_and_ack_order():
@@ -304,12 +306,12 @@ def _hold_steps_reuse_the_settled_injection():
     identity = RequestIdentity("hold", 0, 0)
 
     def rows(step):
-        batch = PackedPhaseRowBatch(
+        batch = PackedPhaseRowBatch.from_rows(
             step,
             1,
             (PackedPhaseRow(0, 0, step, HiddenPhase.PREFILL if step == 0 else HiddenPhase.DECODE, identity),),
         )
-        return PackedSamplerRowBatch(batch, (PackedSamplerRowLink(0, 0),))
+        return PackedSamplerRowBatch.from_links(batch, (PackedSamplerRowLink(0, 0),))
 
     with (
         binding_case(runtime=True, missing=MissingPolicy.HOLD) as (b, _, _, binding, execution, first, peers),
@@ -388,8 +390,8 @@ def test_video_real_frame_math_and_signed_composition():
             pages.append(BorrowedPage(descriptor, value, receiver))
         execution.admit(())
         execution.stage_readonly((BorrowedStateRoot(execution.arena, "features", ref, tuple(pages)),))
-        rows = PackedPhaseRowBatch(0, 0, ())
-        result = execution.step(StepInput(rows, PackedSamplerRowBatch(rows, ())))
+        rows = PackedPhaseRowBatch.from_rows(0, 0, ())
+        result = execution.step(StepInput(rows, PackedSamplerRowBatch.from_links(rows, ())))
         signal = torch.cat(
             (
                 values[0].flatten() / 63,

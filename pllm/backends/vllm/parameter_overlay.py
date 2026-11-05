@@ -4,7 +4,6 @@ the pinned reader (the custom op that reads PTTS pools inside captured graphs) a
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -180,7 +179,7 @@ class _ExactProjection:
                     tuple(
                         operand
                         for operand in operands
-                        if operand.identity == row_overlay.data.step.rows.rows[row_overlay.row].identity
+                        if operand.identity == row_overlay.data.step.rows.identity(row_overlay.row)
                     )
                 ).items()
             }
@@ -269,15 +268,15 @@ class ExactParameterOverlay:
         grouped: dict[tuple[RequestIdentity, HiddenPhase], list[PackedPhaseRow]] = {}
         for row in rows.rows:
             grouped.setdefault((row.identity, row.phase), []).append(row)
-        table = torch.empty((len(rows.rows) + len(grouped),), dtype=torch.long, device=self.device)
+        table = torch.empty((rows.total_rows + len(grouped),), dtype=torch.long, device=self.device)
         host = self._staging.take(table.numel())
-        host[: len(rows.rows)] = [row.packed_row_index for source in grouped.values() for row in source]
-        host[len(rows.rows) :] = [
+        host[: rows.total_rows] = [row.packed_row_index for source in grouped.values() for row in source]
+        host[rows.total_rows :] = [
             source[-1].token_offset == source[-1].prompt_length - 1 for source in grouped.values()
         ]
         self._staging.copy_to(table)
-        indices = torch.split(table[: len(rows.rows)], [len(source) for source in grouped.values()])
-        prompt_ends = table[len(rows.rows) :].bool().unbind()
+        indices = torch.split(table[: rows.total_rows], [len(source) for source in grouped.values()])
+        prompt_ends = table[rows.total_rows :].bool().unbind()
         requests = tuple(
             (source[0], index, prompt_end)
             for (_, source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
@@ -648,10 +647,10 @@ class PinnedParameterOverlay:
         """Open private pages and stage every decode target before replay starts."""
         assert self.math is not None
         self.transition = transition
-        self.apply_count += len(rows.rows) * len(self.readers)
+        self.apply_count += rows.total_rows * len(self.readers)
         batch = transition.prepare(self.math).for_resource(self.math.resource)
-        identities = tuple(dict.fromkeys(row.identity for row in rows.rows))
-        self.sources = tuple(rows.rows[i] for i in range(len(identities)))
+        identities = tuple(dict.fromkeys(rows.identities))
+        self.sources = rows.inspect(np.arange(len(identities), dtype=np.int64))
         self.total_rows = rows.total_rows
         self.updated_apply_count += int(
             (batch.selection.refs.versions[list(batch.selection.state_indices)] > 0).sum()
@@ -676,9 +675,9 @@ class PinnedParameterOverlay:
             self.prepare_decode(rows, transition)
             return
         assert transition is None
-        ordinals = np.fromiter((row.request_ordinal for row in rows.rows), np.int64, rows.total_rows)
+        ordinals = rows.columns[1]
         self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
-        self.sources = tuple(rows.rows[int(index)] for index in self.starts)
+        self.sources = rows.inspect(self.starts)
         self.total_rows = rows.total_rows
         for reader in self.readers:
             versions = context.read_versions(
@@ -692,7 +691,7 @@ class PinnedParameterOverlay:
                 value.record_stream(self.stream)
             reader.prepare(slots, self.starts, rows.total_rows)
         self.embedding.values.record_stream(self.stream)
-        self.apply_count += len(rows.rows) * len(self.readers)
+        self.apply_count += rows.total_rows * len(self.readers)
 
     def complete_decode(self) -> None:
         """Settle replay's stable results through the ordinary projection task."""
@@ -799,8 +798,8 @@ class HybridParameterOverlay:
     ) -> None:
         """Select the same eligibility used by dispatch from the labelled row facts."""
         training = not uniform_decode(
-            any(row.phase is HiddenPhase.PREFILL for row in rows.rows),
-            tuple(Counter(row.identity for row in rows.rows).values()),
+            bool((rows.columns[3] == 1).any()),
+            tuple(np.unique(rows.columns[4], return_counts=True)[1].tolist()),
         )
         for reader in self.pinned.readers:
             reader.enabled = not training

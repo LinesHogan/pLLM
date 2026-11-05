@@ -166,7 +166,7 @@ class RowPlan:
     @classmethod
     def build(cls, data: "TensorFrame", batch: TensorBatch) -> "RowPlan":
         """Resolve operation rows once from the invocation's input and page access."""
-        links = {link.packed_row_index: link.sampler_row_index for link in data.step.sampler_rows.links}
+        links = {packed: sampler for sampler, packed in enumerate(data.step.sampler_rows.packed_indices.tolist())}
         selection = batch.selection
         states = (
             selection.indices(data.rows) if selection.groups and selection.keys != (None,) else (0,) * len(data.rows)
@@ -336,7 +336,7 @@ class TensorFrame:
         """The producer's eligible rows in this frame's order, for both its math and destinations."""
         if phase is None:
             return self.rows
-        eligible = {row.packed_row_index for row in self.step.rows.producer_rows(phase)}
+        eligible = set(self.step.rows.tap_selected[int(phase is HiddenPhase.PREFILL)].tolist())
         return tuple(row for row in self.rows if row.packed_row_index in eligible)
 
     @property

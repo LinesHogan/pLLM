@@ -50,8 +50,8 @@ def setup_feed(workload):
 
 
 def step_rows(step):
-    rows = PackedPhaseRowBatch(step, 0, ())
-    return PackedSamplerRowBatch(rows, ())
+    rows = PackedPhaseRowBatch.from_rows(step, 0, ())
+    return PackedSamplerRowBatch.from_links(rows, ())
 
 
 def join_producer(process, receiver, execution):

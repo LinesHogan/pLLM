@@ -46,8 +46,9 @@ class Mrv1Runner(Runner, GPUModelRunner):
                     self.input_batch,
                     scheduler_output,
                     result[0],
-                    tuple(session.identity(request_id) for request_id in self.input_batch.req_ids),
+                    session.row_labeler,
                     step_id=session.next_step_id,
+                    keep=session.keep_replayed_state,
                 )
             )
         return result

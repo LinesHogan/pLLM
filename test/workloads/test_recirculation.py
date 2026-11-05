@@ -46,7 +46,7 @@ FACTS = BackendCompileFacts(
 )
 WORKLOAD = RecirculationWorkload(alpha=0.7, ramp_tokens=2)
 IDENTITIES = (RequestIdentity("prefill", 0, 0), RequestIdentity("decode", 1, 0))
-ROWS = PackedPhaseRowBatch(
+ROWS = PackedPhaseRowBatch.from_rows(
     1,
     4,
     tuple(
@@ -61,7 +61,9 @@ ROWS = PackedPhaseRowBatch(
         for i in range(4)
     ),
 )
-VALUE = StepInput(ROWS, PackedSamplerRowBatch(ROWS, (PackedSamplerRowLink(0, 2), PackedSamplerRowLink(1, 3))))
+VALUE = StepInput(
+    ROWS, PackedSamplerRowBatch.from_links(ROWS, (PackedSamplerRowLink(0, 2), PackedSamplerRowLink(1, 3)))
+)
 INPUTS = torch.tensor([[0.4, -0.1, 0.3, 0.7], [0.2, 0.9, -0.3, 0.8], [-0.2, 0.1, 0.8, 0.4], [0.7, 0.2, -0.1, 0.3]])
 
 

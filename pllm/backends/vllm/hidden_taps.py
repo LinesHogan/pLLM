@@ -197,18 +197,14 @@ class HiddenTaps:
         host = self._staging.take(self.indices.numel())
         host.fill(-1)
         stream = torch.cuda.current_stream(self.indices.device)
-        phase_rows = tuple(
-            (phase, np.fromiter((row.packed_row_index for row in rows.producer_rows(phase)), dtype=np.int64))
-            for phase in sorted({phase for layout in self.layouts for phase in layout.phases})
-        )
         offset = 0
         for layout in self.layouts:
             tap = layout.tap
-            selected = np.concatenate(tuple(indices for phase, indices in phase_rows if phase in layout.phases))
+            kind = 2 if len(layout.phases) == 2 else int(layout.phases[0] is HiddenPhase.PREFILL)
+            selected = rows.tap_selected[kind]
             slots, _ = self.pools[tap].allocate(0, len(selected), stream)
             self._slots[tap] = slots[:, None]
-            mapping = np.full(rows.total_rows, slots[0] if slots.size else 0, dtype=np.int64)
-            mapping[selected] = slots
+            mapping = slots[rows.tap_ranks[kind]] if slots.size else np.zeros(rows.total_rows, dtype=np.int64)
             self._rows[tap] = mapping
             self._selected[tap] = selected
             size = 2 * layout.tap_rows

@@ -53,8 +53,8 @@ class StepInput:
     @classmethod
     def of_batch(cls, batch: HostBatch[torch.Tensor], readiness: CudaStreamReadiness | None = None) -> StepInput:
         """A host step without request rows, carrying one host batch its CUDA producer readies at `readiness`."""
-        rows = PackedPhaseRowBatch(0, 0, ())
-        return cls(rows, PackedSamplerRowBatch(rows, ()), batch=batch, batch_readiness=readiness)
+        rows = PackedPhaseRowBatch.from_rows(0, 0, ())
+        return cls(rows, PackedSamplerRowBatch.from_links(rows, ()), batch=batch, batch_readiness=readiness)
 
     def order_host_batch(self) -> None:
         """Order the current stream after the host batch producer and keep its tensors alive for that stream."""

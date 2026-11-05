@@ -109,8 +109,10 @@ def example(
     rows = tuple(
         PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0, str(i))) for i in range(count)
     )
-    packed = PackedPhaseRowBatch(0, count, rows)
-    sampler = PackedSamplerRowBatch(packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count)))
+    packed = PackedPhaseRowBatch.from_rows(0, count, rows)
+    sampler = PackedSamplerRowBatch.from_links(
+        packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count))
+    )
     # Trace hidden_port's model-dtype gather and FP32 conversion, including their
     # overlapping lifetimes, along with each executor's consumer index table.
     hidden = (
@@ -269,8 +271,10 @@ def task_example(data: TensorFrame, phase: HiddenPhase | None) -> TensorFrame:
     """Select a method's token phase for shared memory and arithmetic shape tracing."""
     if phase is None:
         return data
-    packed = replace(
-        data.step.rows, rows=tuple(replace(row, phase=phase, prompt_length=1) for row in data.step.rows.rows)
+    packed = PackedPhaseRowBatch.from_rows(
+        data.step.rows.step_id,
+        data.step.rows.total_rows,
+        tuple(replace(row, phase=phase, prompt_length=1) for row in data.step.rows.rows),
     )
     sampler = replace(data.step.sampler_rows, row_batch=packed)
     hidden = None if data.step.hidden is None else replace(data.step.hidden, row_batch=packed)

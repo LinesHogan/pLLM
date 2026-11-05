@@ -558,15 +558,13 @@ class TensorBinding(Builder[TensorFrame]):
         sampled = self.uses_sampler_rows
 
         def prepare(value: StepInput, batch: TensorBatch) -> TensorFrame:
-            rows = read(value.rows)
             if sampled:
-                rows = tuple(
-                    row
-                    for link in value.sampler_rows.links
-                    for row in (value.rows.rows[link.packed_row_index],)
-                    if not row.recomputed
-                    and (row.phase is HiddenPhase.DECODE or row.token_offset == row.prompt_length - 1)
-                )
+                packed = value.sampler_rows.packed_indices
+                columns = value.rows.columns[:, packed]
+                eligible = (columns[6] == 0) & ((columns[3] == 0) | (columns[2] == columns[5] - 1))
+                rows = value.rows.inspect(packed[eligible])
+            else:
+                rows = read(value.rows)
             data = TensorFrame(value, rows)
             match value.batch:
                 case StateImport() as update:

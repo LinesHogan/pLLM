@@ -461,7 +461,7 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
                     )
                 )
                 offsets[request] += 1
-            row_batch = replace(value.rows, rows=tuple(rows))
+            row_batch = type(value.rows).from_rows(value.rows.step_id, value.rows.total_rows, tuple(rows))
             value = replace(value, rows=row_batch, sampler_rows=replace(value.sampler_rows, row_batch=row_batch))
             context = execution.start_step(value, stream)
             execution.advance_to(context, "model.execute")

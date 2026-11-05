@@ -162,9 +162,13 @@ class TensorTask:
         stage = self.sampler_stage
         assert stage is not None
         local = {row.packed_row_index: index for index, row in enumerate(data.rows)}
-        links = tuple(link for link in data.step.sampler_rows.links if link.packed_row_index in local)
+        links = tuple(
+            (sampler, packed)
+            for sampler, packed in enumerate(data.step.sampler_rows.packed_indices.tolist())
+            if packed in local
+        )
         if stage is SamplerStage.PACKED_POST_FILTER_EXACT:
-            positions = tuple(local[link.packed_row_index] for link in links)
+            positions = tuple(local[packed] for _, packed in links)
             result = take_rows(result, positions)
             # Unselected rows keep weight 0, so the sampler leaves their logits unchanged;
             # selecting rows on the host would need a device-to-host read.
@@ -175,11 +179,12 @@ class TensorTask:
                 Observation(
                     "guidance",
                     result[index],
-                    data.step.rows.rows[link.packed_row_index],
-                    _row_ref(batch.selection, data.step.rows.rows[link.packed_row_index].identity),
+                    row,
+                    _row_ref(batch.selection, row.identity),
                     data.step.rows.step_id,
                 )
-                for index, link in enumerate(links)
+                for index, (_, packed) in enumerate(links)
+                for row in (data.step.rows.inspect_row(packed),)
             )
             if batch.observing
             else ()
@@ -188,7 +193,7 @@ class TensorTask:
             guidance=PackedSamplerGuidanceBatch(
                 data.step.sampler_rows,
                 result.detach(),
-                tuple(link.sampler_row_index for link in links),
+                tuple(sampler for sampler, _ in links),
                 self.sampler_beta,
                 stage=stage,
                 row_weights=weights,

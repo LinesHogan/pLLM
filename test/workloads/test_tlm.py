@@ -86,8 +86,8 @@ def _compile(model, config: TLMConfig):
 
 
 def _input(batch):
-    rows = PackedPhaseRowBatch(0, 0, ())
-    return StepInput(rows, PackedSamplerRowBatch(rows, ()), batch=batch)
+    rows = PackedPhaseRowBatch.from_rows(0, 0, ())
+    return StepInput(rows, PackedSamplerRowBatch.from_links(rows, ()), batch=batch)
 
 
 def _reference(model, parameters, batch, config):

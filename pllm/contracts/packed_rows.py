@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+import numpy.typing as npt
+
+from pllm import _core
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.request_identity import RequestIdentity
+
+Slots = npt.NDArray[np.int64]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,51 +34,123 @@ class PackedPhaseRow:
         return HiddenPhase.DECODE if self.token_offset >= self.prompt_length else HiddenPhase.PREFILL
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class PackedPhaseRowBatch:
-    """Immutable row expansion for one exact packed engine step."""
+    """Numeric labels inspected by task execution and diagnostics.
+
+    Columns are packed index, request ordinal, token offset, phase (decode=0/prefill=1),
+    identity-table index, prompt length and retained-replay flag. Tap maps index the
+    allocated slot vector; index zero supplies the same unused-row fill as before.
+    """
 
     step_id: int
-    total_rows: int
-    rows: tuple[PackedPhaseRow, ...]
+    columns: Slots
+    request_identities: tuple[RequestIdentity, ...]
+    request_indices: Slots
+    tap_selected: tuple[Slots, ...]
+    tap_ranks: tuple[Slots, ...]
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, PackedPhaseRowBatch) and self.step_id == other.step_id and self.rows == other.rows
+
+    def __hash__(self) -> int:
+        return hash((self.step_id, self.total_rows, self.rows))
+
+    @classmethod
+    def from_rows(cls, step_id: int, total_rows: int, rows: tuple[PackedPhaseRow, ...]) -> PackedPhaseRowBatch:
+        """Import explicit records for diagnostics and shape tracing."""
+        assert total_rows == len(rows)
+        identities = tuple(dict.fromkeys(row.identity for row in rows))
+        lookup = {identity: index for index, identity in enumerate(identities)}
+        columns = (
+            np.array(
+                [
+                    (
+                        r.packed_row_index,
+                        r.request_ordinal,
+                        r.token_offset,
+                        {HiddenPhase.DECODE: 0, HiddenPhase.PREFILL: 1, HiddenPhase.NONE: -1}[r.phase],
+                        lookup[r.identity],
+                        r.prompt_length,
+                        int(r.recomputed),
+                    )
+                    for r in rows
+                ],
+                dtype=np.int64,
+            )
+            .reshape(-1, 7)
+            .T.copy()
+        )
+        last = {r.identity: r.packed_row_index for r in rows}
+        requests = np.fromiter(last.values(), dtype=np.int64)
+        ordinal_last = np.fromiter({r.request_ordinal: r.packed_row_index for r in rows}.values(), dtype=np.int64)
+        fresh = columns[6] == 0
+        prefill = np.flatnonzero((columns[3] == 1) & (columns[2] == columns[5] - 1) & fresh)
+        decode = np.sort(ordinal_last[(columns[3, ordinal_last] == 0) & fresh[ordinal_last]])
+        selected = (decode, prefill, np.concatenate((decode, prefill)))
+        ranks = tuple(np.zeros(total_rows, dtype=np.int64) for _ in selected)
+        for indices, mapping in zip(selected, ranks, strict=True):
+            mapping[indices] = np.arange(len(indices))
+        return cls(step_id, columns, identities, requests, selected, ranks)
+
+    @property
+    def total_rows(self) -> int:
+        return self.columns.shape[1]
+
+    def inspect(self, indices: Slots) -> tuple[PackedPhaseRow, ...]:
+        """Materialize exact row records for an explicit consumer."""
+        return tuple(
+            PackedPhaseRow(
+                packed,
+                request,
+                offset,
+                HiddenPhase.PREFILL if phase == 1 else HiddenPhase.DECODE if phase == 0 else HiddenPhase.NONE,
+                self.request_identities[int(identity)],
+                prompt,
+                bool(recomputed),
+            )
+            for packed, request, offset, phase, identity, prompt, recomputed in self.columns[:, indices].T.tolist()
+        )
+
+    def inspect_row(self, index: int) -> PackedPhaseRow:
+        """Inspect one packed row without materializing the rest of the batch."""
+        return self.inspect(np.array([index], dtype=np.int64))[0]
+
+    def identity(self, index: int) -> RequestIdentity:
+        """Borrow one row's admitted identity without constructing a row record."""
+        return self.request_identities[int(self.columns[4, int(index)])]
+
+    @property
+    def rows(self) -> tuple[PackedPhaseRow, ...]:
+        return self.inspect(np.arange(self.total_rows, dtype=np.int64))
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
-        return tuple(row.identity for row in self.rows)
+        return tuple(self.request_identities[int(index)] for index in self.columns[4])
 
     @property
     def request_rows(self) -> tuple[PackedPhaseRow, ...]:
-        """Borrow each request's final row in packed request order, shared by producers and consumers."""
-        last = {row.identity: row for row in self.rows}
-        return tuple(last.values())
+        """Each request's final row, in packed request order."""
+        return self.inspect(self.request_indices)
 
     def producer_rows(self, phase: HiddenPhase | None) -> tuple[PackedPhaseRow, ...]:
-        """Fresh prompt endings or latest decode rows; retained-state replay never produces again."""
+        """Fresh prompt endings or latest decode rows."""
         if phase is None:
-            return tuple(row for row in self.request_rows if not row.recomputed)
-        return (
-            tuple(row for row in self.prefill_rows if row.token_offset == row.prompt_length - 1 and not row.recomputed)
-            if phase is HiddenPhase.PREFILL
-            else self.latest_decode_rows
-        )
+            return self.inspect(self.request_indices[self.columns[6, self.request_indices] == 0])
+        return self.inspect(self.tap_selected[int(phase is HiddenPhase.PREFILL)])
 
     @property
     def prefill_rows(self) -> tuple[PackedPhaseRow, ...]:
-        return tuple(row for row in self.rows if row.phase is HiddenPhase.PREFILL)
+        return self.inspect(np.flatnonzero(self.columns[3] == 1))
 
     @property
     def decode_rows(self) -> tuple[PackedPhaseRow, ...]:
-        return tuple(row for row in self.rows if row.phase is HiddenPhase.DECODE)
+        return self.inspect(np.flatnonzero(self.columns[3] == 0))
 
     @property
     def latest_decode_rows(self) -> tuple[PackedPhaseRow, ...]:
-        """Each request's final fresh decode row; a partial retained-state replay has none."""
-        last = {row.request_ordinal: row for row in self.rows}
-        return tuple(
-            row
-            for row in self.rows
-            if row.phase is HiddenPhase.DECODE and last[row.request_ordinal] is row and not row.recomputed
-        )
+        """Each request's final fresh decode row."""
+        return self.inspect(self.tap_selected[0])
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +161,35 @@ class PackedSamplerRowLink:
     packed_row_index: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class PackedSamplerRowBatch:
-    """Ordered sampler rows whose provenance is one exact packed row batch."""
+    """Ordered sampler indices into one exact numeric packed row batch."""
 
     row_batch: PackedPhaseRowBatch
-    links: tuple[PackedSamplerRowLink, ...]
+    packed_indices: Slots
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, PackedSamplerRowBatch) and self.row_batch == other.row_batch and self.links == other.links
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.row_batch, self.links))
+
+    @classmethod
+    def from_links(
+        cls, row_batch: PackedPhaseRowBatch, links: tuple[PackedSamplerRowLink, ...]
+    ) -> PackedSamplerRowBatch:
+        """Import explicit sampler links for diagnostics and shape tracing."""
+        indices = np.empty(len(links), dtype=np.int64)
+        for link in links:
+            indices[link.sampler_row_index] = link.packed_row_index
+        return cls(row_batch, indices)
+
+    @property
+    def links(self) -> tuple[PackedSamplerRowLink, ...]:
+        """Materialize sampler links for explicit inspection."""
+        return tuple(PackedSamplerRowLink(index, packed) for index, packed in enumerate(self.packed_indices.tolist()))
 
     @property
     def step_id(self) -> int:
@@ -96,7 +197,51 @@ class PackedSamplerRowBatch:
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
-        return tuple(self.row_batch.rows[link.packed_row_index].identity for link in self.links)
+        return tuple(
+            self.row_batch.request_identities[int(index)] for index in self.row_batch.columns[4, self.packed_indices]
+        )
+
+
+class RowLabeler:
+    """Admission-time identities and native frontier ownership for one session."""
+
+    def __init__(self) -> None:
+        self.native = _core.RowLabeler()
+        self.ids: dict[str, int] = {}
+        self.identities = np.empty(0, dtype=np.object_)
+        self.slots = np.empty(0, dtype=np.int64)
+
+    def admit(self, identity: RequestIdentity) -> None:
+        """Intern a newly admitted request generation."""
+        index = self.native.admit()
+        self.ids[identity.request_id] = index
+        if index >= len(self.identities):
+            identities = np.empty(max(16, 2 * index), dtype=np.object_)
+            identities[: len(self.identities)] = self.identities
+            self.identities = identities
+        self.identities[index] = identity
+
+    def retire(self, identity: RequestIdentity) -> None:
+        """Release an admitted request generation and its retained frontier."""
+        index = self.ids.pop(identity.request_id)
+        self.native.retire(index)
+        self.identities[index] = None
+
+    def bind(self, request_id: str, slot: int, capacity: int) -> None:
+        """Bind MRv2's persistent slot when vLLM admits or resumes a request."""
+        if len(self.slots) != capacity:
+            self.slots = np.full(capacity, -1, dtype=np.int64)
+        self.slots[slot] = self.ids[request_id]
+
+    def prepare(
+        self, scheduled: np.ndarray, prompt: np.ndarray, computed: np.ndarray, ids: Slots, step_id: int, keep: bool
+    ) -> PackedSamplerRowBatch:
+        """Borrow contiguous host columns for one native label and hidden-map operation."""
+        columns, links, selected, ranks = self.native.prepare(scheduled, prompt, computed, ids, keep)
+        rows = PackedPhaseRowBatch(
+            step_id, columns, tuple(self.identities[ids]), links[scheduled != 0], tuple(selected), tuple(ranks)
+        )
+        return PackedSamplerRowBatch(rows, links)
 
 
 def label_rows(
@@ -106,20 +251,23 @@ def label_rows(
     computed: list[int],
     step_id: int,
 ) -> PackedSamplerRowBatch:
-    """One row per scheduled token in request order; token positions below the prompt length are prefill."""
-    rows: list[PackedPhaseRow] = []
-    links: list[PackedSamplerRowLink] = []
-    for request, (count, length, done) in enumerate(zip(scheduled, prompt, computed, strict=True)):
-        for offset in range(done, done + count):
-            phase = HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE
-            rows.append(PackedPhaseRow(len(rows), request, offset, phase, identities[request], length))
-        # vLLM samples each request's last scheduled token, which is the last packed row of its span.
-        links.append(PackedSamplerRowLink(request, len(rows) - 1))
-    return PackedSamplerRowBatch(PackedPhaseRowBatch(step_id, len(rows), tuple(rows)), tuple(links))
+    """Label explicit host input for CPU checks using the runner's bulk implementation."""
+    labeler = RowLabeler()
+    for identity in identities:
+        labeler.admit(identity)
+    return labeler.prepare(
+        np.asarray(scheduled, dtype=np.int32),
+        np.asarray(prompt, dtype=np.int32),
+        np.asarray(computed, dtype=np.int32),
+        np.arange(len(identities), dtype=np.int64),
+        step_id,
+        False,
+    )
 
 
 __all__ = [
     "label_rows",
+    "RowLabeler",
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedSamplerRowBatch",

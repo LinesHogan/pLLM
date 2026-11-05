@@ -23,7 +23,7 @@ from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
-from pllm.contracts.packed_rows import PackedPhaseRow, label_rows
+from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, label_rows
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import SamplerFeedback, SamplerStage
@@ -38,7 +38,7 @@ from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.model_sites import StateInput
-from pllm.execution.preemption import preemption_policy, retained_rows
+from pllm.execution.preemption import preemption_policy
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_input import StepInput
@@ -1141,3 +1141,21 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
     if failures:
         raise ContractError(tuple(failures))
     return result
+
+
+def retained_rows(rows: PackedSamplerRowBatch, frontiers: dict[RequestIdentity, int]) -> PackedSamplerRowBatch:
+    """CPU reference for retained replay; production uses the native row labeler.
+
+    Mark previously consumed tokens, including partial replay chunks.
+
+    The checker removes frontiers on retirement. Reset-and-replay workloads do not
+    call this: their model-state transitions must run again.
+    """
+    batch = rows.row_batch
+    labeled = tuple(
+        replace(row, recomputed=True) if row.token_offset < frontiers.get(row.identity, 0) else row
+        for row in batch.rows
+    )
+    for row in batch.request_rows:
+        frontiers[row.identity] = max(frontiers.get(row.identity, 0), row.token_offset + 1)
+    return replace(rows, row_batch=PackedPhaseRowBatch.from_rows(batch.step_id, batch.total_rows, labeled))

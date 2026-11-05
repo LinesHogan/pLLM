@@ -162,7 +162,7 @@ def step_input(
     """
     count = len(identities)
     row_phases = tuple(HiddenPhase(token) for token in tokens) if tokens is not None else (HiddenPhase.DECODE,) * count
-    rows = PackedPhaseRowBatch(
+    rows = PackedPhaseRowBatch.from_rows(
         step_id,
         count,
         tuple(
@@ -177,7 +177,7 @@ def step_input(
     )
     return StepInput(
         rows,
-        PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order))),
+        PackedSamplerRowBatch.from_links(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order))),
         HiddenRowBatch(rows, taps) if taps else None,
         operands=operands,
         batch=batch,

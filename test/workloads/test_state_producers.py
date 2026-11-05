@@ -68,9 +68,10 @@ def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None)
     value = testing.step_input(
         identities, hidden, tokens=phases, sampler_order=(1, 0), token_offset=offset, stream=stream
     )
-    rows = replace(
-        value.rows,
-        rows=tuple(replace(row, prompt_length=length) for row, length in zip(value.rows.rows, lengths, strict=True)),
+    rows = type(value.rows).from_rows(
+        value.rows.step_id,
+        value.rows.total_rows,
+        tuple(replace(row, prompt_length=length) for row, length in zip(value.rows.rows, lengths, strict=True)),
     )
     return replace(
         value,

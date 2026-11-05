@@ -28,3 +28,72 @@ def test_prompt_chunks_select_one_completion_among_reordered_decode_rows(length,
         endings.extend(batch.producer_rows(HiddenPhase.PREFILL))
         assert batch.producer_rows(HiddenPhase.DECODE) == (batch.rows[0],)
     assert len(endings) == 1 and endings[0].token_offset == length - 1
+
+
+def test_bulk_labels_links_and_tap_slots_match_retained_replay_and_slot_reuse():
+    """Compare all native facts with the prior record semantics as membership and generations change."""
+    import numpy as np
+
+    from pllm.contracts.packed_rows import PackedPhaseRow, PackedSamplerRowLink, RowLabeler
+
+    labeler = RowLabeler()
+    identities = tuple(RequestIdentity(key, index, 0) for index, key in enumerate(("a", "b", "c")))
+    for identity in identities[:2]:
+        labeler.admit(identity)
+    frontiers = {}
+    for step, (members, counts, lengths, done) in enumerate(
+        (
+            ((0, 1), (2, 1), (4, 1), (0, 0)),
+            ((1, 0), (1, 3), (1, 4), (1, 2)),
+            ((0,), (3,), (4,), (0,)),  # partial retained replay
+            ((0, 1), (3, 1), (4, 1), (3, 2)),  # replay crosses the prompt ending
+            ((2, 0), (1, 1), (1, 4), (0, 6)),  # cancelled b's native ID is reused by c
+        )
+    ):
+        if step == 4:
+            labeler.retire(identities[1])
+            labeler.admit(identities[2])
+        active = tuple(identities[index] for index in members)
+        ids = np.array([labeler.ids[identity.request_id] for identity in active], dtype=np.int64)
+        actual = labeler.prepare(
+            *(np.array(values, dtype=np.int32) for values in (counts, lengths, done)), ids, step, True
+        )
+        rows, links = [], []
+        for ordinal, (identity, count, length, start) in enumerate(zip(active, counts, lengths, done, strict=True)):
+            for offset in range(start, start + count):
+                rows.append(
+                    PackedPhaseRow(
+                        len(rows),
+                        ordinal,
+                        offset,
+                        HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE,
+                        identity,
+                        length,
+                        offset < frontiers.get(identity, 0),
+                    )
+                )
+            links.append(PackedSamplerRowLink(ordinal, len(rows) - 1))
+            frontiers[identity] = max(frontiers.get(identity, 0), start + count)
+        assert actual.row_batch.rows == tuple(rows) and actual.links == tuple(links)
+        last = {row.request_ordinal: row for row in rows}
+        for kind, phases in enumerate(
+            ((HiddenPhase.DECODE,), (HiddenPhase.PREFILL,), (HiddenPhase.DECODE, HiddenPhase.PREFILL))
+        ):
+            selected = [
+                row.packed_row_index
+                for phase in phases
+                for row in rows
+                if row.phase is phase
+                and not row.recomputed
+                and (
+                    row is last[row.request_ordinal]
+                    if phase is HiddenPhase.DECODE
+                    else row.token_offset == row.prompt_length - 1
+                )
+            ]
+            np.testing.assert_array_equal(actual.row_batch.tap_selected[kind], selected)
+            slots = np.arange(len(selected), dtype=np.int64)[::-1] + step * 7
+            expected = np.full(len(rows), slots[0] if slots.size else 0, dtype=np.int64)
+            expected[selected] = slots
+            mapped = slots[actual.row_batch.tap_ranks[kind]] if slots.size else np.zeros(len(rows), dtype=np.int64)
+            np.testing.assert_array_equal(mapped, expected)

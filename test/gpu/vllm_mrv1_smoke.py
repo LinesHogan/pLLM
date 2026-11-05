@@ -44,7 +44,7 @@ def main() -> None:
         assert [link.packed_row_index for link in result.links] == links == logits_indices.tolist()
         widths.add(batch.num_reqs)
         phases.update(row.phase.value for row in result.row_batch.rows)
-        identities_seen.update(identity.prompt_index for identity in identities)
+        identities_seen.update(identity.prompt_index for identity in result.identities)
         row_checks += len(expected)
         return result
 

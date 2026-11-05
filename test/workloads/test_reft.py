@@ -52,8 +52,8 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
     _decode_declarations_are_checked(facts)
-    rows = PackedPhaseRowBatch(0, 0, ())
-    value = StepInput(rows, PackedSamplerRowBatch(rows, ()))
+    rows = PackedPhaseRowBatch.from_rows(0, 0, ())
+    value = StepInput(rows, PackedSamplerRowBatch.from_links(rows, ()))
     (initial,) = execution.admit(())
     assert execution.step(value).publication is None
     identity = RequestIdentity("old", 0, 0)
@@ -111,7 +111,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     adapter = VllmActivationPatch(
         (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),), len(hidden), in_program=False
     )
-    rows = PackedPhaseRowBatch(
+    rows = PackedPhaseRowBatch.from_rows(
         0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
     )
     invocation = execution.start_step(replace(value, batch=update))
@@ -166,7 +166,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     identities = (RequestIdentity("a", 7, 1), RequestIdentity("b", 9, 1))
     initial = execution.admit(identities)
     old_pin = execution.arena.pin_exact(StateRefs.of(initial))
-    rows = PackedPhaseRowBatch(
+    rows = PackedPhaseRowBatch.from_rows(
         0,
         3,
         tuple(
@@ -175,7 +175,9 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
         ),
     )
     delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]])
-    value = StepInput(rows, PackedSamplerRowBatch(rows, ()), batch=StateImport((delta,)), import_rows={"b": 0, "a": 1})
+    value = StepInput(
+        rows, PackedSamplerRowBatch.from_links(rows, ()), batch=StateImport((delta,)), import_rows={"b": 0, "a": 1}
+    )
     invocation = execution.start_step(value)
     execution.execute_anchor(invocation, AnchorId(0))
     context = invocation

@@ -769,7 +769,7 @@ class ProgramOverlay:
 
     def collect(self, results: tuple[OverlayTargetResult, ...], pending: tuple[ProgramOperand, ...]) -> None:
         """Reconstruct invocation metadata from device outputs, including cached graph replays."""
-        row = self.data.step.rows.rows[self.row]
+        row = self.data.step.rows.inspect_row(self.row)
         index = self.batch.selection.state_indices[self.row]
         if self.batch.after_refs[index] != self.batch.selection.refs[index]:
             for target, source in zip(self.batch.roots[index], self.fields, strict=True):

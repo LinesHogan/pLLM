@@ -33,7 +33,7 @@ from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttach
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
-from pllm.contracts.packed_rows import PackedSamplerRowBatch
+from pllm.contracts.packed_rows import PackedSamplerRowBatch, RowLabeler
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
 from pllm.contracts.semantic_graph import (
@@ -46,7 +46,7 @@ from pllm.execution.backend_attachment import attachment_buffer_bytes
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
-from pllm.execution.preemption import preemption_policy, retained_rows
+from pllm.execution.preemption import preemption_policy
 from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
 from pllm.execution.state_feed import (
     Feed,
@@ -204,7 +204,8 @@ class VllmSession(Generic[DataT, ResultT]):
             )
         self._sampler = sampler
         self._identities: dict[str, RequestIdentity] = {}
-        self._token_frontiers: dict[RequestIdentity, int] = {}
+        self.row_labeler = RowLabeler()
+        self.keep_replayed_state = preemption_policy(self.attachment, deployment.execution.math.model_sites) == "keep"
         self._pending_identities: dict[str, RequestIdentity] = {}
         self._next_step_id = 0
         self._step: _PackedStep[DataT] | None = None
@@ -321,6 +322,7 @@ class VllmSession(Generic[DataT, ResultT]):
             if bool(execution.directory.request_states):
                 execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
             for identity in pending:
+                self.row_labeler.admit(identity)
                 self._identities[identity.request_id] = identity
                 self._pending_identities.pop(identity.request_id)
 
@@ -367,8 +369,6 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_input_live()
         self._next_step_id += 1
         execution = self._deployment.execution
-        if preemption_policy(self.attachment, execution.math.model_sites) == "keep":
-            rows = retained_rows(rows, self._token_frontiers)
         step = _PackedStep[DataT](rows)
         self._step = step
         if self._taps is not None:
@@ -473,7 +473,10 @@ class VllmSession(Generic[DataT, ResultT]):
             step.context is None
             and not operands
             and self.input_tokens is None
-            and not any(row.phase in self._hidden_phases for row in step.rows.row_batch.rows)
+            and not any(
+                (step.rows.row_batch.columns[3] == int(phase is HiddenPhase.PREFILL)).any()
+                for phase in self._hidden_phases
+            )
         ):
             self._finish_effects()
             self._step = None
@@ -605,7 +608,7 @@ class VllmSession(Generic[DataT, ResultT]):
             execution.retire(held)
         for identity in identities:
             self._identities.pop(identity.request_id)
-            self._token_frontiers.pop(identity, None)
+            self.row_labeler.retire(identity)
 
     @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:

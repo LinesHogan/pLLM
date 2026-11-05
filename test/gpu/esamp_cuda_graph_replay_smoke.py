@@ -87,12 +87,12 @@ def mean_capture(publish_lag: int = 0) -> None:
     token_buffer = torch.empty(3, device=device, dtype=torch.long)
     for step, count in enumerate((1, 3, 2)):
         hidden.copy_(torch.arange(12, device=device, dtype=torch.float32).view(3, 4) / 10)
-        rows = PackedPhaseRowBatch(
+        rows = PackedPhaseRowBatch.from_rows(
             step,
             count,
             tuple(PackedPhaseRow(i, i, step, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)) for i in range(count)),
         )
-        sampler = PackedSamplerRowBatch(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count)))
+        sampler = PackedSamplerRowBatch.from_links(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count)))
         value = StepInput(
             rows,
             sampler,

@@ -37,7 +37,7 @@ class LayerLogits:
         computed = self.decoder.compute_logits(self.decoder.norms[-1](streams))
         assert computed is not None
         values = computed.view(len(self.streams), len(packed), -1).transpose(0, 1).float()
-        sampler = {link.packed_row_index: link.sampler_row_index for link in rows.links}
+        sampler = {packed: index for index, packed in enumerate(rows.packed_indices.tolist())}
         sampled = tuple((index, sampler[row]) for index, row in enumerate(packed.tolist()) if row in sampler)
         if self.final is not None and sampled:
             kept, positions = (upload(column, logits.device) for column in zip(*sampled, strict=True))
