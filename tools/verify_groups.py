@@ -65,6 +65,16 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("docs/*", ()),
     ("*.md", ()),
 )
+# Maximum vLLM startup demand per GPU; unlisted stages use the Config default (0.5).
+GPU_MEMORY_FRACTIONS = {
+    "attention": 0.3,
+    "producers": 0.25,
+    "esamp": 0.4,
+    "inplace": 0.25,
+    "tp": 0.35,
+    "adaptive-quality": 0.75,
+}
+
 GROUPS = tuple(sorted({group for _, groups in PATH_GROUPS for group in groups}))
 
 
@@ -94,10 +104,14 @@ def selection(base: str, all_groups: bool) -> dict[str, str]:
 def main() -> None:
     """Print the selection, or replay the driver's frozen selection on a compute node."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gpu-memory-fraction", metavar="STAGE", help="Print a stage's maximum vLLM startup fraction")
     parser.add_argument("--base", default="main")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--explain", action="store_true")
     args = parser.parse_args()
+    if args.gpu_memory_fraction:
+        print(GPU_MEMORY_FRACTIONS.get(args.gpu_memory_fraction, 0.5))
+        return
     plan = os.environ.get("VERIFY_SELECTION")
     chosen = (
         dict(line.split("\t", 1) for line in Path(plan).read_text().splitlines())
