@@ -36,7 +36,11 @@ features=(); while IFS=$'\t' read -r group reason; do [ -z "$group" ] || feature
 CPU_STAGES=(ruff format pyright typing layers docs cpu)
 GPU_STAGES=(gpu-core graph-replay enginecore-capture enginecore-io)
 for group in "${features[@]}"; do
-  if [ "$group" = release ]; then CPU_STAGES+=(release); else GPU_STAGES+=("$group"); fi
+  case "$group" in
+    release) CPU_STAGES+=(release) ;;
+    tp) GPU_STAGES+=(tp tp-step-loop) ;;
+    *) GPU_STAGES+=("$group") ;;
+  esac
 done
 if [ -n "$listing" ]; then
   case "$listing" in
@@ -103,7 +107,8 @@ run_stage() {
     inplace) smoke vllm_inplace_ttt_smoke ;;
     tlm) smoke vllm_tlm_smoke ;;
     enginecore) smoke enginecore_smoke || rc=1; smoke vllm_mrv1_smoke || rc=1; return "$rc" ;;
-    tp) pytest_gpu test/gpu/vllm_tp_smoke.py ;;
+    tp) pytest_gpu test/gpu/vllm_tp_smoke.py -k 'not (test_j5_routes and step_loop)' ;;
+    tp-step-loop) pytest_gpu test/gpu/vllm_tp_smoke.py -k 'test_j5_routes and step_loop' ;;
     *) echo "Unknown stage: $1; use --help" >&2; return 2 ;;
   esac
 }

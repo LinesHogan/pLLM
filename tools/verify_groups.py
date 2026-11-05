@@ -82,6 +82,7 @@ GPU_MEMORY_FRACTIONS = {
     "feedback": 0.35,
     "reft": 0.25,
     "tp": 0.35,
+    "tp-step-loop": 0.75,  # The native StepLoop oracle retains its 0.35 baseline during TP startup.
     "adaptive-quality": 0.75,
 }
 
