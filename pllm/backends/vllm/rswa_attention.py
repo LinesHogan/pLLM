@@ -1,58 +1,57 @@
-"""Expose output and LSE from vLLM's native local/R-SWA kernel for custom attention.
+"""Read R-SWA output through vLLM's launcher and recover its otherwise discarded LSE.
 
-The native launcher hides its softmax statistics. One unsplit segment exposes
-those statistics for both prefill and decode, without gathering K/V or changing
-vLLM's page ownership. Full reads keep FlashAttention's optimized GQA decode.
+Custom attention uses FA2 for full/sliding-window reads. vLLM 0.27.1/0.32.0
+TritonAttentionImpl.forward calls unified_attention, which returns only output.
+Its 2-D branch discards M/L, including all prefill; its 3-D branch exposes only
+split-decode scratch. Neither the backend nor reduce_segments returns LSE.
+Until upstream exposes LSE, the extra unsplit launch below recovers M/L only;
+vLLM's ordinary launcher remains responsible for the returned attention output.
 """
 
 import torch
 import triton
-import triton.language as tl
-from vllm.v1.attention.ops.triton_unified_attention import kernel_unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import kernel_unified_attention, unified_attention
 
 from pllm.execution.attention import PagedKV
 
 
-@triton.jit
-def _finish(
-    partial: torch.Tensor,
-    maximum: torch.Tensor,
-    denominator: torch.Tensor,
-    output: torch.Tensor,
-    lse: torch.Tensor,
-    dim: tl.constexpr,
-    padded: tl.constexpr,
-    heads: tl.constexpr,
-    stride: tl.constexpr,
-) -> None:
-    row = tl.program_id(0).to(tl.int64)
-    columns = tl.arange(0, padded)
-    total = tl.load(denominator + row)
-    values = tl.load(partial + row * padded + columns, columns < dim, other=0)
-    tl.store(output + row // heads * stride + row % heads * dim + columns, values / total, columns < dim)
-    tl.store(lse + row, tl.load(maximum + row) + tl.log(total))
-
-
-def window_attention(
-    kv: PagedKV, q: torch.Tensor, scale: float, window: int, output: torch.Tensor
+def rswa_attention(
+    kv: PagedKV, q: torch.Tensor, scale: float, output: torch.Tensor, max_query_len: int, max_seq_len: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read native window/R-SWA pages with an unsplit softmax and float32 LSE."""
+    """Use TritonAttentionImpl's ordinary R-SWA launcher with a separate LSE recovery."""
     q = q.contiguous() if q.stride(-1) != 1 else q
     rows, heads, dim = q.shape
     padded = triton.next_power_of_2(dim)
     partial = torch.empty((rows, heads, padded), dtype=torch.float32, device=q.device)
     maximum, denominator = (torch.empty((rows, heads), dtype=torch.float32, device=q.device) for _ in range(2))
-    lse = torch.empty_like(maximum)
-    _launch(kv, q, scale, window, partial, maximum, denominator)
-    _finish[(rows * heads,)](partial, maximum, denominator, output, lse, dim, padded, heads, output.stride(0))
-    return output, lse
+    unified_attention(
+        q=q,
+        k=kv.key_cache,
+        v=kv.value_cache,
+        out=output,
+        cu_seqlens_q=kv.query_start,
+        max_seqlen_q=max_query_len,
+        seqused_k=kv.seq_lens,
+        max_seqlen_k=max_seq_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=kv.block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        rswa_prefix_lens=kv.prompt_lens,
+        rswa_window=kv.storage_window,
+    )
+    _lse_statistics(kv, q, scale, partial, maximum, denominator)
+    return output, maximum + denominator.log()
 
 
-def _launch(
+def _lse_statistics(
     kv: PagedKV,
     q: torch.Tensor,
     scale: float,
-    window: int,
     partial: torch.Tensor,
     maximum: torch.Tensor,
     denominator: torch.Tensor,
@@ -95,7 +94,7 @@ def _launch(
         USE_QQ_BIAS=False,
         USE_SOFTCAP=False,
         USE_SINKS=False,
-        SLIDING_WINDOW=window,
+        SLIDING_WINDOW=0,
         USE_CAUSAL=True,
         USE_PER_SEQ_CAUSAL=False,
         per_seq_causal_ptr=None,
@@ -103,8 +102,8 @@ def _launch(
         MAX_MM_RANGES=0,
         mm_prefix_range_ptr=None,
         rswa_prefix_lens_ptr=kv.prompt_lens,
-        R_SWA_WINDOW=kv.storage_window if kv.prompt_lens is not None and not window else 0,
-        USE_R_SWA=kv.prompt_lens is not None and not window,
+        R_SWA_WINDOW=kv.storage_window,
+        USE_R_SWA=True,
         stride_k_cache_0=keys.stride(0),
         stride_k_cache_1=keys.stride(1),
         stride_k_cache_2=keys.stride(2),

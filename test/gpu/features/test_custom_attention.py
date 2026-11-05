@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 import pllm
@@ -124,7 +125,7 @@ def test_native_lse_and_selected_oracle():
             captured_selected, _ = Quest().select(q, kv, layer=0)
         graph.replay()
         assert torch.equal(selected, captured_selected)
-        from pllm.backends.vllm.window_attention import window_attention
+        from pllm.backends.vllm.rswa_attention import rswa_attention
 
         strided = q.new_empty((*q.shape[:-1], dim * 2))[..., ::2]
         strided.copy_(q)
@@ -134,7 +135,12 @@ def test_native_lse_and_selected_oracle():
             expected, expected_lse = DenseAttention(local, dim**-0.5)(q, window, None)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out, lse = window_attention(local, strided, dim**-0.5, window, torch.empty_like(q))
+                out, lse = (
+                    rswa_attention(local, strided, dim**-0.5, torch.empty_like(q), max(queries), 95)
+                    if prompt_lens is not None
+                    else flash_attn_varlen_func(**{**args, "q": strided}, window_size=(3, 0), return_softmax_lse=True)
+                )
+                lse = lse if prompt_lens is not None else lse.T
             graph.replay()
             torch.testing.assert_close(out, expected, atol=0.008, rtol=0.008)
             torch.testing.assert_close(lse, expected_lse, atol=0.0001, rtol=0.0001)
@@ -148,6 +154,36 @@ def _layout_read(read, errors, kernel, q, window, topk):
         out, lse = read(kernel, q, window, topk)
     finally:
         torch.cuda.set_sync_debug_mode(mode)
+    if topk is None:
+        kv = kernel.kv
+        native = torch.empty_like(out)
+        args = dict(
+            q=q,
+            k=kv.key_cache,
+            v=kv.value_cache,
+            out=native,
+            cu_seqlens_q=kv.query_start,
+            max_seqlen_q=kernel.metadata.max_query_len,
+            seqused_k=kv.seq_lens,
+            max_seqlen_k=kernel.metadata.max_seq_len,
+            softmax_scale=kernel.impl.scale,
+            causal=True,
+            block_table=kv.block_table,
+            window_size=(window - 1, 0) if window else (-1, -1),
+            softcap=0.0,
+        )
+        if kv.prompt_lens is not None and not window:
+            unified_attention(
+                **args,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                rswa_prefix_lens=kv.prompt_lens,
+                rswa_window=kv.storage_window,
+            )
+        else:
+            flash_attn_varlen_func(**args, fa_version=2, num_splits=kernel.metadata.max_num_splits)
+        assert torch.equal(out, native)
     if kernel.metadata.max_query_len > 1 or kernel.metadata.max_seq_len > 96:
         kv = kernel.kv
         # Independent FP32 softmax over logical positions. No production masking/gather helper.

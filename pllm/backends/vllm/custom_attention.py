@@ -1,6 +1,6 @@
 """Install authored dense reads inside vLLM's opaque attention op, after its native KV write.
 
-The upstream op already supplies graph ordering and capture. Full reads use FA2; local and prompt-sink reads use vLLM's native Triton kernel.
+The upstream op already supplies graph ordering and capture. Full and sliding-window reads use FA2; prompt-sink reads use vLLM's Triton path.
 Selected reads gather logical positions without changing block tables.
 """
 
@@ -17,7 +17,7 @@ from vllm.vllm_flash_attn import flash_attn_varlen_func
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.compat import VLLM_027
 from pllm.backends.vllm.model_sites import ModelSites
-from pllm.backends.vllm.window_attention import window_attention
+from pllm.backends.vllm.rswa_attention import rswa_attention
 from pllm.contracts.kv_layout import storage_layout
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.execution.attention import PagedKV, selected_attention
@@ -52,8 +52,10 @@ class FlashRead:
             topk = torch.arange(self.metadata.max_seq_len, device=q.device)[None, :].expand(len(q), -1)
         if topk is not None:
             result = selected_attention(self.kv, q, self.impl.scale, window, topk)
-        elif (window or self.kv.prompt_lens is not None) and q.dtype == self.kv.key_cache.dtype:
-            result = window_attention(self.kv, q, self.impl.scale, window, output)
+        elif self.kv.prompt_lens is not None and not window and q.dtype == self.kv.key_cache.dtype:
+            result = rswa_attention(
+                self.kv, q, self.impl.scale, output, self.metadata.max_query_len, self.metadata.max_seq_len
+            )
         else:
             out, lse = flash_attn_varlen_func(
                 q=q,

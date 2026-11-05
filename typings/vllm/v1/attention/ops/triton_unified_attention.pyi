@@ -66,3 +66,25 @@ def kernel_unified_attention(
     segm_max_ptr: torch.Tensor,
     segm_expsum_ptr: torch.Tensor,
 ) -> None: ...
+
+
+def unified_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    block_table: torch.Tensor,
+    softcap: float,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    rswa_prefix_lens: torch.Tensor | None = ...,
+    rswa_window: int | None = ...,
+) -> None: ...
