@@ -261,6 +261,8 @@ def guided_sample(
     Scratch is bounded by rows * K; the single kernel reads each filtered logit once.
     """
     rows, vocab = logits.shape
+    hidden = hidden.to(weight.dtype).contiguous()
+    mapping, positions = mapping.contiguous(), positions.contiguous()
     scratch = torch.empty((rows, capacity), dtype=torch.uint64, device=logits.device)
     output = torch.empty(rows, dtype=torch.int64, device=logits.device)
     _sample[(rows,)](

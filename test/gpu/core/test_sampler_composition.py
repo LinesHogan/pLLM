@@ -70,7 +70,7 @@ def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
         from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
         expected = logits.clone()
-        predicted = torch.nn.functional.linear(hidden, weight).float()
+        predicted = torch.nn.functional.linear(hidden.to(weight.dtype), weight).float()
         active = rows >= 0
         selected = rows[active]
         strengths = beta * weights[selected, None]

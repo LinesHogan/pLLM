@@ -16,7 +16,7 @@ def test_bounded_guidance_draw_and_capture(fp64):
     torch.manual_seed(41)
     rows, vocab, width, capacity = 10, 10003, 37, 64
     weight = torch.randn(vocab, width, device="cuda") * 0.1
-    hidden = torch.randn(8, width, device="cuda")
+    hidden = torch.randn(width, 8, device="cuda").T
     logits = torch.randn(rows, vocab, device="cuda")
     counts = (1, 3, capacity, capacity + 1, vocab, vocab, 7, 9, 0, 5)
     for row, count in enumerate(counts):
@@ -25,7 +25,7 @@ def test_bounded_guidance_draw_and_capture(fp64):
     row_map = torch.tensor((0, -1, 1, 2, 3, 4, 5, 6, 7, -1), device="cuda")
     weights = torch.tensor((1, 0.25, 1, 1, 1, 0, 1, 1), device="cuda")
     mapping = torch.randperm(rows, device="cuda")
-    positions = torch.arange(rows, device="cuda", dtype=torch.int64) + 19
+    positions = (torch.arange(2 * rows, device="cuda", dtype=torch.int64) + 19)[::2]
     seeds = torch.arange(rows, device="cuda", dtype=torch.int64) + 2147483648
     temperature = torch.ones(rows, device="cuda")
     temperature[mapping[2]] = 0

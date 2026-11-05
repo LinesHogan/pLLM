@@ -200,7 +200,7 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
                     rows[row] = index
                 sampled = guided_sample(
                     survivors,
-                    guidance.guidance.values.to(guidance.weight.dtype),
+                    guidance.guidance.values,
                     guidance.weight,
                     upload(rows, survivors.device),
                     guidance.guidance.row_weights,
