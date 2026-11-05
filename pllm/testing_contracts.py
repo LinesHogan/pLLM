@@ -875,10 +875,13 @@ def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
         return failures
     result = _run(neutral, neutral_facts, neutral_declaration, neutral_shape, (0, 1, 2))
     failures.extend(result.failures)
+    additive_outputs = {
+        f"sampler {stage.task}" for stage in sampler if stage.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+    }
     failures.extend(
         f"[neutral] {key}: add_logits must return exactly zero"
         for key, value in result.values.items()
-        if key[2].startswith("sampler ") and torch.count_nonzero(value)
+        if key[2] in additive_outputs and torch.count_nonzero(value)
     )
     return failures
 

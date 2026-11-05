@@ -425,8 +425,9 @@ def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram
             continue
         if tokens != "decode":
             raise ValueError(
-                'active= is supported only in @pllm.custom_forward(tokens="decode"); '
-                'change tokens= to "decode" and use a separate unmasked tokens="prefill" method for prompt layers'
+                'Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave '
+                "approximate K/V that every later token reads. Prompt rows run the full model by default; "
+                'add an unmasked tokens="prefill" method only to change prompt computation (prefer over="span").'
             )
         for step in program.steps:
             if not isinstance(step, Segment) or step.active is None:

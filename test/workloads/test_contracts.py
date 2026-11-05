@@ -80,6 +80,22 @@ class Steering(pllm.Workload):
 
 
 @dataclass(frozen=True)
+class SelectedSteering(pllm.Workload):
+    """Row masks may stay enabled when additive logits have zero strength."""
+
+    strength: float = 0.1
+
+    def selected(self, samples=pllm.sample_index()):
+        """Select some samples independently of their packed row positions."""
+        return samples % 2 == 0
+
+    @pllm.add_logits(rows="selected")
+    def bias(self, logits=pllm.layer_logits((-1,))):
+        """Return zero deltas when the author disables steering."""
+        return logits[:, -1].tanh() * self.strength
+
+
+@dataclass(frozen=True)
 class Stack(pllm.Workload):
     esamp: ESampWorkload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
     dola: DoLaWorkload = DoLaWorkload(layers=(0, 2, 4))
@@ -171,9 +187,9 @@ class PromptMask(pllm.Workload):
 
 
 @pytest.mark.parametrize(
-    "workload, error",
+    "workload, neutral, error",
     [
-        (workload, "")
+        (workload, None, "")
         for workload in (
             DummyWorkload(),
             Residual(),
@@ -215,30 +231,46 @@ class PromptMask(pllm.Workload):
         )
     ]
     + [
-        (CoupledAttention(), r"\[isolation\]"),
-        (BatchMeanTrainer(), 'method `learn`.*couples RequestState.*reduction="state_mean"'),
-        (BorrowedMutation(False), "method `change` mutates borrowed input `h`.*clone"),
-        (BorrowedMutation(True), "method `change` mutates borrowed input `w`.*clone"),
-        (BadLogits(), r"@pllm.add_logits.*\[rows, vocab_size\].*got \(3, 8\)"),
-        (sampler_feedback(pllm.base_logits()), r"pllm.base_logits\(\).*Phase.AFTER_SAMPLE.*pllm.layer_logits"),
-        (sampler_feedback(pllm.sampled_tokens()), r"pllm.sampled_tokens\(\).*Phase.AFTER_SAMPLE.*pllm.final_hidden"),
-        (SelectedTrainer(), "rows=.*require a model effect without sampler guidance, or @pllm.add_logits"),
-        (PromptMask(), "active=.*only in @pllm.custom_forward.*decode.*separate unmasked"),
+        (SelectedSteering(), SelectedSteering(0.0), ""),
+        (SelectedSteering(), SelectedSteering(), r"\[neutral\].*sampler bias.*exactly zero"),
+    ]
+    + [
+        (workload, None, error)
+        for workload, error in (
+            (CoupledAttention(), r"\[isolation\]"),
+            (BatchMeanTrainer(), 'method `learn`.*couples RequestState.*reduction="state_mean"'),
+            (BorrowedMutation(False), "method `change` mutates borrowed input `h`.*clone"),
+            (BorrowedMutation(True), "method `change` mutates borrowed input `w`.*clone"),
+            (BadLogits(), r"@pllm.add_logits.*\[rows, vocab_size\].*got \(3, 8\)"),
+            (sampler_feedback(pllm.base_logits()), r"pllm.base_logits\(\).*Phase.AFTER_SAMPLE.*pllm.layer_logits"),
+            (
+                sampler_feedback(pllm.sampled_tokens()),
+                r"pllm.sampled_tokens\(\).*Phase.AFTER_SAMPLE.*pllm.final_hidden",
+            ),
+            (SelectedTrainer(), "rows=.*require a model effect without sampler guidance, or @pllm.add_logits"),
+            (
+                PromptMask(),
+                "Use @pllm.custom_forward.*decode.*active=.*approximate K/V.*every later token reads.*"
+                'full model by default.*prefill.*only to change prompt computation.*over="span"',
+            ),
+        )
     ],
     ids=lambda value: type(value).__name__ if isinstance(value, pllm.Workload) else "",
 )
-def test_schedule_contracts(workload, error, model_config):
+def test_schedule_contracts(workload, neutral, error, model_config):
     cuda_initialized = torch.cuda.is_initialized()
     if error:
         with pytest.raises(testing.ContractError, match=error) as caught:
-            testing.check(workload, model_config)
+            testing.check(workload, model_config, neutral=neutral)
         assert "framework bug" not in str(caught.value)
         assert torch.cuda.is_initialized() == cuda_initialized
         return
-    result = testing.check(workload, model_config)
+    result = testing.check(workload, model_config, neutral=neutral)
     assert torch.cuda.is_initialized() == cuda_initialized
     assert result.passed or result.skipped
     json.dumps(asdict(result))
+    if neutral is not None:
+        assert "neutral" in result.passed
     if isinstance(workload, Stack):
         assert "component independence" in result.passed
         report = pllm.explain(workload, model_config)
