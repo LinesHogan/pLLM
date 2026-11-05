@@ -88,7 +88,11 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
             backend="eager" if requirements.parameter_targets or requirements.custom_residual else "inductor",
-            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if requirements.exact_phases else _OVERLAY_GRAPHS,
+            cudagraph_mode=(
+                CUDAGraphMode.FULL_DECODE_ONLY
+                if requirements.stateful_residual or requirements.exact_phases
+                else _OVERLAY_GRAPHS
+            ),
             cudagraph_capture_sizes=list(sizes),
             max_cudagraph_capture_size=capacity,
         ),
@@ -212,7 +216,7 @@ class OverlayGraphRunner(compat.ModelRunner):
         }
         manager = self.cudagraph_manager
         assert manager is not None
-        mode = CUDAGraphMode.FULL_DECODE_ONLY if attachment.plan.semantic_graph.updates_in_forward else _OVERLAY_GRAPHS
+        mode = self.vllm_config.compilation_config.cudagraph_mode
         if manager.cudagraph_mode != mode:
             raise ValueError(
                 f"vLLM resolved overlay CUDA graphs to {manager.cudagraph_mode.name}, not {mode.name}; "

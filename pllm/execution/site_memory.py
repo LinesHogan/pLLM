@@ -15,6 +15,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.contracts.state_ref import StateRef
+from pllm.execution.cuda_graph import device_branch
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.model_sites import ResidualRewrite
 from pllm.execution.ptts.page_bundle import PageBundleArena
@@ -88,12 +89,30 @@ class SiteMemorySchedule:
     def __call__(self, stream: Tensor, branch: Tensor, invariants: tuple[Tensor, ...]) -> Tensor:
         written = stream + branch
         table = self.table[:, : min(len(stream), self.table.shape[1])]
+        widths = (*tuple(2**p for p in range((len(stream) - 1).bit_length())), len(stream))
+        self.buckets(table, (1,), 0, stream, branch, written, invariants)
+        if len(stream) > 1:
+            # One shared conditional keeps library scratch bounded across capture sizes.
+            with device_branch((table[1] > 1).any()):
+                self.buckets(table, widths[1:], 1, stream, branch, written, invariants)
+        return written
+
+    def buckets(
+        self,
+        table: Tensor,
+        widths: tuple[int, ...],
+        lower: int,
+        stream: Tensor,
+        branch: Tensor,
+        written: Tensor,
+        invariants: tuple[Tensor, ...],
+    ) -> None:
+        """Compact bounded request spans; one-row decode skips all wider buckets."""
         lengths = table[1]
-        lower = 0
         capturing = stream.is_cuda and torch.cuda.is_current_stream_capturing()
         # A bucket of width w has at most capacity / (previous width + 1)
         # requests. Thus padding stays bounded even for a large prefill graph.
-        for width in (*tuple(2**p for p in range((len(stream) - 1).bit_length())), len(stream)):
+        for width in widths:
             if not capturing and self._counts is not None and not any(lower < count <= width for count in self._counts):
                 lower = width
                 continue
@@ -109,7 +128,6 @@ class SiteMemorySchedule:
                 invariants,
             )
             lower = width
-        return written
 
     def one(
         self, values: dict[str, Tensor], x: Tensor, y: Tensor, count: Tensor, invariants: tuple[Tensor, ...]

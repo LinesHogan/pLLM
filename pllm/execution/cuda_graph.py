@@ -33,7 +33,11 @@ def _release_scope() -> None:
 @contextmanager
 def device_branch(predicate: torch.Tensor) -> Generator[None]:
     """Capture a CUDA IF node; cold warmup runs every branch without reading its predicate."""
-    graph = torch.cuda.CUDAGraph.get_currently_capturing_graph() if torch.cuda.is_current_stream_capturing() else None
+    graph = (
+        torch.cuda.CUDAGraph.get_currently_capturing_graph()
+        if predicate.is_cuda and torch.cuda.is_current_stream_capturing()
+        else None
+    )
     if graph is not None:
         graph.begin_capture_to_if_node(predicate)  # pyright: ignore[reportUnknownMemberType]
         _release_scope()
