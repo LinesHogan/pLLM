@@ -18,7 +18,7 @@ pytestmark = pytest.mark.gpu
 
 @pytest.fixture(autouse=True)
 def fixed_kv_cache(monkeypatch):
-    """Keep small contract models independent of desktop free-memory fluctuations."""
+    """Keep small contract models independent of free-memory profiling."""
     monkeypatch.setattr(runtime, "LLM", partial(runtime.LLM, kv_cache_memory_bytes=32 << 20))
 
 

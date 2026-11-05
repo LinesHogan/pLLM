@@ -14,6 +14,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.testing import check_on_gpu
+from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")

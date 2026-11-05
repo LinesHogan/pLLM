@@ -408,4 +408,12 @@ def input_tokens_port(history: int) -> TensorPort:
 
 def result_port(source: TaskResultInputSource) -> TensorPort:
     """Read a previously evaluated task's named output."""
-    return TensorPort(source, lambda data, batch: batch.results[source.task, source.output])
+
+    def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        value = batch.results[source.task, source.output]
+        if batch.stream is not None and value.is_cuda:
+            # The producer's allocation can otherwise be recycled before this lane finishes reading it.
+            value.record_stream(batch.stream)
+        return value
+
+    return TensorPort(source, read)

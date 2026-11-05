@@ -9,10 +9,12 @@ from safetensors.torch import save_file
 
 import pllm
 from examples.engram_lite import EngramLite, fit
+from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.state_execution import StateExecution
 from pllm.testing import check_on_gpu
 from pllm.testing_gpu import _release_models
 from test.gpu.features.test_custom_residual import CONFIG, Observe, _generate
+from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 from test.workloads.test_pretrained import LogitLookup
 
 
@@ -52,6 +54,12 @@ def test_engram_placements_and_capture(tmp_path, logits):
     config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=32, enable_chunked_prefill=True)
     expected = generation(replace(host, placement="device"), config)
     execute = StateExecution._execute_task
+    fill_versions = PageBundleArena._fill_versions
+
+    def delay_admission(arena, write, fields):
+        if not write.sources and any(target.table.pools.host_tensors for target in write.targets):
+            torch.cuda._sleep(100_000_000)
+        fill_versions(arena, write, fields)
 
     def delayed(execution, context, task):
         if task.lane == "side":
@@ -60,7 +68,10 @@ def test_engram_placements_and_capture(tmp_path, logits):
         execute(execution, context, task)
 
     # The main model reaches the consumer before the side copy unless its graph waits on the event.
-    with patch.object(StateExecution, "_execute_task", delayed):
+    with (
+        patch.object(StateExecution, "_execute_task", delayed),
+        patch.object(PageBundleArena, "_fill_versions", delay_admission),
+    ):
         assert generation(host, config) == expected
     if not logits:
         assert generation(host, replace(config, cuda_graphs=False)) == expected

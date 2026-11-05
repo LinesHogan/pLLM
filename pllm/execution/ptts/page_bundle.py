@@ -672,11 +672,20 @@ class PageBundleArena:
         return self._pools[root.resource].tensor(field, root.pages[field])
 
     def writable_roots(self, token: PageWrite, *, initialize: bool = False) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Borrow writable fields, completing GPU work before handing storage to a CPU initializer."""
         self._issued_write(token)
-        return tuple(
+        roots = tuple(
             self._pools[root.resource].views(root.slots, root.generations, host=initialize)
             for root, _ in self._held_roots((token,) * len(token.after_refs), token.after_refs)
         )
+        if (
+            initialize
+            and token.stream is not None
+            and any(field.device.type == "cpu" for root in roots for field in root)
+        ):
+            # Admission zeroing and prior GPU readers must finish before CPU writes to mapped pages.
+            token.stream.synchronize()
+        return roots
 
     def publish(self, token: PageWrite) -> PagePublication:
         write = self._issued_write(token)

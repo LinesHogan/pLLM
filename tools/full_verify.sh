@@ -84,7 +84,7 @@ run_stage() {
     pyright) "$PY" -m pyright --pythonpath "$PY" "${PROJECT[@]}" ;;
     typing) "$PY" tools/check_typing.py ;;
     layers) "$PY" tools/check_import_layers.py ;;
-    docs) "$PY" tools/check_docs.py ;;
+    docs) "${CPU[@]}" "$PY" tools/check_docs.py ;;
     cpu) pytest_cpu -m 'not gpu' test/boundary test/workloads ;;
     release) pytest_cpu test/release ;;
     gpu-core) pytest_gpu --import-mode=importlib -m gpu test/boundary test/workloads test/gpu/core ;;
@@ -93,7 +93,12 @@ run_stage() {
     enginecore-io) smoke enginecore_smoke --gpu-io-only ;;
     adaptive) pytest_gpu test/gpu/features/test_adaptive_depth.py ;;
     attention) pytest_gpu test/gpu/features/test_custom_attention.py ;;
-    residual) pytest_gpu test/gpu/features/test_custom_residual.py test/gpu/features/test_custom_kernels.py test/gpu/features/test_engram_lite.py ;;
+    residual)
+      # The FP32 oracle and compiled engines must leave before subprocess kernels and the 3 GiB host table.
+      for name in custom_residual custom_kernels engram_lite; do
+        pytest_gpu "test/gpu/features/test_$name.py" || rc=1
+      done
+      return "$rc" ;;
     producers) pytest_gpu test/gpu/features/test_state_producers.py ;;
     routes)
       pytest_gpu test/gpu/features/test_composed_model_sites.py || rc=1

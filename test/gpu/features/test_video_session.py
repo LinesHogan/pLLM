@@ -2,7 +2,7 @@
 
 import multiprocessing as mp
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from unittest.mock import patch
 
@@ -15,6 +15,7 @@ from pllm.contracts.semantic_graph import StateResource
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot
 from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.state_feed import _ConsumerClosed
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.video import VideoWorkload, frame_features
 from test.workloads.test_video import frames
@@ -255,35 +256,41 @@ def model_config():
     )
 
 
-def produce_frames(feed, source, events):
-    previous = source[0].cuda()
-    try:
-        for kind, frame in zip(events, source, strict=True):
-            if kind == "missing":
-                feed.missing()
-                continue
-            current = frame.cuda()
-            values = frame_features(current, previous, 2)
-            feed.publish(
-                **dict(zip(("qp", "residual_energy", "motion_magnitude", "segmentation"), values, strict=True))
-            )
-            previous = current
-            for value in values:
-                value.zero_()  # publish returning permits immediate mutation of its source tensors.
-        feed.end()
-    finally:
-        feed.close()
+def produce_frames(feed, source, events, teardown):
+    # Preemption deliberately closes the consumer while this producer still owns pages.
+    with suppress(BrokenPipeError, _ConsumerClosed) if teardown is not None else nullcontext():
+        previous = source[0].cuda()
+        try:
+            for index, (kind, frame) in enumerate(zip(events, source, strict=True)):
+                if index == 1 and teardown is not None:
+                    assert teardown.wait(120), "consumer did not finish teardown"
+                if kind == "missing":
+                    feed.missing()
+                    continue
+                current = frame.cuda()
+                values = frame_features(current, previous, 2)
+                feed.publish(
+                    **dict(zip(("qp", "residual_energy", "motion_magnitude", "segmentation"), values, strict=True))
+                )
+                previous = current
+                for value in values:
+                    value.zero_()  # publish returning permits immediate mutation of its source tensors.
+            feed.end()
+        finally:
+            feed.close()
 
 
-def run_video(workload, events, steps, config=None):
+def run_video(workload, events, steps, config=None, *, consumer_fails=False):
     from vllm import SamplingParams
 
+    context = mp.get_context("spawn")
+    teardown = context.Event() if consumer_fails else None
     process = None
     try:
         with pllm.make_llm(config=config or model_config(), workload=workload) as llm:
-            process = mp.get_context("spawn").Process(
+            process = context.Process(
                 target=produce_frames,
-                args=(llm.feed("features"), frames(len(events)), events),
+                args=(llm.feed("features"), frames(len(events)), events, teardown),
             )
             process.start()
             outputs = llm.generate(
@@ -293,6 +300,8 @@ def run_video(workload, events, steps, config=None):
             assert len(outputs[0].outputs[0].token_ids) == steps
             return llm.diagnostics(), outputs[0].outputs[0].text
     finally:
+        if teardown is not None:
+            teardown.set()
         if process is not None:
             process.join(120)
             if process.is_alive():
@@ -335,4 +344,4 @@ def test_video_session_failure_retains_owner_without_fallback():
         return before_execute(session, scheduler_output)
 
     with patch.object(VllmSession, "before_execute", preempt), pytest.raises(RuntimeError, match="preempt"):
-        run_video(VideoWorkload(grid_size=2), ("publish", "publish"), 2)
+        run_video(VideoWorkload(grid_size=2), ("publish", "publish"), 2, consumer_fails=True)
