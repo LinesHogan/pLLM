@@ -310,7 +310,11 @@ custom forward 单元里需要 `register_vmap`。`register_kernel("cpu")` 可选
 
 `InstanceState(..., pretrained=path)` 从 safetensors 读初值（字段同名张量；文件哈希计入负载身份）。`placement="host"`
 把只被按行 gather 的只读预训练字段放在锁页主机内存里；默认 `placement="device"` 放不下也不会回退到主机。显存预算与
-主机内存分开计算；`pllm.explain` 给出主机字节数与每行传输字节数。一个 state 里的字段要么都写形状（或形状函数），要么
+主机内存分开计算；`pllm.explain` 给出主机字节数与每行传输字节数。主机表支持按行读取：`table[idx]`、`torch.index_select`、
+`torch.nn.functional.embedding`、`torch.vmap` 里的按行读，以及先取视图（如 `table[:, ::2]`）再按行读；对主机表做其他运算会在
+规划阶段被拒绝。只依赖 `pllm.input_tokens` 和只读表的查表方法，会在每步开始（`request.prepare`）放到旁路 CUDA stream（`side`）
+上，并只用约四分之一的 SM 读主机内存，从而与模型 forward 重叠；`pllm.explain` 里显示为 `request.prepare / side / captured`。
+一个 state 里的字段要么都写形状（或形状函数），要么都写 `pllm.Field`。
 都写 `pllm.Field`。
 
 ## 请求 Overlay
