@@ -389,8 +389,14 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
                     else "forward reads its entry state",
                 )
             )
-        if member.effect in ("custom_forward", "custom_residual"):
+        if member.effect == "custom_forward":
             result.append(EscapeHatch(name, member.effect, "enabled", False, "model forward runs eagerly"))
+        elif member.effect == "custom_residual":
+            result.append(
+                EscapeHatch(
+                    name, member.effect, "enabled", False, "model graphs capture source operators, not inductor fusion"
+                )
+            )
     for task in plan.semantic_graph.tasks:
         if task.custom_forward is not None and task.custom_forward.adaptive:
             result.append(

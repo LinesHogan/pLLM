@@ -42,9 +42,12 @@ class PagedKV:
 
     @property
     def requests(self) -> torch.Tensor:
-        """Request index per query, materialized only by reads that need token positions."""
+        """Request index per query, materialized only by reads that need token positions.
+
+        CUDA-graph padding rows past the last query map to the last request; their outputs are discarded.
+        """
         rows = torch.arange(self.query_count, device=self.query_start.device)
-        return (rows[:, None] >= self.query_start[1:][None, :]).sum(-1)
+        return (rows[:, None] >= self.query_start[1:][None, :]).sum(-1).clamp(max=len(self.seq_lens) - 1)
 
     @property
     def positions(self) -> torch.Tensor:
@@ -99,8 +102,7 @@ def selected_attention(
     kv: PagedKV, q: torch.Tensor, scale: float, window: int, topk: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather only selected positions; shared CPU/CUDA reference for dense read selection."""
-    rows = torch.arange(len(q), device=q.device)
-    requests = (rows[:, None] >= kv.query_start[1:][None, :]).sum(-1)
+    requests = kv.requests
     chosen = topk[:, None, :].expand(-1, q.shape[1], -1) if topk.ndim == 2 else topk
     valid = (chosen >= 0) & (chosen <= kv.positions[:, None, None])
     if kv.storage_window:
