@@ -37,7 +37,7 @@
 - [能力地图：哪些推理时算法今天能用 pllm 写](guides/capability-map.md)
 - [写一个负载：声明、时机、输入来源](guides/write-a-workload.md)
 - [写代码时就看到成本：pllm.explain](guides/explain.md)
-- [pllm 替你省下了什么：以内存为中心的性能指南](guides/performance.md)
+- [性能指南：为什么几行算法会拖慢解码，pllm 替你省下了什么](guides/performance.md)
 - [状态与记忆：作用域、冻结、route 键、memory 与捕获](guides/state-and-memory.md)
 - [训练与观测：loss 约定、梯度边、导出与 trace](guides/training-and-observation.md)
 - [Overlay 与重放：引擎内训练、外部导入、激活检查点](guides/overlays-and-replay.md)
