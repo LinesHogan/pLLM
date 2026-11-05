@@ -24,6 +24,7 @@ from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, paramete
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.sampler import (
+    BoundedSamplerGuidance,
     SamplerGuidance,
     SignedSamplerGuidance,
     SignedSamplerStages,
@@ -81,6 +82,14 @@ class VllmSession(Generic[DataT, ResultT]):
         cache_policy: CachePolicy,
     ) -> None:
         self._compute_logits = decoder.compute_logits
+        capacity = deployment.attachment.spec.guidance_capacity
+        self._guidance_weight = None
+        if capacity is not None and any(
+            stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in deployment.attachment.spec.sampler
+        ):
+            self._guidance_weight = decoder.guidance_weight()
+            if sampler is None or not sampler.bounded_guidance:
+                raise ValueError('bounded guidance needs runner="mrv2"; use guidance_capacity=None for exact guidance')
         self._cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
         plan = attachment.plan
@@ -523,8 +532,13 @@ class VllmSession(Generic[DataT, ResultT]):
         self.complete_forward()
         if self._step is None or self._sampler is None or not self._context().guidance:
             return lm_head(hidden) if logits is None else logits
-        stages: list[SignedSamplerGuidance] = []
+        stages: list[SignedSamplerGuidance | BoundedSamplerGuidance] = []
         for guidance in self._sampler_guidance():
+            if guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT and self._guidance_weight is not None:
+                capacity = self.attachment.spec.guidance_capacity
+                assert capacity is not None
+                stages.append(BoundedSamplerGuidance(guidance, self._guidance_weight, capacity))
+                continue
             if guidance.stage is not SamplerStage.PACKED_POST_FILTER_EXACT:
                 predicted = guidance.values
             elif logits is None:

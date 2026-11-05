@@ -367,6 +367,21 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
             + ("training may overlap later forwards" if lag else "updates serialize before the next forward"),
         )
     ]
+    if any(task.sampler_beta for task in binding.tensor_tasks.values()):
+        capacity = config.execution.guidance_capacity
+        result.append(
+            EscapeHatch(
+                "",
+                "guidance_capacity",
+                str(capacity),
+                capacity is None,
+                "exact dense post-filter guidance"
+                if capacity is None
+                else f"bounded guidance at <= {capacity} survivors/row; wider rows stay unguided; "
+                "peaked full-vocabulary rows use the true one-token nucleus when top-1 probability >= top_p < 1; "
+                "FLOP/byte estimates use capacity upper bounds; needs MRv2, unquantized unscaled TP=1 LM head",
+            )
+        )
     for name, member in binding.members.items():
         if member.phase is not None:
             result.append(EscapeHatch(name, "phase", member.phase, False, "overrides automatic task timing"))

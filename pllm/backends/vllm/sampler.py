@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
 
 from pllm.backends.vllm import compat
+from pllm.backends.vllm.guided_sampling import guided_sample
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.execution.cuda_stream import upload
 
@@ -53,14 +54,23 @@ class SignedSamplerGuidance:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundedSamplerGuidance:
+    """A hidden prediction whose projection is bounded by a survivor capacity."""
+
+    guidance: PackedSamplerGuidanceBatch
+    weight: torch.Tensor
+    capacity: int
+
+
+@dataclass(frozen=True, slots=True)
 class SignedSamplerStages:
     """Declared-order additions followed by the optional filtered-distribution guide."""
 
-    stages: tuple[SignedSamplerGuidance, ...]
+    stages: tuple[SignedSamplerGuidance | BoundedSamplerGuidance, ...]
     capture_feedback: bool = False
 
     @property
-    def guide(self) -> SignedSamplerGuidance | None:
+    def guide(self) -> SignedSamplerGuidance | BoundedSamplerGuidance | None:
         """The at-most-one post-filter stage admitted by the authoring boundary."""
         return next(
             (stage for stage in self.stages if stage.guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT), None
@@ -69,7 +79,7 @@ class SignedSamplerStages:
     def add_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Sum additions in their declared order before vLLM applies its filters."""
         for stage in self.stages:
-            if stage.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+            if isinstance(stage, SignedSamplerGuidance) and stage.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
                 logits = add_logits(logits, stage)
         return logits
 
@@ -83,6 +93,7 @@ class SamplerGuidance:
     """One intervention lifecycle and mathematical boundary shared by both runner ABIs."""
 
     _active_guidance: SignedSamplerStages | _SampledGuidance | None = None
+    bounded_guidance: bool = False
 
     def begin_guidance(self, guidance: SignedSamplerStages) -> None:
         assert self._active_guidance is None
@@ -138,6 +149,7 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
     """
 
     __slots__ = ("_active_guidance",)
+    bounded_guidance = True
 
     def __init__(self, upstream: VllmSampler) -> None:
         assert type(upstream) is VllmSampler
@@ -181,6 +193,27 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
         use_fused_sampler: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         match self._active_guidance:
+            case SignedSamplerStages(guide=BoundedSamplerGuidance() as guidance):
+                survivors = apply_top_k_top_p(processed_logits, top_k, top_p)
+                rows = [-1] * survivors.shape[0]
+                for index, row in enumerate(guidance.guidance.affected_row_ids):
+                    rows[row] = index
+                sampled = guided_sample(
+                    survivors,
+                    guidance.guidance.values.to(guidance.weight.dtype),
+                    guidance.weight,
+                    upload(rows, survivors.device),
+                    guidance.guidance.row_weights,
+                    guidance.guidance.beta,
+                    guidance.capacity,
+                    expanded_idx_mapping,
+                    self.sampling_states.temperature.gpu,
+                    self.sampling_states.seeds.gpu,
+                    pos,
+                    top_p,
+                    fp64=self.use_fp64_gumbel,
+                )
+                return sampled, survivors
             case SignedSamplerStages(guide=SignedSamplerGuidance() as guidance):
                 survivors = apply_top_k_top_p(processed_logits, top_k, top_p)
                 reweighted = self._reweight_finite_survivors(survivors, guidance)

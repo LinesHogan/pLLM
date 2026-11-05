@@ -124,6 +124,7 @@ class BackendAttachmentSpec:
 
     import_fields: tuple[tuple[str, FieldView], ...] = ()
     sampler: tuple[SamplerBinding, ...] = ()
+    guidance_capacity: int | None = None
     # The @pllm.train methods (request rows or a host batch).
     training: tuple[TaskSymbol, ...] = ()
     exports: tuple[TaskSymbol, ...] = ()

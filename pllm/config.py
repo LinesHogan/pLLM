@@ -55,6 +55,11 @@ class ExecutionOptions:
     # Only "measured" searches and times additional implementations.
     tuning: Literal["heuristic", "measured"] = "heuristic"
     publish_lag: int = 1
+    # None keeps exact dense post-filter guidance. Bounded mode guides all finite survivors
+    # when their count <= K; wider rows stay unguided. Full-vocabulary rows whose top-1
+    # probability >= top_p use the true one-token nucleus (only when top_p < 1).
+    # The bounded implementation needs MRv2 and an unquantized, unscaled TP=1 LM head.
+    guidance_capacity: int | None = None
 
     @property
     def model_capture_bytes(self) -> int:
@@ -62,6 +67,8 @@ class ExecutionOptions:
         return self.capture_memory_bytes or 64 << 20
 
     def __post_init__(self) -> None:
+        if self.guidance_capacity is not None and self.guidance_capacity not in (64, 128, 256, 512, 1024, 2048, 4096):
+            raise ValueError("guidance_capacity must be None (exact) or a power of two from 64 through 4096")
         if self.publish_lag < 0:
             raise ValueError("publish_lag must be >= 0; use 0 for strict ordering")
         if self.tuning not in ("heuristic", "measured"):

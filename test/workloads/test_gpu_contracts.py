@@ -36,28 +36,29 @@ class Steering(pllm.Workload):
 
 
 @pytest.mark.parametrize(
-    "workload,neutral",
+    "workload,neutral,capacity",
     [
-        (ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), ESampWorkload(ESampConfig(rank=2))),
-        (OutputLoRAWorkload(), OutputLoRAWorkload()),
-        (FactorAdapterWorkload(), FactorAdapterWorkload()),
-        (Steering(), Steering()),
-        (DoLaWorkload(layers=(0, 2)), None),
-        (PromptFactorsWorkload(), None),
+        (ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), ESampWorkload(ESampConfig(rank=2)), None),
+        (ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), ESampWorkload(ESampConfig(rank=2)), 4096),
+        (OutputLoRAWorkload(), OutputLoRAWorkload(), None),
+        (FactorAdapterWorkload(), FactorAdapterWorkload(), None),
+        (Steering(), Steering(), None),
+        (DoLaWorkload(layers=(0, 2)), None, None),
+        (PromptFactorsWorkload(), None, None),
         # The pretrained LM head needs late-layer features. Midpoint exits produce near-tied junk tokens,
         # whose argmax changes with GEMM width after eviction even when recompute is correct.
-        (Exit("mixed", exit_layer=22), Exit("all")),
+        (Exit("mixed", exit_layer=22), Exit("all"), None),
     ],
-    ids=("esamp", "output_lora", "adapter", "caa", "dola", "prompt_factors", "adaptive"),
+    ids=("esamp", "esamp_bounded", "output_lora", "adapter", "caa", "dola", "prompt_factors", "adaptive"),
 )
-def test_gpu_contracts(workload, neutral):
+def test_gpu_contracts(workload, neutral, capacity):
     config = pllm.ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct",
         max_model_len=64,
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
-        execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+        execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20, guidance_capacity=capacity),
     )
     result = check_on_gpu(workload, config, neutral=neutral)
     assert "explain/probe" in result.passed

@@ -43,6 +43,7 @@ class BenchmarkOptions:
     memory_budget_bytes: int | None = None
     sampling_n: int = 16  # completions per prompt, as in the aligned throughput settings
     cuda_graphs: bool = True  # --eager switches every arm and its vanilla reference to eager execution
+    guidance_capacity: int | None = None
 
     @classmethod
     def parse(cls, parser: argparse.ArgumentParser | None = None) -> tuple[BenchmarkOptions, argparse.Namespace]:
@@ -55,6 +56,12 @@ class BenchmarkOptions:
         parser.add_argument("--warmup", type=int, default=1)
         parser.add_argument("--sampling-n", type=int, default=16)
         parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
+        parser.add_argument(
+            "--guidance-capacity",
+            type=int,
+            choices=(64, 128, 256, 512, 1024, 2048, 4096),
+            help="guide rows with <= K survivors, wide rows unguided, peaked full rows use true nucleus; default exact",
+        )
         parser.add_argument(
             "--profile", type=Path, help="directory for a separate replay of the measured rounds per arm"
         )
@@ -91,6 +98,7 @@ class BenchmarkOptions:
             None if args.execution_memory_mib is None else args.execution_memory_mib * 1024**2,
             sampling_n=args.sampling_n,
             cuda_graphs=not args.eager,
+            guidance_capacity=args.guidance_capacity,
         )
         return options, args
 
@@ -237,6 +245,7 @@ def _measure_arm(
             capture_memory_bytes=options.capture_memory_bytes,
             state_memory_bytes=options.state_memory_bytes,
             memory_budget_bytes=options.memory_budget_bytes,
+            guidance_capacity=options.guidance_capacity,
         ),
     )
     started = perf_counter()

@@ -7,6 +7,7 @@ import torch
 from vllm import SamplingParams
 
 import pllm
+from pllm.backends.vllm import compat, sampler
 from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerStages
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload
 
@@ -28,11 +29,12 @@ class Stack(pllm.Workload):
     esamp: ESampWorkload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
 
 
-@pytest.mark.parametrize("runner", ("mrv1", "mrv2"))
-def test_additions_then_filtered_guidance(monkeypatch, runner):
+@pytest.mark.parametrize("runner,capacity", (("mrv1", None), ("mrv2", None), ("mrv2", 4096)))
+def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
     workload = Stack()
     add, reweight = SignedSamplerStages.add_logits, SamplerGuidance._reweight_finite_survivors
     checks = {"add": 0, "guide": 0, "trained": 0}
+    fused = sampler.guided_sample
 
     def inspect_add(stages, logits):
         assert [stage.guidance.member for stage in stages.stages[:2]] == ["steer.bias", "dola.contrast"]
@@ -62,6 +64,35 @@ def test_additions_then_filtered_guidance(monkeypatch, runner):
         checks["trained"] += int(weights.count_nonzero())
         return actual
 
+    def inspect_fused(
+        logits, hidden, weight, rows, weights, beta, limit, mapping, temperature, seeds, positions, p, *, fp64
+    ):
+        from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+        expected = logits.clone()
+        predicted = torch.nn.functional.linear(hidden, weight).float()
+        active = rows >= 0
+        selected = rows[active]
+        strengths = beta * weights[selected, None]
+        expected[active] = torch.where(
+            expected[active].isfinite(),
+            (1 + strengths) * expected[active] - strengths * predicted[selected],
+            expected[active],
+        )
+        actual = fused(
+            logits, hidden, weight, rows, weights, beta, limit, mapping, temperature, seeds, positions, p, fp64=fp64
+        )
+        torch.testing.assert_close(logits, expected, atol=0.02, rtol=0.004)
+        draw_args = {} if compat.VLLM_027 else {"is_drafting": False}
+        token = gumbel_sample(
+            expected, mapping, temperature, seeds, positions, apply_temperature=False, use_fp64=fp64, **draw_args
+        )
+        assert torch.equal(actual, token)
+        assert (logits.isfinite().sum(-1) <= 7).all()
+        checks["guide"] += 1
+        checks["trained"] += int(weights.count_nonzero())
+        return actual
+
     config = pllm.ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct",
         max_model_len=64,
@@ -69,10 +100,12 @@ def test_additions_then_filtered_guidance(monkeypatch, runner):
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
         runner=runner,
+        execution=pllm.ExecutionOptions(guidance_capacity=capacity),
     )
     with pllm.make_llm(config, workload=workload) as handle:
         monkeypatch.setattr(SignedSamplerStages, "add_logits", inspect_add)
         monkeypatch.setattr(SamplerGuidance, "_reweight_finite_survivors", staticmethod(inspect_guide))
+        monkeypatch.setattr(sampler, "guided_sample", inspect_fused)
         outputs = handle.generate(
             ["The sky is", "Water freezes because"],
             SamplingParams(max_tokens=5, ignore_eos=True, temperature=0.8, top_k=7, top_p=0.9, seed=7),

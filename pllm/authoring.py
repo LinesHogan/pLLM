@@ -149,7 +149,9 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             facts.state_memory_budget_bytes,
             facts.device,
         )
-        return bind_backend_attachment(plan, facts.probe, attachment)
+        return bind_backend_attachment(
+            plan, facts.probe, replace(attachment, guidance_capacity=facts.guidance_capacity)
+        )
 
     @abstractmethod
     def bind_math(
@@ -224,6 +226,7 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
         facts,
         timeline=timeline,
         state_memory_budget_bytes=options.state_memory_bytes or facts.state_memory_budget_bytes,
+        guidance_capacity=options.guidance_capacity,
     )
 
 

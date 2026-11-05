@@ -22,6 +22,7 @@ class BackendCompileFacts:
     vocab_size: int = 0
     layer_count: int = 0
     checkpoint: str = ""
+    guidance_capacity: int | None = None
 
     @property
     def device(self) -> torch.device:

@@ -153,6 +153,16 @@ def test_declared_flop_estimates(model_config):
     assert estimates["loss"].matmul_flops_estimate == rows * 14 * hidden * rank
     assert estimates["loss"].optimizer_bytes_estimate > 0
     assert estimates["predict"].sampler_bytes_estimate == rows * vocab * 10
+    bounded = pllm.explain(
+        ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
+        replace(model_config, execution=pllm.ExecutionOptions(guidance_capacity=4096)),
+    )
+    prediction = next(task for member in bounded.members for task in member.tasks if task.name == "predict")
+    assert prediction.estimate.projection_flops_estimate == rows * 2 * hidden * vocab
+    assert prediction.estimate.sampler_bytes_estimate == rows * (
+        4 * vocab + vocab * (hidden * 2 + 20) + hidden * 2 + 16
+    )
+    assert "wider rows stay unguided" in str(bounded)
     dola = pllm.explain(DoLaWorkload(layers=(0, 2)), model_config)
     contrast = next(task for member in dola.members for task in member.tasks if task.name == "contrast")
     assert contrast.estimate.projection_flops_estimate == rows * 3 * 2 * hidden * padded_vocab
