@@ -226,7 +226,7 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | Setting | Effect | Cost |
 | --- | --- | --- |
 | `ExecutionOptions(publish_lag=0)` | An update computed at step n is read from step n + 1 (default `1`: from n + 2). | Training no longer overlaps the next forward. |
-| `@pllm.train_in_forward(visibility="exact")` | Later chunks of the same forward read the updates of earlier chunks (default `"forward_pinned"`: the whole forward reads the state it started with). | Later chunks wait for earlier chunks' updates. Decode updates are captured in CUDA graphs; an engine with captured exact updates currently does not return all GPU memory when closed, so start further engines in a new process. |
+| `@pllm.train_in_forward(visibility="exact")` | Later chunks of the same forward read the updates of earlier chunks (default `"forward_pinned"`: the whole forward reads the state it started with). | Later chunks wait for earlier chunks' updates. Decode updates are captured in CUDA graphs; engines can be closed and recreated in the same process. |
 | `tokens=` on `pllm.hidden` / `pllm.residual` / `pllm.final_hidden` | `"prefill"` reads each prompt's last token once its prefill completes (default `"decode"`: the latest decode token). | None; it selects different rows. |
 | `tokens=` on `@pllm.custom_forward` / `@pllm.train_in_forward` | Which tokens the method handles: `"prefill"`, `"decode"` or `"all"`. | Rows outside the selection run the plain model. |
 | `@pllm.on(phase)` | Moves a method to another phase. | Overrides automatic timing; `explain` lists it. |

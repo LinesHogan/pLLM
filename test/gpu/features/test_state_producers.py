@@ -2,17 +2,92 @@
 
 import time
 from dataclasses import dataclass, replace
+from unittest.mock import patch
 
 import pytest
 import torch
 from vllm import SamplingParams
 
 import pllm
+from pllm.backends.vllm.sampler import GuidedSampler
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import StateResource
 from pllm.execution.tensor_executor import TensorExecutor
 from pllm.workloads.state_producers import DecodeFactorsWorkload, PromptFactorsWorkload, PromptMixtureWorkload
-from test.gpu.vllm_inplace_ttt_smoke import open_llm
+from test.gpu.vllm_inplace_ttt_smoke import ImportedLowRank, open_llm
+
+
+def _assert_imported_factor_rows(handle, fields, indices):
+    """Read the graph's actual page indices, independently of admission and publication order."""
+    session = handle.runner.require_session()
+    (reader,) = session._overlay.readers
+    rows = session._step.rows.row_batch
+    count = next(size for size in reader.programs if size >= rows.total_rows)
+    slots, positions, owners = reader.ports(reader.table, count)
+    for row in rows.request_rows:
+        block = int(owners[row.packed_row_index]) // positions.shape[1]
+        prompt = indices.index(row.identity.prompt_index)
+        for field, (pool, expected) in enumerate(zip(reader.pools, fields, strict=True)):
+            torch.testing.assert_close(pool[int(slots[block, field])], expected[prompt].to(pool), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("workload", [PromptFactorsWorkload(), ImportedLowRank()])
+@pytest.mark.parametrize("chunked", [False, True])
+def test_prompt_lora_batch_matches_individual_requests(workload, chunked):
+    """Prompt-produced and imported factors follow prompt order across prefill chunks and samples."""
+    prompts = [
+        "What is the capital of France? Answer in one sentence.",
+        "Name three primary colors.",
+        "What is two plus two? Explain your answer in one sentence.",
+    ]
+    indices = (29, 3, 17)
+    with open_llm(
+        workload,
+        seqs=6,
+        tokens=8 if chunked else 128,
+        model_length=128,
+        chunked=chunked,
+        cuda_graphs=True,
+        capture_memory_bytes=512 << 20,
+        memory_budget_bytes=3 << 30,
+    ) as handle:
+        fields = None
+        if isinstance(workload, ImportedLowRank):
+            (layout,) = handle.attachment.plan.tensor_layout_request.layouts
+            # A small external hypernetwork maps prompt features to distinct LoRA factors.
+            features = torch.tensor([[len(p) / 64, sum(p.encode()) % 31 / 31] for p in prompts])
+            generator = torch.Generator().manual_seed(19)
+            fields = tuple(
+                torch.einsum("pc,c...->p...", features, torch.randn(2, *field.shape, generator=generator) * 0.02).to(
+                    handle.device
+                )
+                for field in layout.layout.fields
+            )
+        sample = GuidedSampler.__call__
+
+        def inspect(sampler, logits, inputs):
+            if fields is not None:
+                _assert_imported_factor_rows(handle, fields, indices)
+            return sample(sampler, logits, inputs)
+
+        with patch.object(GuidedSampler, "__call__", inspect):
+            for n in (1, 2):
+                # Exercise one adapted decode step; low temperature avoids rounding-sensitive random draws.
+                sampling = SamplingParams(max_tokens=2, temperature=0 if n == 1 else 0.1, n=n, seed=71, ignore_eos=True)
+                batch = None if fields is None else pllm.io.StateImport(fields)
+                outputs = handle.generate(prompts, sampling, batch=batch, prompt_indices=indices)
+                for i, prompt in enumerate(prompts):
+                    batch = None if fields is None else pllm.io.StateImport(tuple(field[i : i + 1] for field in fields))
+                    (single,) = handle.generate([prompt], sampling, batch=batch, prompt_indices=(indices[i],))
+                    assert outputs[i].prompt_token_ids == single.prompt_token_ids
+                    assert [sample.token_ids for sample in outputs[i].outputs] == [
+                        sample.token_ids for sample in single.outputs
+                    ]
+        diagnostics = handle.diagnostics()
+        assert diagnostics.active_states == len(
+            handle.runner.require_session()._deployment.execution.directory.instance_states
+        )
+        assert diagnostics.pending_state_releases == 0
 
 
 @pytest.mark.parametrize("workload", [PromptFactorsWorkload(), PromptMixtureWorkload(), DecodeFactorsWorkload()])
