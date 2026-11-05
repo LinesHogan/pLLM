@@ -78,13 +78,14 @@ def _host_rows(
     source: torch.Tensor,
     rows: torch.Tensor,
     output: torch.Tensor,
-    height: tl.constexpr,
+    height: int,
     width: tl.constexpr,
-    stride0: tl.constexpr,
-    stride1: tl.constexpr,
-    count: tl.constexpr,
+    stride0: int,
+    stride1: int,
+    count: int,
     block: tl.constexpr,
 ) -> None:
+    # Row counts and strides vary per step and view; as runtime arguments they reuse one compiled kernel.
     tiles = tl.cdiv(width, block)
     for tile in tl.range(tl.program_id(0), count * tiles, tl.num_programs(0)):
         row = tile // tiles
