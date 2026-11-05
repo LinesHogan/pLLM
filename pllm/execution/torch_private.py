@@ -22,10 +22,13 @@ from torch._library.custom_ops import CustomOpDef as CustomOpDef, _maybe_get_opd
 from torch._ops import OpOverload, OpOverloadPacket, _OpNamespace, _Ops  # pyright: ignore[reportPrivateUsage]
 from torch._subclasses.fake_tensor import DynamicOutputShapeException, FakeTensor, FakeTensorMode as FakeTensorMode
 from torch.multiprocessing.reductions import StorageWeakRef
+from torch.overrides import TorchFunctionMode
 from torch.utils import _python_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 from torch.utils.flop_counter import flop_registry
+
+from pllm.kernels.page_copy import host_rows
 
 fork_rng: Callable[[list[int]], AbstractContextManager[None]] = torch.random.fork_rng  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
 manual_seed: Callable[[int], torch.Generator] = torch.manual_seed  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
@@ -177,6 +180,47 @@ class CustomOpTrace(TorchDispatchMode):
             )
             self.calls.append((definition, flops, size))
         return result
+
+
+class HostGather(TorchFunctionMode):
+    """Materialize declared host tables' row reads before compiled tensor arithmetic."""
+
+    def __init__(self, tables: tuple[torch.Tensor, ...]) -> None:
+        self.tables = tables
+
+    def __torch_function__(
+        self,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        keywords = kwargs or {}
+        if func in (torch.nn.functional.embedding, torch.embedding, torch.ops.aten.embedding.default):
+            weight, index = (1, 0) if func is torch.nn.functional.embedding else (0, 1)
+            source = args[weight] if len(args) > weight else keywords["weight"]
+            key = "input" if func is torch.nn.functional.embedding else "indices"
+            indices = args[index] if len(args) > index else keywords[key]
+            if any(source is table for table in self.tables):
+                assert isinstance(source, torch.Tensor) and isinstance(indices, torch.Tensor)
+                return host_rows(source, indices)
+        source = args[0] if args else keywords.get("input", keywords.get("self"))
+        if any(source is table for table in self.tables):
+            assert isinstance(source, torch.Tensor)
+            if func in (torch.Tensor.__getitem__, torch.ops.aten.index.Tensor):
+                indices = tree_leaves(args[1] if len(args) > 1 else keywords["indices"])
+                if len(indices) == 1 and isinstance(indices[0], torch.Tensor):
+                    return host_rows(source, indices[0])
+            if func in (torch.index_select, torch.Tensor.index_select, torch.ops.aten.index_select.default):
+                indices = args[2] if len(args) > 2 else keywords["index"]
+                assert isinstance(indices, torch.Tensor)
+                return host_rows(source, indices)
+            result = func(*args, **keywords)
+            # Planning already restricts host-table operations to views and row reads.
+            if isinstance(result, torch.Tensor):
+                self.tables = (*self.tables, result)
+            return result
+        return func(*args, **keywords)
 
 
 class GatherTrace(TorchDispatchMode):

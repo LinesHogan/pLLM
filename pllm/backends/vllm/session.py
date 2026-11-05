@@ -366,6 +366,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if self._attention is not None:
             self._attention.prepare(rows.row_batch, rows)
         adapter = self._forward_overlay
+        # Token-only helpers need their side lane started before the model forward.
         if (
             adapter is None
             and self._activation is None
@@ -373,6 +374,7 @@ class VllmSession(Generic[DataT, ResultT]):
             and (self._attention is None or not self._attention.program.facts)
             and self._custom_forward is None
             and not self._trains_on_batch
+            and self.input_tokens is None
         ):
             return
         if adapter is not None:

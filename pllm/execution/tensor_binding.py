@@ -64,6 +64,7 @@ from pllm.execution.tensor_program import (
     native_body,
 )
 from pllm.execution.tensor_task import TensorTask
+from pllm.execution.torch_private import HostGather
 
 if TYPE_CHECKING:
     from pllm.execution.checkpoint import PretrainedFile
@@ -113,6 +114,26 @@ def _tensor_math(function: TensorMath, **inputs: torch.Tensor) -> torch.Tensor |
     # Dynamo installs bytecode globals in this module, rather than a frozen
     # workload function's private snapshot of its author's globals.
     return function(**inputs)
+
+
+def _host_math(
+    function: TensorMath, names: tuple[str, ...], **inputs: torch.Tensor
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    tables = tuple(inputs[name] for name in names)
+    if not tables[0].is_cuda:
+        return function(**inputs)
+    with HostGather(tables):
+        return function(**inputs)
+
+
+def _host_table_task(task: TensorTask, resources: set[StateResource]) -> TensorTask:
+    """Lower every host field's row reads through the same bounded gather."""
+    names = tuple(
+        key
+        for key, source in task.sources.items()
+        if isinstance(source, StateSelectionInputSource) and source.resource in resources
+    )
+    return replace(task, function=partial(_host_math, task.function, names)) if names else task
 
 
 def _lookup_math(task: TensorTask, facts: BackendCompileFacts | None) -> TensorMath | None:
@@ -328,6 +349,8 @@ class TensorBinding(Builder[TensorFrame]):
             for symbol in self.operations
             if symbol not in self.tensor_tasks
         }
+        host = {state.resource for state in self.graph.states if state.placement == "host"}
+        tasks = {symbol: _host_table_task(task, host) for symbol, task in self.tensor_tasks.items()}
         scans = (
             None
             if facts is None
@@ -342,21 +365,28 @@ class TensorBinding(Builder[TensorFrame]):
                 blas_workspace_bytes=facts.probe.blas_workspace_bytes,
             )
         )
-        compiled = {symbol: _lookup_math(task, facts) for symbol, task in self.tensor_tasks.items()}
+        compiled = {symbol: _lookup_math(task, facts) for symbol, task in tasks.items()}
         warmed = {
             dependency.symbol
             for symbol, function in compiled.items()
             if warmup and function is not None
-            for dependency in self.tensor_tasks[symbol].dependencies(self.tensor_tasks)
+            for dependency in tasks[symbol].dependencies(tasks)
         }
         sample = example(self, facts, ExecutionOptions()) if warmed and facts is not None else None
         for symbol in producers_first(self.graph, tuple(self.tensor_tasks)):
-            task = self.tensor_tasks[symbol]
+            task = tasks[symbol]
             values = (
                 None if sample is None or symbol not in warmed else (task_example(sample[0], task.phase), sample[1])
             )
             build = partial(
-                self._tensor_operation, task, facts, limits if capture else {}, compiled[symbol], values, map_host
+                self._tensor_operation,
+                task,
+                tasks,
+                facts,
+                limits if capture else {},
+                compiled[symbol],
+                values,
+                map_host,
             )
             operations[symbol] = build() if scans is None else scans.bind(build)()
         if scans is None:
@@ -378,6 +408,7 @@ class TensorBinding(Builder[TensorFrame]):
     def _tensor_operation(
         self,
         task: TensorTask,
+        tasks: Mapping[TaskSymbol, TensorTask],
         facts: BackendCompileFacts | None,
         limits: Mapping[TaskSymbol, TaskResourceFact],
         compiled: TensorMath | None,
@@ -393,7 +424,7 @@ class TensorBinding(Builder[TensorFrame]):
         if task.writer is None:
             executor = TensorExecutor(
                 task,
-                self.tensor_tasks,
+                tasks,
                 optimizer,
                 capture=step_capture,
                 device=torch.device("cpu") if facts is None else facts.device,

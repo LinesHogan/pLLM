@@ -1,16 +1,21 @@
 """Explicit host lookup matches device lookup, neutral residuals and the bounded-memory large-table case."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 from unittest.mock import patch
 
 import pytest
 import torch
 from safetensors.torch import save_file
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 import pllm
 from examples.engram_lite import EngramLite, fit
+from pllm.backends.vllm.session import VllmSession
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.state_execution import StateExecution
+from pllm.execution.step_capture import capture_graph
+from pllm.execution.torch_private import HostGather
 from pllm.testing import check_on_gpu
 from pllm.testing_gpu import _release_models
 from test.gpu.features.test_custom_residual import CONFIG, Observe, _generate
@@ -33,6 +38,38 @@ def test_lookup_compile_failure_at_startup():
     with pytest.raises(ValueError, match=message):
         with pllm.make_llm(CONFIG, workload=UntraceableLookup()):
             pass
+
+
+def _row_reads(table, indices):
+    with HostGather((table,)):
+        table = table[:, ::2]
+        return (
+            table[indices - 4],
+            torch.index_select(input=table, dim=0, index=indices[0]),
+            torch.nn.functional.embedding(input=indices, weight=table),
+            torch.vmap(lambda row: table[row])(indices),
+        )
+
+
+def test_host_row_gathers_replay_device_indices():
+    for dtype, index_dtype in ((torch.bfloat16, torch.int64), (torch.int64, torch.int32)):
+        host = torch.arange(8 * 32771, dtype=torch.int64).to(dtype).reshape(8, 32771).pin_memory()
+        table = get_accelerator_view_from_cpu_tensor(host)
+        indices = torch.zeros((2, 3), device="cuda", dtype=index_dtype)
+        read = torch.compile(_row_reads, fullgraph=True, options={"triton.cudagraphs": False})
+        graph, outputs, _ = capture_graph(table.device, partial(read, table, indices))
+        for values in ([[7, 1, 1], [0, 4, 3]], [[2, 5, 0], [6, 7, 2]]):
+            rows = torch.tensor(values)
+            indices.copy_(rows)
+            graph.replay()
+            expected = (
+                host[:, ::2][rows - 4],
+                host[:, ::2].index_select(0, rows[0]),
+                host[:, ::2][rows],
+                host[:, ::2][rows],
+            )
+            for actual, wanted in zip(outputs, expected, strict=True):
+                torch.testing.assert_close(actual.cpu(), wanted, rtol=0, atol=0)
 
 
 def generation(workload, config):
@@ -61,6 +98,13 @@ def test_engram_placements_and_capture(tmp_path, logits):
             torch.cuda._sleep(100_000_000)
         fill_versions(arena, write, fields)
 
+    complete = VllmSession.complete_forward
+
+    def complete_forward(session):
+        # A late request.prepare would serialize host reads after the transformer.
+        assert session._step is not None and session._step.context is not None
+        complete(session)
+
     def delayed(execution, context, task):
         if task.lane == "side":
             with torch.cuda.stream(execution.side_stream):
@@ -71,6 +115,7 @@ def test_engram_placements_and_capture(tmp_path, logits):
     with (
         patch.object(StateExecution, "_execute_task", delayed),
         patch.object(PageBundleArena, "_fill_versions", delay_admission),
+        patch.object(VllmSession, "complete_forward", complete_forward),
     ):
         assert generation(host, config) == expected
     if not logits:
