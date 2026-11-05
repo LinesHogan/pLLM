@@ -18,7 +18,7 @@ from pllm.execution.step_capture import capture_graph
 from pllm.execution.torch_private import HostGather
 from pllm.testing import check_on_gpu
 from pllm.testing_gpu import _release_models
-from test.gpu.features.test_custom_residual import CONFIG, Observe, _generate
+from test.gpu.features.test_custom_residual import CONFIG, Observe, _deviation, _generate, _oracle_logprobs
 from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 from test.workloads.test_pretrained import LogitLookup
 
@@ -78,6 +78,24 @@ def generation(workload, config):
     return _generate(workload, config)
 
 
+def _lookup_logprobs(tokens, table):
+    """The FP32 model plus the lookup's pretrained bonus, before normalization."""
+    logprobs = _oracle_logprobs(tokens)
+    ids = torch.tensor(tokens, device=logprobs.device)
+    previous = torch.cat((ids.new_full((1,), -1), ids[:-1]))
+    bonus = table.to(logprobs)[(ids + previous).remainder(len(table))]
+    return (logprobs + bonus).log_softmax(-1)
+
+
+def _assert_lookup_generation(actual, expected, table):
+    """Concurrent model kernels may round differently; host lookup must retain FP32 accuracy."""
+    assert [tokens for tokens, _ in actual] == [tokens for tokens, _ in expected]
+    oracle = partial(_lookup_logprobs, table=table)
+    expected_error, _ = _deviation(expected, oracle)
+    actual_error, _ = _deviation(actual, oracle)
+    assert actual_error <= expected_error + torch.finfo(torch.bfloat16).eps
+
+
 @pytest.mark.parametrize("logits", (False, True))
 def test_engram_placements_and_capture(tmp_path, logits):
     corpus = tmp_path / "corpus.txt"
@@ -86,7 +104,8 @@ def test_engram_placements_and_capture(tmp_path, logits):
     fit(str(corpus), path, buckets=1024, width=16)
     host = EngramLite(path, buckets=1024, width=16, placement="host")
     if logits:
-        save_file({"table": torch.randn(8, 151936, dtype=torch.bfloat16) / 64}, path)
+        table = torch.randn(8, 151936, dtype=torch.bfloat16) / 64
+        save_file({"table": table}, path)
         host = LogitLookup(path)
     config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=32, enable_chunked_prefill=True)
     expected = generation(replace(host, placement="device"), config)
@@ -117,12 +136,20 @@ def test_engram_placements_and_capture(tmp_path, logits):
         patch.object(PageBundleArena, "_fill_versions", delay_admission),
         patch.object(VllmSession, "complete_forward", complete_forward),
     ):
-        assert generation(host, config) == expected
+        actual = generation(host, config)
+    if logits:
+        _assert_lookup_generation(actual, expected, table.float() * host.gate)
+    else:
+        assert actual == expected
     if not logits:
         assert generation(host, replace(config, cuda_graphs=False)) == expected
     # Residual hooks capture vLLM source operators; use that arithmetic for the logprob oracle.
     baseline = generation(None, config) if logits else generation(Observe(), replace(config, cuda_graphs=False))
-    assert generation(replace(host, gate=0), config) == baseline
+    neutral = generation(replace(host, gate=0), config)
+    if logits:
+        _assert_lookup_generation(neutral, baseline, torch.zeros_like(table, dtype=torch.float32))
+    else:
+        assert neutral == baseline
     result = check_on_gpu(host, replace(config, max_num_batched_tokens=128), neutral=replace(host, gate=0))
     assert "host syncs: eight steady decode steps" in result.passed
     assert (
