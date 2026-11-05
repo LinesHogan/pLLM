@@ -112,12 +112,12 @@ class CenteredHidden(pllm.Workload):
 批次类型，顺序为 `WeightedRowBatch`、`CausalTrainBatch`、`WeightedCEBatch`。
 状态的优化器与输入不符时，声明期报错并说明应声明哪种优化器。
 
-`@train(state=..., update=...)` 绑定一个标量 loss 和一个可选的状态资格选择器；
-`@on(phase, rows=...)` 独立选择它的前向行。选择器是具名 Tensor 方法，
+`@train(state=..., rows=..., update_rows=...)` 绑定一个 loss、一个可选的前向行选择器（`rows=`）
+和一个可选的状态资格选择器（`update_rows=`）。选择器是具名 Tensor 方法，
 只使用该操作已注解输入的子集，返回其原始行轴上的布尔掩码，并成为同一签名图中的
-普通任务 —— 不是执行期回调。旧的 `train(select=...)` 选项已移除；
-OverRIDE 用 `on(..., rows=...)` 表达它原先的训练子集。
-不带 `update` 时，更新前向行所代表的状态。显式的 update 掩码授权每个选中行的
+普通任务 —— 不是执行期回调。独立的请求训练和与 `@pllm.guide_sampling` 并存的训练会更新
+每个选中的状态，这两种情况下 `rows=`/`update_rows=` 会被拒绝。
+不带 `update_rows` 时，更新前向行所代表的状态。显式的 update_rows 掩码授权每个选中行的
 原始状态（任一选中行授权共享状态一次），与前向或梯度资格相互独立。
 空的 update 选择保留所有字段与版本；被授权的零梯度仍会推进 Adam 步数、
 动量与衰减，包括空前向调用。标量函数自己拥有归约；绑定不会发明归一化。

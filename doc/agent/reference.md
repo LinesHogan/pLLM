@@ -204,7 +204,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
 
 | Name | Meaning |
 | --- | --- |
-| `@pllm.train(*, state, reduction="mean", rows="", update_rows="", steps=1, reset="")` | Minimize the returned loss with the optimizer declared on `state`; the framework masks padding, averages, backpropagates, applies the optimizer and publishes the new version. Return a `[rows]` loss (or a scalar). `reduction="state_mean"` averages each state's rows, then sums over states. |
+| `@pllm.train(*, state, reduction="state_mean", rows="", update_rows="", steps=1, reset="")` | Minimize the returned loss with the optimizer declared on `state`; the framework masks padding, averages, backpropagates, applies the optimizer and publishes the new version. Return a `[rows]` loss (or a scalar). The default `reduction="state_mean"` averages each state's rows, then sums over states; `"mean"` averages over all rows. |
 | `pllm.AdamW(lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0)` | The optimizer for training on request rows and on `WeightedRowBatch` / `CausalTrainBatch` host batches. Declared on the state: `optimizer=pllm.AdamW(1e-3)`. |
 | `pllm.SGD(lr)` | The optimizer for `WeightedCEBatch` training (`steps=`, `reset=`) and for `@pllm.train_in_forward`. |
 | `@pllm.differentiate(*, inputs=(), parameters=False, input_rows="", parameter_rows="")` | Keep gradient edges through a non-loss method: `inputs` names its arguments whose gradients flow, `parameters=True` lets its parameters train too. A training method reads its result with `pllm.result(name)`. |

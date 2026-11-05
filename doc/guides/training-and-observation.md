@@ -52,7 +52,8 @@ def learn(
 第三个约定容易踩坑：**零梯度不等于不更新**。被授权的状态即使梯度为零，也会
 推进优化器的步数、动量与衰减。如果你真的想跳过某些行的更新，不要靠让梯度
 变零，而要在选择器层面把行排除——`@train(state=..., rows=...)` 或
-`@train(state=..., update=...)` 的选择器就是干这个的。
+`@train(state=..., update_rows=...)` 的选择器就是干这个的。注意：独立的请求训练和与
+`@pllm.guide_sampling` 并存的训练会更新每个选中的状态，这两种情况下声明 `rows=`/`update_rows=` 会被拒绝。
 
 最后，如果你想让训练影响采样本身：加一个 `BEFORE_SAMPLE` 相位的任务并声明
 `@pllm.guide_sampling(beta=...)`，它返回的 hidden 预测会经原始采样器链接

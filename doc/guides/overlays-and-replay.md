@@ -149,7 +149,7 @@ AFTER_FORWARD 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；
 forward，不改变已完成的 prompt forward 或由它采样的第一个生成 token。
 
 These examples use eager execution with TP=PP=1. See
-[Supported models](../../README.md#支持的模型与限制) for
+[Supported models](../../README.md#支持的模型) for
 architectures and the exact-class admission rule: overlays and replay need a
 Qwen2, Llama or Qwen3 model, quantized or not. Q/V factor sizes come from
 the selected projections; query width need not equal hidden width. The AdamW

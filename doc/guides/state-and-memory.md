@@ -99,7 +99,7 @@ pin 住的版本，永远不是「最新值」。`pllm.version(state)` 输入给
 ## 我想跨步记点东西：carry 字段与 pllm.carry
 
 优化器状态（参数 + Adam 槽）之外的普通记忆——上一轮的 carry、上一个请求
-的终态——用 `memory=` 声明：
+的终态——用 `carry=` 声明：
 
 ```python
 head = pllm.RequestState(
