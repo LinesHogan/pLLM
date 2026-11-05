@@ -464,7 +464,7 @@ class LookupPrior(pllm.Workload):
 > **实用建议与限制**
 > * **怎么让主机查表成功藏进前向里？** 把查表写成**不带效果装饰器的独立方法**，只读取 `pllm.input_tokens` 和不可变状态，再让 `@pllm.add_logits` 或 `@pllm.custom_residual` 通过 `pllm.result("lookup")` 读它的结果。这样规划器才能把它排到 `request.prepare / side`。如果把查表直接写在 `@pllm.add_logits` 方法体里，它会落在 `model.execute / main`；如果查表方法还读了 `pllm.hidden` 或 `pllm.final_hidden`，它要等前向结束（`state.publish / main`）。两种情况传输都无法与前向重叠。
 > * **怎么估算 PCIe 传输能不能藏住？** 看 `pllm.explain` 输出的 `logical transfer bytes/row`（或 `decode bytes/step`），用 $\frac{\text{并发数} \times \text{bytes/row}}{22\text{ GB/s}}$ 估算 PCIe 耗时。只要它明显短于一次模型前向（如 0.5B 的 $3.3\text{ ms}$），绝大部分传输都能被藏住。
-> * **`placement="host"` 支持的操作**：仅支持只读 `pretrained` 表的按行读取，包括直接索引 `table[idx]`（含切片视图如 `table[:, ::2][idx]`）、`torch.index_select`、`torch.nn.functional.embedding` 和 `torch.vmap`，其他操作在规划时被拒绝。模型层内的方法（如 `@pllm.custom_residual`）不能直接读主机表，要通过 `pllm.result` 读取独立查表方法的结果。`pllm` 不会为了装下预算自动把表挪到主机内存，这个取舍由你显式声明。
+> * **`placement="host"` 支持的操作**：仅支持只读 `pretrained` 表的按行读取，包括直接索引 `table[idx]`（含切片视图如 `table[:, ::2][idx]`）、`torch.index_select`、`torch.nn.functional.embedding` 和 `torch.vmap`，其他操作在规划时被拒绝。模型层内的方法（如 `@pllm.custom_residual`）不能直接读主机表，要通过 `pllm.result` 读取独立查表方法的结果。原因是：模型层内的方法在模型图里、主 stream 上某一层的中间执行，在那里读主机内存，PCIe 搬运会直接卡住这一层之后的前向，藏不掉；拆成只依赖 token 和只读表的独立方法后，规划器才能把它提前到步首的旁路 stream，用少量 SM 读、与前向重叠（见上一条）。同一个查表结果也可以同时交给多个效果方法，而只搬一次。`pllm` 不会为了装下预算自动把表挪到主机内存，这个取舍由你显式声明。
 
 ---
 
