@@ -113,3 +113,4 @@ vLLM 的 DSA、DeepSeek V4/V4.1 的 attention 路径需要 sm90 及以上的 GPU
 - 静态 KV 布局需要 MRv2 runner（默认），不能和 `PositionState` 或 `@pllm.custom_forward` 一起用。
 - 张量并行只在 vLLM 0.32.0 的 MRv2 runner 上，哪些功能可以多卡见 README。
 - 一个原则：贵的选择由你显式写出来，pllm 不替你做——大表放显存还是主机内存、KV 怎么存、训练结果几步后可见（`publish_lag`），都写在你的声明里，`pllm.explain` 把代价列出来。默认值只替你省掉小的决定。
+- 这些能力各自省的是哪种资源（显存容量、显存带宽、PCIe、卡间通信、时间线气泡、SM、host CPU）、实测效果和边界，见 [以内存为中心的性能指南](performance.md)。

@@ -177,6 +177,7 @@ Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构验
 - 用 agent 开发 pllm workload → 把 [agent skill](doc/agent/SKILL.md) 和 [agent 参考](doc/agent/reference.md)交给你的编码代理：工作流、报错修法和全部公开名字，示例都可执行
 - 想知道某类算法能不能写 → [能力地图](doc/guides/capability-map.md)
 - 写好负载、启动之前先看计划 → [写代码时就看到成本](doc/guides/explain.md)
+- 想知道 pllm 在显存、带宽、PCIe、气泡上替你省了什么、边界在哪 → [以内存为中心的性能指南](doc/guides/performance.md)
 - 按任务查写法 → [使用指南](doc/README.md#使用指南任务导向)
 - 查某条声明的精确边界 → [负载创作契约](doc/reference/authoring-contract.md)
 - 理解架构 → [设计说明](doc/design/architecture.md)
