@@ -53,6 +53,7 @@ def frozen_projection(hidden: torch.Tensor, projection: LinearBase) -> torch.Ten
 
 def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
     """Normalize the dense families' full hidden width in FP32, rounding once to the model dtype."""
+    assert module.variance_size_override is None
     return F.rms_norm(hidden.float(), (hidden.shape[-1],), module.weight.float(), module.variance_epsilon).to(
         hidden.dtype
     )
