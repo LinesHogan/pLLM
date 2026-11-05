@@ -76,8 +76,7 @@ GPU_MEMORY_FRACTIONS = {
     "residual": 0.2,
     "producers": 0.25,
     "feeds": 0.25,
-    "routes": 0.3,
-    "positions": 0.25,
+    "routes": 0.4,  # Composed TTT state/scratch accompanies the 0.3 model reservation.
     "esamp": 0.4,
     "feedback": 0.35,
     "reft": 0.25,
