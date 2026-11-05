@@ -67,10 +67,20 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 # Maximum vLLM startup demand per GPU; unlisted stages use the Config default (0.5).
 GPU_MEMORY_FRACTIONS = {
+    "gpu-core": 0.3,
+    "graph-replay": 0.25,
+    "enginecore-capture": 0.25,
+    "enginecore-io": 0.35,
+    "enginecore": 0.35,
     "attention": 0.3,
+    "residual": 0.2,
     "producers": 0.25,
+    "feeds": 0.25,
+    "routes": 0.3,
+    "positions": 0.25,
     "esamp": 0.4,
-    "inplace": 0.25,
+    "feedback": 0.35,
+    "reft": 0.25,
     "tp": 0.35,
     "adaptive-quality": 0.75,
 }
