@@ -65,9 +65,9 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("docs/*", ()),
     ("*.md", ()),
 )
-# Maximum vLLM startup demand per GPU; unlisted stages use the Config default (0.5).
+# Startup demand per GPU, including resident oracles; unlisted stages use 0.5.
 GPU_MEMORY_FRACTIONS = {
-    "gpu-core": 0.3,
+    "gpu-core": 0.4,  # 0.3 startup plus retained FP32 oracle and closed-engine allocations.
     "graph-replay": 0.25,
     "enginecore-capture": 0.25,
     "enginecore-io": 0.35,
