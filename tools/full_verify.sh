@@ -102,6 +102,7 @@ run_stage() {
     producers) pytest_gpu test/gpu/features/test_state_producers.py ;;
     routes)
       pytest_gpu test/gpu/features/test_composed_model_sites.py || rc=1
+      pytest_gpu test/gpu/features/test_custom_forward_adapter.py || rc=1
       for name in vllm_layer_loop_smoke vllm_recirculation_smoke vllm_route_updates_smoke; do smoke "$name" || rc=1; done
       return "$rc" ;;
     positions) smoke vllm_step_loop_smoke ;;

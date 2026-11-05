@@ -432,7 +432,7 @@ def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram
         for step in program.steps:
             if not isinstance(step, Segment) or step.active is None:
                 continue
-            for target in b.overlay_targets:
+            for target in () if b.overlay_math is None else b.overlay_math.targets:
                 if target.layer is not None and step.start <= target.layer < step.stop:
                     raise ValueError(
                         f"train_in_forward targets layer {target.layer}, which tokens skip; target layers below {step.start} or remove active="
@@ -456,8 +456,7 @@ def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram
 
 
 def _check_custom_forward(b: TensorBinding) -> None:
-    """Reject effects whose backend hooks index the forward's packed rows, which a custom forward replaces with its
-    own row waves and layer visits."""
+    """Reject output taps that the custom layer loop does not produce."""
     for task in b.graph.tasks:
         if any(
             isinstance(port.source, HiddenInputSource)
@@ -468,15 +467,6 @@ def _check_custom_forward(b: TensorBinding) -> None:
                 f"{task.symbol} reads block or model outputs, which a @pllm.custom_forward does not produce; "
                 "use pllm.residual or pllm.layer_logits to read each layer's last visited stream"
             )
-    adapters = {binding.resource for binding in b.effects.overlay_bindings} - {
-        str(effect.resource) for task in b.graph.tasks if task.symbol == b.effects.in_forward for effect in task.effects
-    }
-    if adapters:
-        raise ValueError(
-            f"pllm.model.Adapter reading {sorted(adapters)} corrects projections for the model's own packed rows; "
-            "inside a @pllm.custom_forward only the @pllm.train_in_forward state is applied, so train the adapter "
-            "with train_in_forward or drop the custom forward"
-        )
 
 
 def _read_publications(b: TensorBinding, publications: tuple[Call, ...], task: SemanticTask) -> SemanticTask:

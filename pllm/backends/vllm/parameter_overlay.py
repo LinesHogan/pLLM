@@ -402,11 +402,14 @@ class _ProjectionReader:
         budget: int,
         *,
         math: OverlayTransition | None = None,
+        in_program: bool = False,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
         self.forward_base = self.module.forward
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
+        self.in_program = in_program
+        self.call_rows: torch.Tensor | None = None
         self.enabled = True
         self.pools = [view.read(arena.field_pool(binding.resource, view.field), pooled=True) for view in binding.fields]
         self.table = torch.zeros(
@@ -505,9 +508,12 @@ class _ProjectionReader:
             columns = output[:, self.offset : self.offset + self.width]
             columns.copy_((columns + result * self.binding.scale).to(output.dtype))
             return
-        count = next(size for size in self.programs if size >= hidden.shape[0])
-        padded = torch.nn.functional.pad(hidden, (0, 0, 0, count - hidden.shape[0]))
-        result = self.read(padded, pools, table, count)
+        if self.call_rows is None:
+            count = next(size for size in self.programs if size >= hidden.shape[0])
+            padded = torch.nn.functional.pad(hidden, (0, 0, 0, count - hidden.shape[0]))
+            result = self.read(padded, pools, table, count)
+        else:
+            result = self.read_rows(hidden, pools, table, self.call_rows)
         output[:, self.offset : self.offset + self.width].add_(
             (result[: hidden.shape[0]] * self.binding.scale).to(output.dtype)
         )
@@ -516,6 +522,28 @@ class _ProjectionReader:
         values = (hidden, *self.ports(table, count), *pools)
         return self.programs[count](*values)[0]
 
+    def read_rows(
+        self, hidden: torch.Tensor, pools: list[torch.Tensor], table: torch.Tensor, packed: torch.Tensor
+    ) -> torch.Tensor:
+        """Read the pinned delta for every actual projection call, in its device-selected row order.
+
+        Waves and adaptive buckets use one block per lane. Long spans retain the standard request blocks so
+        gathering a large dense adapter does not copy its matrix once per token. Both use projection_read's
+        existing arithmetic and bounded scratch; graph replay never reads an index on the host.
+        """
+        slots, rows, owners = self.ports(table, self.rows)
+        owners = owners.index_select(0, packed)
+        lanes = torch.arange(len(hidden), device=hidden.device)
+        if len(hidden) <= self.requests:
+            slots = slots.index_select(0, owners.clamp_min(0) // rows.shape[1])
+            rows = lanes[:, None]
+            owners = lanes.masked_fill(owners < 0, -1)
+        else:
+            inverse = torch.zeros(self.rows, device=hidden.device, dtype=torch.long)
+            inverse.index_copy_(0, packed, lanes)
+            rows = inverse.index_select(0, rows.flatten()).view_as(rows)
+        return self.programs[self.rows](hidden, slots, rows, owners, *pools)[0]
+
     def prepare(self, field_slots: Slots, starts: Slots, total: int) -> None:
         host = self.host
         maximum = projection_blocks(self.rows, self.requests)
@@ -523,7 +551,8 @@ class _ProjectionReader:
         positions = host[maximum * len(self.pools) : -self.rows].reshape(maximum, ROWS_PER_BLOCK)
         owners = host[-self.rows :]
         owners.fill(-1)
-        count = next(size for size in capacities(self.rows) if size >= total)
+        # A cached wave can replay under different packed batch sizes; its table geometry must stay fixed.
+        count = self.rows if self.in_program else next(size for size in capacities(self.rows) if size >= total)
         width = projection_block_rows(count, self.requests)
         lengths = np.diff(np.append(starts, total))
         blocks = (lengths + width - 1) // width
@@ -559,9 +588,11 @@ class PinnedParameterOverlay:
         *,
         phases: tuple[HiddenPhase, ...],
         math: OverlayTransition | None = None,
+        in_program: bool = False,
     ) -> None:
         self.readers = tuple(
-            _ProjectionReader(decoder, binding, arena, rows, requests, budget, math=math) for binding in bindings
+            _ProjectionReader(decoder, binding, arena, rows, requests, budget, math=math, in_program=in_program)
+            for binding in bindings
         )
         self.phases = phases
         self.embedding = _EmbeddingRows(
@@ -809,7 +840,7 @@ def parameter_overlay(
     math: OverlayTransition | None = None,
 ) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
     """Install each projection wrapper once, before compiling or capturing the model."""
-    if in_program or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
+    if (in_program and math is not None) or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
         return ExactParameterOverlay(decoder, bindings, arena.device, rows)
     pinned = PinnedParameterOverlay(
         decoder,
@@ -820,6 +851,7 @@ def parameter_overlay(
         budget,
         phases=() if in_forward else phases,
         math=math if in_forward else None,
+        in_program=in_program,
     )
     if not in_forward:
         return pinned

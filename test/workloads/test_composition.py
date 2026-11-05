@@ -214,8 +214,6 @@ REJECTED = {
     "Positions+AddLogits": CUSTOM_FORWARD_TAPS,
     "Positions+Guide": CUSTOM_FORWARD_TAPS,
     "Positions+Export": CUSTOM_FORWARD_TAPS,
-    "Adapt+Forward": "corrects projections for the model's own packed rows",
-    "Adapt+Positions": "corrects projections for the model's own packed rows",
     "InForward+Adapt": "does not yet combine with a pllm.model.Adapter",
     "InForward+Positions": POSITIONS,
     "Patch+Positions": POSITIONS,

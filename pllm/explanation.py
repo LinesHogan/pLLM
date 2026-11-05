@@ -409,7 +409,23 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
                 )
             )
         if member.effect == "custom_forward":
-            result.append(EscapeHatch(name, member.effect, "enabled", False, "model forward runs eagerly"))
+            result.append(
+                EscapeHatch(
+                    name, member.effect, "enabled", False, "model wrapper runs eagerly; layer waves use CUDA graphs"
+                )
+            )
+        elif member.effect == "Adapter" and plan.semantic_graph.custom_forward_task is not None:
+            result.append(
+                EscapeHatch(
+                    name,
+                    "projection calls",
+                    "forward-pinned state",
+                    True,
+                    "apply the delta on every projection invocation, including repeated layer calls and replay; "
+                    "compacted rows and reordered waves select each request through device indices; "
+                    "native QKV propagation also uses the delta; 0 blocking host syncs per step",
+                )
+            )
         elif member.effect == "custom_residual":
             result.append(
                 EscapeHatch(

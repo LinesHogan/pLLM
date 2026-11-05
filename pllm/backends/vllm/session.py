@@ -20,7 +20,7 @@ from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_taps import HiddenTaps
 from pllm.backends.vllm.layer_logits import LayerLogits
 from pllm.backends.vllm.model_sites import ModelSites
-from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, parameter_overlay
+from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, PinnedParameterOverlay, parameter_overlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.sampler import (
@@ -114,7 +114,7 @@ class VllmSession(Generic[DataT, ResultT]):
             self._layer_logits = LayerLogits(decoder, taps, probe.layer_logits)
         overlay_bindings = attachment.spec.overlay_bindings
         custom_forward_task = plan.semantic_graph.custom_forward_task
-        program_overlay = bool(overlay_bindings) and custom_forward_task is not None
+        program_overlay = attachment.spec.in_forward is not None and custom_forward_task is not None
         self._overlay = (
             parameter_overlay(
                 decoder,
@@ -126,7 +126,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 phases=attachment.spec.overlay_phases,
                 in_forward=plan.semantic_graph.updates_in_forward,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
-                in_program=program_overlay,
+                in_program=custom_forward_task is not None,
                 math=deployment.execution.math.parameter_overlay,
             )
             if overlay_bindings
@@ -200,6 +200,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 position_layers=position_layers,
                 allocation_block_size=allocation_block_size,
                 overlay=self._overlay if isinstance(self._overlay, ExactParameterOverlay) and program_overlay else None,
+                adapter=self._overlay if isinstance(self._overlay, PinnedParameterOverlay) else None,
             )
         self._sampler = sampler
         self._identities: dict[str, RequestIdentity] = {}

@@ -958,6 +958,12 @@ class Adapter:
 
     `weight` names the field of a "dense" or "per_head" delta, `factors` the two fields of a "low_rank" one; the
     delta is multiplied by `scale`.
+
+    A weight delta applies on every invocation of its projection, including repeated layer calls and replay in
+    @pllm.custom_forward. Each call uses its actual input and each row's request state, pinned at forward entry.
+    Compacted active= rows and reordered waves retain that ownership through device indices; skipped projections
+    receive no correction. Native QKV propagation for skipped layers still applies the Q/V deltas when it runs.
+    This lets custom depth schedules use the same adapted model as the standard forward.
     """
 
     state: str

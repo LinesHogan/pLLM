@@ -98,6 +98,9 @@ def attachment_buffer_bytes(
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
             buffers += 2 * blocks * sum(prod(field.shape) * width for field in binding.fields)
             buffers += blocks * ROWS_PER_BLOCK * 2 * width * (inputs + outputs)
+            if graph.custom_forward_task is not None and attachment.in_forward is None:
+                # Per-call row ownership, inverse span mapping and remapped projection ports.
+                buffers += 8 * (3 * rows + blocks * ROWS_PER_BLOCK + probe.causal_domain.requests * len(binding.fields))
     for binding in attachment.activation_bindings:
         shape = binding.fields[0].shape
         rank = shape[0] if len(shape) == 2 else 0
@@ -114,7 +117,7 @@ def attachment_buffer_bytes(
                 )
                 buffers += 2 * rows * hidden * width
                 buffers += (3 * hidden * width + 16) * len(task.custom_forward.position_states) + 2
-                if probe.causal_domain is not None and attachment.overlay_bindings:
+                if probe.causal_domain is not None and attachment.in_forward is not None:
                     requests = probe.causal_domain.requests
                     # Two phase signatures at every exact width, plus one ordinary span.
                     buffers += (requests * (requests + 1) + requests) * (
