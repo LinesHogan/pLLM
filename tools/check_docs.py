@@ -191,10 +191,13 @@ def broken_links(path: Path, texts: list[str]) -> list[str]:
 
 
 # Runs each cell in one shared namespace under its own file name, so a traceback names the failing cell.
-CELL_RUNNER = """import json, sys
+# Cells are registered in linecache, as Jupyter does, so inspect.getsource works (Triton's @jit needs it).
+CELL_RUNNER = """import json, linecache, sys
 namespace = {"__name__": "__main__"}
 for where, source in json.load(sys.stdin):
-    exec(compile(source, f"<{where}>", "exec"), namespace)
+    name = f"<{where}>"
+    linecache.cache[name] = (len(source), None, source.splitlines(True), name)
+    exec(compile(source, name, "exec"), namespace)
 """
 CELL_FRAME = re.compile(r'File "<((?:cell|line) \d+)>", line (\d+)')
 

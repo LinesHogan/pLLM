@@ -230,14 +230,18 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 
 | 组合 | 原因 |
 | --- | --- |
-| 两个采样器方法（`@add_logits` 与 `@guide_sampling`，或两个同类） | 采样器每步只应用一个方法；合并成一个方法 |
+| 两个 `@guide_sampling` 方法（包括来自不同组件的） | 每步只应用一个引导方法；多个 `@add_logits` 可以并存，先于引导应用 |
 | 请求行训练与宿主批训练 | 每个负载只资助一种训练方式 |
-| `@custom_forward` 与读 hidden 行的方法 | custom forward 可能每个 token 跑某层多次或不跑，hidden 行没有唯一值 |
+| `@custom_forward` 与读 `pllm.hidden` / `pllm.final_hidden` 的方法 | custom forward 可能每个 token 跑某层多次或不跑，这些行没有唯一值；`pllm.residual` 与 `pllm.layer_logits` 读每层最后一次访问的流，可以并存 |
 | `@custom_forward` 与 `pllm.model.Adapter` | Adapter 的投影钩子按模型自己的行索引 |
 | `@train_in_forward` 与 `pllm.model.Adapter` | 两者共用同一组投影钩子 |
 | 带 feed 的状态与其他状态或方法 | feed 的条件输入组只容纳它的写链与读取它的模型 |
 | 同一子层上的两个 `@custom_residual` 方法 | 一个方法拥有一个子层的残差更新 |
 | 状态子层与 `@custom_forward` | 记忆每个 token 前进一次，custom forward 的层访问次数不定 |
+| 静态 KV 布局（`keep="window"` / `"none"`）与 `pllm.PositionState` 或 `@custom_forward` | 布局让 vLLM 分出多个 KV 组，这两者要求只有一个 KV 组 |
+
+一个负载可以把其他负载声明为 dataclass 字段（`probe: Probe = field(default_factory=Probe)`）。每个字段是一个独立的
+组件：状态、方法和导出名带上字段名前缀（`probe.norm`），组件之间不能互读状态；上表的冲突跨组件同样检查，错误信息点名冲突的两方。
 
 ## 定制残差（`@pllm.custom_residual`）
 
@@ -257,8 +261,9 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 `2 * layer`，MLP 再加 1）、`pllm.value(layer)` 与 `pllm.residual(layer)`（同一 token 在本次前向中
 更早位置的值）。张量为模型 dtype，需要时在方法内用 float32 计算。实例状态按本步最新版本读取，
 请求状态按每行所属请求的版本读取。框架用模型自己的融合 add+norm kernel 归一化方法写出的流，
-所以恒等方法与原模型逐位相同。定制残差目前以 eager 运行（`cuda_graphs="auto"` 自动选择 eager），
-需要 `tensor_parallel_size=1`，且要求关闭前缀缓存。它与 `@pllm.custom_forward` 组合：
+所以恒等方法与原模型逐位相同。定制残差在模型的 CUDA graph 里运行：vLLM 捕获模型原本的算子而不是 inductor
+融合后的算子，所以恒等方法与 eager 模式的原生 vLLM 逐位相同（与默认的融合版原生 vLLM 有舍入差异）。带状态的
+方法需要更大的 `ExecutionOptions(capture_memory_bytes=...)`。定制残差需要 `tensor_parallel_size=1`，且要求关闭前缀缓存。它与 `@pllm.custom_forward` 组合：
 custom forward 运行的每一层也经过这些方法。
 
 带 `state=` 与 `chunk=` 的方法是一个**状态子层**（TTT / Titans 风格的快权重记忆）：`state` 是只有一个
@@ -267,6 +272,46 @@ custom forward 运行的每一层也经过这些方法。
 chunk 开始时的携带量；chunk 的最后一行运行后才应用更新，所以结果不依赖 vLLM 怎样把 prompt 切成步。
 未完成 chunk 的行由框架保存。每行的流应只依赖该行与携带量。状态子层读自己的携带量、实例状态与
 `pllm.depth()`；它不与 `@pllm.custom_forward` 组合（custom forward 可能在一个 token 内多次运行或跳过该层）。
+
+## 定制 attention 读法与 KV 布局（`@pllm.custom_attention`）
+
+`@pllm.custom_attention(*, layers=None, keep="all", window=0, source=0, sink=False)` 替换指定层的 FlashAttention 读法；
+原生的 q/k/v 投影与 KV 写入不变。方法签名 `f(q, kv, ...标记)`：`q` 是加过 RoPE 的 `[行, 头, 头维]`，`kv` 是只读的
+`pllm.model.PagedKV`（本 token 的 K/V 已写入）。返回与 `q` 同形状同 dtype 的输出，可以再返回一个 `[行, ...]` 的 aux。
+`kv.attend(q, *, window=0, topk=None)` 返回 `(输出, float32 LSE [行, 头])`；不带选择时是原生因果 kernel；`window`
+从当前 token 往回数（含当前 token）；`topk` 是逻辑位置 `[行, k]` 或 `[行, 头, k]`，用 -1 补齐，与因果性和窗口取交集，
+同一个头内位置不能重复。选择只省读，不省显存。之后的参数可以读 `pllm.parameter`、`pllm.module`、`pllm.depth()` 和更早
+层的 `pllm.attention(layer, "aux" / "lse")`；张量方法里的 `pllm.attention` 读被采样的行。方法里可以调用纯的自写算子。
+
+布局：`keep="window", window=N` 只保留最近 N 个 token 的 KV（vLLM 的滑动窗口规格释放旧块）；再加 `sink=True` 保留整个
+prompt 加窗口（vLLM 的 R-SWA）；`keep="none", source=k` 这一层不分配 KV，读下面第 k 层的（源只能是更早的层；更深层为源要用
+`@pllm.custom_forward` 的 `kv="peek"`）。`window=` / `sink=` 只接受字面值，不接受 `pllm.Attr`。布局限制所有读取，包括 `topk`。
+`pllm.explain` 的 `KV layer` 行给出每层每个请求的分配上限。按分数释放显存的驱逐不支持。
+
+要求：`tensor_parallel_size=1`、FlashAttention 2 后端、未量化 KV、没有 ALiBi/softcap/sink 的普通 RoPE attention、关闭前缀缓存；
+只用于 KV 全在分页缓存里的模型（稠密 Qwen2/Llama/Qwen3 与 Qwen3-MoE）。静态布局需要 MRv2，且不能与 `pllm.PositionState`
+或 `@pllm.custom_forward` 同时使用。每层只能有一个定制 attention 方法。
+
+## 自写算子（`torch.library.custom_op`）
+
+负载方法可以调用用 `torch.library.custom_op` 定义的算子。规则：`mutates_args=()`，返回新张量，状态只通过 pllm 的效果改变；
+必须 `register_fake`（显存规划与同步检查用形状）；输出形状必须由输入决定；调用算子对象本身，不写 `torch.ops.<命名空间>.<名字>`
+（pllm 要读到并记下它的源码，Triton kernel 的源码也计入负载指纹）；训练穿过它需要 `register_autograd`；在 `over="token"` 的
+custom forward 单元里需要 `register_vmap`。`register_kernel("cpu")` 可选，但没有它 `pllm.testing.check` 无法在 CPU 上执行
+这段数学；`register_flop_formula` 可选，`pllm.explain` 用它给出每行 FLOP。`check_on_gpu` 对调用自写算子的负载把 CPU 检查脚本
+的输入搬到 GPU 上重放，按 dtype 默认容差比较输出（设备等价）。
+
+## Token 历史与表的放置
+
+`pllm.input_tokens(history=n)` 是 int64 `[行, n + 1]`：当前 token 在前，随后是前 n 个，请求开始之前为 -1；需要 MRv2。
+被 `@pllm.custom_residual` 读取（通过 `pllm.result`）的结果按每个被调度的 token 计算；其他方法按被采样的行。
+送入 `custom_residual`、且只依赖 token id 与不变状态的结果，在 forward 开始前于旁路 stream 上执行。读取 token 历史的结果送入 `custom_residual`
+时需要 `tensor_parallel_size=1`。
+
+`InstanceState(..., pretrained=path)` 从 safetensors 读初值（字段同名张量；文件哈希计入负载身份）。`placement="host"`
+把只被按行 gather 的只读预训练字段放在锁页主机内存里；默认 `placement="device"` 放不下也不会回退到主机。显存预算与
+主机内存分开计算；`pllm.explain` 给出主机字节数与每行传输字节数。一个 state 里的字段要么都写形状（或形状函数），要么
+都写 `pllm.Field`。
 
 ## 请求 Overlay
 

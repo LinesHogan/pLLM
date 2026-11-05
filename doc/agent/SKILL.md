@@ -1,6 +1,6 @@
 ---
 name: pllm-workload
-description: Write, inspect and check a pllm.Workload, an inference-time LLM algorithm that runs inside vLLM (activation steering, probes and SAE monitoring, logit edits such as DoLa, decode-time training such as ESamp, per-request adapters, residual rewrites, recurrent depth, host feedback loops such as TTRL). Use when asked to implement or port such an algorithm with pllm, or to fix a pllm rejection or ContractError.
+description: Write, inspect and check a pllm.Workload, an inference-time LLM algorithm that runs inside vLLM (activation steering, probes and SAE monitoring, logit edits such as DoLa, decode-time training such as ESamp, per-request adapters, residual rewrites, custom attention reads and KV layouts, token-history lookups, custom kernels, recurrent depth and early exit, host feedback loops such as TTRL). Use when asked to implement or port such an algorithm with pllm, or to fix a pllm rejection or ContractError.
 ---
 
 # Writing a pllm workload
@@ -11,10 +11,13 @@ pllm handles per-request state and memory, CUDA graph capture, overlap with the 
 updates.
 
 It fits algorithms that read or add a computation at a point of the forward (steering, probes and SAEs,
-ReFT, logit edits, logit lens and DoLa, residual rewrites), keep state that evolves with tokens per request
-or per engine (generated LoRA, decode-time training such as ESamp, test-time learning, fast weights), rerun
-layers per token (recurrent depth, early exit), or control a generate-score-update loop (TTRL). Pretraining
-from scratch, new operators and new model architectures are out of scope.
+ReFT, logit edits, logit lens and DoLa, residual rewrites), change how a layer reads its KV or how KV is stored
+(attention monitors, Quest-style top-K reads, sliding-window and cross-layer KV layouts), look up tables keyed by
+token history (n-gram priors, Engram-style memory), keep state that evolves with tokens per request or per engine
+(generated LoRA, decode-time training such as ESamp, test-time learning, fast weights), rerun or skip layers per
+token (recurrent depth, early exit), or control a generate-score-update loop (TTRL). Kernels of your own enter as
+`torch.library.custom_op`. Pretraining from scratch and new model architectures are out of scope;
+the [capability map](../guides/capability-map.md) (Chinese) lists what can and cannot be written, with reasons.
 
 Read [reference.md](reference.md) for every name, grouped by task. The repository's README lists the
 supported models and the tutorials (`doc/tutorials/`), one per algorithm family.
@@ -66,12 +69,15 @@ The three kinds of declaration:
 
 | Declares | Written as | Names |
 | --- | --- | --- |
-| what a method reads | a parameter default | `pllm.hidden`, `pllm.residual`, `pllm.final_hidden`, `pllm.layer_logits`, `pllm.parameter`, `pllm.module`, `pllm.version`, `pllm.index`, `pllm.sample_index`, `pllm.result`, `pllm.base_logits`, `pllm.sampled_tokens`, `pllm.batch`, `pllm.operand`, `pllm.causal_model`, `pllm.depth`, `pllm.value` |
+| what a method reads | a parameter default | `pllm.hidden`, `pllm.residual`, `pllm.final_hidden`, `pllm.layer_logits`, `pllm.parameter`, `pllm.module`, `pllm.version`, `pllm.index`, `pllm.sample_index`, `pllm.result`, `pllm.base_logits`, `pllm.sampled_tokens`, `pllm.input_tokens`, `pllm.batch`, `pllm.operand`, `pllm.causal_model`, `pllm.depth`, `pllm.value`, `pllm.attention` |
 | what the workload owns | a class attribute or a property annotated with the state type | `pllm.RequestState` (one copy per request), `pllm.InstanceState` (one shared copy), `pllm.PositionState`; optimizers `pllm.AdamW`, `pllm.SGD` |
-| what a result does | a method decorator, or a model-site attribute | `@pllm.export`, `@pllm.add_logits`, `@pllm.guide_sampling`, `@pllm.train`, `@pllm.write`, `@pllm.train_in_forward`, `@pllm.custom_residual`, `@pllm.custom_forward`; `pllm.model.ActivationPatch`, `pllm.model.Adapter` |
+| what a result does | a method decorator, or a model-site attribute | `@pllm.export`, `@pllm.add_logits`, `@pllm.guide_sampling`, `@pllm.train`, `@pllm.write`, `@pllm.train_in_forward`, `@pllm.custom_residual`, `@pllm.custom_attention`, `@pllm.custom_forward`; `pllm.model.ActivationPatch`, `pllm.model.Adapter` |
 
 Everything else is your tensor math on row tensors: dimension 0 holds one row per request (or per sampled
-token), packed in an order you do not control.
+token), packed in an order you do not control. A kernel of your own enters that math as a
+`torch.library.custom_op` with a `register_fake` (see tutorial 09); call the op object, not `torch.ops.<namespace>`.
+A workload can also hold other workloads as dataclass fields; each is an independent component and pllm rejects
+real conflicts between them by name.
 
 ## Workflow
 
@@ -198,7 +204,7 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | `x: give every input a source as its default, e.g. ...` | Give every parameter after `self` a marker default: `x: torch.Tensor = pllm.hidden(0)`. |
 | `the workload has no effect on the model: add @pllm.train, ...` | Add the effect that says where the result goes; a method without an effect decorator only runs as a `rows=` selector. |
 | `a method takes one pllm decorator of each kind; split stacked effects into one method per effect` | Use one method per effect; share math through a helper function or `pllm.result(name)`. |
-| `... both send a result to vLLM's sampler, which applies one @pllm.add_logits or @pllm.guide_sampling method per step; combine them into one method` | Keep one sampler method per workload. |
+| `... both declare @pllm.guide_sampling; keep at most one guidance method` | Keep one `@pllm.guide_sampling` method per workload, components included; several `@pllm.add_logits` methods may coexist and are applied before guidance. |
 | `tensor export needs positive every, max_rows and max_cols, with max_rows * max_cols * 8 <= 32768 bytes (32 KiB)` | Lower `max_rows` or `max_cols`. A full 896-wide hidden row allows `max_rows=4`; rows beyond `max_rows` in one step are dropped (`event.dropped_rows`), so pass at most `max_rows` prompts per `generate` call when you read prompt-end rows (see reference.md, Export observations). |
 | `property 'x' needs a return annotation; ...` | Annotate state properties `-> pllm.RequestState` / `-> pllm.InstanceState`, other properties with their type. |
 | `pllm.parameter('s', 'f') names no declared field; declared: ...` | Use a declared state and field name; a `shape=` state has the single field `"value"`, a `module=` state is read with `pllm.module(s)`. |
@@ -207,8 +213,8 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | `... pllm funds one training mode per workload, so move one of them to a separate workload` | Do not mix request-row training and host-batch training in one workload. |
 | `a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase` | `pllm.base_logits()` and `pllm.sampled_tokens()` exist only after sampling: read logits before sampling with `pllm.layer_logits((-1,))`, or move the method to `@pllm.train` / `@pllm.on(pllm.Phase.AFTER_SAMPLE)`. |
 | `Tensor.item() cannot be called on meta tensors` with the note `methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values` | Remove `.item()`, `.tolist()`, `print(tensor)` and `if tensor ...:` from methods; use masks and `torch.where`. |
-| `... reads hidden rows (pllm.hidden, pllm.residual, pllm.layer_logits or pllm.final_hidden), which a @pllm.custom_forward does not produce: ...` | Move the reading method to a separate workload, or compute what you need inside the custom forward. |
-| `active= currently needs @pllm.custom_forward(tokens="decode"); keep prompt layers unmasked` | Use `tokens="decode"` for early exit. |
+| `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | Read `pllm.residual(layer)` or `pllm.layer_logits(...)` instead of `pllm.hidden` / `pllm.final_hidden`, or compute what you need inside the custom forward. |
+| `active= is supported only in @pllm.custom_forward(tokens="decode"); change tokens= to "decode" and use a separate unmasked tokens="prefill" method for prompt layers` | Use `tokens="decode"` for early exit. |
 | `activation patches run outside CUDA graphs; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | The workload needs eager execution; do not force `cuda_graphs=True`. |
 | `worker processes cannot send X defined in __main__ or a notebook; move it into an importable .py module, ...` | Move the class to a module, or keep `multiprocessing=False`. |
 | ContractError `method 'm' mixes rows: equal inputs for this request produced different outputs. Dimension 0 holds request rows; reduce features (dim=-1), not requests (dim=0).` | The method computes across rows (`mean(0)`, `sum(0)`, batch norm, sorting rows) or keeps Python state between calls (`self.count += 1`). Make each row depend only on its own inputs. |
@@ -220,12 +226,14 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | Setting | Effect | Cost |
 | --- | --- | --- |
 | `ExecutionOptions(publish_lag=0)` | An update computed at step n is read from step n + 1 (default `1`: from n + 2). | Training no longer overlaps the next forward. |
-| `@pllm.train_in_forward(visibility="exact")` | Later chunks of the same forward read the updates of earlier chunks (default `"forward_pinned"`: the whole forward reads the state it started with). | With `tokens="decode"` or `"all"` the forward runs eagerly. |
+| `@pllm.train_in_forward(visibility="exact")` | Later chunks of the same forward read the updates of earlier chunks (default `"forward_pinned"`: the whole forward reads the state it started with). | Later chunks wait for earlier chunks' updates. Decode updates are captured in CUDA graphs; an engine with captured exact updates currently does not return all GPU memory when closed, so start further engines in a new process. |
 | `tokens=` on `pllm.hidden` / `pllm.residual` / `pllm.final_hidden` | `"prefill"` reads each prompt's last token once its prefill completes (default `"decode"`: the latest decode token). | None; it selects different rows. |
 | `tokens=` on `@pllm.custom_forward` / `@pllm.train_in_forward` | Which tokens the method handles: `"prefill"`, `"decode"` or `"all"`. | Rows outside the selection run the plain model. |
 | `@pllm.on(phase)` | Moves a method to another phase. | Overrides automatic timing; `explain` lists it. |
-| `@pllm.custom_forward` | Your program over layer slices: loops, early exit, KV peeks. | The forward runs eagerly; no hidden-row readers or `pllm.model.Adapter` in the same workload; `tensor_parallel_size=1`. |
-| `@pllm.custom_residual` | Your residual update at a sublayer, value rows or the final stream. | The forward runs eagerly; `tensor_parallel_size=1`; prefix caching off. |
+| `@pllm.custom_forward` | Your program over layer slices: loops, early exit (`active=`), KV peeks. | vLLM's whole-model graph is replaced by graphs pllm captures per slice (`eager_reason` names it); no `pllm.hidden` / `pllm.final_hidden` readers or `pllm.model.Adapter` in the same workload; may need a larger `capture_memory_bytes`, which explain does not estimate; tensor parallelism only on vLLM 0.32.0 MRv2. |
+| `@pllm.custom_residual` | Your residual update at a sublayer, value rows or the final stream. | Runs inside the model's CUDA graphs (vLLM captures source operators, not inductor-fused ones); `tensor_parallel_size=1`; prefix caching off; stateful sublayers need a larger `capture_memory_bytes`. |
+| `@pllm.custom_attention` | Your attention read per layer: `kv.attend(q, window=, topk=)`; static KV layouts with `keep=` / `window=` / `sink=` / `source=`. | `tensor_parallel_size=1`; FlashAttention 2 and unquantized KV; prefix caching off; layouts need MRv2 and exclude `pllm.PositionState` and `@pllm.custom_forward`; top-K selection saves reads, not memory; score-based memory eviction is unsupported. |
+| `pllm.InstanceState(..., pretrained=path, placement="host")` | Keeps a read-only pretrained table that methods only gather from in pinned host memory (default `"device"` never falls back to host). | Every gathered row crosses PCIe each step; explain reports the transfer bytes per row. |
 | `pllm.model.ActivationPatch` | Edits layer outputs from a state. | The forward runs eagerly. |
 
 `explain` prints every non-default setting in its `timing` lines.

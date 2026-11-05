@@ -378,7 +378,10 @@ with pllm.make_llm(GPU_CONFIG, workload=Steering()) as llm:
 The site tensors come first, without defaults; later inputs may be `pllm.parameter`, `pllm.module`,
 `pllm.depth()`, `pllm.value(layer)` and `pllm.residual(layer)` (the same token, earlier in this forward).
 Tensors are in the model dtype. A method returning the plain update (`x + y`, `v`) reproduces the model
-bitwise. Costs: the forward runs eagerly, `tensor_parallel_size=1`, prefix caching off.
+bitwise. Costs: the method runs inside the model's CUDA graphs, where vLLM captures the model's own operators
+instead of inductor-fused ones, so compare a neutral run with eager vLLM (or use `check_on_gpu`, which builds a
+matching vanilla engine); `tensor_parallel_size=1`; prefix caching off. Stateful sublayers (`state=`) need a larger
+`ExecutionOptions(capture_memory_bytes=...)`; the error names the bytes required.
 
 ```python
 @dataclass(frozen=True)
@@ -402,9 +405,12 @@ print(pllm.explain(ValueResidual(), CONFIG).eager_reason)
 | `pllm.model.LayerOutputs` | What `layers(...)` returns: the post-layer residual streams, indexed by absolute layer (`out[-1]` is the last layer run). |
 | `pllm.scan(step, *, carry, over, chunk, invariants=(), valid_rows=None)` | Run `step(carry, *slices, *invariants) -> (carry, readout)` over `over` in chunks of `chunk` rows, in order, returning the final carry and the readouts. |
 
-A custom forward runs eagerly, cannot be combined with methods reading hidden rows (`pllm.hidden`,
-`pllm.residual`, `pllm.layer_logits`, `pllm.final_hidden`) or with `pllm.model.Adapter`, and needs
-`tensor_parallel_size=1`. Bounded Python `for` loops over workload settings are unrolled when traced.
+pllm schedules a custom forward's layer slices itself and captures its own CUDA graphs for them, so vLLM's
+whole-model graph is not used and `eager_reason` names `@pllm.custom_forward`. Methods reading `pllm.hidden` or
+`pllm.final_hidden` and `pllm.model.Adapter` are rejected; `pllm.residual` and `pllm.layer_logits` read each layer's
+last visited stream. Tensor parallelism needs vLLM 0.32.0 with `runner="mrv2"`. The slice graphs may need a larger
+`ExecutionOptions(capture_memory_bytes=...)` than the default; explain does not estimate it, and the error names the
+bytes required. Bounded Python `for` loops over workload settings are unrolled when traced.
 
 ```python
 @dataclass(frozen=True)
