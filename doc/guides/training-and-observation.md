@@ -17,6 +17,9 @@
 的 Tensor 方法，再用两个装饰器告诉框架它何时运行、更新谁：
 
 ```python
+import torch
+import pllm
+
 @pllm.on(pllm.Phase.AFTER_SAMPLE)
 @pllm.train(state="head", reduction="state_mean")
 def learn(
@@ -115,7 +118,8 @@ def features(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
 如果你不想改负载，只想在运行时临时挑某个任务来看，用 trace 选择器：
 
 ```python
-from pllm.execution.trace import TraceSelection
+# check-docs: skip: requires the running CUDA engine llm, prompts and params
+from pllm.io import TraceSelection
 
 llm.select_trace(TraceSelection(names=("loss",), tensors=True, max_tensor_bytes=32768))
 llm.generate(prompts, params)
@@ -131,6 +135,7 @@ llm.select_trace(TraceSelection())            # 关掉
 generate 重置。所以要拿"这一次"的新鲜事件，用游标切片：
 
 ```python
+# check-docs: skip: continues the running CUDA engine trace example
 before = llm.trace_snapshot()
 cursor = before.dropped + len(before.events)          # 绝对事件索引
 llm.generate(prompts, params)
@@ -172,7 +177,7 @@ or mix rows with batch normalization, attention, or another cross-row operation.
 framework gives padding zero weight and a sink parameter row that is never optimized.
 Shared instance parameters use one live state; request parameters use the admitted state
 bound. Eager execution uses the same step body with the invocation's actual dimensions.
-`rows=` and `update=` selectors stay boolean masks on the device: the method runs on every
+`rows=` and `update_rows=` selectors stay boolean masks on the device: the method runs on every
 row, so it must accept unselected rows, and their losses get zero weight. A state without a
 selected row still publishes, with its fields byte-for-byte unchanged, so selection never
 reads the mask back to the host.

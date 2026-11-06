@@ -41,8 +41,13 @@ python tools/check_typing.py
 ## 检查自己写的 workload
 
 ```python
+import pllm
 from pllm import testing
+from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
+model_config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8)
+workload = ESampWorkload(ESampConfig(rank=4, intervention_beta=0.5))
+disabled_workload = ESampWorkload(ESampConfig(rank=4, intervention_beta=0.0))
 result = testing.check(workload, model_config, neutral=disabled_workload)
 print(result)
 ```

@@ -133,11 +133,22 @@ AdamW 示例的损失只训练旁路预测，不对 vLLM attention 或历史 KV 
 ```python
 @pllm.on(pllm.Phase.AFTER_FORWARD)
 @pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))
-def produce(self, h=pllm.hidden(8, tokens="prefill"), net=pllm.module("network")):
-    return make_factor_tuple(net(h))  # 四个 tensor，前导轴对应本任务的请求行
+def produce(
+    self,
+    h: torch.Tensor = pllm.hidden(8, tokens="prefill"),
+    net: torch.nn.Module = pllm.module("network"),
+    aq: torch.Tensor = pllm.parameter("factors", "a_0"),
+    bq: torch.Tensor = pllm.parameter("factors", "b_0"),
+    av: torch.Tensor = pllm.parameter("factors", "a_1"),
+    bv: torch.Tensor = pllm.parameter("factors", "b_1"),
+) -> tuple[torch.Tensor, ...]:
+    templates = (aq, bq, av, bv)
+    values = torch.split(net(h), [value.flatten(1).shape[1] for value in templates], dim=-1)
+    return tuple(value.reshape_as(template).to(template)
+                 for value, template in zip(values, templates, strict=True))
 ```
 
-`make_factor_tuple` 是用户自己的张量数学；完整可运行拆分见上面的示例。
+按目标字段形状拆分网络输出；完整状态声明见上面的示例。
 写入总是返回 tuple，包括只有一个字段时的 `(value,)`；字段作为一个版本原子发布。
 目标展开名称是 `a_0/b_0/a_1/b_1`。InstanceState 写入没有请求轴。
 替换优化器管理的参数保留其 moments/step；不会隐式重置优化器。

@@ -13,7 +13,44 @@
 如果你想知道写好的在线训练负载能不能跑进 CUDA graph、每步计算怎么重叠，可以直接对教程 03 里的 `MiniESamp` 类调用 `pllm.explain`（类的定义见教程 03）：
 
 ```python
+from dataclasses import dataclass
+
+import torch
+from torch import nn
+from torch.nn import functional as F
 import pllm
+
+class Distiller(nn.Module):
+    def __init__(self, width: int, rank: int) -> None:
+        super().__init__()
+        self.down = nn.Linear(width, rank, bias=False)
+        self.up = nn.Linear(rank, width, bias=False)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = x + self.up(F.silu(self.down(x)))
+        return F.layer_norm(y, y.shape[-1:])
+
+@dataclass(frozen=True)
+class MiniESamp(pllm.Workload):
+    beta: float
+    rank: int = 4
+
+    @property
+    def distiller(self) -> pllm.RequestState:
+        return pllm.RequestState(module=lambda m: Distiller(m.hidden_size, self.rank), optimizer=pllm.AdamW(1e-3))
+
+    def trained(self, versions: torch.Tensor = pllm.version("distiller")) -> torch.Tensor:
+        return versions > 0
+
+    @pllm.train(state="distiller", reduction="state_mean")
+    def loss(self, shallow: torch.Tensor = pllm.hidden(0), deep: torch.Tensor = pllm.hidden(-1),
+             f: Distiller = pllm.module("distiller")) -> torch.Tensor:
+        return (f(shallow) - deep).square().mean(-1)
+
+    @pllm.guide_sampling(beta=pllm.Attr("beta"), rows="trained")
+    def predict(self, shallow: torch.Tensor = pllm.hidden(0), f: Distiller = pllm.module("distiller")) -> torch.Tensor:
+        return f(shallow)
 
 config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_model_len=512, max_num_seqs=128,
                           max_num_batched_tokens=8192)

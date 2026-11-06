@@ -26,12 +26,15 @@
 配方——一个实例作用域的冻结编码器：
 
 ```python
+import torch
+import pllm
+
 class Probe(pllm.Workload):
     # 实例作用域 + 冻结：准入时初始化一次，之后任何任务（包括观测）可读，永不被更新
     encoder = pllm.InstanceState(
         {"weight": lambda m: (4, m.hidden_size)},   # 形状回调拿到模型事实
         dtype=torch.float32,
-        initialize=lambda tensors, generator: tensors["weight"].copy_(torch.eye(4)),
+        initialize=lambda tensors, generator: tensors["weight"].copy_(torch.eye(4, tensors["weight"].shape[-1])),
         optimizer=None,                              # 可省略，默认即 None
     )
 ```
@@ -61,7 +64,10 @@ FP32 相对 BF16 使该字段的 payload 翻倍，也增加投影读取的转换
 session = pllm.RequestState({"proj": lambda m: (m.hidden_size, m.hidden_size)},
                             optimizer=pllm.AdamW(lr=1e-3),
                             key_fields=("route",))
+```
 
+```python
+# check-docs: skip: requires a CUDA engine, prompts, params and application route_of
 llm.generate(prompts, params, routes=tuple(route_of(p) for p in prompts))
 ```
 
@@ -85,6 +91,8 @@ route 完全隔离。
 混合批次里每行拿到自己 lineage 的版本。请求参数的矩阵运算使用按行形式：
 
 ```python
+h = torch.ones(2, 4)
+w = torch.eye(4).expand(2, 4, 4)
 torch.bmm(h.unsqueeze(1), w).squeeze(1)     # (rows, H) @ (rows, H, H) → (rows, H)
 ```
 

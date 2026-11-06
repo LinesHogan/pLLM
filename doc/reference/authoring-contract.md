@@ -382,6 +382,10 @@ overlay 的字段值不必来自引擎内更新：任何宿主计算 —— 读�
 算子、因子与 scale：
 
 ```python
+from dataclasses import dataclass
+
+targets = (pllm.model.Projection("down_proj", 9),)
+
 @dataclass(frozen=True)
 class ShineStyleLoRA(pllm.Workload):
     @property
@@ -594,6 +598,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 低秩因子，推理通过 `pllm.model.Adapter` 读取同一状态。使用时只提供配置与训练批：
 
 ```python
+# check-docs: skip: TLM generation and training require CUDA
 import torch
 import pllm
 from vllm import SamplingParams

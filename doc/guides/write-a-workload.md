@@ -21,6 +21,8 @@ class MyProbe(pllm.Workload):
         hidden: torch.Tensor = pllm.hidden(0),           # 数据从哪来：第 0 层块的输出
     ) -> torch.Tensor:
         return hidden - hidden.mean(dim=-1, keepdim=True)
+
+print(pllm.explain(MyProbe(), pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct")))
 ```
 
 这就是全部——没有 register、没有 hook 句柄、没有运行时回调。逐个问题看：
@@ -43,7 +45,10 @@ class MyProbe(pllm.Workload):
 写好后交给工厂就行，不需要任何注册步骤：
 
 ```python
-with pllm.make_llm(ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=MyProbe()) as llm:
+# check-docs: skip: model generation requires CUDA
+from vllm import SamplingParams
+
+with pllm.make_llm(pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=MyProbe()) as llm:
     outputs = llm.generate(["Hello"], SamplingParams(max_tokens=8))
 ```
 

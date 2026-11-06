@@ -55,6 +55,7 @@ Qwen2.5-0.5B、批次 8、256 token、三轮、一轮预热与 0.25 GPU 显存�
 公共模型负载入口不要求训练或捕获：
 
 ```python
+# check-docs: skip: requires a CUDA engine and the user's my_workload
 from pllm.benchmark import BenchmarkOptions, compare
 
 results = compare(my_workload, BenchmarkOptions(batch=4, tokens=64, rounds=1))
