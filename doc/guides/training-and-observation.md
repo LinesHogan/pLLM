@@ -87,6 +87,62 @@ def encode(self, features: torch.Tensor = pllm.result("extract")) -> torch.Tenso
 - 如果你的外部浮动输入需要梯度，从
   `result.input_gradients[(operation, argument)]` 读回。
 
+## 训练的归约：mean 还是 sum
+
+用 `@pllm.train(state=..., reduction=...)` 定义在线请求训练时，方法针对当前批次的请求行返回一个形状为 `[rows]` 的逐行损失向量。pllm 的步进模型是：**每个状态在每个引擎步（engine step）执行一次优化器更新**，更新前先将该状态在本步中被选中的行归约为一个标量损失。
+
+如果你写的是最常见的、按默认 `request_id` 隔离的 decode 阶段训练，每个请求在每个引擎步里只有 1 行（该状态本步选中行数 $n_s = 1$）。此时对 1 个数求均值和求和完全一样，`reduction="mean"` 与 `reduction="sum"` 没有任何区别，你不需要为此操心。
+
+只有当**同一个状态在同一个引擎步内对应多行**时，`reduction` 才会真正决定同一状态内各行的相对权重，以及跨步之间的梯度幅度：
+
+- 包含多个 token 的 **prompt 行**（prefill 阶段）；
+- 多个请求通过共享 `key_fields` 映射到同一个状态；
+- 所有请求共享同一个 `InstanceState`；
+- 其它在单步内为同一状态产生多行的场景。
+
+### 机制与怎么选
+
+`@pllm.train` 的 `reduction` 只在每个状态内部归约本步选中的行，**两个选项都保持不同状态之间相互独立**：
+
+- `reduction="mean"`（默认）：对每个状态 $s$ 在本步选中的 $n_s$ 行取均值，即 $\frac{1}{n_s}\sum_{r \in s} \ell_r$。
+- `reduction="sum"`：对每个状态 $s$ 在本步选中的行直接求和，即 $\sum_{r \in s} \ell_r$。
+
+选择哪一个，取决于你使用的优化器以及多行之间的关系：
+
+1. **使用 `pllm.AdamW` 时，默认选 `"mean"`**
+   AdamW 对全局常数缩放不敏感，但会受**不同步之间梯度幅度跳变**的影响。在 prefill 步中，一个请求可能一次进入 $P$ 个 prompt 行；如果用 `"sum"`，prefill 步的梯度幅度会比单行 decode 步放大约 $P$ 倍，导致 AdamW 的二阶矩估计 $v$ 被放大约 $P^2$ 倍，进而压制后续大量 decode 步的有效步长（这是按 Adam 更新公式推出的结论，尚未专门实测）。`"mean"` 消除了单步内行数 $n_s$ 的影响，让 prefill 步与 decode 步的梯度尺度保持一致。
+2. **使用 `pllm.SGD` 且需要每 token 学习率恒定时，选 `"sum"`**
+   SGD 没有二阶矩历史；如果你希望每个 token 对参数产生的更新量只取决于该 token 自身的梯度和学习率，而不因本步恰好有多少行同批到达而被 $1/n_s$ 摊薄，应选 `"sum"`。
+3. **共享 `key_fields` 的在线组训练，选 `"sum"`**
+   当一组兄弟采样请求共享同一个状态时，不同样本往往在不同步提前结束。如果使用 `"mean"`，随着部分样本结束退出，分母 $n_s$ 变小，剩余存活样本中每个 token 的权重会被动放大；使用 `"sum"` 则保证每个存活 token 始终贡献恒定的一份梯度。
+
+### 常用归一化配方
+
+围绕 `@pllm.train` 的返回值与参数，可以直接组合出常见的训练变体：
+
+- **逐行加权**（如优势值、置信度、门控权重 $w_r$）：直接在训练方法里返回 `weight * loss`（即 $w_r \cdot \ell_r$），配合 `reduction="mean"` 或 `"sum"` 即可。
+- **Dr.GRPO 式的常数长度归一化**：希望除以固定常数 $L_{\max}$ 而不是当前步的动态行数 $n_s$ 时，使用 `reduction="sum"`，并在返回时直接将损失乘以常数 $1 / L_{\max}$。
+- **排除特定行：优先用 `rows=`，不要用零权重配 mean**：在 `reduction="mean"` 下，返回 `0.0 * loss` 的行**依然计入分母 $n_s$**，会平白稀释其它有效行的梯度；`rows=` 会把这一行同时从分子和分母里去掉。注意 `rows=` 只在请求训练与模型效果或 `@pllm.add_logits` 组合时可用；独立的请求训练、以及与 `@pllm.guide_sampling` 并存的训练会训练每个选中状态的所有行。这两种场景下想排除某些行，可以用 `reduction="sum"` 加零权重：求和时零权重行不贡献，也不改变其它行的权重。
+- **时间衰减与动量**：跨步的指数移动平均（EMA）或衰减属于优化器职责（如 AdamW 的 $\beta_1$、`weight_decay`）或显式正则项，不应试图通过步内归约来实现。
+
+### Host batch 训练：自己返回标量并完成归一化
+
+当方法接收 `WeightedRowBatch`、`CausalTrainBatch`、`WeightedCEBatch` 字段或作用于因果模型时，它走的是 host batch 训练（例如用 `pllm.AdamW` 走一步，或配合 `reset` 用 `pllm.SGD` 走 `steps` 步）。这类方法**直接返回一个标量**并自行负责归一化，不能传入非默认的 `reduction=`。
+
+原因在于许多序列级强化学习算法需要完整序列长度 $|o_i|$ 才能归一化，在线逐 token 步进时不满足因果性，只能在凑齐 host batch 后按公式归约。四种常见归约的区别在于如何对待组大小 $G$ 与序列长度 $|o_i|$：
+
+| 算法 | 标量损失归约公式 | 归一化特点 |
+| :--- | :--- | :--- |
+| **GRPO** | $\frac{1}{G}\sum_{i=1}^{G} A_i \frac{1}{\|o_i\|} \sum_{t} \ell_{i,t}$ | 先在每条序列内按自身长度 $\|o_i\|$ 取均值，再对组内 $G$ 条序列取均值；依赖最终长度，只能用 host batch |
+| **DAPO** | $\frac{\sum_{i=1}^{G} \sum_{t} A_i \ell_{i,t}}{\sum_{i=1}^{G} \|o_i\|}$ | 按整个批次的总 token 数求全局均值，长序列贡献更多 token |
+| **RLOO / REINFORCE** | $\frac{1}{G}\sum_{i=1}^{G} A_i \sum_{t} \ell_{i,t}$ | 序列内对 token 求和，组间按 $G$ 取均值 |
+| **Dr.GRPO** | $\frac{1}{G}\sum_{i=1}^{G} A_i \frac{1}{L_{\max}} \sum_{t} \ell_{i,t}$ | 用固定常数 $L_{\max}$ 代替序列长度 $\|o_i\|$，消除长度偏置 |
+
+### 两个容易混淆的边界
+
+- **Prompt 行训练的切块依赖 vs. `train_in_forward(chunk=)`**：由于 `@pllm.train` 是每个引擎步走一步优化器，prompt 行在开启 chunked prefill 时会“每个 prefill 分块训练一次”，因此更新轨迹取决于调度器如何切块。如果你的算法（如测试时训练中的小批量更新）要求严格按序列位置对齐的固定块均值、不受引擎调度切块影响，应改用 `train_in_forward(chunk=...)`。
+- **跨请求耦合靠状态声明，不靠 `reduction`**：`reduction` 只决定单个状态内部在本步的多行如何合并，永远不会把不同请求的状态混在一起。如果你确实需要让多个请求共享一次参数更新，应当通过将状态声明为 `InstanceState`，或在请求状态上声明共享的 `key_fields` 来表达。
+
 ## 观测：把值拿出来
 
 训练跑起来之后，下一个问题自然是"怎么看到里面的值"。PLLM 提供两条通道，
