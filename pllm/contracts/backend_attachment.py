@@ -63,6 +63,7 @@ class ModelProbe:
     blas_workspace_bytes: int = 0
     # Shape-only planning selects an ordinal without querying CUDA; workers use their current device.
     device_index: int | None = None
+    tensor_parallel_size: int = 1
 
 
 class ActivationPatchOperator(StrEnum):

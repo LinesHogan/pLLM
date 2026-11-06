@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import asdict, dataclass, replace
+from math import prod
 from pathlib import Path
 from typing import Literal
 
@@ -312,3 +313,63 @@ def test_guidance_head_selection(model_config, metadata, reason):
         32 if reason == "bounded fused guidance" else 64
     )
     assert reason in str(report)
+
+
+@pytest.mark.parametrize(
+    "kind", ["dense", "low_rank", "dense_train", "low_rank_train", "dense_shared", "low_rank_shared"]
+)
+def test_tp_down_shard_costs(model_config, kind):
+    from pllm.backends.vllm import compat
+    from test.tp_overlays import DenseDownTraining, DownAdapter, LowRankDownTraining, SharedDownAdapter
+
+    if compat.VLLM_027:
+        pytest.skip("TP needs vLLM 0.32")
+    workload = {
+        "dense": DownAdapter(),
+        "low_rank": DownAdapter("low_rank"),
+        "dense_train": DenseDownTraining(),
+        "low_rank_train": LowRankDownTraining(),
+        "dense_shared": SharedDownAdapter(),
+        "low_rank_shared": SharedDownAdapter("low_rank"),
+    }[kind]
+    whole = pllm.explain(workload, model_config).states[0]
+    sharded = pllm.explain(workload, replace(model_config, tensor_parallel_size=2)).states[0]
+    assert sharded.fields[0].shape == (*whole.fields[0].shape[:-1], whole.fields[0].shape[-1] // 2)
+    assert sharded.fields[1:] == whole.fields[1:]
+    assert sharded.bytes_per_root == sum(field.dtype.itemsize * prod(field.shape) for field in sharded.fields)
+    from pllm.contracts.parameter_overlay import ProjectionShape
+    from test.tp_overlays import TARGETS
+
+    initialized = []
+    for tp in (1, 2):
+        facts = testing.backend_facts(
+            8, layer_count=10, memory_bytes=1 << 20, targets=(ProjectionShape(TARGETS[0], 8 // tp, 8, tp),)
+        )
+        binding = workload.build(replace(facts, probe=replace(facts.probe, tensor_parallel_size=tp)))
+        ranks = []
+        for rank in range(tp):
+            binding.tensor_parallel_rank = rank
+            root = tuple(
+                torch.zeros(spec.shape, dtype=spec.dtype.torch) for spec in binding.layouts.layouts[0].layout.fields
+            )
+            binding.initializer("weights", torch.device("cpu"), 7)((root,), (None,))
+            ranks.append(root)
+        initialized.append((torch.cat([rank[0] for rank in ranks], -1), *ranks[0][1:]))
+        assert all(all(torch.equal(a, b) for a, b in zip(ranks[0][1:], rank[1:])) for rank in ranks)
+    assert all(torch.equal(a, b) for a, b in zip(*initialized))
+
+
+def test_tp_down_rejects_cross_shard_loss(model_config):
+    from pllm.backends.vllm import compat
+
+    if compat.VLLM_027:
+        pytest.skip("TP needs vLLM 0.32")
+    from pllm.authoring import BackendRequirements
+
+    with pytest.raises(ValueError, match="q/v parameter overlays.*M3"):
+        compat.admit_parallel(
+            replace(model_config, tensor_parallel_size=2),
+            BackendRequirements(parameter_targets=(pllm.model.Projection("q_proj", 0),)),
+        )
+    with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):
+        pllm.explain(PrefillAdaptersWorkload(rank=2, chunk_size=4), replace(model_config, tensor_parallel_size=2))

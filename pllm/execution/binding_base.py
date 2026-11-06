@@ -14,7 +14,7 @@ from pllm.contracts.parameter_overlay import (
     ProjectionDelta,
 )
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.declaration import Dimensions, LayoutField
+from pllm.execution.declaration import Dimensions, FieldShard, LayoutField
 
 
 @dataclass(frozen=True)
@@ -77,11 +77,47 @@ def overlay_fields(
             dimensions.dtype,
             {key: dtype(f"{key}_{index}", value) for key, value in fields.items()},
         )
+    if dimensions.tensor_parallel_size > 1:
+        if any(inputs % dimensions.tensor_parallel_size for inputs, _ in dimensions.target_shapes):
+            raise ValueError("down input features must divide tensor_parallel_size evenly")
+        if effect.operator is ParameterOverlayOperator.HEAD_ADD:
+            raise ValueError(
+                "per_head down adapters need tensor_parallel_size=1; M4 admits dense and low_rank down deltas"
+            )
+        for inputs, outputs in dimensions.target_shapes:
+            _check_target_fields(
+                effect,
+                fields,
+                "rank-local down projection",
+                inputs // dimensions.tensor_parallel_size,
+                outputs,
+                dimensions.dtype,
+                {key: dtype(key, value) for key, value in fields.items()},
+            )
     return tuple(
-        layout_field(f"{key}_{index}", field, lambda m, i=index: m.target_shapes[i], dtype(f"{key}_{index}", field))
-        for index in range(len(effect.targets))
+        overlay_field(f"{key}_{index}", field, inputs, outputs, dimensions, dtype(f"{key}_{index}", field))
+        for index, (inputs, outputs) in enumerate(dimensions.target_shapes)
         for key, field in fields.items()
     )
+
+
+def overlay_field(
+    name: str, field: Field, inputs: int, outputs: int, dimensions: Dimensions, dtype: TensorDType
+) -> LayoutField:
+    """Partition input-feature axes; constant-sized fields remain replicated."""
+    shape = field.size(inputs, outputs)
+    size = dimensions.tensor_parallel_size
+    local = field.size(inputs // size, outputs) if size > 1 else shape
+    axes = tuple(i for i, (whole, part) in enumerate(zip(shape, local, strict=True)) if whole != part)
+    shard = None
+    if axes:
+        if len(axes) != 1 or shape[axes[0]] != local[axes[0]] * size:
+            raise ValueError(
+                f"{name}: TP down fields must partition one input-feature axis evenly; use tensor_parallel_size=1"
+            )
+        axis = axes[0]
+        shard = FieldShard(shape, axis)
+    return LayoutField(name, local, dtype, 8 if dtype is TensorDType.INT64 else 16, shard)
 
 
 def _check_target_fields(

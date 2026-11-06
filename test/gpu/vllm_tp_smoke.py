@@ -154,12 +154,13 @@ def test_j1_admission():
         with pytest.raises(ValueError, match=name + "=1"):
             pllm.make_llm(replace(config(), **{name: 2}), workload=DummyWorkload())
     for workload, message, milestone in (
-        (PrefillAdaptersWorkload(), "parameter overlays", "M3/M4"),
         (TLMWorkload(TLMConfig()), "causal_model", "M5"),
         (VideoWorkload(), "state feeds", "E1"),
     ):
         with pytest.raises(ValueError, match=message + ".*tensor_parallel_size=1.*" + milestone):
             pllm.make_llm(config(), workload=workload)
+    with pytest.raises(ValueError, match="not shard-local.*other ranks"):
+        pllm.explain(PrefillAdaptersWorkload(), config())
     with pytest.raises(ValueError, match='runner="mrv2"'):
         pllm.make_llm(replace(config(), runner="mrv1"), workload=DummyWorkload())
 
@@ -423,3 +424,117 @@ def test_j5_routes(route, graphs):
             "ranks/runs bitwise equal",
             flush=True,
         )
+
+
+_M4_FIELDS = []
+_M4_SYNC = None
+_M4_RETIRE = None
+
+
+def _m4_instrument(worker):
+    from types import SimpleNamespace
+
+    from pllm.testing_gpu import _SyncCheck
+    from test.gpu import vllm_tp_smoke as test
+
+    runner = worker.workload_runner
+    session = runner.require_session()
+    execution = session._deployment.execution
+    sync = _SyncCheck(SimpleNamespace(runner=runner))
+    test._M4_SYNC = sync
+    execution.execute_anchor = sync.anchor
+    execution.execute_part = sync.part
+    session.prepare_input = sync.input
+    session._forward_overlay.prepare = sync.overlay
+    test._M4_FIELDS.clear()
+    retire = execution.arena.retire
+    test._M4_RETIRE = retire
+
+    def record(refs):
+        if not test._M4_FIELDS:
+            selected = refs[:1]
+            pin = execution.arena.pin_exact(selected, torch.cuda.current_stream())
+            try:
+                test._M4_FIELDS.extend(
+                    tuple(field.float().cpu().numpy() for field in execution.arena.snapshot(pin, ref))
+                    for ref in selected
+                )
+            finally:
+                execution.arena.wait_release(execution.arena.release_pin(pin))
+        return retire(refs)
+
+    execution.arena.retire = record
+
+
+def _m4_fields(worker):
+    from test.gpu.vllm_tp_smoke import _M4_FIELDS, _M4_RETIRE, _M4_SYNC
+
+    assert len(_M4_SYNC.input_checked) >= 8
+    session = worker.workload_runner.require_session()
+    execution = session._deployment.execution
+    execution.arena.retire = _M4_RETIRE
+    execution.execute_anchor = _M4_SYNC.execute
+    execution.execute_part = _M4_SYNC.execute_part
+    session.prepare_input = _M4_SYNC.prepare_input
+    session._forward_overlay.prepare = _M4_SYNC.prepare_overlay
+    return _M4_FIELDS
+
+
+@pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train"])
+def test_m4_down(kind, monkeypatch):
+    from time import perf_counter
+
+    from test.tp_overlays import DenseDownTraining, DownAdapter, LowRankDownTraining
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    workload = {
+        "dense": DownAdapter(),
+        "low_rank": DownAdapter("low_rank"),
+        "dense_train": DenseDownTraining(),
+        "low_rank_train": LowRankDownTraining(),
+    }[kind]
+    observed = []
+    rates = []
+    params = SamplingParams(max_tokens=16, temperature=0, ignore_eos=True, logprobs=1)
+    for tp in (1, 2):
+        settings = replace(
+            config(),
+            tensor_parallel_size=tp,
+            multiprocessing=True,
+            execution=ExecutionOptions(capture_memory_bytes=256 << 20),
+        )
+        report = pllm.explain(workload, settings)
+        with pllm.make_llm(settings, workload=workload) as handle:
+            llm = handle._require_open()
+            llm.collective_rpc(_m4_instrument)
+            output = handle.generate(PROMPTS, params)
+            fields = llm.collective_rpc(_m4_fields)
+            # Field snapshots are explicit diagnostics, outside the measured generation.
+            started = perf_counter()
+            handle.generate(PROMPTS, SamplingParams(max_tokens=64, temperature=0, ignore_eos=True))
+            rates.append(8 * 64 / (perf_counter() - started))
+            assert handle.diagnostics().active_states == 0
+        roots = []
+        for row in range(1):
+            values = []
+            for index, spec in enumerate(report.states[0].fields):
+                parts = [torch.tensor(rank[row][index]) for rank in fields]
+                value = torch.cat(parts, dim=-1) if index == 0 else parts[0]
+                if index:
+                    assert all(torch.equal(parts[0], part) for part in parts[1:])
+                values.append(value)
+            roots.append(values)
+        probabilities = [
+            [step[token].logprob for token, step in zip(row.outputs[0].token_ids, row.outputs[0].logprobs)]
+            for row in output
+        ]
+        observed.append((tokens(output), roots, torch.tensor(probabilities)))
+    assert observed[0][0] == observed[1][0]
+    torch.testing.assert_close(observed[1][2], observed[0][2], rtol=0, atol=0.08)
+    for whole, sharded in zip(observed[0][1], observed[1][1]):
+        for value, reference in zip(sharded, whole):
+            torch.testing.assert_close(value, reference, rtol=0.02, atol=2e-5)
+    print(
+        f"M4 {kind}: TP1={rates[0]:.1f} TP2={rates[1]:.1f} tok/s; matching global fields/logprobs; zero host syncs",
+        flush=True,
+    )

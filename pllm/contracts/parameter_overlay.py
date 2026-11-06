@@ -61,6 +61,7 @@ class ProjectionShape:
     target: Projection
     input_size: int
     output_size: int
+    input_partitions: int = 1
 
 
 @dataclass(frozen=True, slots=True)

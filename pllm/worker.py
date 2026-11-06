@@ -57,6 +57,7 @@ class GPUWorker(compat.Worker):
                 "the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; "
                 "run both processes from the same installed sources and do not rewrite pretrained files while the engine starts"
             )
+        declaration.tensor_parallel_rank = self.rank
         runner.attach_workload(
             workload.bind_backend(
                 install.facts,

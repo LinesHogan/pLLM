@@ -129,7 +129,17 @@ class ModelShape:
             shape.num_hidden_layers,
             shape.vocab_size,
             pad_vocab_size(shape.vocab_size),
-            shape.projections(targets),
+            tuple(
+                ProjectionShape(
+                    target.target,
+                    target.input_size // config.tensor_parallel_size,
+                    target.output_size,
+                    config.tensor_parallel_size,
+                )
+                if target.target.name == "down_proj"
+                else target
+                for target in shape.projections(targets)
+            ),
             read_only,
             shape.forward_flops(),
             shape.num_attention_heads,

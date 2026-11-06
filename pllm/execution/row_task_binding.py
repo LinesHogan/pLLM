@@ -256,9 +256,14 @@ def parameter_ports(
     b.field_views.update({(str(state.declaration.resource), key): view for key, view in views.items()})
 
     if initialize is not None:
+        shards = b.field_shards[str(state.declaration.resource)]
+        seed_views = {
+            key: replace(view, shape=shards[view.field].shape) if view.field in shards else view
+            for key, view in views.items()
+        }
 
         def init(root: tuple[torch.Tensor, ...], generator: torch.Generator) -> None:
-            initialize({key: view.read(root[view.field]) for key, view in views.items()}, generator)
+            initialize({key: view.read(root[view.field]) for key, view in seed_views.items()}, generator)
 
         b.initializers[str(state.declaration.resource)] = init
 

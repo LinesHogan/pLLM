@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import LinearBase, RowParallelLinear
 
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, frozen_weight
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -53,14 +53,56 @@ def inspect_parameter_targets(
         module, offset, size, _ = decoder.projection(target)
         if (
             target in targets[:index]
-            or module.tp_size != 1
+            or (module.tp_size != 1 and target.name != "down_proj")
             or not module.return_bias
             or module.params_dtype is not dtype
             or offset + size > module.output_size_per_partition
         ):
-            raise ValueError("parameter overlay requires unique, exact unsharded projections matching model dtype")
-        specs.append(ProjectionShape(target, module.input_size_per_partition, size))
+            raise ValueError("parameter overlay needs unique q/v or row-parallel down projections matching model dtype")
+        specs.append(
+            ProjectionShape(
+                target, module.input_size_per_partition, size, module.tp_size if target.name == "down_proj" else 1
+            )
+        )
     return tuple(specs)
+
+
+class _ProjectionHook:
+    """Put a down delta inside vLLM's GEMM, before its own row all-reduce.
+
+    TP1 keeps the established forward hook. TP>1 intercepts only quant_method.apply;
+    input slicing, rank-zero bias, reduction and return-bias handling stay upstream.
+    """
+
+    def __init__(self, module: LinearBase) -> None:
+        self.module = module
+        self.forward = module.forward
+        self.apply = module.quant_method.apply if isinstance(module, RowParallelLinear) and module.tp_size > 1 else None
+        self.callback: Callable[[torch.Tensor], LinearOutput] = self.forward
+        self.bias: torch.Tensor | None = None
+
+    def base(self, hidden: torch.Tensor) -> LinearOutput:
+        if self.apply is None:
+            return self.forward(hidden)
+        return self.apply(self.module, hidden, self.bias), None
+
+    def partial(self, layer: LinearBase, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        self.bias = bias
+        output = self.callback(x)
+        assert isinstance(output, tuple)
+        return output[0]
+
+    def install(self, callback: Callable[[torch.Tensor], LinearOutput]) -> None:
+        self.callback = callback
+        if self.apply is None:
+            self.module.forward = callback
+        else:
+            self.module.quant_method.apply = self.partial
+
+    def close(self) -> None:
+        self.module.forward = self.forward
+        if self.apply is not None:
+            self.module.quant_method.apply = self.apply
 
 
 Slice = tuple[ParameterOverlayFieldBinding, int, int]
@@ -111,7 +153,8 @@ class _ExactProjection:
         self.embedding = embedding
         self.module, self.mlp = module, mlp
         self.bindings = slices
-        self.original_forward = module.forward
+        self.hook = _ProjectionHook(module)
+        self.original_forward = self.hook.base
         self.original_mlp_forward = None if mlp is None else mlp.forward
         self.prepared: tuple[_PreparedRows, ...] = ()
         self.operand_count = 0
@@ -137,7 +180,7 @@ class _ExactProjection:
         if not self.prepared:
             return base
         assert hidden.shape[0] == self.total_rows and not self.operand_count
-        # The unquantized TP1 projection owns this fresh output, not an input or state page.
+        # The GEMM owns this fresh partial output, not an input or state page.
         match base:
             case (output, *_):
                 pass
@@ -242,7 +285,7 @@ class ExactParameterOverlay:
         self.device = device
         self._staging = PinnedStaging()
         for handle in self._modules:
-            handle.module.forward = handle.forward
+            handle.hook.install(handle.forward)
             if handle.mlp is not None:
                 handle.mlp.forward = handle.forward_mlp
 
@@ -341,7 +384,7 @@ class ExactParameterOverlay:
         self.clear()
         self.embedding.close()
         for handle in self._modules:
-            handle.module.forward = handle.original_forward
+            handle.hook.close()
             if handle.mlp is not None and handle.original_mlp_forward is not None:
                 handle.mlp.forward = handle.original_mlp_forward
 
@@ -404,7 +447,8 @@ class _ProjectionReader:
         in_program: bool = False,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
-        self.forward_base = self.module.forward
+        self.hook = _ProjectionHook(self.module)
+        self.forward_base = self.hook.base
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
         self.in_program = in_program
@@ -446,7 +490,7 @@ class _ProjectionReader:
             # Warm every row bucket against the actual readonly pools before graph capture.
             self.read(self.captured[:count], self.pools, self.table, count)
         _READERS[self.table.data_ptr()] = self
-        self.module.forward = self.forward
+        self.hook.install(self.forward)
         if self.mlp is not None:
             self.mlp.forward = self.forward_mlp
 
@@ -567,7 +611,7 @@ class _ProjectionReader:
         self.staging.copy_to(self.table)
 
     def close(self) -> None:
-        self.module.forward = self.forward_base
+        self.hook.close()
         if self.mlp is not None and self.mlp_base is not None:
             self.mlp.forward = self.mlp_base
         _READERS.pop(self.table.data_ptr())

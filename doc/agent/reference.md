@@ -679,7 +679,7 @@ pllm.PositionState(initial: float = 0.0)
     One model-hidden vector per KV allocation block, initialized at token zero.
 pllm.AdamW(lr: 'float', betas: 'tuple[float, float]' = (0.9, 0.999), eps: 'float' = 1e-08, weight_decay: 'float' = 0.0)
 pllm.SGD(lr: 'float')
-pllm.Dimensions(hidden_size: 'int', vocab_size: 'int', target_shapes: 'tuple[tuple[int, int], ...]' = (), dtype: 'TensorDType' = <TensorDType.FLOAT32: 'float32'>, layer_count: 'int' = 0)
+pllm.Dimensions(hidden_size: 'int', vocab_size: 'int', target_shapes: 'tuple[tuple[int, int], ...]' = (), dtype: 'TensorDType' = <TensorDType.FLOAT32: 'float32'>, layer_count: 'int' = 0, tensor_parallel_size: 'int' = 1)
 pllm.Field(shape: 'tuple[int, ...] | Callable[[int, int], tuple[int, ...]]', dtype: "torch.dtype | Literal['auto'] | None" = 'auto')
     A state field with an explicit dtype, or a shape computed from a projection's (in_features, out_features); a field read by an adapter gets one copy per target projection. Storage follows its declared role by default: accumulators use FP32, other fields use model precision. An explicit dtype overrides this; None follows the model.
 pllm.UpdateOutput(output: 'torch.Tensor', changed: 'torch.Tensor', update_count: 'torch.Tensor', trained_rows: 'torch.Tensor', metrics: 'Mapping[str, torch.Tensor]' = <factory>)

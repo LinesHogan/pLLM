@@ -40,7 +40,7 @@ from pllm.contracts.state_feed import FeedBinding
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorFieldSpec
 from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.declaration import Builder, Dimensions, native, operation_mode
+from pllm.execution.declaration import Builder, Dimensions, FieldShard, native, operation_mode
 from pllm.execution.module_state import copy_initial
 from pllm.execution.overlay_batch import OverlayBatch
 from pllm.execution.ptts.page_bundle import PagePublication
@@ -70,6 +70,19 @@ if TYPE_CHECKING:
     from pllm.execution.checkpoint import PretrainedFile
     from pllm.execution.compile_facts import BackendCompileFacts
     from pllm.execution.step_input import StepInput
+
+
+def _initialize_fields(
+    initialize: Callable[[tuple[torch.Tensor, ...], torch.Generator], None],
+    shards: Mapping[int, FieldShard],
+    tensors: tuple[torch.Tensor, ...],
+    generator: torch.Generator,
+    rank: int,
+) -> None:
+    full = tuple(tensor.new_zeros(shards[i].shape) if i in shards else tensor for i, tensor in enumerate(tensors))
+    initialize(full, generator)
+    for i, shard in shards.items():
+        tensors[i].copy_(shard.read(full[i], tuple(tensors[i].shape), rank))
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +180,7 @@ class TensorBinding(Builder[TensorFrame]):
         super().__init__(name, digest, dimensions)
         self.dimensions = dimensions
         self.host = host
+        self.tensor_parallel_rank = 0
         self.gather_bytes: dict[tuple[TaskSymbol, str], int] = {}
         self.pretrained: dict[str, PretrainedFile] = {}
         self.members: dict[str, MemberDeclaration] = {}
@@ -223,6 +237,7 @@ class TensorBinding(Builder[TensorFrame]):
     ) -> Callable[[Roots, tuple[RequestStateKey | None, ...]], None]:
         """Copy one resource's shared initial tensors into each newly admitted root."""
         init = self.initializers.get(resource)
+        shards = self.field_shards.get(resource, {})
         if resource in self.initial_values:
             init = partial(copy_initial, self.initial_values[resource](self.dimensions, seed).to(device))
         if init is None:
@@ -233,13 +248,21 @@ class TensorBinding(Builder[TensorFrame]):
 
             def seed_roots(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:
                 for root in roots:
-                    init(root, torch.Generator(device=initial_device).manual_seed(seed))
+                    _initialize_fields(
+                        init,
+                        shards,
+                        root,
+                        torch.Generator(device=initial_device).manual_seed(seed),
+                        self.tensor_parallel_rank,
+                    )
 
             return seed_roots
         layout = next(item.layout for item in self.layouts.layouts if item.resource == resource)
         tensors = tuple(torch.zeros(field.shape, dtype=field.dtype.torch, device=device) for field in layout.fields)
         # A resource's initial tensors are shared values, independent of admission history.
-        init(tensors, torch.Generator(device=device).manual_seed(seed))
+        _initialize_fields(
+            init, shards, tensors, torch.Generator(device=device).manual_seed(seed), self.tensor_parallel_rank
+        )
         values = {i: tensors[i] for i in self.retained_fields(resource)}
 
         def initialize(roots: Roots, keys: tuple[RequestStateKey | None, ...]) -> None:

@@ -785,6 +785,18 @@ class InstanceState:
                 raise ValueError(f"{context.binding.feeds[0].resource} and {name}: declare one fed state per workload")
             context.binding.feeds = (FeedBinding(name, FeedOrder(self.feed), tuple(self.fields)),)
         fields = self.layout_fields(name, context)
+        if context.binding.dimensions.tensor_parallel_size > 1 and any(field.shard is not None for field in fields):
+            if (
+                self.optimizer is not None
+                or self.imported
+                or self.checkpoint
+                or self.pretrained
+                or self.module is not None
+            ):
+                raise ValueError(
+                    "TP down Adapter fields use initialize= and shard-local @pllm.train_in_forward updates; "
+                    "optimizer/import/checkpoint/module-backed adapters need tensor_parallel_size=1"
+                )
         context.states[name], ports = declare_parameters(
             context.binding,
             name,
@@ -964,6 +976,13 @@ class Adapter:
     Compacted active= rows and reordered waves retain that ownership through device indices; skipped projections
     receive no correction. Native QKV propagation for skipped layers still applies the Q/V deltas when it runs.
     This lets custom depth schedules use the same adapted model as the standard forward.
+
+    At TP>1 (vLLM 0.32 MRv2), M4 admits dense/low_rank down projections. Declare input-sized fields with
+    Field(lambda inputs, outputs: ...): dense weights and low-rank A partition their input axis; B and small
+    fields replicate. Initialization runs globally before slicing, and explain reports rank-local storage.
+    vLLM sums each rank's corrected partial output in its existing all-reduce. Updates must be shard-local;
+    reconstruction losses and updates to B that need the full projected input require TP=1. per_head and q/v
+    overlays remain deferred, as do imported/checkpoint adapters and side-lane adapter training at TP>1.
     """
 
     state: str
@@ -1566,6 +1585,21 @@ class _TrainInForward(_Effect):
             raise ValueError(
                 "rename the state fields that repeat an operand name (input, target, embedding, weight, prompt_end)"
             )
+        from pllm.execution.overlay_parallel import admit_update
+
+        admit_update(
+            freeze(operation.function),
+            fields,
+            effect,
+            context.binding.dimensions,
+            bindings,
+            {
+                key: tuple(torch.empty(view.shape, device="meta") for view in views)
+                for key, (_, views) in invariants.items()
+            },
+            gradient=optimizer is not None,
+            chunked=self.chunk is not None,
+        )
         identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = freeze(operation.function)
         initialize = context.initializer(self.state, tuple(definition.fields))
@@ -3038,6 +3072,15 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         context.attach_imports()
         context.attach_effects()
         context.attach_training()
+        if b.dimensions.tensor_parallel_size > 1:
+            for task in b.graph.tasks:
+                for effect in task.effects:
+                    if b.field_shards.get(str(effect.resource)) and effect.kind is not StateEffectKind.READ:
+                        if b.effects.in_forward is None:
+                            raise ValueError(
+                                "TP down Adapter updates need shard-local @pllm.train_in_forward; "
+                                "side-lane updates need tensor_parallel_size=1"
+                            )
         if all(
             capability in capabilities
             for capability in ("compute/cuda@1", "transition/full_root@1", "backend/tensor_parallel@1")
@@ -3051,9 +3094,10 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         dimensions = Dimensions(
             facts.probe.hidden_size,
             facts.vocab_size,
-            tuple((target.input_size, target.output_size) for target in facts.probe.targets),
+            tuple((target.input_size * target.input_partitions, target.output_size) for target in facts.probe.targets),
             facts.probe.tensor_dtype,
             facts.layer_count,
+            facts.probe.tensor_parallel_size,
         )
         b = TensorBinding(type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions)
         b.probe = facts.probe

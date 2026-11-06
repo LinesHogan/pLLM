@@ -8,6 +8,8 @@ from enum import Enum
 from functools import partial
 from typing import Generic, Literal, TypeVar
 
+import torch
+
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     BackendAttachmentSpec,
@@ -93,6 +95,7 @@ class Dimensions:
     target_shapes: tuple[tuple[int, int], ...] = ()
     dtype: TensorDType = TensorDType.FLOAT32
     layer_count: int = 0
+    tensor_parallel_size: int = 1
 
 
 Shape = tuple[int, ...] | Callable[[Dimensions], tuple[int, ...]]
@@ -118,11 +121,24 @@ class When(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class FieldShard:
+    """A contiguous axis slice of one globally initialized field."""
+
+    shape: tuple[int, ...]
+    axis: int
+
+    def read(self, tensor: torch.Tensor, shape: tuple[int, ...], rank: int) -> torch.Tensor:
+        """Borrow this rank's slice of a full tensor."""
+        return tensor.narrow(self.axis, rank * shape[self.axis], shape[self.axis])
+
+
+@dataclass(frozen=True, slots=True)
 class LayoutField:
     name: str
     shape: Shape
     dtype: TensorDType | Callable[[Dimensions], TensorDType] = TensorDType.FLOAT32
     alignment: int = 16
+    shard: FieldShard | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +232,7 @@ class Builder(Generic[D]):
         self.effects = BackendAttachmentSpec()
         self.dimensions = dimensions
         self.operations: dict[TaskSymbol, TensorOperation[D]] = {}
+        self.field_shards: dict[str, dict[int, FieldShard]] = {}
         self.publications: dict[TaskSymbol, PublishStateTask[D]] = {}
         # Fields that start at zero in a fresh page pool, so admission need not write them (AdamW state other than
         # the parameters). Request-scoped pages are recycled and dirty, so only instance states qualify.
@@ -263,6 +280,7 @@ class Builder(Generic[D]):
                 for name in ADAM_FIELDS
             )
         fields = (*fields, *carry)
+        self.field_shards[name] = {i: field.shard for i, field in enumerate(fields) if field.shard is not None}
         if len({field.name for field in fields}) != len(fields):
             raise ValueError(f"{name}: duplicate field name")
         declaration = SemanticState(StateResource(name), scope, keys)

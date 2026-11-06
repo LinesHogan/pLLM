@@ -104,6 +104,7 @@ def compile_facts(
                 *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in shape.targets),
             )
         ),
+        tensor_parallel_size=config.tensor_parallel_size,
         hidden_size=shape.hidden_size,
         custom_attention=requirements.custom_attention,
         attention_heads=shape.attention_heads,

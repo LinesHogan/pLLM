@@ -24,3 +24,5 @@ class LinearBase(Module):
     return_bias: bool
     # Replaceable per instance: overlays install their own bound forward.
     forward: Callable[[torch.Tensor], _LinearOutput]
+
+class RowParallelLinear(LinearBase): ...
