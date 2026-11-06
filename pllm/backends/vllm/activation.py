@@ -111,7 +111,7 @@ class VllmActivationPatch:
                         for identity in identities
                     )
                     pins, refs = zip(*held_versions, strict=True)
-                    _, slots = context.arena.slots(pins, StateRefs.of(refs))
+                    _, slots = context.arena.slots(pins, np.arange(len(pins), dtype=np.int64), StateRefs.of(refs))
                     host[1:, indices] = slots[inverse][:, [view.field for view in binding.fields]].T
 
     @staticmethod
