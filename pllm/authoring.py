@@ -226,7 +226,7 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
         facts,
         timeline=timeline,
         state_memory_budget_bytes=options.state_memory_bytes or facts.state_memory_budget_bytes,
-        guidance_capacity=options.guidance_capacity,
+        guidance_capacity=options.guidance_capacity if facts.guidance_rejection is None else None,
     )
 
 

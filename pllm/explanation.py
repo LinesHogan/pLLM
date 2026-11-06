@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from pllm.backends.vllm.kv_layout import layout_capacity
-from pllm.config import ModelConfig
+from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite
@@ -365,7 +365,9 @@ def _states(plan: PlanBundle, binding: TensorBinding, rows: int) -> tuple[StateC
     return tuple(costs)
 
 
-def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> tuple[EscapeHatch, ...]:
+def _settings(
+    binding: TensorBinding, config: ModelConfig, plan: PlanBundle, facts: BackendCompileFacts
+) -> tuple[EscapeHatch, ...]:
     lag = config.execution.publish_lag
     result = [
         EscapeHatch(
@@ -378,18 +380,25 @@ def _settings(binding: TensorBinding, config: ModelConfig, plan: PlanBundle) -> 
         )
     ]
     if any(task.sampler_beta for task in binding.tensor_tasks.values()):
-        capacity = config.execution.guidance_capacity
+        capacity = facts.guidance_capacity
         result.append(
             EscapeHatch(
                 "",
                 "guidance_capacity",
-                str(capacity),
-                capacity is None,
-                "exact dense post-filter guidance"
+                str(config.execution.guidance_capacity),
+                config.execution.guidance_capacity == ExecutionOptions().guidance_capacity,
+                (
+                    "exact dense post-filter guidance: "
+                    + (
+                        "explicit guidance_capacity=None"
+                        if config.execution.guidance_capacity is None
+                        else str(facts.guidance_rejection)
+                    )
+                )
                 if capacity is None
-                else f"bounded guidance at <= {capacity} survivors/row; wider rows stay unguided; "
+                else f"bounded fused guidance: guide the highest {capacity} survivors/row, tail unguided; "
                 "peaked full-vocabulary rows use the true one-token nucleus when top-1 probability >= top_p < 1; "
-                "FLOP/byte estimates use capacity upper bounds; needs MRv2, unquantized unscaled TP=1 LM head",
+                "MRv2, unquantized unscaled TP=1 LM head; FLOP/byte estimates are capacity upper bounds",
             )
         )
     for name, member in binding.members.items():
@@ -537,7 +546,7 @@ def _specialize(
 
 
 def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
-    """Plan using config.json and shape-only tensor tracing; never load base-model weights or allocate CUDA storage.
+    """Plan using model/quantization metadata and shape-only tracing; never load weights or allocate CUDA storage.
 
     Declared pretrained state files are read and validated on CPU.
 
@@ -616,7 +625,7 @@ def explain_facts(
         if plan.semantic_graph.trains_on_batch or binding.sites.rewrites or binding.attention.methods or ops
         else 0,
         tuple(attachment.spec.exports),
-        _settings(binding, config, plan),
+        _settings(binding, config, plan, facts),
         (
             "Hidden taps, route math and PositionState are replicated across TP ranks; pllm issues no tensor collectives. PositionState uses each rank's KV budget.",
             "GPU fit is decided at make_llm after vLLM allocates; weights, KV cache, vLLM activations and fragmentation are excluded.",

@@ -596,7 +596,7 @@ execution.retire(rows, wait=True)
 pllm.make_llm(config: 'ModelConfig', *, workload: 'BackendWorkload[D, R] | None' = None) -> 'VllmLlm[D, R] | VllmLlm[None, None]'
     A context-managed vLLM engine; execution options apply when a workload is installed.
 pllm.explain(workload: 'Workload', config: 'ModelConfig') -> 'ExplainResult'
-    Plan using config.json and shape-only tensor tracing; never load base-model weights or allocate CUDA storage.
+    Plan using model/quantization metadata and shape-only tracing; never load weights or allocate CUDA storage.
 pllm.scan(step: collections.abc.Callable[..., tuple[torch.Tensor, torch.Tensor]], *, carry: torch.Tensor, over: tuple[torch.Tensor, ...], chunk: int, invariants: tuple[torch.Tensor, ...] = (), valid_rows: torch.Tensor | None = None) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]
     Run ``step(carry, *slices, *invariants)`` in chunk order, returning exclusive readouts.
 pllm.custom_forward(*, tokens: 'Tokens' = 'all', over: 'Over' = 'token') -> 'Callable[[F], F]'
@@ -612,7 +612,7 @@ pllm.depth() -> 'Any'
 pllm.value(layer: 'int | Attr') -> 'Any'
     Inside a @pllm.custom_residual method, the value rows [rows, kv_heads, head_dim] layer `layer` computed for the same token in this forward (after its own value rewrite).
 pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, runner: Literal['mrv1', 'mrv2'] = 'mrv2', execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
-pllm.ExecutionOptions(max_training_rows: int = 1, capture_memory_bytes: int | None = None, state_memory_bytes: int = 0, memory_budget_bytes: int | None = None, allow_numerical_transforms: bool = True, tuning: Literal['heuristic', 'measured'] = 'heuristic', publish_lag: int = 1, guidance_capacity: int | None = None)
+pllm.ExecutionOptions(max_training_rows: int = 1, capture_memory_bytes: int | None = None, state_memory_bytes: int = 0, memory_budget_bytes: int | None = None, allow_numerical_transforms: bool = True, tuning: Literal['heuristic', 'measured'] = 'heuristic', publish_lag: int = 1, guidance_capacity: int | None = 256)
     Framework execution policy; lag counts post-sampler steps hidden from readers.
 pllm.KVOffload(connector: Literal['OffloadingConnector', 'SimpleCPUOffloadConnector'] = 'OffloadingConnector', cpu_bytes: int = 536870912, prompt_only: bool = False)
     Batched same-engine CPU offload of complete allocation pages.

@@ -11,16 +11,17 @@ from pllm.execution.step_capture import capture_graph
 pytestmark = pytest.mark.gpu
 
 
-@pytest.mark.parametrize("fp64", (False, True))
-def test_bounded_guidance_draw_and_capture(fp64):
+@pytest.mark.parametrize("fp64,capacity,dtype", ((False, 32, torch.float32), (True, 256, torch.bfloat16)))
+def test_bounded_guidance_draw_and_capture(fp64, capacity, dtype):
     torch.manual_seed(41)
-    rows, vocab, width, capacity = 10, 10003, 37, 64
+    rows, vocab, width = 10, 10003, 37
     weight = torch.randn(vocab, width, device="cuda") * 0.1
     hidden = torch.randn(width, 8, device="cuda").T
-    logits = torch.randn(rows, vocab, device="cuda")
+    logits = torch.randn(rows, vocab, device="cuda").to(dtype)
     counts = (1, 3, capacity, capacity + 1, vocab, vocab, 7, 9, 0, 5)
     for row, count in enumerate(counts):
         logits[row, count:] = -torch.inf
+    logits[3, : capacity + 1] = 0.5  # Capacity ties select the lower token IDs.
     logits[4, 9001] = 100
     row_map = torch.tensor((0, -1, 1, 2, 3, 4, 5, 6, 7, -1), device="cuda")
     weights = torch.tensor((1, 0.25, 1, 1, 1, 0, 1, 1), device="cuda")
@@ -30,7 +31,7 @@ def test_bounded_guidance_draw_and_capture(fp64):
     temperature = torch.ones(rows, device="cuda")
     temperature[mapping[2]] = 0
     top_p = torch.full((rows,), 0.95, device="cuda")
-    expected = logits.clone()
+    expected = logits.float().clone()
     # The reference rounds the FP64 head to its native output dtype, as the upstream head does.
     prediction = (hidden.double() @ weight.double().T).float()
     for row, count in enumerate(counts):
@@ -41,12 +42,13 @@ def test_bounded_guidance_draw_and_capture(fp64):
             support = torch.zeros(vocab, dtype=torch.bool, device="cuda")
             support[9001] = True
             expected[row, ~support] = -torch.inf
-        elif count <= capacity:
-            support = logits[row].isfinite()
         else:
-            continue  # Genuinely wide overflow stays unguided, including the flat full-vocab row.
+            ids = torch.argsort(logits[row], descending=True, stable=True)[:capacity]
+            support = torch.zeros(vocab, dtype=torch.bool, device="cuda")
+            support[ids] = logits[row, ids].isfinite()
         beta = 0.5 * weights[index]
-        expected[row, support] = (1 + beta) * logits[row, support] - beta * prediction[index, support]
+        expected[row, support] = (1 + beta) * logits[row, support].float() - beta * prediction[index, support]
+    expected = expected.to(dtype)
     draw_args = {} if compat.VLLM_027 else {"is_drafting": False}
     reference = gumbel_sample(
         expected, mapping, temperature, seeds, positions, apply_temperature=False, use_fp64=fp64, **draw_args
@@ -76,5 +78,5 @@ def test_bounded_guidance_draw_and_capture(fp64):
         graph.replay()
         torch.testing.assert_close(workspace, expected, atol=2e-6, rtol=2e-6)
         assert torch.equal(output, reference)
-    for row in (1, 3, 5, 6, 9):
+    for row in (1, 6, 9):
         assert torch.equal(workspace[row], logits[row])

@@ -29,7 +29,7 @@ class Stack(pllm.Workload):
     esamp: ESampWorkload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
 
 
-@pytest.mark.parametrize("runner,capacity", (("mrv1", None), ("mrv2", None), ("mrv2", 4096)))
+@pytest.mark.parametrize("runner,capacity", (("mrv1", 512), ("mrv2", None), ("mrv2", 512)))
 def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
     workload = Stack()
     add, reweight = SignedSamplerStages.add_logits, SamplerGuidance._reweight_finite_survivors

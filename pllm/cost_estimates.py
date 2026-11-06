@@ -200,16 +200,16 @@ def estimate_tasks(
         projection = sampler = 0
         if task is not None:
             if task.sampler_beta:
-                capacity = options.guidance_capacity
+                capacity = facts.guidance_capacity
                 projected_tokens = padded_vocab_size if capacity is None else min(capacity, facts.vocab_size)
                 projection += 2 * facts.max_admitted_lineages * facts.probe.hidden_size * projected_tokens
                 width = facts.probe.tensor_dtype.itemsize
-                # Bounded figures include indirect weights, scratch and the full-row mask write
-                # on the peaked branch. Dense reweight reads survivors and predictions, writes logits.
+                # Bounded traffic covers the scan, overflow selection/tail draw, peaked-row mask,
+                # indirect weights and scratch. Dense reads survivors/predictions and writes logits.
                 sampler = facts.max_admitted_lineages * (
                     facts.vocab_size * (8 + width)
                     if capacity is None
-                    else 8 * facts.vocab_size
+                    else 16 * facts.vocab_size
                     + projected_tokens * (facts.probe.hidden_size * width + 20)
                     + facts.probe.hidden_size * width
                     + 16

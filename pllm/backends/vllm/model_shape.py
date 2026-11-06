@@ -1,21 +1,25 @@
-"""Model dimensions read by CPU diagnostics and by the loaded vLLM backend probe."""
+"""Model dimensions and LM-head eligibility shared by CPU diagnostics and loaded backend probes."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
+import torch
 from cattrs import structure
-from vllm.config import ModelConfig as VllmModelConfig
-from vllm.model_executor.layers.vocab_parallel_embedding import pad_vocab_size
+from vllm.config import LoadConfig, ModelConfig as VllmModelConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+    pad_vocab_size,
+)
+from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.model_executor.models import ModelRegistry
 
 from pllm.config import ModelConfig
 from pllm.contracts.parameter_overlay import Projection, ProjectionShape, expand_targets
 
 if TYPE_CHECKING:
-    import torch
-
     from pllm.backends.vllm.architecture import Decoder
 
 
@@ -32,6 +36,8 @@ class _ConfigShape:
     num_attention_heads: int
     num_key_value_heads: int | None = None
     head_dim: int | None = None
+    logit_scale: float = 1.0
+    tie_word_embeddings: bool = False
 
     def forward_flops(self) -> int | None:
         """Dense projection matmuls per token, excluding attention over the growing KV history."""
@@ -61,6 +67,26 @@ class _ConfigShape:
         return tuple(ProjectionShape(target, *sizes[target.name]) for target in expanded)
 
 
+def _head_rejection(model: VllmModelConfig, shape: _ConfigShape, architecture: str) -> str | None:
+    from pllm.backends.vllm.architecture import guidance_head_rejection
+
+    # Ask vLLM which method its head would use, without allocating or loading base weights.
+    tied_embedding = architecture in ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM") and shape.tie_word_embeddings
+    with torch.device("meta"):
+        head = (VocabParallelEmbedding if tied_embedding else ParallelLMHead)(
+            shape.vocab_size, shape.hidden_size, params_dtype=model.dtype, disable_tp=True
+        )
+    # GptOss constructs its head without quant_config, even when its experts are quantized.
+    if model.quantization is not None and architecture != "GptOssForCausalLM":
+        quantization = get_quant_config(model, LoadConfig())
+        quantization.maybe_update_config(model.model, hf_config=model.hf_config, revision=model.revision)
+        method = quantization.get_quant_method(head, prefix="model.embed_tokens" if tied_embedding else "lm_head")
+        if method is not None:
+            head.quant_method = method
+    scale = shape.logit_scale if architecture == "LlamaForCausalLM" else 1.0
+    return guidance_head_rejection(head, scale, model.head_dtype)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelShape:
     """Geometry shared by config-only planning and loaded-model probing, without weights."""
@@ -77,6 +103,7 @@ class ModelShape:
     kv_heads: int = 0
     head_dim: int = 0
     intermediate_size: int = 0
+    guidance_rejection: str | None = None
 
     @classmethod
     def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
@@ -109,11 +136,13 @@ class ModelShape:
             shape.num_key_value_heads or shape.num_attention_heads,
             shape.head_dim or shape.hidden_size // shape.num_attention_heads,
             shape.intermediate_size,
+            _head_rejection(model, shape, info.architecture),
         )
 
     @classmethod
     def of_model(cls, decoder: Decoder, targets: tuple[Projection, ...], dtype: torch.dtype) -> Self:
         """Inspect the actual loaded projection slices, including architecture-specific admission."""
+        from pllm.backends.vllm.architecture import guidance_rejection
         from pllm.backends.vllm.parameter_overlay import inspect_parameter_targets
 
         model = decoder.model
@@ -133,4 +162,5 @@ class ModelShape:
             config.num_key_value_heads or config.num_attention_heads,
             config.head_dim or config.hidden_size // config.num_attention_heads,
             config.intermediate_size,
+            guidance_rejection(model.lm_head, model.logits_processor),
         )

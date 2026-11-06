@@ -37,7 +37,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerTensorOnlineLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_and_maybe_dequant_weights
-from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod, VocabParallelEmbedding
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2ForCausalLM,
@@ -156,6 +156,25 @@ def frozen_weight(projection: LinearBase) -> Tensor:
     return get_and_maybe_dequant_weights(projection, projection.params_dtype)
 
 
+_GUIDANCE_TRANSFORM_REJECTION = "scaled or transformed LM head needs exact dense projection"
+
+
+def guidance_head_rejection(head: VocabParallelEmbedding, scale: float, dtype: torch.dtype | None) -> str | None:
+    """Classify head arithmetic identically for meta-device and loaded-model probes."""
+    if not isinstance(head.quant_method, UnquantizedEmbeddingMethod):
+        return f"LM-head method {type(head.quant_method).__name__} needs exact dense projection"
+    if scale != 1.0 or dtype not in (None, head.weight.dtype):
+        return _GUIDANCE_TRANSFORM_REJECTION
+    return None
+
+
+def guidance_rejection(head: VocabParallelEmbedding, processor: torch.nn.Module) -> str | None:
+    """Why the loaded head and its processor need dense guidance."""
+    if not isinstance(processor, LogitsProcessor) or processor.soft_cap is not None or processor.logits_as_input:
+        return _GUIDANCE_TRANSFORM_REJECTION
+    return guidance_head_rejection(head, processor.scale, processor.head_dtype)
+
+
 class Mlp(Protocol):
     """MLP call whose input supplies the down-projection training target."""
 
@@ -172,21 +191,6 @@ class Decoder:
     read_only: str | None
     # The norms between sublayers (see `sublayer_norms`), as their own forwards saved before any tap wraps them.
     norms: tuple[NormForward, ...]
-
-    def guidance_weight(self) -> Tensor:
-        """Borrow the native dense head for bounded guidance, rejecting unsupported head transformations."""
-        head, processor = self.model.lm_head, self.model.logits_processor
-        if not isinstance(head.quant_method, UnquantizedEmbeddingMethod) or head.tp_size != 1:
-            raise ValueError("bounded guidance needs an unquantized TP=1 LM head; use guidance_capacity=None")
-        if (
-            not isinstance(processor, LogitsProcessor)
-            or processor.scale != 1.0
-            or processor.soft_cap is not None
-            or processor.logits_as_input
-            or processor.head_dtype not in (None, head.weight.dtype)
-        ):
-            raise ValueError("bounded guidance needs an unscaled model-dtype LM head; use guidance_capacity=None")
-        return head.weight
 
     def writable(self, feature: str) -> WritableLM:
         """The model for `feature`, which rewrites weights or reruns layers; read-only models reject it."""

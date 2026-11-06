@@ -23,6 +23,7 @@ class BackendCompileFacts:
     layer_count: int = 0
     checkpoint: str = ""
     guidance_capacity: int | None = None
+    guidance_rejection: str | None = None
 
     @property
     def device(self) -> torch.device:

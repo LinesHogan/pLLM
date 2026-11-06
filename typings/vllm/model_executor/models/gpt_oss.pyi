@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.nn import Module
 from transformers import GptOssConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 class TransformerBlock(Module):
@@ -22,6 +23,7 @@ class GptOssModel(Module):
 class GptOssForCausalLM(Module):
     model: GptOssModel
     lm_head: VocabParallelEmbedding
+    logits_processor: LogitsProcessor
     config: GptOssConfig
 
     def compute_logits(self, hidden_states: Tensor) -> Tensor | None: ...

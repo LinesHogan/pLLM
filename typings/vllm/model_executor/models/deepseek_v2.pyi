@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.nn import Module
 from transformers import DeepseekV2Config
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 class DeepseekV2DecoderLayer(Module):
@@ -21,6 +22,7 @@ class DeepseekV2Model(Module):
 class DeepseekV2ForCausalLM(Module):
     model: DeepseekV2Model
     lm_head: VocabParallelEmbedding
+    logits_processor: LogitsProcessor
     config: DeepseekV2Config
 
     def compute_logits(self, hidden_states: Tensor) -> Tensor | None: ...

@@ -171,6 +171,11 @@ def compile_facts(
         shape.vocab_size,
         shape.layer_count,
         checkpoint,
+        guidance_rejection='MRv1 needs exact dense guidance; bounded guidance uses runner="mrv2"'
+        if config.runner != "mrv2"
+        else "TP>1 LM head needs exact dense projection"
+        if config.tensor_parallel_size > 1
+        else shape.guidance_rejection,
     )
     return facts
 

@@ -87,9 +87,8 @@ class VllmSession(Generic[DataT, ResultT]):
         if capacity is not None and any(
             stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in deployment.attachment.spec.sampler
         ):
-            self._guidance_weight = decoder.guidance_weight()
-            if sampler is None or not sampler.bounded_guidance:
-                raise ValueError('bounded guidance needs runner="mrv2"; use guidance_capacity=None for exact guidance')
+            assert sampler is not None and sampler.bounded_guidance
+            self._guidance_weight = decoder.model.lm_head.weight
         self._cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
         plan = attachment.plan

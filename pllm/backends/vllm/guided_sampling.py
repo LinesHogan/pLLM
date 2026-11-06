@@ -15,6 +15,7 @@ from pllm.backends.vllm.compat import VLLM_027
 
 @triton.jit
 def _keys(logits: tl.tensor, tokens: tl.tensor, finite: tl.tensor) -> tl.tensor:
+    logits = tl.where(logits == 0, 0.0, logits)
     bits = logits.to(tl.uint32, bitcast=True)
     ordered = tl.where(bits & 0x80000000 != 0, ~bits, bits ^ 0x80000000)
     return tl.where(finite, (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - tokens.to(tl.uint32)), 0)
@@ -103,7 +104,6 @@ def _scan_survivors(
     V027: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor, tl.tensor, tl.tensor]:
     offsets = tl.arange(0, BLOCK)
-    slots = tl.arange(0, K)
     count = tl.full((), 0, tl.int32)
     best = tl.full((), float("-inf"), tl.float64 if FP64 else tl.float32)
     winner = tl.full((), 0, tl.int32)
@@ -128,14 +128,7 @@ def _scan_survivors(
         if guided & (count + added <= K):
             ranks = tl.cumsum(finite.to(tl.int32), 0) - 1
             tl.store(Scratch + row * K + count + ranks, keys, finite)
-        else:
-            if guided & (count > 0) & (count <= K):
-                tl.debug_barrier()
-                previous = tl.load(Scratch + row * K + slots, slots < count, other=0)
-                values, ids = _decode(previous)
-                best, winner = _draw(
-                    values, ids, previous != 0, row, Mapping, Temperature, Seeds, Positions, VOCAB, FP64, V027
-                )
+        if not guided:
             value, token = _draw(
                 logits, tokens, tokens < VOCAB, row, Mapping, Temperature, Seeds, Positions, VOCAB, FP64, V027
             )
@@ -146,6 +139,71 @@ def _scan_survivors(
         p = tl.load(TopP + row)
         peak_key = tl.where(full & (p < 1) & (1.0 / mass >= p), peak_key, 0)
     return count, best, winner, peak_key
+
+
+@triton.jit
+def _select_top_survivors(
+    Logits: torch.Tensor,
+    Scratch: torch.Tensor,
+    row: tl.tensor,
+    LS: tl.constexpr,
+    VOCAB: tl.constexpr,
+    K: tl.constexpr,
+    TILE: tl.constexpr,
+) -> tl.tensor:
+    # Only overflow needs ordering. Merge each nonempty tile into the retained top K.
+    retained = tl.full((TILE,), 0, tl.uint64)
+    for start in range(tl.cdiv(VOCAB, TILE)):
+        tokens = start * TILE + tl.arange(0, TILE)
+        logits = tl.load(Logits + row * LS + tokens, tokens < VOCAB, other=float("-inf")).to(tl.float32)
+        finite = (logits != float("-inf")) & (logits != float("inf")) & (logits == logits)
+        if tl.sum(finite.to(tl.int32), 0) > 0:
+            keys = _keys(logits, tokens, finite)
+            merged = tl.sort(tl.join(retained, keys).reshape((2 * TILE,)), descending=True)
+            retained = tl.gather(merged, tl.arange(0, TILE), 0)
+            retained = tl.where(tl.arange(0, TILE) < K, retained, 0)
+    tl.store(Scratch + row * K + tl.arange(0, TILE), retained, tl.arange(0, TILE) < K)
+    return tl.min(tl.where(tl.arange(0, TILE) < K, retained, 0xFFFFFFFFFFFFFFFF), 0)
+
+
+@triton.jit
+def _draw_tail(
+    Logits: torch.Tensor,
+    row: tl.tensor,
+    threshold: tl.tensor,
+    Mapping: torch.Tensor,
+    Temperature: torch.Tensor,
+    Seeds: torch.Tensor,
+    Positions: torch.Tensor,
+    LS: tl.constexpr,
+    VOCAB: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FP64: tl.constexpr,
+    V027: tl.constexpr,
+) -> tuple[tl.tensor, tl.tensor]:
+    best = tl.full((), float("-inf"), tl.float64 if FP64 else tl.float32)
+    winner = tl.full((), 0, tl.int32)
+    for start in range(tl.cdiv(VOCAB, BLOCK)):
+        tokens = start * BLOCK + tl.arange(0, BLOCK)
+        logits = tl.load(Logits + row * LS + tokens, tokens < VOCAB, other=float("-inf")).to(tl.float32)
+        finite = (logits != float("-inf")) & (logits != float("inf")) & (logits == logits)
+        keys = _keys(logits, tokens, (tokens < VOCAB) & finite)
+        value, token = _draw(
+            logits,
+            tokens,
+            (keys != 0) & (keys < threshold),
+            row,
+            Mapping,
+            Temperature,
+            Seeds,
+            Positions,
+            VOCAB,
+            FP64,
+            V027,
+        )
+        replace = (value > best) | ((value == best) & (token < winner))
+        best, winner = tl.maximum(best, value), tl.where(replace, token, winner)
+    return best, winner
 
 
 @triton.jit
@@ -199,8 +257,12 @@ def _sample(
         V027,
     )
     if guided:
-        if count > K:
-            count = tl.full((), 0, tl.int32)
+        if count > K and peak_key == 0:
+            threshold = _select_top_survivors(Logits, Scratch, row, LS, VOCAB, K, max(K, 512))
+            best, winner = _draw_tail(
+                Logits, row, threshold, Mapping, Temperature, Seeds, Positions, LS, VOCAB, BLOCK, FP64, V027
+            )
+            count = tl.full((), K, tl.int32)
         if peak_key != 0:
             # The upstream filter skipped its mask; explicitly use the true one-token nucleus.
             _, peak_token = _decode(peak_key)
@@ -254,11 +316,10 @@ def guided_sample(
     *,
     fp64: bool,
 ) -> torch.Tensor:
-    """Guide rows with at most K survivors; wider rows keep the upstream unguided distribution.
+    """Guide the K highest-logit finite survivors, leaving the remaining survivors unguided.
 
     Full-vocabulary rows whose top-1 probability >= top_p < 1 use the true one-token nucleus.
-    This is an opt-in approximation to vLLM's skipped-mask distribution. Top-1 ties use token ID.
-    Scratch is bounded by rows * K; the single kernel reads each filtered logit once.
+    Ties use token ID. Scratch is bounded by rows * K; only overflow needs selection and a tail draw.
     """
     rows, vocab = logits.shape
     hidden = hidden.to(weight.dtype).contiguous()

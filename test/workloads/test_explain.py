@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 
 import pllm
 from pllm import testing
+from pllm.backends.vllm import compat
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.workloads import (
     DoLaWorkload,
@@ -147,7 +149,10 @@ def test_esamp_attribution_and_budget_fallback(model_config):
 
 
 def test_declared_flop_estimates(model_config):
-    report = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), model_config)
+    report = pllm.explain(
+        ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
+        replace(model_config, execution=pllm.ExecutionOptions(guidance_capacity=None)),
+    )
     estimates = {task.name: task.estimate for member in report.members for task in member.tasks}
     rows, hidden, rank, vocab, padded_vocab = 3, 8, 2, 32, 64
     assert estimates["predict"].matmul_flops_estimate == rows * 6 * hidden * rank
@@ -158,14 +163,24 @@ def test_declared_flop_estimates(model_config):
     assert estimates["predict"].sampler_bytes_estimate == rows * vocab * 10
     bounded = pllm.explain(
         ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
-        replace(model_config, execution=pllm.ExecutionOptions(guidance_capacity=4096)),
+        model_config,
     )
     prediction = next(task for member in bounded.members for task in member.tasks if task.name == "predict")
     assert prediction.estimate.projection_flops_estimate == rows * 2 * hidden * vocab
     assert prediction.estimate.sampler_bytes_estimate == rows * (
-        8 * vocab + vocab * (hidden * 2 + 20) + hidden * 2 + 16
+        16 * vocab + vocab * (hidden * 2 + 20) + hidden * 2 + 16
     )
-    assert "wider rows stay unguided" in str(bounded)
+    assert "bounded fused guidance" in str(bounded) and "tail unguided" in str(bounded)
+    for config, reason in (
+        (replace(model_config, runner="mrv1"), "MRv1"),
+        (replace(model_config, tensor_parallel_size=2), "TP>1"),
+    ):
+        if config.tensor_parallel_size > 1 and compat.VLLM_027:
+            continue
+        fallback = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), config)
+        prediction = next(task for member in fallback.members for task in member.tasks if task.name == "predict")
+        assert prediction.estimate.projection_flops_estimate == rows * 2 * hidden * padded_vocab
+        assert "exact dense post-filter guidance" in str(fallback) and reason in str(fallback)
     dola = pllm.explain(DoLaWorkload(layers=(0, 2)), model_config)
     contrast = next(task for member in dola.members for task in member.tasks if task.name == "contrast")
     assert contrast.estimate.projection_flops_estimate == rows * 3 * 2 * hidden * padded_vocab
@@ -252,3 +267,47 @@ def test_storage_precision_follows_declared_role(dtype, model_dtype, model_confi
     assert {key: layouts[key[0]].fields[declaration.field_views[key].field].dtype.value for key in expected} == {
         key: value if dtype == "auto" else str(dtype).removeprefix("torch.") for key, value in expected.items()
     }
+
+
+@pytest.mark.parametrize(
+    "metadata,reason",
+    (
+        (
+            {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "logit_scale": 2.0},
+            "scaled or transformed LM head",
+        ),
+        (
+            {
+                "quantization_config": {
+                    "quant_method": "auto_gptq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "sym": True,
+                    "desc_act": False,
+                    "lm_head": True,
+                    "modules_in_block_to_quantize": ["lm_head"],
+                }
+            },
+            "LM-head method AutoGPTQLinearMethod",
+        ),
+        ({"quantization_config": {"quant_method": "fp8", "activation_scheme": "dynamic"}}, "bounded fused guidance"),
+        ({"head_dtype": "float32"}, "scaled or transformed LM head"),
+        (
+            {
+                "architectures": ["GptOssForCausalLM"],
+                "model_type": "gpt_oss",
+                "quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"},
+            },
+            "bounded fused guidance",
+        ),
+    ),
+)
+def test_guidance_head_selection(model_config, metadata, reason):
+    path = Path(model_config.model) / "config.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) | metadata))
+    report = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), model_config)
+    prediction = next(task for member in report.members for task in member.tasks if task.name == "predict")
+    assert prediction.estimate.projection_flops_estimate == 3 * 2 * 8 * (
+        32 if reason == "bounded fused guidance" else 64
+    )
+    assert reason in str(report)

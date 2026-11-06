@@ -43,7 +43,7 @@ class BenchmarkOptions:
     memory_budget_bytes: int | None = None
     sampling_n: int = 16  # completions per prompt, as in the aligned throughput settings
     cuda_graphs: bool = True  # --eager switches every arm and its vanilla reference to eager execution
-    guidance_capacity: int | None = None
+    guidance_capacity: int | None = ExecutionOptions().guidance_capacity
 
     @classmethod
     def parse(cls, parser: argparse.ArgumentParser | None = None) -> tuple[BenchmarkOptions, argparse.Namespace]:
@@ -58,9 +58,10 @@ class BenchmarkOptions:
         parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
         parser.add_argument(
             "--guidance-capacity",
-            type=int,
-            choices=(64, 128, 256, 512, 1024, 2048, 4096),
-            help="guide rows with <= K survivors, wide rows unguided, peaked full rows use true nucleus; default exact",
+            type=lambda value: None if value.lower() == "none" else int(value),
+            default=ExecutionOptions().guidance_capacity,
+            choices=(None, 32, 64, 128, 256, 512, 1024, 2048, 4096),
+            help="guide the highest K survivors, tail unguided; None selects exact dense (default: %(default)s)",
         )
         parser.add_argument(
             "--profile", type=Path, help="directory for a separate replay of the measured rounds per arm"
