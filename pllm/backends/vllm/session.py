@@ -138,9 +138,7 @@ class VllmSession(Generic[DataT, ResultT]):
         in_forward = attachment.spec.in_forward
         self._transition_task = None if in_forward is None else plan.scheduled(in_forward).task_id
         self._activation = (
-            VllmActivationPatch(
-                attachment.spec.activation_bindings, probe.max_packed_rows, in_program=custom_forward_task is not None
-            )
+            VllmActivationPatch(attachment.spec.activation_bindings, probe.max_packed_rows, deployment.execution.arena)
             if attachment.spec.activation_bindings
             else None
         )

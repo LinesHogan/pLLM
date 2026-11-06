@@ -13,7 +13,7 @@ from torch import Tensor, fx
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.proxy import TraceError
 
-from pllm.execution.model_sites import PatchInput, Place, ResidualRewrite, SiteValues
+from pllm.execution.model_sites import PatchInput, Place, ResidualRewrite, SiteValues, activation_write
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.torch_private import tensor_node_metadata
 
@@ -127,6 +127,11 @@ class SiteWrite:
 
     def operands(self, *tensors: Tensor) -> tuple[Tensor, ...] | None:
         """Return a conversion source or same-dtype add operands for the caller's port."""
+        if self.rewrite.write is activation_write:
+            stream, branch = tensors
+            ((_, source),) = self.rewrite.inputs
+            assert isinstance(source, PatchInput)
+            return stream, source.value(self.values, self.rewrite.depth(self.place))(branch)
         key = self._key(tensors)
         if key not in self._bodies:
             self._trace(tensors)

@@ -284,7 +284,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             )
             hidden = torch.arange(8).reshape(4, 2).float()
             for layer, values in enumerate(expected_deltas):
-                actual = session._activation.patch(StateResource("inject"), layer, None, ())(hidden.clone())
+                actual = session._activation.patch(StateResource("inject"), layer, None)(hidden.clone())
                 torch.testing.assert_close(actual, hidden + torch.tensor(values)[:, None], rtol=0, atol=0)
             session.complete_forward()
             session.complete_sampler()
@@ -338,7 +338,7 @@ def _hold_steps_reuse_the_settled_injection():
             assert current.version_id == (1 if step < 2 else 2)
             for layer in range(3):
                 delta = 20 if step >= 2 and layer == 0 else 10
-                actual = session._activation.patch(StateResource("inject"), layer, None, ())(torch.full((1, 2), 2.0))
+                actual = session._activation.patch(StateResource("inject"), layer, None)(torch.full((1, 2), 2.0))
                 torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
             session.complete_forward()
             session.complete_sampler()

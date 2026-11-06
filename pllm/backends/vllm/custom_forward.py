@@ -62,8 +62,6 @@ class ProgramWave(Generic[DataT, ResultT]):
             self.seed,
         )
         self.row_overlays: tuple[ProgramOverlay, ...] = ()
-        # The packed rows of the staged lanes, on the host.
-        self.packed: tuple[int, ...] = ()
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output = self.observation = self.seed
         self.results: tuple[tuple[tuple[OverlayTargetResult, ...], tuple[ProgramOperand, ...]], ...] = ()
@@ -73,7 +71,6 @@ class ProgramWave(Generic[DataT, ResultT]):
     def stage(self, rows: tuple[PackedPhaseRow, ...]) -> None:
         """Queue complete wave input copies without reading any device scalar."""
         owner = self.custom_forward
-        self.packed = tuple(row.packed_row_index for row in rows)
         assert owner.hidden is not None and owner.positions is not None
         host = self.staging.take(self.indices.numel()).reshape(self.indices.shape)
         host[:] = np.asarray(
@@ -114,7 +111,7 @@ class ProgramWave(Generic[DataT, ResultT]):
         for row_overlay in self.row_overlays:
             row_overlay.reset()
         generated, *entries = self.position.entry(())
-        with self.custom_forward.sites_rows(self.indices[0], self.packed) as stream:
+        with self.custom_forward.sites_rows(self.indices[0]) as stream:
             if self.signature[0]:
                 hidden, saved = execute_token_program(
                     self.custom_forward.program["decode" if self.signature[2] else "prefill"],
@@ -231,10 +228,8 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         return self._rows
 
     @contextmanager
-    def sites_rows(
-        self, packed: torch.Tensor, rows: tuple[int, ...], active: torch.Tensor | None = None
-    ) -> Generator[Stream]:
-        """Select each layer call's device rows for state reads and host rows for patch presence.
+    def sites_rows(self, packed: torch.Tensor, active: torch.Tensor | None = None) -> Generator[Stream]:
+        """Select each layer call's device rows for state fields and patch masks.
 
         Compacted waves retain their parent's homogeneous patch presence; device indices
         still gather each selected request's fields. Return the hooks' completed stream.
@@ -244,32 +239,30 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         for reader in readers:
             reader.call_rows = packed
         try:
-            with self.residual_rows(packed, rows, active) as stream:
+            with self.residual_rows(packed, active) as stream:
                 yield stream
         finally:
             for reader, previous in zip(readers, previous_rows, strict=True):
                 reader.call_rows = previous
 
     @contextmanager
-    def residual_rows(
-        self, packed: torch.Tensor, rows: tuple[int, ...], active: torch.Tensor | None
-    ) -> Generator[Stream]:
+    def residual_rows(self, packed: torch.Tensor, active: torch.Tensor | None) -> Generator[Stream]:
         """Bind the custom residual hooks within the shared per-call state scope."""
         if self.sites is None:
             yield add
             return
         sites = self.sites
-        previous = sites.rows, sites.packed, sites.active
-        sites.rows, sites.packed, sites.active = packed, rows, active
+        previous = sites.rows, sites.active
+        sites.rows, sites.active = packed, active
         taps = () if sites.taps is None else tuple(sites.taps.taps.values())
         for tap in taps:
             tap.rows, tap.active = packed, active
         try:
             yield sites.stream_after
         finally:
-            sites.rows, sites.packed, sites.active = previous
+            sites.rows, sites.active = previous
             for tap in taps:
-                tap.rows, tap.active = previous[0], previous[2]
+                tap.rows, tap.active = previous
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         self.clear()
@@ -425,7 +418,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         saved: tuple[torch.Tensor, ...] = ()
         with (
             override_forward_context(context),
-            self.sites_rows(packed, tuple(row.packed_row_index for row in rows)) as stream,
+            self.sites_rows(packed) as stream,
         ):
             if program is None:
                 hidden = ordinary_pass(seed, self.effect.layer_count, layer, stream)

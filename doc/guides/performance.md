@@ -210,10 +210,9 @@ config_auto = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", cuda_graphs="auto")
 config_strict = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", cuda_graphs=True)
 ```
 
-例如带 `ActivationPatch` 的 workload 在 `cuda_graphs=True` 下会得到 `ValueError: activation patches run outside CUDA graphs; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False`。
+`ActivationPatch` 通过 `custom_residual` 机制在 CUDA Graph 内执行，支持 `cuda_graphs=True`。
 
 哪些特性会让模型前向退回 eager（或替换整图）？
-* `pllm.model.ActivationPatch`：模型前向退回 eager。
 * 共享可变 `InstanceState` 的 `pllm.model.Adapter`：退回 eager。
 * `@pllm.custom_forward`：vLLM 的整模型图会被替换为 `pllm` 按层切片捕获的分段图（`eager_reason` 会注明 `@pllm.custom_forward`）。
 
@@ -566,7 +565,7 @@ class ScaleResidual(pllm.Workload):
 
 #### 原理与代价：比 `ActivationPatch` 快在哪里？
 
-如果用 `pllm.model.ActivationPatch` 修改层输出，整个模型前向会退回 eager 模式（eager 下连原生 vLLM 也只有图模式吞吐的 **45%**）。
+`pllm.model.ActivationPatch` 通过同一套 `custom_residual` 模型站点在 CUDA Graph 内修改层输出。
 而 `@pllm.custom_residual` 会被 `pllm` 降级为具名算子 `pllm::model_site`，并用设备端索引读写私有状态页，使 vLLM 在录制整模型 CUDA Graph 时**把你的残差改写一并录进图里**。
 
 在 RTX 4090（0.5B，8 条 prompt $\times n=4$，生成 256 tokens）下的实测吞吐占原生图模式比例：
@@ -698,7 +697,7 @@ class Monitor(pllm.Workload):
 | 你遇到的症状或问题 | 第一步：看 `pllm.explain(workload, config)` | 第二步：可调的配置开关或代码改动 | 第三步：运行时查 `llm.diagnostics()` / `llm.trace_snapshot()` |
 | :--- | :--- | :--- | :--- |
 | **启动时报显存不足，或可用 KV 并发太低** | 看 `state` 行（`roots`、`bytes/root`、`dtype`）；看 `memory peak`；看 `budget_errors` | 大只读表改 `placement="host"`；注意力改静态 `keep="window"` 或 `source=k`；只读字段让 `dtype="auto"` 自动选 BF16；调 `state_memory_bytes` / `memory_budget_bytes` / `capture_memory_bytes`；主机批训练时调小 `max_training_rows` | 查 `state_usage`（对比逻辑存活字节与物理分配字节，以及 `admission_capacity_failures`）、`kv_cache_blocks`、`kv_cache_max_concurrency` |
-| **步时明显变慢，怀疑退回了 eager 或有 CPU 同步** | 看 `forward` 行是否显示 `eager: ...`；看 `member` 行是否 `captured`；看 `host` 行是 `0 syncs` 还是 `unverified` | 方法里的 `.item()` / `if tensor:` 改用 `torch.where`；将 `ActivationPatch` 替换为 `@pllm.custom_residual`；设 `ModelConfig(cuda_graphs=True)` 让任何 eager 原因直接报错；跑 `testing.check_on_gpu` 抓模型层内的隐式同步 | 查 `eager_reason`（为空字符串表示运行在整图模式） |
+| **步时明显变慢，怀疑退回了 eager 或有 CPU 同步** | 看 `forward` 行是否显示 `eager: ...`；看 `member` 行是否 `captured`；看 `host` 行是 `0 syncs` 还是 `unverified` | 方法里的 `.item()` / `if tensor:` 改用 `torch.where`；设 `ModelConfig(cuda_graphs=True)` 让任何 eager 原因直接报错；跑 `testing.check_on_gpu` 抓模型层内的隐式同步 | 查 `eager_reason`（为空字符串表示运行在整图模式） |
 | **加了引导采样或额外计算后吞吐下降明显** | 看 `member` 行在哪个阶段运行；看每个方法的 `projection FLOP`、`sampler ... bytes`；检查是否声明了多层 `pllm.layer_logits` | 用 `@pllm.guide_sampling` 替代独立读多层 `layer_logits`（共用 LM Head GEMM）；用 `rows=` 选择器缩小 `@pllm.add_logits` 或 `@pllm.guide_sampling` 的作用行数 | 查 `trace_snapshot()` 中的任务耗时 |
 | **大表设了 `placement="host"` 但吞吐依然很低** | 看查表方法的 `anchor / lane` 是否为 `request.prepare / side`；看 `logical transfer bytes/row` | 把查表写成只读 `pllm.input_tokens` 和不可变状态的独立方法，经 `pllm.result` 交给效果方法（不要混读 `pllm.hidden`，否则无法提前到步首与前向重叠）；检查每步总传输字节除以 $22\text{ GB/s}$ 是否已经超过了模型单步前向时间 | — |
 | **旁路训练（`side`）没有和前向重叠** | 看 `member` 的 lane 是 `side` 还是退回了 `main`；看 `timing` 行的 `publish_lag` | 保持默认 `publish_lag=1`；如果预算介于 `memory` 行的两个阈值之间导致退回内联，调大 `ExecutionOptions(memory_budget_bytes=...)` | 查 `trace_snapshot()` 中主干流与旁路流的耗时分布 |

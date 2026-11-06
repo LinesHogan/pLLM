@@ -23,76 +23,79 @@ from test.workloads.test_video import frames
 
 @contextmanager
 def observe_model(workload):
+    from vllm.forward_context import get_forward_context
+
+    from pllm.backends.vllm.model_sites import ModelSites, _Boundary
+
     original_make, original_read, original_close = pllm.make_llm, BorrowedStateRoot.tensors, BorrowedPage.close
-    seen = set()
+    original_install, original_emit = ModelSites.__init__, _Boundary.emit
+    seen, recordings, caches, history = set(), {}, {}, {}
     fenced = False
     steps, identities, phases = [], set(), []
+    model = None
+
+    def install(sites, decoder, *args, **kwargs):
+        nonlocal model
+        model = decoder.model.model
+        original_install(sites, decoder, *args, **kwargs)
+
+    def cells(cache, slots, count):
+        indices = slots[:count].clamp_min(0)
+        return cache[indices // cache.shape[2], :, indices % cache.shape[2]]
+
+    def emit(boundary, inputs, outputs):
+        if boundary.before != ("mlp", workload.layer):
+            return original_emit(boundary, inputs, outputs)
+        assert model is not None
+        context = get_forward_context()
+        if context.slot_mapping is None:
+            return original_emit(boundary, inputs, outputs)
+        assert isinstance(context.slot_mapping, dict)
+        for ordinal, layer in enumerate(model.layers):
+            attention = layer.self_attn.attn
+            caches[ordinal] = attention.kv_cache, context.slot_mapping[attention.layer_name]
+        branch, stream = (value.clone() for value in inputs)
+        cache, slots = caches[workload.layer]
+        prior_kv = cells(cache, slots, len(branch)).clone()
+        original_emit(boundary, inputs, outputs)
+        recordings[len(branch)] = (
+            branch,
+            stream,
+            outputs[1].clone(),
+            prior_kv,
+            cells(cache, slots, len(branch)).clone(),
+            dict(caches),
+        )
 
     def make(*args, **kwargs):
         llm = original_make(*args, **kwargs)
-        layer = llm.runner.model.model.layers[workload.layer]
         session = llm.runner.require_session()
-        before = []
-        history, current_views = {}, {}
-
-        def views(module, rows):
-            from vllm.forward_context import get_forward_context
-
-            from pllm.backends.vllm.custom_forward_attention import attention_metadata
-
-            _, cache, slots = attention_metadata(get_forward_context(), module.self_attn.attn)
-            return tuple(
-                (
-                    row.token_offset,
-                    cache[
-                        int(slots[row.packed_row_index]) // cache.shape[2],
-                        :,
-                        int(slots[row.packed_row_index]) % cache.shape[2],
-                        :,
-                    ],
-                )
-                for row in rows
-            )
-
-        def capture(module, inputs, output):
-            rows = session._step.rows.row_batch.rows
-            before.append((output.detach().clone(), tuple(value.clone() for _, value in views(layer, rows))))
-
-        layer.mlp.register_forward_hook(capture)
-
-        def check(module, inputs, output):
-            execution = session._deployment.execution
-            step = session._step
-            (ref,) = step.context.publication.after_refs
-            (delta,) = execution.snapshot(ref, torch.cuda.current_stream())
-            expected, prior_kv = before.pop()
-            original = expected.clone()
-            selected = torch.tensor(sorted({0, len(expected) - 1}), device=expected.device)
-            expected.index_add_(0, selected, delta.to(expected).expand(len(selected), -1))
-            torch.testing.assert_close(output[1], inputs[1] + expected, rtol=0, atol=0)
-            assert torch.count_nonzero(expected - original) > 0
-            rows = step.rows.row_batch.rows
-            for (_, actual), prior in zip(views(layer, rows), prior_kv, strict=True):
-                torch.testing.assert_close(
-                    actual, prior, rtol=0, atol=0
-                )  # Layer-output injection cannot rewrite this layer's KV.
-            for ordinal, decoder in enumerate(llm.runner.model.model.layers):
-                current_views.update({(ordinal, position): value for position, value in views(decoder, rows)})
-            identities.update(row.identity for row in rows)
-            steps.append((step.rows.step_id, int(ref.version_id)))
-            phases.append(tuple(row.phase.value for row in rows))
-
-        # The patched MLP output joins the residual stream in the next norm; its second output is that stream.
-        layers = llm.runner.model.model.layers
-        following = layers[workload.layer + 1].input_layernorm if workload.layer + 1 < len(layers) else None
-        (following or llm.runner.model.model.norm).register_forward_hook(check)
         complete = session.complete_forward
 
         def completed():
+            step = session._step
+            rows = step.rows.row_batch.rows
+            branch, stream, actual, prior_kv, after_kv, access = recordings[
+                min(n for n in recordings if n >= len(rows))
+            ]
+            (ref,) = step.context.publication.after_refs
+            (delta,) = session._deployment.execution.snapshot(ref, torch.cuda.current_stream())
+            expected = branch[: len(rows)].clone()
+            selected = torch.tensor(sorted({0, len(rows) - 1}), device=expected.device)
+            expected.index_add_(0, selected, delta.to(expected).expand(len(selected), -1))
+            torch.testing.assert_close(actual[: len(rows)], stream[: len(rows)] + expected, rtol=0, atol=0)
+            assert torch.count_nonzero(expected - branch[: len(rows)]) > 0
+            torch.testing.assert_close(after_kv[: len(rows)], prior_kv[: len(rows)], rtol=0, atol=0)
             for view, saved in history.values():
-                torch.testing.assert_close(view, saved, rtol=0, atol=0)  # Previously cached positions stay unchanged.
-            history.update({key: (view, view.clone()) for key, view in current_views.items()})
-            current_views.clear()
+                torch.testing.assert_close(view, saved, rtol=0, atol=0)
+            for ordinal, (cache, slots) in access.items():
+                for row in rows:
+                    slot = int(slots[row.packed_row_index])
+                    view = cache[slot // cache.shape[2], :, slot % cache.shape[2]]
+                    history[ordinal, row.token_offset] = view, view.clone()
+            identities.update(row.identity for row in rows)
+            steps.append((step.rows.step_id, int(ref.version_id)))
+            phases.append(tuple(row.phase.value for row in rows))
             complete()
 
         session.complete_forward = completed
@@ -128,6 +131,8 @@ def observe_model(workload):
     try:
         with (
             patch.object(pllm, "make_llm", make),
+            patch.object(ModelSites, "__init__", install),
+            patch.object(_Boundary, "emit", emit),
             patch.object(BorrowedStateRoot, "tensors", read),
             patch.object(BorrowedPage, "close", finish),
         ):
@@ -174,9 +179,9 @@ def observe_replay(*, versions):
                 capturing["normal"] = wave.custom_forward.model.norm(result[0] + result[1]).clone()
         return result
 
-    def patching(activation, resource, layer, rows, packed):
+    def patching(activation, resource, layer, rows):
         """Record a captured wave's MLP output of the patched layer before and after the patch."""
-        apply = original_patch(activation, resource, layer, rows, packed)
+        apply = original_patch(activation, resource, layer, rows)
 
         def recorded(hidden):
             base = hidden.clone() if capturing is not None and torch.cuda.is_current_stream_capturing() else None
@@ -204,10 +209,10 @@ def observe_replay(*, versions):
             (ref,) = context.pin.refs
             pin = context.pin
         field = context.arena.borrow_field(pin, ref, LayoutFieldId(0))
-        # Each lane's fields are staged into stable per-row buffers the captured wave gathers from.
-        (buffer,) = holder["session"]._activation._row_fields[StateResource("inject"), 1]
-        staged = buffer.index_select(0, wave.indices[0])
-        assert buffer.data_ptr() != field.data_ptr()
+        # Captured waves gather the invocation's exact PTTS slot, without per-row field copies.
+        patch = holder["session"]._activation._patches[StateResource("inject"), 1]
+        slots = patch.table[1].index_select(0, wave.indices[0])
+        staged = patch.pools[0].index_select(0, slots)
         torch.testing.assert_close(staged, field.expand_as(staged), rtol=0, atol=0)
         for hidden, patched in observed["patches"]:
             torch.testing.assert_close(patched, hidden + field.expand_as(hidden).to(hidden.dtype), rtol=0, atol=0)

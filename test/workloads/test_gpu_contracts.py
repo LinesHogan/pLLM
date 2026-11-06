@@ -32,7 +32,7 @@ class Steering(pllm.Workload):
 
     @property
     def steer(self) -> pllm.model.ActivationPatch:
-        return pllm.model.ActivationPatch("direction", (0,), operator="add")
+        return pllm.model.ActivationPatch("direction", (0,), operator="add", decode=True)
 
 
 @pytest.mark.parametrize(

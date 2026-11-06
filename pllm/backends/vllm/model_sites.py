@@ -90,7 +90,6 @@ class ModelSites:
         # The packed rows of the layer call a custom forward is running (on the device and the host); None while
         # vLLM runs the whole step.
         self.rows: Tensor | None = None
-        self.packed: tuple[int, ...] = ()
         self._activation = activation
         self.count = 0  # rows of the current hook call (vLLM may pad the step's rows)
         self._requests_of = torch.zeros(rows, dtype=torch.long, device=weight.device)
@@ -243,6 +242,8 @@ class ModelSites:
     def run_hook(self, hook: int, inputs: list[Tensor], outputs: list[Tensor]) -> None:
         """Keep orchestration opaque to Dynamo; declare only scratch and private pools writable."""
         reads = [self._requests_of, *self._states.values(), *self._results.values()]
+        if self._activation is not None:
+            reads.extend(self._activation.buffers)
         writes = [*self._earlier.values()]
         for memory in self._memories.values():
             reads.extend((memory.table, memory.rows))
@@ -313,7 +314,7 @@ class ModelSites:
 
     def patch(self, source: PatchInput, layer: int) -> Callable[[Tensor], Tensor]:
         assert self._activation is not None
-        return self._activation.patch(source.resource, layer, self.rows, self.packed)
+        return self._activation.patch(source.resource, layer, self.rows)
 
     def store_rows(self, buffer: Tensor, values: Tensor) -> None:
         """Write current rows, preserving destinations of inactive custom-forward lanes."""

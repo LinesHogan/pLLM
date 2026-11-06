@@ -104,12 +104,12 @@ class AdaptiveSlice:
         if owner.sites is not None:
             owner.sites.frozen(step.start, step.stop, hidden)
         with device_branch(count == width):
-            with owner.sites_rows(self.wave.indices[0], self.wave.packed) as stream:
+            with owner.sites_rows(self.wave.indices[0]) as stream:
                 full = execute_segment(step, hidden, self.wave.layer, stream)
                 for destination, value in zip(output, full, strict=True):
                     destination.copy_(value)
         with device_branch(count < width):
-            with owner.sites_rows(self.wave.indices[0], self.wave.packed):
+            with owner.sites_rows(self.wave.indices[0]):
                 self.propagate(step, hidden, active)
             if self.widths:
                 with device_branch(count > 0):
@@ -146,7 +146,7 @@ class AdaptiveSlice:
         # per-request patch fields are gathered with the compacted device indices.
         with (
             override_forward_context(bucket.context),
-            owner.sites_rows(wave.indices[0].index_select(0, rows), wave.packed, selected) as stream,
+            owner.sites_rows(wave.indices[0].index_select(0, rows), selected) as stream,
         ):
             computed = execute_segment(step, seed, self.layer, stream)
             for destination, value in zip(output, computed, strict=True):

@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from pllm.authoring import BackendRequirements
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.admission import model_capture_bytes
+from pllm.backends.vllm.admission import model_capture_bytes, model_hooks
 from pllm.backends.vllm.architecture import DecoderBody, bind_model
 from pllm.backends.vllm.parameter_overlay import capacities, uniform_decode
 from pllm.config import ModelConfig
@@ -72,7 +72,7 @@ class GraphOptions(TypedDict, total=False):
 
 def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
     """Announce model hooks before profiling; ordinary workloads keep vLLM's capture sizes."""
-    if not (requirements.parameter_targets or requirements.custom_residual or requirements.custom_attention):
+    if not model_hooks(requirements):
         return {}
     # Request memories and exact decode updates both capture only decode capacity.
     capacity = (
@@ -87,7 +87,11 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
-            backend="eager" if requirements.parameter_targets or requirements.custom_residual else "inductor",
+            backend=(
+                "eager"
+                if requirements.parameter_targets or requirements.custom_residual or requirements.activation_layers
+                else "inductor"
+            ),
             cudagraph_mode=(
                 CUDAGraphMode.FULL_DECODE_ONLY
                 if requirements.stateful_residual or requirements.exact_phases

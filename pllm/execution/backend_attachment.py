@@ -101,10 +101,14 @@ def attachment_buffer_bytes(
             if graph.custom_forward_task is not None and attachment.in_forward is None:
                 # Per-call row ownership, inverse span mapping and remapped projection ports.
                 buffers += 8 * (3 * rows + blocks * ROWS_PER_BLOCK + probe.causal_domain.requests * len(binding.fields))
+    state_layouts = {entry.resource: entry.layout for entry in layouts.layouts}
     for binding in attachment.activation_bindings:
         shape = binding.fields[0].shape
         rank = shape[0] if len(shape) == 2 else 0
-        buffers += rows * (width * (2 * hidden + 3 * rank) + 8)
+        # Mask and exact field slots are stable; graph replays gather row fields from PTTS.
+        layout = state_layouts[binding.resource]
+        gathered = sum(prod(view.shape) * layout.fields[view.field].dtype.itemsize for view in binding.fields)
+        buffers += rows * (width * (2 * hidden + 3 * rank) + 8 * (1 + len(binding.fields)) + gathered)
     for task in graph.tasks:
         match task.custom_forward:
             case TokenProgramEffect():

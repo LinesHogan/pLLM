@@ -104,7 +104,7 @@ def native(args):
             replay(graph)
             if graph in graphs:
                 wave = graphs[graph]
-                rows = tuple(wave.custom_forward.rows[index] for index in wave.packed)
+                rows = tuple(wave.custom_forward.rows[index] for index in wave.indices[0].tolist())
                 for start, (stop, mask) in buffers[wave].items():
                     observations.append(
                         (

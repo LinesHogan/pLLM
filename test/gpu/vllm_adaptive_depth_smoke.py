@@ -231,7 +231,7 @@ class Audit:
         self.counts.add(count)
         wave = selection.wave
         if count == len(hidden):
-            with wave.custom_forward.sites_rows(wave.indices[0], wave.packed) as stream:
+            with wave.custom_forward.sites_rows(wave.indices[0]) as stream:
                 return execute_segment(step, hidden, wave.layer, stream)
         selection.propagate(step, hidden, active)
         output = tuple(hidden.clone() for _ in step.taps)

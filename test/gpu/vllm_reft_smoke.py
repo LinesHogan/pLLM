@@ -2,7 +2,7 @@
 output, which joins the residual stream in the final norm."""
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -82,10 +82,11 @@ def check_prompt_steering() -> None:
 
 
 def main() -> None:
-    handle = pllm.make_llm(
-        workload=ReFTWorkload(ReFTConfig((23,), 2, first_tokens=1, last_tokens=1)),
-        config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET),
+    workload = ReFTWorkload(ReFTConfig((23,), 2, first_tokens=1, last_tokens=1))
+    config = ModelConfig(
+        "Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET, cuda_graphs=False
     )
+    handle = pllm.make_llm(workload=workload, config=config)
     execution = handle.runner.require_session()._deployment.execution
     baseline = []
     observed = []
@@ -100,7 +101,7 @@ def main() -> None:
 
         hooks.append(norm.register_forward_pre_hook(capture))
         prompts = ["The sky is", "Water freezes at"]
-        sampling = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
+        sampling = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True, logprobs=1)
         handle.generate(prompts, sampling)
         assert execution.diagnostics().update_count == 0 and len(baseline) == 1
         hooks.pop().remove()
@@ -133,7 +134,7 @@ def main() -> None:
             observed.append(selected.numel())
 
         hooks.append(norm.register_forward_hook(check))
-        handle.generate(prompts, sampling, batch=pllm.io.StateImport(parameters))
+        eager = handle.generate(prompts, sampling, batch=pllm.io.StateImport(parameters))
         assert observed == [4]
         diagnostics = execution.diagnostics()
         assert diagnostics.update_count == 1
@@ -144,6 +145,18 @@ def main() -> None:
             hook.remove()
         handle.close()
     assert execution.diagnostics().active_states == 0
+    with pllm.make_llm(workload=workload, config=replace(config, cuda_graphs=True)) as captured:
+        assert captured.diagnostics().eager_reason == ""
+        outputs = captured.generate(prompts, sampling, batch=pllm.io.StateImport(parameters))
+    for actual, expected in zip(outputs, eager, strict=True):
+        a, b = actual.outputs[0], expected.outputs[0]
+        assert a.token_ids == b.token_ids
+        torch.testing.assert_close(
+            torch.tensor([row[token].logprob for row, token in zip(a.logprobs, a.token_ids, strict=True)]),
+            torch.tensor([row[token].logprob for row, token in zip(b.logprobs, b.token_ids, strict=True)]),
+            rtol=0,
+            atol=0.05,
+        )
     check_prompt_steering()
 
 

@@ -109,7 +109,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     execution = deployment.execution
     (binding,) = deployment.attachment.spec.activation_bindings
     adapter = VllmActivationPatch(
-        (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),), len(hidden), in_program=False
+        (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),), len(hidden), execution.arena
     )
     rows = PackedPhaseRowBatch.from_rows(
         0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
@@ -118,10 +118,10 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     execution.execute_anchor(invocation, AnchorId(0))
     try:
         adapter.prepare(rows, invocation, execution.directory)
-        actual = adapter.patch(binding.resource, binding.layer, None, ())(hidden.clone())
+        actual = adapter.patch(binding.resource, binding.layer, None)(hidden.clone())
         torch.testing.assert_close(actual, hidden + expected)
         # The same exact parameters must operate on each forward's current hidden.
-        actual = adapter.patch(binding.resource, binding.layer, None, ())(hidden * 2)
+        actual = adapter.patch(binding.resource, binding.layer, None)(hidden * 2)
         constant = sum(bias[k] * rotation[:, k] for k in range(len(bias)))
         torch.testing.assert_close(actual, 2 * hidden + 2 * expected - constant)
         adapter.clear()
@@ -183,7 +183,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     context = invocation
 
     (binding,) = deployment.attachment.spec.activation_bindings
-    adapter = VllmActivationPatch(deployment.attachment.spec.activation_bindings, 3, in_program=False)
+    adapter = VllmActivationPatch(deployment.attachment.spec.activation_bindings, 3, execution.arena)
     try:
         adapter.prepare(rows, context, execution.directory)
         hidden = torch.arange(12, dtype=torch.float64).reshape(3, 4)
@@ -192,8 +192,7 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
         expected[2] += delta[0].double()
         # The patch edits the MLP output it is handed, before the residual add.
         branch = hidden.clone()
-        patched = adapter.patch(binding.resource, binding.layer, None, ())(branch)
-        assert patched is branch
+        patched = adapter.patch(binding.resource, binding.layer, None)(branch)
         torch.testing.assert_close(patched, expected, rtol=0, atol=0)
         for ref in initial:
             assert torch.count_nonzero(execution.arena.snapshot(old_pin, ref)[0]) == 0

@@ -8,6 +8,16 @@ from pllm.config import ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase
 
 
+def model_hooks(requirements: BackendRequirements) -> bool:
+    """Whether projections, residuals or attention need hooks in the model's graph."""
+    return bool(
+        requirements.parameter_targets
+        or requirements.custom_residual
+        or requirements.custom_attention
+        or requirements.activation_layers
+    )
+
+
 def model_capture_bytes(config: ModelConfig, requirements: BackendRequirements) -> int:
     """Fund the model pool and each decode conditional's separate library workspace by default."""
     if HiddenPhase.DECODE in requirements.exact_phases and config.execution.capture_memory_bytes is None:
@@ -25,8 +35,6 @@ def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Ite
         yield "cuda_graphs", "ModelConfig(cuda_graphs=False)"
     if config.runner == "mrv1":
         yield "runner", 'runner="mrv1" runs workloads without CUDA graphs'
-    if requirements.activation_layers:
-        yield "ActivationPatch", "activation patches run outside CUDA graphs"
     if requirements.custom_forward:
         yield "custom_forward", "@pllm.custom_forward schedules model slices and owns their wave graphs"
     if requirements.instance_adapter:
