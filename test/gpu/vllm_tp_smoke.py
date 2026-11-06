@@ -456,7 +456,7 @@ def _m4_instrument(worker):
             pin = execution.arena.pin_exact(selected, torch.cuda.current_stream())
             try:
                 test._M4_FIELDS.extend(
-                    tuple(field.float().cpu().numpy() for field in execution.arena.snapshot(pin, ref))
+                    tuple(field.float().cpu().numpy().tobytes() for field in execution.arena.snapshot(pin, ref))
                     for ref in selected
                 )
             finally:
@@ -518,7 +518,10 @@ def test_m4_down(kind, monkeypatch):
         for row in range(1):
             values = []
             for index, spec in enumerate(report.states[0].fields):
-                parts = [torch.tensor(rank[row][index]) for rank in fields]
+                parts = [
+                    torch.frombuffer(bytearray(rank[row][index]), dtype=torch.float32).reshape(spec.shape)
+                    for rank in fields
+                ]
                 value = torch.cat(parts, dim=-1) if index == 0 else parts[0]
                 if index:
                     assert all(torch.equal(parts[0], part) for part in parts[1:])
