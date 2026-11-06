@@ -495,7 +495,8 @@ def test_m4_down(kind, monkeypatch):
     }[kind]
     observed = []
     rates = []
-    params = SamplingParams(max_tokens=16, temperature=0, ignore_eos=True, logprobs=1)
+    # Force a common continuation so near-tied greedy logits cannot change later inputs.
+    params = SamplingParams(max_tokens=16, temperature=0, ignore_eos=True, logprobs=1, allowed_token_ids=[42])
     for tp in (1, 2):
         settings = replace(
             config(),
@@ -536,8 +537,13 @@ def test_m4_down(kind, monkeypatch):
     torch.testing.assert_close(observed[1][2], observed[0][2], rtol=0, atol=0.08)
     for whole, sharded in zip(observed[0][1], observed[1][1]):
         for value, reference in zip(sharded, whole):
-            torch.testing.assert_close(value, reference, rtol=0.02, atol=2e-5)
+            torch.testing.assert_close(
+                value, reference, rtol=0.02 if kind.endswith("train") else 0, atol=2e-5 if kind.endswith("train") else 0
+            )
     print(
-        f"M4 {kind}: TP1={rates[0]:.1f} TP2={rates[1]:.1f} tok/s; matching global fields/logprobs; zero host syncs",
+        f"M4 {kind}: TP1={rates[0]:.1f} TP2={rates[1]:.1f} tok/s; "
+        f"logprob max_abs={(observed[1][2] - observed[0][2]).abs().max():.6g}; "
+        f"field max_abs={max((a - b).abs().max().item() for x, y in zip(observed[1][1], observed[0][1]) for a, b in zip(x, y)):.6g}; "
+        "zero host syncs",
         flush=True,
     )
