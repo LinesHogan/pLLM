@@ -480,8 +480,34 @@ def _m4_fields(worker):
     return _M4_FIELDS
 
 
+def _m4_scores(output):
+    return torch.tensor(
+        [
+            [step[token].logprob for token, step in zip(row.outputs[0].token_ids, row.outputs[0].logprobs)]
+            for row in output
+        ]
+    )
+
+
+def _m4_params():
+    # Raw logprobs precede this mask, retaining the unmodified model distribution.
+    return SamplingParams(max_tokens=16, temperature=0, ignore_eos=True, logprobs=1, allowed_token_ids=[42])
+
+
+@pytest.fixture(scope="module")
+def m4_reference():
+    scores = []
+    for tp in (1, 2):
+        settings = replace(config(), tensor_parallel_size=tp, multiprocessing=True)
+        with pllm.make_llm(settings) as handle:
+            scores.append(_m4_scores(handle.generate(PROMPTS, _m4_params())))
+    error = (scores[1] - scores[0]).abs().max().item()
+    print(f"M4 plain vLLM TP logprob max_abs={error:.6g}", flush=True)
+    return error
+
+
 @pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train"])
-def test_m4_down(kind, monkeypatch):
+def test_m4_down(kind, monkeypatch, m4_reference):
     from time import perf_counter
 
     from test.tp_overlays import DenseDownTraining, DownAdapter, LowRankDownTraining
@@ -495,8 +521,7 @@ def test_m4_down(kind, monkeypatch):
     }[kind]
     observed = []
     rates = []
-    # Force a common continuation so near-tied greedy logits cannot change later inputs.
-    params = SamplingParams(max_tokens=16, temperature=0, ignore_eos=True, logprobs=1, allowed_token_ids=[42])
+    params = _m4_params()
     for tp in (1, 2):
         settings = replace(
             config(),
@@ -528,13 +553,9 @@ def test_m4_down(kind, monkeypatch):
                     assert all(torch.equal(parts[0], part) for part in parts[1:])
                 values.append(value)
             roots.append(values)
-        probabilities = [
-            [step[token].logprob for token, step in zip(row.outputs[0].token_ids, row.outputs[0].logprobs)]
-            for row in output
-        ]
-        observed.append((tokens(output), roots, torch.tensor(probabilities)))
+        observed.append((tokens(output), roots, _m4_scores(output)))
     assert observed[0][0] == observed[1][0]
-    torch.testing.assert_close(observed[1][2], observed[0][2], rtol=0, atol=0.08)
+    torch.testing.assert_close(observed[1][2], observed[0][2], rtol=0, atol=1.2 * m4_reference + 0.01)
     for whole, sharded in zip(observed[0][1], observed[1][1]):
         for value, reference in zip(sharded, whole):
             torch.testing.assert_close(
