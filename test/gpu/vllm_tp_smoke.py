@@ -500,7 +500,11 @@ def m4_reference():
     for tp in (1, 2):
         settings = replace(config(), tensor_parallel_size=tp, multiprocessing=True)
         with pllm.make_llm(settings) as handle:
-            scores.append(_m4_scores(handle.generate(PROMPTS, _m4_params())))
+            plain = handle._require_open()
+            plain.sleep(level=0, mode="keep")
+            plain.enqueue(PROMPTS, _m4_params(), use_tqdm=False)
+            plain.wake_up(tags=["scheduling"])
+            scores.append(_m4_scores(plain.wait_for_completion(RequestOutput, use_tqdm=False)))
     error = (scores[1] - scores[0]).abs().max().item()
     print(f"M4 plain vLLM TP logprob max_abs={error:.6g}", flush=True)
     return error

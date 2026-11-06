@@ -84,7 +84,9 @@ class _ProjectionHook:
     def base(self, hidden: torch.Tensor) -> LinearOutput:
         if self.apply is None:
             return self.forward(hidden)
-        return self.apply(self.module, hidden, self.bias), None
+        # Accumulating the correction in BF16 before the reduction adds a rounding
+        # on every rank. Keep the partial sum wide and round once after vLLM sums it.
+        return self.apply(self.module, hidden, self.bias).float(), None
 
     def partial(self, layer: LinearBase, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         self.bias = bias
@@ -92,12 +94,18 @@ class _ProjectionHook:
         assert isinstance(output, tuple)
         return output[0]
 
+    def reduced(self, hidden: torch.Tensor) -> LinearOutput:
+        output = self.forward(hidden)
+        assert isinstance(output, tuple)
+        return output[0].to(self.module.params_dtype), output[1]
+
     def install(self, callback: Callable[[torch.Tensor], LinearOutput]) -> None:
         self.callback = callback
         if self.apply is None:
             self.module.forward = callback
         else:
             self.module.quant_method.apply = self.partial
+            self.module.forward = self.reduced
 
     def close(self) -> None:
         self.module.forward = self.forward
