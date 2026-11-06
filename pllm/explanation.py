@@ -398,6 +398,8 @@ def _settings(
                 if capacity is None
                 else f"bounded fused guidance: guide the highest {capacity} survivors/row, tail unguided; "
                 "peaked full-vocabulary rows use the true one-token nucleus when top-1 probability >= top_p < 1; "
+                "choose capacities so the common case never takes the overflow path; "
+                "smaller K is slower because overflow rows need top-K selection; "
                 "MRv2, unquantized unscaled TP=1 LM head; FLOP/byte estimates are capacity upper bounds",
             )
         )

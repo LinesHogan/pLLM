@@ -44,7 +44,16 @@ class KVOffload:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOptions:
-    """Framework execution policy; lag counts post-sampler steps hidden from readers."""
+    """Framework execution policy; lag counts post-sampler steps hidden from readers.
+
+    Post-filter guidance defaults to capacity K=4096. Choose capacities so the common
+    case never takes the overflow path; smaller K is slower because overflow rows need
+    top-K selection. In the measured ESamp beta=.5 corpus, the largest real nucleus was
+    2,785 tokens: K=4096 kept those rows on the simple path, reaching 34,742 tok/s versus
+    33,737 at K=256, 34,069 at K=1024 and 32,624 with dense guidance. Policy p99.9 TV
+    was about 6e-14 with 100% shared-Gumbel draw agreement on those measured corpora.
+    These measurements do not guarantee that other workloads fit the capacity.
+    """
 
     max_training_rows: int = 1
     capture_memory_bytes: int | None = None  # None derives tensor-task reservations from the workload.
@@ -57,9 +66,8 @@ class ExecutionOptions:
     publish_lag: int = 1
     # Guide the K highest-logit post-filter survivors; leave the tail unguided.
     # Peaked full-vocabulary rows use their true nucleus. None opts out to exact dense.
-    # ESamp beta=.5: K=256 meets measured p99.9 TV < 4.88e-4 and Gumbel agreement >=99.99%.
     # Unsupported runners/heads select exact dense automatically.
-    guidance_capacity: int | None = 256
+    guidance_capacity: int | None = 4096
 
     @property
     def model_capture_bytes(self) -> int:

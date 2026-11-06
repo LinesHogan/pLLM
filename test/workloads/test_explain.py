@@ -170,7 +170,8 @@ def test_declared_flop_estimates(model_config):
     assert prediction.estimate.sampler_bytes_estimate == rows * (
         16 * vocab + vocab * (hidden * 2 + 20) + hidden * 2 + 16
     )
-    assert "bounded fused guidance" in str(bounded) and "tail unguided" in str(bounded)
+    assert "highest 4096 survivors/row" in str(bounded) and "tail unguided" in str(bounded)
+    assert "smaller K is slower because overflow rows need top-K selection" in str(bounded)
     for config, reason in (
         (replace(model_config, runner="mrv1"), "MRv1"),
         (replace(model_config, tensor_parallel_size=2), "TP>1"),

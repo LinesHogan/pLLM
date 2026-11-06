@@ -11,7 +11,7 @@ from pllm.execution.step_capture import capture_graph
 pytestmark = pytest.mark.gpu
 
 
-@pytest.mark.parametrize("fp64,capacity,dtype", ((False, 32, torch.float32), (True, 256, torch.bfloat16)))
+@pytest.mark.parametrize("fp64,capacity,dtype", ((False, 32, torch.float32), (True, 4096, torch.bfloat16)))
 def test_bounded_guidance_draw_and_capture(fp64, capacity, dtype):
     torch.manual_seed(41)
     rows, vocab, width = 10, 10003, 37

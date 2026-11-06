@@ -379,13 +379,24 @@ class SelectiveBias(pllm.Workload):
 
 偏置向量在调用时传入：`llm.generate(..., batch=pllm.io.StateImport((vector,)))`。
 
-#### 原理与代价拆解：引导采样的 $401\ \mu\text{s}$ 去哪了？
+#### 默认有界融合引导：容量为什么是 4096？
 
-在 RTX 4090（0.5B，128 并发）下，`ESamp` 只开 `@pllm.train`（`beta=0`）时吞吐约为原生 vLLM 的 **92.5%**（$36,113\text{ tok/s}$；教程 03 的 `MiniESamp` 为 **95%**）；开启 `@pllm.guide_sampling`（`beta=0.5`）后约为 **83.4%**（$32,614\text{ tok/s}$；`MiniESamp` 为 **84%**），每步比 `beta=0` 多花约 **$401\ \mu\text{s}$**。这部分开销主要由三项组成：
+`ExecutionOptions.guidance_capacity` 默认是 **4096**。在支持的 MRv2、TP=1、未量化且未缩放或变换的 LM Head 上，框架在 vLLM 完成过滤后只投影保留下来的 token，并把引导与抽样融合；不支持的 runner 或 LM Head 会自动选择精确的 dense 路径。`guidance_capacity=None` 可显式选择精确 dense，`pllm.explain` 会报告实际路径、回退原因以及相应的 FLOP/字节估计。
 
-1. **LM Head 投影行数翻倍（$+118\ \mu\text{s}$）**：`@pllm.guide_sampling` 返回 `[rows, hidden]` 的预测隐状态，需要通过模型的 LM Head 投影成 `[rows, 151936]` 的词表 logits。如果单独再跑一次 128 行的 LM Head，光读一遍 $272\text{ MB}$ 权重就要约 **$380\ \mu\text{s}$**。`pllm` 的做法是**把引导隐状态直接拼在 vLLM 原有 `compute_logits` 输入的末尾**，把矩阵乘从 $[128, 896] \times [896, 151936]$ 扩成 $[256, 896] \times [896, 151936]$——权重只读一遍，因此耗时仅增加 **$118\ \mu\text{s}$**。
-2. **词表宽度重加权（$+187\ \mu\text{s}$）**：按 $(1+\beta)\,\text{logits} - \beta\,\text{pred}$ 混合两个 $[128, 151936]$ 的大张量。`pllm` 用单个融合内核完成，单次逻辑读写流量固定为 **$195\text{ MB}$**，$187\ \mu\text{s}$ 已贴近 4090 显存带宽的物理极限。
-3. **额外两次小 CUDA Graph 回放（约 $+56\ \mu\text{s}$）与过滤（约 $+8\ \mu\text{s}$）**。
+**容量应让常见行不进入 overflow 路径；较小的 K 反而更慢，因为 overflow 行还需要 top-K 选择。** 保留下来的有限 logits 不超过 K 时，内核直接压紧、投影、抽样，无需排序。超过 K 时才选出 logits 最高的 K 个 token 进行引导，其余 tail 保持未引导并参与抽样（相同 logit 按 token ID 决胜）。若上游跳过了全词表行的过滤，且 top-1 概率达到 `top_p < 1`，则使用真正的单 token nucleus。
+
+同一轮 RTX 4090、Qwen2.5-0.5B、128 并发、256 生成 token、`beta=0.5`、CUDA Graph、FlashInfer sampler 的七轮测量中，各容量的吞吐中位数如下：
+
+| guidance capacity | 吞吐（tok/s） |
+|---|---:|
+| 256 | 33,737 |
+| 1024 | 34,069 |
+| **4096（默认）** | **34,742** |
+| `None`（精确 dense） | 32,624 |
+
+四组实测语料共 652,800 行中，最大的真实 nucleus 为 **2,785**，因此 K=4096 的真实支持集全部走简单路径；相对 dense 引导的策略误差 p99.9 TV 约 **$6\times10^{-14}$**，共享 Gumbel 抽样一致率为 **100%**。这些是该工作负载的测量结果，并非其他模型、过滤参数或 beta 的精度保证；有界路径在 overflow 时只引导 top-K，尖峰全词表行也会使用上述 nucleus 规则。需要精确 dense 行为时设置 `guidance_capacity=None`。
+
+Dense 路径仍需额外的全词表 LM Head 投影和重加权：旧版 RTX 4090 测量中，开启引导比 `beta=0` 每步多约 $401\ \mu\text{s}$，其中投影约 $118\ \mu\text{s}$、重加权约 $187\ \mu\text{s}$。这些 dense 成本不代表默认有界融合路径；有界路径的 `explain` 投影与流量数字是容量上界，不能把更小的上界直接当作更高的吞吐。
 
 旁路训练本身也很省：在 `beta=0` 时每步 $177.6\ \mu\text{s}$ 的旁路 GPU 时间里，分页 `AdamW` 只占 **$29.3\ \mu\text{s}$**——它直接从源物理槽位读取参数和一阶/二阶矩并写回目标槽位，省去了对 5 个优化器状态字段做写时复制的整页搬运。
 
