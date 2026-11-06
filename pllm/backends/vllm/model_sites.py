@@ -22,6 +22,7 @@ from torch import Tensor
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, hidden_binding, sublayer_norms
 from pllm.backends.vllm.hidden_taps import HiddenTaps, Tap
+from pllm.backends.vllm.site_write import SiteWrite
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.packed_rows import PackedPhaseRowBatch
 from pllm.execution.attention_methods import AttentionProgram
@@ -45,13 +46,17 @@ Forward = Callable[..., Tensor | tuple[Tensor, ...]] | Callable[[Tensor], Linear
 _SITES: dict[int, "ModelSites"] = {}
 
 
-@torch.library.custom_op("pllm::model_site", mutates_args={"inputs", "outputs", "buffers"})
-def model_site(inputs: list[Tensor], outputs: list[Tensor], buffers: list[Tensor], hook: int) -> None:
+@torch.library.custom_op("pllm::model_site", mutates_args={"outputs", "writes"})
+def model_site(
+    inputs: list[Tensor], outputs: list[Tensor], reads: list[Tensor], writes: list[Tensor], hook: int
+) -> None:
     """Run a bound hook inside vLLM's capture, with stable state and same-forward scratch ports."""
-    _SITES[buffers[0].data_ptr()].hooks[hook].emit(inputs, outputs)
+    _SITES[reads[0].data_ptr()].hooks[hook].emit(inputs, outputs)
 
 
-def _model_site_meta(inputs: list[Tensor], outputs: list[Tensor], buffers: list[Tensor], hook: int) -> None:
+def _model_site_meta(
+    inputs: list[Tensor], outputs: list[Tensor], reads: list[Tensor], writes: list[Tensor], hook: int
+) -> None:
     return None
 
 
@@ -160,6 +165,7 @@ class ModelSites:
             )
             for source in earlier
         }
+        self.count = 1
         for index, (norm, kernel) in enumerate(zip(sublayer_norms(decoder.model), decoder.norms, strict=True)):
             layer, attention = divmod(index, 2)
             before: Place | None = ("attention", layer) if attention else ("mlp", layer - 1) if layer else None
@@ -185,6 +191,12 @@ class ModelSites:
                 ),
                 (None, None) if taps is None else (taps.taps.get((path, 0)), taps.taps.get((path, 1))),
             )
+            if boundary.owner is not None and boundary.owner.memory is None and self.streams == 1:
+                assert before is not None
+                sample = weight.new_empty((1, self.hidden))
+                boundary.write = SiteWrite(boundary.owner, before, self, (sample, torch.empty_like(sample)))
+                if boundary.write.identity:
+                    boundary.owner = None
             if before is not None and before[0] == "mlp":
                 self._ends[before[1]] = boundary
             if (
@@ -210,6 +222,13 @@ class ModelSites:
                 width,
                 head_dim,
             )
+            if hook.owner is not None:
+                sample = weight.new_empty((1, width // head_dim, head_dim))
+                hook.write = SiteWrite(hook.owner, ("value", layer), self, (sample,))
+                if hook.write.identity:
+                    hook.owner = None
+            if hook.owner is None and hook.keeps is None:
+                continue
             hook.index = len(self.hooks)
             self._install(module, hook.graph_forward if graphs else hook)
             self.hooks.append(hook)
@@ -221,20 +240,14 @@ class ModelSites:
         """Whether hooks consume versioned state, task results or retained request memory."""
         return bool(self._sources or self._result_sources or self._memories)
 
-    @property
-    def buffers(self) -> list[Tensor]:
-        """The uploaded row-to-request table, staged fields and same-forward scratch used by captured hooks."""
-        return [
-            self._requests_of,
-            *self._states.values(),
-            *self._results.values(),
-            *self._earlier.values(),
-            *(buffer for memory in self._memories.values() for buffer in memory.buffers),
-        ]
-
     def run_hook(self, hook: int, inputs: list[Tensor], outputs: list[Tensor]) -> None:
-        """Keep orchestration opaque to Dynamo; upstream owns each capacity's graph and its allocations."""
-        model_site(inputs, outputs, self.buffers, hook)
+        """Keep orchestration opaque to Dynamo; declare only scratch and private pools writable."""
+        reads = [self._requests_of, *self._states.values(), *self._results.values()]
+        writes = [*self._earlier.values()]
+        for memory in self._memories.values():
+            reads.extend((memory.table, memory.rows))
+            writes.extend(memory.pools)
+        model_site(inputs, outputs, reads, writes, hook)
 
     def _install(self, module: torch.nn.Module, hook: Forward) -> None:
         self._installed.append((module, module.forward))
@@ -360,6 +373,7 @@ class _Boundary:
     # The taps of the module's normalized output and residual stream, which this hook copies itself.
     taps: tuple[Tap | None, Tap | None]
     index: int = 0
+    write: SiteWrite | None = None
 
     def graph_forward(self, branch: Tensor, stream: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
         """Expose fresh outputs with the shapes vLLM's compiled model carries between boundaries."""
@@ -373,16 +387,44 @@ class _Boundary:
         return normed, residual
 
     def emit(self, inputs: list[Tensor], outputs: list[Tensor]) -> None:
-        """Materialize the hook's results into the graph's declared outputs."""
-        if len(inputs) == 1:
-            result = self(inputs[0])
+        """Run the norm directly in its declared ports, without copying its outputs."""
+        branch, stream = inputs[0], inputs[1] if len(inputs) == 2 else None
+        self.sites.count = len(branch)
+        if stream is None:
+            result = self(branch)
             assert isinstance(result, Tensor)
             outputs[0].copy_(result)
+            return
+        normed, residual = outputs
+        operands = (
+            (stream, branch)
+            if self.owner is None
+            else None
+            if self.write is None
+            else self.write.operands(stream, branch)
+        )
+        if operands is not None and self.reader is None and self.final is None:
+            left, right = operands
+            residual.copy_(left)
+            normed.copy_(right)
+            self._normalize(normed, residual)
         else:
-            result = self(inputs[0], inputs[1])
-            assert isinstance(result, tuple)
-            outputs[0].copy_(result[0])
-            outputs[1].copy_(result[1])
+            x = self.complete(branch, stream)
+            if self.final is not None:
+                x = self._final(self.final, x)
+            residual.copy_(x)
+            if self.reader is None:
+                normed.zero_()
+                self._normalize(normed, residual)
+            else:
+                normed.copy_(self._read(self.reader, x))
+                self._normalize(normed, torch.zeros_like(normed))
+        self._keep(normed, residual)
+
+    def _normalize(self, branch: Tensor, stream: Tensor) -> None:
+        normed, residual = self.norm(branch, stream)
+        branch.copy_(normed)
+        stream.copy_(residual)
 
     def streams_of(self, stream: Tensor) -> Tensor:
         """The stream as [rows, n, d] with n residual streams. vLLM passes the embedding to the first layer's
@@ -415,27 +457,25 @@ class _Boundary:
 
     def __call__(self, branch: Tensor, stream: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
         self.sites.count = len(branch)
-        if stream is None:
-            # The model's first norm, a custom forward entering mid-model, or a custom forward normalizing its result.
-            x = branch if self.before is not None else self.streams_of(branch).reshape(len(branch), -1)
-        elif self.owner is None and self.sites.streams == 1 and self.reader is None and self.final is None:
-            normed, x = self.norm(branch, stream)
-            self._keep(normed, x)
-            return normed, x
-        else:
-            x = self.complete(branch, stream)
+        if stream is not None:
+            width = self.sites.hidden * (self.sites.streams if self.final is None else 1)
+            # Eager native boundaries donate their inputs; captured ops use fresh ports.
+            outputs = (
+                [branch, stream]
+                if self.owner is None and self.reader is None and self.final is None and self.sites.streams == 1
+                else [torch.empty_like(branch), branch.new_empty((len(branch), width))]
+            )
+            self.emit([branch, stream], outputs)
+            return outputs[0], outputs[1]
+        x = branch if self.before is not None else self.streams_of(branch).reshape(len(branch), -1)
         if self.final is not None:
             x = self._final(self.final, x)
         u = x if self.reader is None else self._read(self.reader, x)
-        # The fused kernel over (u, 0) normalizes exactly u; the first norm has no residual and uses the plain one.
-        normed = self.norm(u) if stream is None else self.norm(u.clone(), torch.zeros_like(u))[0]
-        if stream is None:
-            normalized = self.taps[0]
-            if normalized is not None:
-                normalized.copy(normed)
-        else:
-            self._keep(normed, x)
-        return normed if stream is None else (normed, x)
+        normed = self.norm(u)
+        normalized = self.taps[0]
+        if normalized is not None:
+            normalized.copy(normed)
+        return normed
 
     def _read(self, reader: ResidualRewrite, stream: Tensor) -> Tensor:
         assert self.after is not None
@@ -483,31 +523,43 @@ class _Value:
     width: int
     head_dim: int
     index: int = 0
+    write: SiteWrite | None = None
 
     def __call__(self, hidden: Tensor) -> LinearOutput:
         output = self.native(hidden)
         projected = output if isinstance(output, Tensor) else output[0]
-        self.emit([projected], [])
+        self.emit([], [projected])
         return output
 
     def graph_forward(self, hidden: Tensor) -> LinearOutput:
         """Keep the native projection compiled and capture just its value rewrite as a model-site op."""
         output = self.native(hidden)
         projected = output if isinstance(output, Tensor) else output[0]
-        self.sites.run_hook(self.index, [projected], [])
+        self.sites.run_hook(self.index, [], [projected])
         return output
 
     def emit(self, inputs: list[Tensor], outputs: list[Tensor]) -> None:
         """Rewrite and retain the value slice in place before attention reads it."""
-        (projected,) = inputs
+        (projected,) = outputs
         self.sites.count = len(projected)
         value = projected[:, self.start : self.start + self.width].view(len(projected), -1, self.head_dim)
         if self.owner is not None:
-            written = self.owner.call_write(("value", self.layer), self.sites, value)
-            if written.shape != value.shape or written.dtype != value.dtype:
-                raise ValueError(
-                    f"{self.owner.name}: return value rows [rows, {value.shape[1]}, {self.head_dim}] {value.dtype}"
-                )
-            value.copy_(written)
+            assert self.write is not None
+            operands = self.write.operands(value)
+            if operands is None:
+                self._write(value)
+            elif len(operands) == 1:
+                value.copy_(operands[0])
+            else:
+                torch.add(*operands, out=value)
         if self.keeps is not None:
             self.sites.keep(self.keeps, value)
+
+    def _write(self, value: Tensor) -> None:
+        assert self.owner is not None
+        written = self.owner.call_write(("value", self.layer), self.sites, value)
+        if written.shape != value.shape or written.dtype != value.dtype:
+            raise ValueError(
+                f"{self.owner.name}: return value rows [rows, {value.shape[1]}, {self.head_dim}] {value.dtype}"
+            )
+        value.copy_(written)

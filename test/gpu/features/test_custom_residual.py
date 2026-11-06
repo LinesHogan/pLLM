@@ -484,7 +484,11 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
                     start += count
                 frontiers[request] += count
             torch.testing.assert_close(
-                actual, result, rtol=0, atol=0, msg=lambda message: f"chunk={chunk} step={step}: {message}"
+                actual[: sum(counts)],
+                result[: sum(counts)],
+                rtol=0,
+                atol=0,
+                msg=lambda message: f"chunk={chunk} step={step}: {message}",
             )
             execution.advance_to(context, "next.prepare")
             execution.finish_step(context, stream)

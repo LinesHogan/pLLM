@@ -57,11 +57,6 @@ class SiteMemorySchedule:
         self._counts: tuple[int, ...] | None = None
         self._buckets: dict[tuple[int, int], Callable[..., tuple[dict[str, Tensor], Tensor]]] = {}
 
-    @property
-    def buffers(self) -> list[Tensor]:
-        """Storage read and written by the opaque model hook."""
-        return [self.table, self.rows, *self.pools]
-
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
         """Upload host scheduling facts and the exact slots authorized by the pending PTTS write."""
         resource = self.memory.carry.resource
@@ -87,7 +82,8 @@ class SiteMemorySchedule:
             host[: sum(self._counts)] = tuple(i for group in packed.values() for i in group)
 
     def __call__(self, stream: Tensor, branch: Tensor, invariants: tuple[Tensor, ...]) -> Tensor:
-        written = stream + branch
+        # Buckets overwrite every live row; padded model lanes have no consumer.
+        written = torch.empty_like(stream)
         table = self.table[:, : min(len(stream), self.table.shape[1])]
         widths = (*tuple(2**p for p in range((len(stream) - 1).bit_length())), len(stream))
         self.buckets(table, (1,), 0, stream, branch, written, invariants)
