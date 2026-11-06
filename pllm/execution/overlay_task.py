@@ -484,7 +484,7 @@ class OverlayTransition:
             )
             if results:
                 data.entries.append(
-                    OverlayEntry(identity, batch.selection.refs[index], batch.after_refs[index], results)
+                    OverlayEntry(identity, batch.selection.refs[int(index)], batch.after_refs[int(index)], results)
                 )
                 changed[index] = results[0].update.changed
                 for result in results[1:]:
@@ -690,7 +690,7 @@ class ProgramOverlay:
             self.entry_fields, self.fields, self.saved = (
                 tuple(torch.empty_like(field) for field in self.batch.roots[0]) for _ in range(3)
             )
-        index = self.batch.selection.state_indices[row]
+        index = int(self.batch.selection.state_indices[row])
         for ports, fields in (
             (self.entry_fields, self.entry.roots[index]),
             (self.saved, self.batch.roots[index]),
@@ -770,8 +770,8 @@ class ProgramOverlay:
     def collect(self, results: tuple[OverlayTargetResult, ...], pending: tuple[ProgramOperand, ...]) -> None:
         """Reconstruct invocation metadata from device outputs, including cached graph replays."""
         row = self.data.step.rows.inspect_row(self.row)
-        index = self.batch.selection.state_indices[self.row]
-        if self.batch.after_refs[index] != self.batch.selection.refs[index]:
+        index = int(self.batch.selection.state_indices[self.row])
+        if self.batch.after_refs[int(index)] != self.batch.selection.refs[int(index)]:
             for target, source in zip(self.batch.roots[index], self.fields, strict=True):
                 target.copy_(source)
         copied = tuple(
@@ -790,7 +790,9 @@ class ProgramOverlay:
         )
         if copied:
             self.data.entries.append(
-                OverlayEntry(row.identity, self.batch.selection.refs[index], self.batch.after_refs[index], copied)
+                OverlayEntry(
+                    row.identity, self.batch.selection.refs[int(index)], self.batch.after_refs[int(index)], copied
+                )
             )
         if not self.in_program:
             self.ordinary.extend(

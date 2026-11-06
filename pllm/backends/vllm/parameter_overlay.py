@@ -4,7 +4,7 @@ the pinned reader (the custom op that reads PTTS pools inside captured graphs) a
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -300,7 +300,7 @@ class ExactParameterOverlay:
 
     def prepare_wave(
         self,
-        rows: tuple[PackedPhaseRow, ...],
+        rows: Sequence[PackedPhaseRow],
         row_overlays: tuple[ProgramOverlay, ...],
         indices: tuple[torch.Tensor, ...],
     ) -> None:
@@ -312,7 +312,7 @@ class ExactParameterOverlay:
             handle.prepared = tuple(
                 _PreparedRows(
                     row,
-                    row_overlay.batch.after_refs[row_overlay.batch.selection.state_indices[row_overlay.row]],
+                    row_overlay.batch.after_refs[int(row_overlay.batch.selection.state_indices[row_overlay.row])],
                     index,
                     binding,
                     offset,
@@ -628,7 +628,7 @@ class PinnedParameterOverlay:
                     ),
                 )
                 reader.embedding = self.embedding.values
-        self.sources: tuple[PackedPhaseRow, ...] = ()
+        self.sources: Sequence[PackedPhaseRow] = ()
         self.starts: Slots = np.empty(0, dtype=np.int64)
         self.total_rows = 0
         self.stream: torch.cuda.Stream | None = None
@@ -685,7 +685,7 @@ class PinnedParameterOverlay:
             )
             pins = tuple(pin for pin, _ in versions)
             refs = StateRefs.of(tuple(ref for _, ref in versions))
-            _, slots = context.arena.slots(pins, refs)
+            _, slots = context.arena.slots(pins, np.arange(len(pins), dtype=np.int64), refs)
             self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):
                 value.record_stream(self.stream)

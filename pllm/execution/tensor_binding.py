@@ -21,7 +21,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.member import MemberDeclaration
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
+from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedRows
 from pllm.contracts.parameter_overlay import FieldView, Projection
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
@@ -280,7 +280,7 @@ class TensorBinding(Builder[TensorFrame]):
                     "side tensor tasks need fixed row inputs; declare row inputs or move the task before the model"
                 )
 
-    def step_row_reader(self) -> Callable[[StepInput], tuple[PackedPhaseRow, ...]]:
+    def step_row_reader(self) -> Callable[[StepInput], PackedRows]:
         """The rows that open a step's state context, chosen once at bind: a model effect reading request state
         selects every packed row's request; a custom forward over no request state selects none."""
         effects, request = self.effects, any(state.scope is StateScope.REQUEST for state in self.graph.states)
@@ -289,9 +289,9 @@ class TensorBinding(Builder[TensorFrame]):
             or self.sites.rewrites
             or (effects.custom_forward is not None and effects.overlay_bindings)
         ):
-            return (lambda value: value.rows.rows) if request else (lambda value: ())
+            return (lambda value: value.rows.rows) if request else (lambda value: value.rows.rows[:0])
         if effects.custom_forward is not None and not request:
-            return lambda value: ()
+            return lambda value: value.rows.rows[:0]
         read = self.row_reader()
         return lambda value: read(value.rows)
 
@@ -492,12 +492,12 @@ class TensorBinding(Builder[TensorFrame]):
         (resource,) = self.imports
         selection = batch.selection
         group = selection.for_resource(StateResource(resource))
-        if group.keys == (None,):
-            data.replacements = ((selection.refs.index(group.refs[0]), update.values),)
+        if group.instance:
+            data.replacements = ((int(selection.refs.positions(group.refs)[0]), update.values),)
         else:
             selected: dict[int, int] = {}
             for row, index in zip(selection.rows, group.state_indices, strict=True):
-                if selection.refs[index].version_id != 0:
+                if selection.refs[int(index)].version_id != 0:
                     continue
                 source = data.step.import_rows[row.identity.request_id]
                 if index in selected and selected[index] != source:
@@ -545,7 +545,7 @@ class TensorBinding(Builder[TensorFrame]):
             return None
         return HiddenPhase.DECODE
 
-    def row_reader(self) -> Callable[[PackedPhaseRowBatch], tuple[PackedPhaseRow, ...]]:
+    def row_reader(self) -> Callable[[PackedPhaseRowBatch], PackedRows]:
         """Bind the frame's row selection once; tasks filter only when they need a narrower phase."""
         if self.row_phase() is None:
             return lambda rows: rows.producer_rows(None)
@@ -562,7 +562,7 @@ class TensorBinding(Builder[TensorFrame]):
                 packed = value.sampler_rows.packed_indices
                 columns = value.rows.columns[:, packed]
                 eligible = (columns[6] == 0) & ((columns[3] == 0) | (columns[2] == columns[5] - 1))
-                rows = value.rows.inspect(packed[eligible])
+                rows = PackedRows(value.rows, packed[eligible])
             else:
                 rows = read(value.rows)
             data = TensorFrame(value, rows)

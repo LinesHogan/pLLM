@@ -164,22 +164,24 @@ class _Pin:
 class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
     """Batch slot access with tensor views and individual bundles materialized only on demand."""
 
-    def __init__(self, arena: PageBundleArena, access: tuple[PagePin | PageWrite, ...], refs: StateRefs) -> None:
-        self._arena, self._access, self._refs = arena, access, refs
+    def __init__(
+        self, arena: PageBundleArena, access: tuple[PagePin | PageWrite, ...], owners: Slots, refs: StateRefs
+    ) -> None:
+        self._arena, self._access, self._owners, self._refs = arena, access, owners, refs
         self._views: dict[int, tuple[torch.Tensor, ...]] = {}
         self._matrix: tuple[str, Slots] | None = None
 
     def __len__(self) -> int:
         return len(self._refs)
 
-    def select(self, indices: tuple[int, ...]) -> LazyRoots:
+    def select(self, indices: Slots) -> LazyRoots:
         """Borrow a resource-specific subset under the same issued page access."""
-        return LazyRoots(self._arena, tuple(self._access[i] for i in indices), self._refs.take(indices))
+        return LazyRoots(self._arena, self._access, self._owners[indices], self._refs.take(indices))
 
     def slot_matrix(self) -> tuple[str, Slots]:
         """One matrix for all fields, in selection order."""
         if self._matrix is None:
-            self._matrix = self._arena.slots(self._access, self._refs)
+            self._matrix = self._arena.slots(self._access, self._owners, self._refs)
         return self._matrix
 
     def field_slots(self, field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -197,7 +199,9 @@ class LazyRoots(Sequence[tuple[torch.Tensor, ...]]):
         if isinstance(index, slice):
             return tuple(self[i] for i in range(*index.indices(len(self))))
         if index not in self._views:
-            self._views[index] = self._arena.borrow_roots((self._access[index],), self._refs.take((index,)))[0]
+            self._views[index] = self._arena.borrow_roots(
+                (self._access[int(self._owners[index])],), self._refs.take((index,))
+            )[0]
         return self._views[index]
 
 
@@ -428,13 +432,12 @@ class PageBundleArena:
             rows,
         )
 
-    def latest_batch(self, resource: str, refs: StateRefs) -> StateRefs:
-        """Read the latest versions by cached arena row, without allocating individual refs."""
+    def latest_batch(self, resource: str, columns: Slots) -> StateRefs:
+        """Read latest versions using the native projection's layout, lineage and arena-row columns."""
         self._require_live()
-        table, rows = self._tables[resource], refs.rows
-        assert rows is not None
-        assert (table.status[rows] == 2).all() and (table.lineages[rows] == refs.lineages).all()
-        return StateRefs(refs.layouts, refs.lineages, table.versions[rows], rows)
+        table, rows = self._tables[resource], columns[2]
+        assert (table.status[rows] == 2).all() and (table.lineages[rows] == columns[1]).all()
+        return StateRefs(columns[0], columns[1], table.versions[rows], rows)
 
     def root(self, ref: StateRef) -> PageBundle:
         self._require_live()
@@ -766,6 +769,16 @@ class PageBundleArena:
                 raise KeyError(ref)
         return tuple(result)
 
+    def ref_resource(self, refs: StateRefs) -> str:
+        """Look up a homogeneous selection's resource by its arena-wide lineage identity."""
+        lineage = LineageId(int(refs.lineages[0]))
+        return next(resource for resource, table in self._tables.items() if lineage in table.row_of)
+
+    def access_resource(self, access: PagePin | PageWrite) -> str:
+        """Read the homogeneous resource of an issued access without inspecting state records."""
+        (group,) = self._access_pages(access)
+        return group.table.resource
+
     def slot_matrix(self, access: PagePin | PageWrite, refs: StateRefs) -> tuple[str, Slots]:
         """Resolve a homogeneous array selection under its issued pin or private write."""
         for group in self._access_pages(access):
@@ -777,24 +790,31 @@ class PageBundleArena:
                     return group.table.resource, group.slots[positions]
         raise KeyError(refs)
 
-    def slots(self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs) -> tuple[str, Slots]:
-        """Resolve all field slots once for a homogeneous resource selection."""
-        tokens = tuple(dict.fromkeys(access))
-        if len(tokens) == 1:
-            return self.slot_matrix(tokens[0], refs)
-        else:
-            positions = {
-                token: {ref: (group, i) for group in self._access_pages(token) for i, ref in enumerate(group.refs)}
-                for token in tokens
-            }
-            selected = [positions[token][ref] for token, ref in zip(access, refs)]
-        resource = selected[0][0].table.resource
-        assert all(group.table.resource == resource for group, _ in selected)
-        return resource, np.stack([group.slots[i] for group, i in selected])
+    def slots(self, access: tuple[PagePin | PageWrite, ...], owners: Slots, refs: StateRefs) -> tuple[str, Slots]:
+        """Resolve numeric owner positions, looping only over issued access and resource groups."""
+        if len(access) == 1:
+            return self.slot_matrix(access[0], refs)
+        resource = ""
+        result = np.empty((len(refs), 0), dtype=np.int64)
+        for owner, token in enumerate(access):
+            selected = np.flatnonzero(owners == owner)
+            if not len(selected):
+                continue
+            for group in self._access_pages(token):
+                positions = group.refs.positions(refs.take(selected))
+                found = positions >= 0
+                if not found.any():
+                    continue
+                if not resource:
+                    resource = group.table.resource
+                    result = np.empty((len(refs), group.slots.shape[1]), dtype=np.int64)
+                assert group.table.resource == resource
+                result[selected[found]] = group.slots[positions[found]]
+        return resource, result
 
-    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs) -> LazyRoots:
+    def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], owners: Slots, refs: StateRefs) -> LazyRoots:
         """Defer individual tensor views; batch slots stay in their exact pin/write matrix."""
-        return LazyRoots(self, access, refs)
+        return LazyRoots(self, access, owners, refs)
 
     def _root_views(self, root: PageBundle, writable: frozenset[int] | None) -> tuple[torch.Tensor, ...]:
         self._require_live()
@@ -819,7 +839,7 @@ class PageBundleArena:
         self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs, field: LayoutFieldId
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
         """The field pool and each selected exact-version slot."""
-        resource, slots = self.slots(access, refs)
+        resource, slots = self.slots(access, np.arange(len(access), dtype=np.int64), refs)
         return self._pools[resource].tensors[field].detach(), tuple(slots[:, field].tolist())
 
     def _held_fields(

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from functools import cached_property
-from typing import overload
+from typing import SupportsIndex, overload
 
 import numpy as np
 import numpy.typing as npt
 
+from pllm import _core
 from pllm.contracts.state_ref import LayoutId, LineageId, StateRef, VersionId
 
 Indices = npt.NDArray[np.int64]
@@ -41,17 +41,24 @@ class StateRefs(Sequence[StateRef]):
         return iter(self.refs)
 
     @overload
-    def __getitem__(self, index: int) -> StateRef: ...
+    def __getitem__(self, index: SupportsIndex) -> StateRef: ...
 
     @overload
     def __getitem__(self, index: slice) -> StateRefs: ...
 
-    def __getitem__(self, index: int | slice) -> StateRef | StateRefs:
-        return self.take(index) if isinstance(index, slice) else self.refs[index]
+    def __getitem__(self, index: SupportsIndex | slice) -> StateRef | StateRefs:
+        if isinstance(index, slice):
+            return self.take(index)
+        index = int(index)
+        return StateRef(
+            LayoutId(int(self.layouts[index])),
+            LineageId(int(self.lineages[index])),
+            VersionId(int(self.versions[index])),
+        )
 
-    @cached_property
+    @property
     def refs(self) -> tuple[StateRef, ...]:
-        """The individual identities, built once when a cold path first inspects them."""
+        """The individual identities, built only when a cold path inspects them."""
         return tuple(
             StateRef(LayoutId(layout), LineageId(lineage), VersionId(version))
             for layout, lineage, version in zip(self.layouts.tolist(), self.lineages.tolist(), self.versions.tolist())
@@ -60,11 +67,8 @@ class StateRefs(Sequence[StateRef]):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, StateRefs):
             return NotImplemented
-        return self is other or all(
-            np.array_equal(left, right)
-            for left, right in zip(
-                (self.layouts, self.lineages, self.versions), (other.layouts, other.lineages, other.versions)
-            )
+        return self is other or _core.refs_equal(
+            self.layouts, self.lineages, self.versions, other.layouts, other.lineages, other.versions
         )
 
     @classmethod
@@ -103,37 +107,24 @@ class StateRefs(Sequence[StateRef]):
         """Select a batch without materializing identities."""
         index = indices if isinstance(indices, (np.ndarray, slice)) else np.asarray(indices, dtype=np.int64)
         return StateRefs(
-            self.layouts[index],
-            self.lineages[index],
-            self.versions[index],
-            None if self.rows is None else self.rows[index],
+            np.ascontiguousarray(self.layouts[index]),
+            np.ascontiguousarray(self.lineages[index]),
+            np.ascontiguousarray(self.versions[index]),
+            None if self.rows is None else np.ascontiguousarray(self.rows[index]),
         )
 
     def positions(self, refs: StateRefs) -> Indices:
         """Positions of exact identities in this batch; -1 denotes an absent version."""
-        if self is refs:
-            return np.arange(len(self), dtype=np.int64)
-        if not self:
-            return np.full(len(refs), -1, dtype=np.int64)
-        keys, selected = self._keys(), refs._keys()
-        order = np.argsort(keys)
-        indices = order[np.minimum(np.searchsorted(keys[order], selected), len(self) - 1)]
-        return np.where(keys[indices] == selected, indices, -1)
-
-    def _keys(self) -> npt.NDArray[np.void]:
-        # A pin can hold several versions of the same lineage. Search all three
-        # identity columns together, not just the lineage's first occurrence.
-        return np.column_stack((self.layouts, self.lineages, self.versions)).view(np.dtype((np.void, 24))).ravel()
+        return _core.ref_positions(
+            self.layouts, self.lineages, self.versions, refs.layouts, refs.lineages, refs.versions
+        )
 
     def replace_versions(self, before: StateRefs, after: StateRefs) -> StateRefs:
         """Substitute a transition's exact sources while retaining selection order."""
-        if self == before:
-            return after
         positions = before.positions(self)
-        changed = positions >= 0
-        versions = self.versions.copy()
-        versions[changed] = after.versions[positions[changed]]
-        return StateRefs(self.layouts, self.lineages, versions, self.rows)
+        return StateRefs(
+            self.layouts, self.lineages, _core.replace_versions(self.versions, positions, after.versions), self.rows
+        )
 
     def next_versions(self) -> StateRefs:
         """The successor of every selected version, in the same arena rows."""

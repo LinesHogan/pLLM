@@ -14,6 +14,7 @@ from typing import Literal
 
 import torch
 
+from pllm import _core
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.request_identity import RequestIdentity
@@ -69,7 +70,7 @@ class FieldWriter:
                 torch.stack(tuple(fields[i] for _, fields in data.replacements)) for i in range(len(self.fields))
             )
         values = tuple(batch.results[self.source.symbol, name] for name in self.source.outputs)
-        if batch.selection.for_resource(self.resource).keys == (None,):
+        if batch.selection.for_resource(self.resource).instance:
             values = tuple(value.unsqueeze(0) for value in values)
         targets = tuple(
             view.read(batch.roots[selected[0]][view.field]).unsqueeze(0).expand(len(selected), *view.shape)
@@ -85,10 +86,14 @@ class FieldWriter:
         rows = data.producer_rows(self.phase)
         if self.phase is not None and not rows:
             return ()
-        if group.keys == (None,):
-            return tuple(selection.refs.index(ref) for ref in group.refs)
-        indices = {row.identity: index for row, index in zip(selection.rows, group.state_indices, strict=True)}
-        return tuple(dict.fromkeys(indices[row.identity] for row in rows))
+        if group.instance:
+            return tuple(selection.refs.positions(group.refs).tolist())
+        indices = _core.select_states(
+            selection.rows.batch.columns[4, selection.rows.indices],
+            group.state_indices,
+            rows.batch.columns[4, rows.indices],
+        )
+        return tuple(indices.tolist())
 
 
 @dataclass(frozen=True, slots=True)

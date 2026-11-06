@@ -10,18 +10,18 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import cached_property
 from types import MappingProxyType
-from typing import NamedTuple
 
 import numpy as np
 import torch
 
-from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm import _core
+from pllm.contracts.packed_rows import PackedRows, identity_words
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.semantic_graph import SemanticState, StateResource, StateScope
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin, PagePublication
-from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.ptts.state_refs import Indices, StateRefs
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,27 +30,39 @@ class StateAddress:
     key: RequestStateKey | None
 
 
-class _Projection(NamedTuple):
-    """One state's resource, its keys and their lineages, and each row's position in the selection."""
-
-    resource: StateResource
-    keys: tuple[RequestStateKey | None, ...]
-    lineages: StateRefs
-    positions: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class ResourceSelection:
+    """One resource's exact refs and numeric row-to-state projection."""
+
     resource: StateResource
-    keys: tuple[RequestStateKey | None, ...]
+    key_table: Mapping[int, RequestStateKey | None]
     refs: StateRefs
     # Indices into the containing selection's flat refs, aligned to its rows.
-    state_indices: tuple[int, ...]
+    state_indices: Indices
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, ResourceSelection)
+            and self.resource == other.resource
+            and self.refs == other.refs
+            and self.keys == other.keys
+            and np.array_equal(self.state_indices, other.state_indices)
+        )
+
+    @property
+    def instance(self) -> bool:
+        """Whether admission bound this resource to instance scope."""
+        return len(self.key_table) == 1 and next(iter(self.key_table.values())) is None
+
+    @property
+    def keys(self) -> tuple[RequestStateKey | None, ...]:
+        """Materialize resource keys only for inspection and explicit state imports."""
+        return tuple(self.key_table[int(lineage)] for lineage in self.refs.lineages)
 
 
 @dataclass(frozen=True)
 class RequestStateSelection:
-    rows: tuple[PackedPhaseRow, ...]
+    rows: PackedRows
     groups: tuple[ResourceSelection, ...]
 
     @cached_property
@@ -72,7 +84,7 @@ class RequestStateSelection:
         group = self.for_resource(resource)
         return RequestStateSelection(
             self.rows,
-            (replace(group, state_indices=tuple(group.refs.index(self.refs[index]) for index in group.state_indices)),),
+            (replace(group, state_indices=group.refs.positions(self.refs.take(group.state_indices))),),
         )
 
     def _sole_group(self) -> ResourceSelection:
@@ -85,24 +97,23 @@ class RequestStateSelection:
         return self._sole_group().keys if self.groups else ()
 
     @property
-    def state_indices(self) -> tuple[int, ...]:
-        return self._sole_group().state_indices if self.groups else ()
+    def state_indices(self) -> Indices:
+        return self._sole_group().state_indices if self.groups else np.empty(0, dtype=np.int64)
+
+    @property
+    def instance(self) -> bool:
+        """Whether the sole resource has one instance-scoped state."""
+        return bool(self.groups) and self._sole_group().instance
 
     @cached_property
     def row_states(self) -> Mapping[RequestIdentity, int]:
         return MappingProxyType({row.identity: index for row, index in zip(self.rows, self.state_indices, strict=True)})
 
-    def indices(self, rows: tuple[PackedPhaseRow, ...]) -> tuple[int, ...]:
-        """Reuse the directory's projection when a tensor invocation covers the selected rows."""
-        if rows == self.rows:
-            return self.state_indices
-        return tuple(self.row_states[row.identity] for row in rows)
-
     def ref_for(self, identity: RequestIdentity, resource: StateResource | None = None) -> StateRef:
         group = self._sole_group() if resource is None else self.for_resource(resource)
         for row, index in zip(self.rows, group.state_indices, strict=True):
             if row.identity == identity:
-                return self.refs[index]
+                return self.refs[int(index)]
         raise KeyError(identity)
 
 
@@ -114,7 +125,16 @@ class RequestStateDirectory:
         self._lineages: dict[StateAddress, LineageId] = {}
         self._identity_holds: dict[tuple[StateResource, RequestIdentity], StateAddress] = {}
         self._inference_pins: dict[RequestIdentity, PagePin] = {}
-        self._projection: tuple[tuple[RequestIdentity, ...], tuple[_Projection, ...]] | None = None
+        fields = {
+            RequestKeyField.REQUEST_ID: 1,
+            RequestKeyField.PROMPT_INDEX: 2,
+            RequestKeyField.SAMPLE_INDEX: 4,
+            RequestKeyField.ROUTE: 8,
+        }
+        self._projection = _core.ResourceProjection(
+            np.array([sum(fields[field] for field in state.key_fields) for state in states], dtype=np.int64)
+        )
+        self._keys: list[dict[int, RequestStateKey | None]] = [{} for _ in states]
 
     @property
     def state(self) -> SemanticState | None:
@@ -200,7 +220,6 @@ class RequestStateDirectory:
                     lineages[key] = ref.lineage_id
                 receipt = self.arena.publish(write)
                 self._lineages = lineages
-                self._projection = None
         except Exception:
             for _, pin in pins:
                 self.arena.release_pin(pin)
@@ -210,55 +229,52 @@ class RequestStateDirectory:
         for identity, key in holds:
             self._identity_holds[key.resource, identity] = key
         self._inference_pins.update(pins)
+        self._bind(identities)
         return receipt
+
+    def _bind(self, identities: tuple[RequestIdentity, ...]) -> None:
+        """Install numeric projection bindings at admission, including shared route keys."""
+        for resource, state in enumerate(self.states):
+            keys: dict[int, RequestStateKey | None] = (
+                {} if state.scope is StateScope.INSTANCE else self._keys[resource].copy()
+            )
+            for identity in identities if state.scope is StateScope.REQUEST else (None,):
+                key = None if identity is None else RequestStateKey.project(identity, state.key_fields)
+                address = StateAddress(state.resource, key)
+                ref = self.arena.resolve_lineages(state.resource, (self._lineages[address],))
+                assert ref.rows is not None
+                words = np.empty(0, dtype=np.int64) if identity is None else identity_words(identity)
+                lineage = int(ref.lineages[0])
+                keys[lineage] = key
+                self._projection.bind(words, resource, int(ref.layouts[0]), lineage, int(ref.rows[0]))
+            self._keys[resource] = keys
 
     def latest_refs(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         return tuple(self.arena.latest(self._lineages[key]) for key in self._addresses(identities))
 
-    def select(self, rows: tuple[PackedPhaseRow, ...], history: tuple[StateRefs, ...] = ()) -> RequestStateSelection:
-        """Select exact versions, rewinding recent step inputs newest first when lag is requested."""
-        identities = tuple(row.identity for row in rows)
-        if self._projection is None or self._projection[0] != identities:
-            self._projection = identities, self._project(rows)
-        groups = tuple(
-            ResourceSelection(resource, keys, self.arena.latest_batch(resource, lineages), positions)
-            for resource, keys, lineages, positions in self._projection[1]
+    def select(self, rows: PackedRows, history: tuple[StateRefs, ...] = ()) -> RequestStateSelection:
+        """Project numeric rows and select exact versions, rewinding inputs for declared lag."""
+        batch = rows.batch
+        projected = self._projection.project(
+            batch.identity_data, batch.identity_offsets, np.ascontiguousarray(batch.columns[4, rows.indices])
         )
-        if history:
-            groups = tuple(replace(group, refs=self._rewind(group.refs, history)) for group in groups)
-        return RequestStateSelection(rows if self.states else (), groups)
+        groups: list[ResourceSelection] = []
+        for state, keys, (columns, positions) in zip(self.states, self._keys, projected, strict=True):
+            refs = self.arena.latest_batch(state.resource, columns)
+            if history:
+                refs = self._rewind(refs, history)
+            groups.append(ResourceSelection(state.resource, keys, refs, positions))
+        return RequestStateSelection(rows if self.states else rows[:0], tuple(groups))
 
     @staticmethod
     def _rewind(refs: StateRefs, history: tuple[StateRefs, ...]) -> StateRefs:
-        versions = refs.versions.copy()
-        for before in reversed(history):
-            _, selected, previous = np.intersect1d(refs.lineages, before.lineages, return_indices=True)
-            versions[selected] = before.versions[previous]
+        versions = _core.rewind_versions(
+            refs.lineages,
+            refs.versions,
+            [before.lineages for before in history],
+            [before.versions for before in history],
+        )
         return StateRefs(refs.layouts, refs.lineages, versions, refs.rows)
-
-    def _project(self, rows: tuple[PackedPhaseRow, ...]) -> tuple[_Projection, ...]:
-        """Each state's keys, their lineages, and every row's position in the selection.
-
-        Decode batches repeat the same rows step after step, so `select` reuses this until the rows
-        or the admitted lineages change; only the latest versions are read again.
-        """
-        projections: list[_Projection] = []
-        offset = 0
-        for state in self.states:
-            if state.scope is StateScope.INSTANCE:
-                keys: tuple[RequestStateKey | None, ...] = (None,)
-                positions = (offset,) * len(rows)
-            else:
-                projected = tuple(RequestStateKey.project(row.identity, state.key_fields) for row in rows)
-                keys = tuple(dict.fromkeys(projected))
-                indices = {key: offset + i for i, key in enumerate(keys)}
-                positions = tuple(indices[key] for key in projected)
-            lineages = tuple(self._lineages[StateAddress(state.resource, key)] for key in keys)
-            projections.append(
-                _Projection(state.resource, keys, self.arena.resolve_lineages(state.resource, lineages), positions)
-            )
-            offset += len(keys)
-        return tuple(projections)
 
     def retire(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         addresses = self._addresses(identities)
@@ -287,9 +303,18 @@ class RequestStateDirectory:
             for identity in identities:
                 self._identity_holds.pop((state.resource, identity))
         for key in releasing:
-            self._lineages.pop(key)
-            self._projection = None
+            self._forget_key(key)
         return tuple(dict.fromkeys((*refs, *(ref for pin in pins for ref in pin.refs))))
+
+    def _forget_key(self, address: StateAddress) -> None:
+        lineage = self._lineages.pop(address)
+        for resource, state in enumerate(self.states):
+            if state.resource == address.resource:
+                self._projection.retire(resource, int(lineage))
+                keys = self._keys[resource].copy()
+                del keys[lineage]
+                self._keys[resource] = keys
+                break
 
     def retire_dormant(self) -> tuple[StateRef, ...]:
         held = set(self._identity_holds.values())
@@ -298,6 +323,5 @@ class RequestStateDirectory:
         if refs:
             self.arena.retire(StateRefs.of(refs))
         for key in dormant:
-            self._lineages.pop(key)
-            self._projection = None
+            self._forget_key(key)
         return refs

@@ -377,7 +377,8 @@ class DecodeOverlay:
         width = len(self.math.buffers)
         batch = batch.for_resource(self.math.resource)
         indices = {
-            row.identity: index for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
+            row.identity: int(index)
+            for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
         }
         fields = tuple(batch.field_slots(self.target * width + i) for i in range(width))
         self.host[-1, : len(identities)] = 1

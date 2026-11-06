@@ -67,7 +67,7 @@ class SiteMemorySchedule:
         spans = _request_spans(rows)
         packed: dict[StateRef, list[int]] = {}
         for start, end in spans:
-            ref = selection.refs[indices[rows.identity(start)]]
+            ref = selection.refs[int(indices[rows.identity(start)])]
             packed.setdefault(ref, []).extend(range(start, end))
         positions = write.before_refs.positions(StateRefs.of(tuple(packed)))
         _, slots = context.arena.slot_matrix(write, write.after_refs)

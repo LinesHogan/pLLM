@@ -1,6 +1,6 @@
 """CPU adaptive-depth contracts: compact execution against a rowwise masked decoder oracle."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
 import torch
@@ -29,14 +29,14 @@ class _Decoder(SerialCustomForward):
         self.program, self.parameters = program, parameters
         self.cache = torch.full((3, layers, 4, 2, hidden), float("nan"), dtype=dtype)
         self.seed = torch.sin(torch.arange(3 * hidden).reshape(3, hidden).float() * 0.17).to(dtype)
-        self.batch: tuple[PackedPhaseRow, ...] = ()
+        self.batch: Sequence[PackedPhaseRow] = ()
         self.indices = torch.arange(3)
         self.offset = 0
         self.output = self.seed
         self.decisions: list[torch.Tensor] = []
 
     @property
-    def rows(self) -> tuple[PackedPhaseRow, ...]:
+    def rows(self) -> Sequence[PackedPhaseRow]:
         return self.batch
 
     def stage(self, order: tuple[int, ...], position: int) -> None:

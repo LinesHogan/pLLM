@@ -23,7 +23,13 @@ from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, label_rows
+from pllm.contracts.packed_rows import (
+    PackedPhaseRow,
+    PackedPhaseRowBatch,
+    PackedRows,
+    PackedSamplerRowBatch,
+    label_rows,
+)
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import SamplerFeedback, SamplerStage
@@ -389,7 +395,7 @@ def _field_name(declaration: TensorBinding, resource: str, index: int) -> str:
 def _state_values(
     execution: StateExecution[StepInput, TensorFrame, TensorOutput], row: PackedPhaseRow, declaration: TensorBinding
 ) -> dict[str, torch.Tensor]:
-    selection = execution.directory.select((row,))
+    selection = execution.directory.select(PackedRows.from_rows((row,)))
     immutable = {state.resource for state in declaration.graph.states if state.immutable}
     return {
         f"state {group.resource}.{_field_name(declaration, str(group.resource), index)}": value.detach().clone()
@@ -649,7 +655,7 @@ def _run(
                     for row, output in zip(value.rows.rows, forward.output, strict=True)
                 )
             for row in value.rows.producer_rows(None):
-                for group in execution.directory.select((row,)).groups:
+                for group in execution.directory.select(PackedRows.from_rows((row,))).groups:
                     if str(group.resource) in run.shared_resources and any(ref.version_id > 0 for ref in group.refs):
                         run.shared_values.update(
                             (row.identity.request_id, row.token_offset, name)

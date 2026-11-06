@@ -13,12 +13,14 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Generic, Literal, Never, Protocol, TypeVar
 
+import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.optim.sgd import sgd
 
+from pllm import _core
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.packed_rows import PackedPhaseRow, PackedRows
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
@@ -31,6 +33,7 @@ from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
 from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.ptts.slot_pools import Slots
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
 from pllm.execution.torch_private import MemoryTrace, MemoryUsage, measure
@@ -75,7 +78,7 @@ class TensorBatch:
     )
     borrowed_roots: tuple[BorrowedStateRoot, ...] = ()
     local_pin: PagePin | None = None
-    select_resource: Callable[[StateResource], TensorBatch] = _unwired
+    resources: Mapping[StateResource, TensorBatch] = field(default_factory=lambda: dict[StateResource, TensorBatch]())
     retain_gradients: bool = True
 
     def for_resource(self, resource: StateResource) -> TensorBatch:
@@ -83,7 +86,7 @@ class TensorBatch:
         return (
             self
             if len(self.selection.groups) == 1 and self.selection.groups[0].resource == resource
-            else self.select_resource(resource)
+            else replace(self.resources[resource], resources=self.resources)
         )
 
     def state_free(self) -> TensorBatch:
@@ -177,6 +180,33 @@ class InvocationOutput:
     value: torch.Tensor | None = None
 
 
+def _batch_access(
+    context: StateTaskContext[D],
+    reads: tuple[tuple[StateResource, Literal["input", "private", "published"]], ...],
+) -> tuple[StateRefs, tuple[PagePin | PageWrite, ...], Slots]:
+    refs = context.pin.refs
+    access: list[PagePin | PageWrite] = [context.pin]
+    owners = np.zeros(len(refs), dtype=np.int64)
+    for resource, origin in reads:
+        if origin == "input":
+            continue
+        write = context.pending_write(resource)
+        receipt = context.publication_of(resource)
+        if origin == "private" and write is not None:
+            before, after = write.before_refs, write.after_refs
+            token: PagePin | PageWrite = write
+        elif receipt is not None:
+            before, after = receipt.before_refs, receipt.after_refs
+            token = context.borrow_published(after)
+        else:
+            continue
+        positions = before.positions(refs)
+        versions, owners = _core.read_versions(refs.versions, owners, positions, after.versions, len(access))
+        refs = StateRefs(refs.layouts, refs.lineages, versions, refs.rows)
+        access.append(token)
+    return refs, tuple(access), owners
+
+
 def read_batch(
     context: StateTaskContext[D],
     version: Literal["input", "private", "published"] = "input",
@@ -186,39 +216,8 @@ def read_batch(
     """Borrow the invocation's selected version for tensor operations and layer replay: the input version, or the
     pending private write / the publication of `resource` this invocation made. Produced reads are
     selected independently, so a writer can consume another state's new values in the same step."""
-    refs = context.pin.refs
-    access: tuple[PagePin | PageWrite, ...] = (context.pin,) * len(refs)
-    for selected, origin in (*produced, (resource, version)):
-        if origin == "input":
-            continue
-        write = context.pending_write(selected)
-        receipt = context.publication_of(selected)
-        if origin == "private" and write is not None:
-            positions = write.before_refs.positions(refs)
-            refs = refs.replace_versions(write.before_refs, write.after_refs)
-            access = tuple(
-                write if index >= 0 else previous for index, previous in zip(positions.tolist(), access, strict=True)
-            )
-        elif receipt is not None:
-            pin = context.borrow_published(receipt.after_refs)
-            positions = receipt.before_refs.positions(refs)
-            refs = refs.replace_versions(receipt.before_refs, receipt.after_refs)
-            access = tuple(
-                pin if index >= 0 else previous for index, previous in zip(positions.tolist(), access, strict=True)
-            )
-    roots = context.arena.lazy_roots(access, refs)
-
-    def scoped(resource: StateResource) -> TensorBatch:
-        selection = context.selection.scoped(resource)
-        selected = roots.select(tuple(context.selection.refs.index(ref) for ref in selection.refs))
-        return replace(
-            batch,
-            selection=selection,
-            roots=selected,
-            after_refs=tuple(refs[context.selection.refs.index(ref)] for ref in selection.refs),
-            field_slots=selected.field_slots,
-            slot_matrix=selected.slot_matrix,
-        )
+    refs, access, owners = _batch_access(context, (*produced, (resource, version)))
+    roots = context.arena.lazy_roots(access, owners, refs)
 
     batch = TensorBatch(
         context.selection,
@@ -232,16 +231,30 @@ def read_batch(
         local_pin=context.pin,
         field_slots=roots.field_slots,
         slot_matrix=roots.slot_matrix,
-        select_resource=scoped,
         retain_gradients=context.retain_gradients or context.trace.observing,
     )
-    return batch
+    if len(context.selection.groups) <= 1:
+        return batch
+    resources: dict[StateResource, TensorBatch] = {}
+    for group in context.selection.groups:
+        selection = context.selection.scoped(group.resource)
+        indices = context.selection.refs.positions(selection.refs)
+        selected = roots.select(indices)
+        resources[group.resource] = replace(
+            batch,
+            selection=selection,
+            roots=selected,
+            after_refs=refs.take(indices),
+            field_slots=selected.field_slots,
+            slot_matrix=selected.slot_matrix,
+        )
+    return replace(batch, resources=resources)
 
 
 @dataclass(frozen=True, slots=True)
 class FunctionMath(Generic[I, D, R]):
     initializers: Mapping[str, Callable[[Roots, tuple[RequestStateKey | None, ...]], None]]
-    rows: Callable[[I], tuple[PackedPhaseRow, ...]]
+    rows: Callable[[I], PackedRows]
     prepare_data: Callable[[I, TensorBatch], D]
     output_data: Callable[[D, InvocationOutput], R]
     resume_data: Callable[[D, D], D] | None = None
@@ -554,7 +567,7 @@ class TensorOperation(Generic[D]):
                     and len(output.gradients) == len(selected)
                 )
                 write = context.prepare_owned_write(batch.selection.refs.take(selected), copy_fields=self.copy_fields)
-                roots = context.arena.lazy_roots((write,) * len(selected), write.after_refs)
+                roots = context.arena.lazy_roots((write,), np.zeros(len(selected), dtype=np.int64), write.after_refs)
                 self.apply_gradients(roots, roots.field_slots, tuple(batch.roots[index] for index in selected), output)
             if write is None:
                 write = context.pending_write(self.resource)

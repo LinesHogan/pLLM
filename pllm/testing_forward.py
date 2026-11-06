@@ -3,7 +3,7 @@
 It exercises real state bindings and token programs; its pointwise layers do not model attention or KV caches.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -37,7 +37,7 @@ class CheckForward(SerialCustomForward):
         )
         execution.rebind_implementation(replace(binding, primitive=self))
         self.attention: CheckAttention | None = None
-        self._rows: tuple[PackedPhaseRow, ...] = ()
+        self._rows: Sequence[PackedPhaseRow] = ()
         self.inputs = torch.empty(0)
         self.output = torch.empty(0)
 
@@ -46,7 +46,7 @@ class CheckForward(SerialCustomForward):
         self._rows, self.inputs = value.rows.rows, inputs
 
     @property
-    def rows(self) -> tuple[PackedPhaseRow, ...]:
+    def rows(self) -> Sequence[PackedPhaseRow]:
         return self._rows
 
     def begin(self, row: PackedPhaseRow) -> tuple[torch.Tensor, torch.Tensor]:
@@ -119,7 +119,7 @@ class CheckAttention:
                 outputs[row.identity.request_id, row.token_offset, f"attention {layer}"] = tensor.detach().clone()
         return outputs
 
-    def paged(self, rows: tuple[PackedPhaseRow, ...], layer: int, q: torch.Tensor, read: "_CheckRead") -> "PagedKV":
+    def paged(self, rows: Sequence[PackedPhaseRow], layer: int, q: torch.Tensor, read: "_CheckRead") -> "PagedKV":
         """Stage request-local dictionaries as fixed-size pages, including all current K/V writes."""
         from pllm.execution.attention import CHECK_PAGE_SIZE, PagedKV
 
@@ -159,7 +159,7 @@ class CheckAttention:
             torch.tensor(tuple(group[0].prompt_length for group in groups)) if layout.sink else None,
         )
 
-    def layer(self, rows: tuple[PackedPhaseRow, ...], layer: int, hidden: torch.Tensor) -> torch.Tensor:
+    def layer(self, rows: Sequence[PackedPhaseRow], layer: int, hidden: torch.Tensor) -> torch.Tensor:
         """Execute the actual method over the whole scheduled batch, so cross-request reads fail isolation."""
         from pllm.execution.attention import DenseAttention
         from pllm.execution.model_sites import DepthInput, StateInput

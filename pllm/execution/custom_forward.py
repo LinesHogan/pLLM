@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import partial
@@ -38,7 +38,7 @@ class CustomForwardPrimitive(ABC):
 
     @property
     @abstractmethod
-    def rows(self) -> tuple[PackedPhaseRow, ...]: ...
+    def rows(self) -> Sequence[PackedPhaseRow]: ...
 
     @abstractmethod
     def run(

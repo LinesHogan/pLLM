@@ -6,7 +6,7 @@ The backend must keep its cache and page tables stable until the invocation
 completes.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -41,7 +41,7 @@ class PagedAccessPlan:
         return slot // paged.cache.shape[2], slot % paged.cache.shape[2]
 
 
-def bind_paged_access(rows: tuple[PackedPhaseRow, ...], layers: tuple[PagedLayer, ...]) -> PagedAccessPlan:
+def bind_paged_access(rows: Sequence[PackedPhaseRow], layers: tuple[PagedLayer, ...]) -> PagedAccessPlan:
     """Check that each request's rows are consecutive positions and record their intervals.
 
     A layer reads [0, token) and replaces token; its read of the newly written

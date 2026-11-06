@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.state_execution import PartialCommitError
 from test.state_fixtures import (
@@ -91,7 +92,7 @@ def test_retiring_a_request_cancels_its_invocation_and_releases_only_its_pins():
     execution.cancel_step(execution.begin(step_for(b).rows.rows))
     execution.retire((b,))
     # An offline instance invocation has no request roots, even in a mixed directory.
-    invocation = execution.begin(())
+    invocation = execution.begin(PackedRows.from_rows(()))
     assert tuple(invocation.pin.refs) == (global_ref,)
     assert tuple(invocation.selection.for_resource(DENSE).refs) == ()
     execution.retire(())

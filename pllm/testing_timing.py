@@ -1,5 +1,6 @@
 """Version-read observations for the CPU schedule checker, independent of retained-pin selection."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from pllm.contracts.host_batch import StateImport
@@ -46,7 +47,7 @@ class VersionChecks:
             symbol = execution.arena.plan.semantic_graph.tasks[task.task_id].symbol
             for group in selection.groups:
                 for row, index in zip(selection.rows, group.state_indices, strict=True):
-                    ref = selection.refs[index]
+                    ref = selection.refs[int(index)]
                     if task.read_origin == "boundary" and lag:
                         # The oldest input of the last L engine steps bounds visibility.
                         for before in self.history[-lag:]:
@@ -68,7 +69,7 @@ class VersionChecks:
                     self.expected[symbol, str(group.resource), row.identity.request_id] = ref.version_id + int(imported)
         self.history.append(entry)
 
-    def record(self, task: TensorTask, data: TensorFrame, rows: tuple[PackedPhaseRow, ...]) -> None:
+    def record(self, task: TensorTask, data: TensorFrame, rows: Sequence[PackedPhaseRow]) -> None:
         """Inspect the version column used by the method, rather than trusting the planned distance."""
         if data.fixed is None:
             return

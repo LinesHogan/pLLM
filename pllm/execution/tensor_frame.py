@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, overload
 import numpy as np
 import torch
 
+from pllm import _core
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
@@ -155,40 +156,39 @@ class RowPlan:
     update-state positions with their issued destination slots.
     """
 
-    packed: Slots
-    sampler: tuple[int, ...]
-    samples: tuple[int, ...]
-    states: tuple[int, ...]
-    versions: tuple[int, ...]
+    columns: Slots
     sources: Slots
+    updated: Slots
+    last: Slots
     writes: tuple[tuple[int, ...], Slots] | None = None
 
     @classmethod
     def build(cls, data: "TensorFrame", batch: TensorBatch) -> "RowPlan":
-        """Resolve operation rows once from the invocation's input and page access."""
-        links = {packed: sampler for sampler, packed in enumerate(data.step.sampler_rows.packed_indices.tolist())}
-        selection = batch.selection
-        states = (
-            selection.indices(data.rows) if selection.groups and selection.keys != (None,) else (0,) * len(data.rows)
+        """Resolve invocation columns and last-state positions in one native array operation."""
+        rows, selection = data.rows, batch.selection
+        columns, updated, last = _core.row_plan(
+            rows.batch.columns,
+            rows.indices,
+            data.step.sampler_rows.packed_indices,
+            rows.batch.identity_data,
+            rows.batch.identity_offsets,
+            selection.rows.batch.columns[4, selection.rows.indices],
+            selection.state_indices,
+            selection.refs.versions,
+            selection.instance if selection.groups else False,
         )
-        return cls(
-            np.fromiter((row.packed_row_index for row in data.rows), dtype=np.int64, count=len(data.rows)),
-            tuple(links.get(row.packed_row_index, -1) for row in data.rows),
-            tuple(row.identity.sample_index for row in data.rows),
-            states,
-            tuple(selection.refs.versions[list(states)].tolist()) if selection.groups else states,
-            batch.slot_matrix()[1] if batch.roots else np.empty((0, 0), dtype=np.int64),
-        )
+        sources = batch.slot_matrix()[1] if batch.roots else np.empty((0, 0), dtype=np.int64)
+        return cls(columns, sources, updated, last)
 
     @property
-    def columns(self) -> tuple[tuple[int, ...], ...]:
-        """Serialize named fields only at the device-table boundary."""
-        return self.sampler, self.samples, self.states, self.versions, tuple(self.packed.tolist())
+    def packed(self) -> Slots:
+        """Packed positions used to gather hidden slots."""
+        return self.columns[4]
 
     @property
-    def last(self) -> dict[int, int]:
-        """Last row position of every state with rows."""
-        return {state: position for position, state in enumerate(self.states)}
+    def sampler(self) -> Slots:
+        """Sampler positions, with -1 for tokens that have no sampled output."""
+        return self.columns[0]
 
 
 class RowIndex(NamedTuple):
@@ -314,7 +314,7 @@ class FixedRows:
 @dataclass(slots=True)
 class TensorFrame:
     step: StepInput
-    rows: tuple[PackedPhaseRow, ...]
+    rows: PackedRows
     entries: list[OverlayEntry] = field(default_factory=lambda: list[OverlayEntry]())
     input_gradients: dict[tuple[str, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
@@ -332,12 +332,9 @@ class TensorFrame:
     # Owned by row_task_binding's weighted batch training.
     weighted: WeightedBatch | None = None
 
-    def producer_rows(self, phase: HiddenPhase | None) -> tuple[PackedPhaseRow, ...]:
-        """The producer's eligible rows in this frame's order, for both its math and destinations."""
-        if phase is None:
-            return self.rows
-        eligible = set(self.step.rows.tap_selected[int(phase is HiddenPhase.PREFILL)].tolist())
-        return tuple(row for row in self.rows if row.packed_row_index in eligible)
+    def producer_rows(self, phase: HiddenPhase | None) -> PackedRows:
+        """Select the producer's eligible rows in this frame's order without inspecting records."""
+        return self.rows.producer(phase)
 
     @property
     def table(self) -> FixedRows:

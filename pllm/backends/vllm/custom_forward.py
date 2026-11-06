@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Generic
@@ -68,7 +68,7 @@ class ProgramWave(Generic[DataT, ResultT]):
         lanes = torch.arange(width, device=tensor.device)
         self.lanes = tuple(lanes[i : i + 1] for i in range(width))
 
-    def stage(self, rows: tuple[PackedPhaseRow, ...]) -> None:
+    def stage(self, rows: Sequence[PackedPhaseRow]) -> None:
         """Queue complete wave input copies without reading any device scalar."""
         owner = self.custom_forward
         assert owner.hidden is not None and owner.positions is not None
@@ -209,7 +209,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         self.attentions = tuple(layer.self_attn.attn for layer in self.model.layers)
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
-        self._rows: tuple[PackedPhaseRow, ...] = ()
+        self._rows: Sequence[PackedPhaseRow] = ()
         self.context: StateTaskContext[DataT] | None = None
         self.hidden: torch.Tensor | None = None
         self.positions: torch.Tensor | None = None
@@ -224,7 +224,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         self.model.forward = self.forward
 
     @property
-    def rows(self) -> tuple[PackedPhaseRow, ...]:
+    def rows(self) -> Sequence[PackedPhaseRow]:
         return self._rows
 
     @contextmanager
@@ -372,7 +372,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
             if effect.rows == "all" or row.role.value == effect.rows:
                 observe(row.packed_row_index, self.observations[row.packed_row_index : row.packed_row_index + 1])
 
-    def span(self, rows: tuple[PackedPhaseRow, ...], program: TokenProgram | None = None) -> None:
+    def span(self, rows: Sequence[PackedPhaseRow], program: TokenProgram | None = None) -> None:
         """One native varlen pass, committing the last touched position of every page."""
         assert self.hidden is not None and self.positions is not None and self.output is not None
         context = get_forward_context()
@@ -455,8 +455,8 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
 
     def save_span(
         self,
-        rows: tuple[PackedPhaseRow, ...],
-        groups: tuple[tuple[PackedPhaseRow, ...], ...],
+        rows: Sequence[PackedPhaseRow],
+        groups: tuple[Sequence[PackedPhaseRow], ...],
         requests: torch.Tensor,
         hidden: torch.Tensor,
         saved_values: dict[str, torch.Tensor],

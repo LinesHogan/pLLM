@@ -18,7 +18,7 @@ import torch
 
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -188,7 +188,7 @@ class StateTaskContext(Generic[DataT]):
         (write,) = [
             entry.write
             for entry in self._obligations
-            if isinstance(entry, _WriteAbort) and self.arena.root(entry.write.before_refs[0]).resource == resource
+            if isinstance(entry, _WriteAbort) and self.arena.access_resource(entry.write) == resource
         ] or (None,)
         return write
 
@@ -208,7 +208,7 @@ class StateTaskContext(Generic[DataT]):
             (
                 receipt
                 for receipt in reversed(self.publications)
-                if self.arena.root(receipt.after_refs[0]).resource == resource
+                if self.arena.ref_resource(receipt.after_refs) == resource
             ),
             None,
         )
@@ -245,7 +245,7 @@ class StateTaskContext(Generic[DataT]):
         """Prepare a private transition of `sources` and return its destination slots: a row per source, a column
         per field."""
         write = self.prepare_owned_write(sources, copy_fields=copy_fields)
-        return self.arena.slots((write,) * len(write.after_refs), write.after_refs)[1]
+        return self.arena.slot_matrix(write, write.after_refs)[1]
 
     def publish_owned_write(self, token: PageWrite) -> PagePublication:
         self.check_page_execution()
@@ -299,12 +299,12 @@ class StateTaskContext(Generic[DataT]):
         pin borrowing every such publication, or the selected ref itself under the invocation pin.
         """
         group = self.selection.for_resource(resource)
-        if group.keys == (None,) and not latest:
+        if group.instance and not latest:
             pins = tuple(directory.inference_pin(identity) for identity in identities)
             return tuple(
                 (pin, next(ref for ref in pin.refs if self.arena.root(ref).resource == resource)) for pin in pins
             )
-        if group.keys == (None,):
+        if group.instance:
             entry = group.refs.take((0,) * len(identities))
         else:
             # One index for the whole batch: decode replays resolve every request before each graph launch.
@@ -364,7 +364,7 @@ class StateMath(Protocol[InputContra, DataT, ResultCo]):
         self, roots: tuple[tuple[torch.Tensor, ...], ...], addresses: tuple[StateAddress, ...], /
     ) -> None: ...
 
-    def rows(self, value: InputContra, /) -> tuple[PackedPhaseRow, ...]: ...
+    def rows(self, value: InputContra, /) -> PackedRows: ...
 
     def prepare(self, value: InputContra, context: StateTaskContext[DataT]) -> DataT: ...
 
@@ -664,7 +664,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def begin(
         self,
-        rows: tuple[PackedPhaseRow, ...],
+        rows: PackedRows,
         stream: torch.cuda.Stream | None = None,
         *,
         history: tuple[StateRefs, ...] = (),
@@ -695,7 +695,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             context.invocation_id,
             refs=pin.refs,
             pin_id=pin.pin_id,
-            identities=tuple(row.identity for row in selection.rows),
+            identities=selection.rows.identities,
         )
         return context
 

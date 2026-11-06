@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 pub struct RowLabeler {
     frontiers: Vec<Option<i64>>,
     free: Vec<usize>,
+    identities: Vec<Vec<i64>>,
 }
 
 struct Labels {
@@ -25,6 +26,8 @@ type Output<'py> = (
     Array<'py>,
     Vec<Array<'py>>,
     Vec<Array<'py>>,
+    Array<'py>,
+    Array<'py>,
 );
 
 #[pymethods]
@@ -34,14 +37,17 @@ impl RowLabeler {
         Self::default()
     }
 
-    fn admit(&mut self) -> usize {
+    fn admit(&mut self, words: PyReadonlyArray1<'_, i64>) -> PyResult<usize> {
+        let words = column(&words)?.to_vec();
         if let Some(id) = self.free.pop() {
             self.frontiers[id] = Some(0);
-            return id;
+            self.identities[id] = words;
+            return Ok(id);
         }
         let id = self.frontiers.len();
         self.frontiers.push(Some(0));
-        id
+        self.identities.push(words);
+        Ok(id)
     }
 
     fn retire(&mut self, id: usize) {
@@ -71,6 +77,12 @@ impl RowLabeler {
         let rows = numpy::ndarray::Array2::from_shape_vec((7, labels.rows.len() / 7), labels.rows)
             .expect("label columns have equal lengths")
             .into_pyarray(py);
+        let mut words = Vec::new();
+        let mut offsets = vec![0];
+        for &id in ids {
+            words.extend_from_slice(&self.identities[id as usize]);
+            offsets.push(words.len() as i64);
+        }
         Ok((
             rows,
             labels.links.into_pyarray(py),
@@ -84,6 +96,8 @@ impl RowLabeler {
                 .into_iter()
                 .map(|v| v.into_pyarray(py))
                 .collect(),
+            words.into_pyarray(py),
+            offsets.into_pyarray(py),
         ))
     }
 }
@@ -195,7 +209,7 @@ impl RowLabeler {
     }
 }
 
-fn column<'a, T: Element>(array: &'a PyReadonlyArray1<'_, T>) -> PyResult<&'a [T]> {
+pub(crate) fn column<'a, T: Element>(array: &'a PyReadonlyArray1<'_, T>) -> PyResult<&'a [T]> {
     // rust-numpy 0.23 checks contiguity but does not check pointer alignment before making a slice.
     if array.data().is_null() || !array.data().is_aligned() {
         return Err(PyValueError::new_err(

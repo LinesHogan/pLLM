@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -41,6 +42,7 @@ from pllm.execution.host_runtime import HostConfig, measured_timeline
 from pllm.execution.model_sites import EarlierInput, PatchInput, ResultInput, SiteInput, StateInput
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.ptts.request_state import RequestStateSelection, ResourceSelection
+from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import TensorFrame
@@ -96,6 +98,14 @@ def _hidden_storage(facts: BackendCompileFacts, resource: PackedHiddenResourceBi
     return meta(count, facts.probe.hidden_size, dtype=facts.probe.tensor_dtype.torch)
 
 
+def _example_field_slots(fields: tuple[torch.Tensor, ...], field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
+    return fields[field], tuple(range(len(fields[field])))
+
+
+def _example_slot_matrix(resource: str, fields: tuple[torch.Tensor, ...]) -> tuple[str, Slots]:
+    return resource, np.repeat(np.arange(len(fields[0]), dtype=np.int64)[:, None], len(fields), axis=1)
+
+
 def example(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> tuple[TensorFrame, TensorBatch]:
@@ -110,6 +120,7 @@ def example(
         PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0, str(i))) for i in range(count)
     )
     packed = PackedPhaseRowBatch.from_rows(0, count, rows)
+    rows = packed.rows
     sampler = PackedSamplerRowBatch.from_links(
         packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count))
     )
@@ -143,9 +154,11 @@ def example(
         groups.append(
             ResourceSelection(
                 state.resource,
-                keys,
+                dict(zip(refs.lineages.tolist(), keys, strict=True)),
                 refs,
-                tuple(len(roots) + i for i in range(count)) if state.key_fields else (len(roots),) * count,
+                np.arange(count, dtype=np.int64) + len(roots)
+                if state.key_fields
+                else np.full(count, len(roots), dtype=np.int64),
             )
         )
         fields = tuple(meta(states, *field.shape, dtype=field.dtype.torch) for field in layout.layout.fields)
@@ -155,31 +168,11 @@ def example(
         roots.extend(tuple(field[i] for field in fields) for i in range(states))
     selection = RequestStateSelection(rows, tuple(groups))
 
-    def scoped(resource: StateResource) -> TensorBatch:
-        selected = selection.scoped(resource)
-        fields = resource_pools[resource]
-
-        def field_slots(field: int) -> tuple[torch.Tensor, tuple[int, ...]]:
-            return fields[field], tuple(range(len(fields[field])))
-
-        return replace(
-            batch,
-            selection=selected,
-            roots=tuple(roots[selection.refs.index(ref)] for ref in selected.refs),
-            after_refs=selected.refs,
-            field_slots=field_slots,
-            slot_matrix=lambda: (
-                resource,
-                np.repeat(np.arange(len(selected.refs), dtype=np.int64)[:, None], len(fields), axis=1),
-            ),
-        )
-
     batch = TensorBatch(
         selection,
         tuple(roots),
         selection.refs,
         None,
-        select_resource=scoped,
         feedback=SamplerFeedback(
             sampler,
             meta(count, facts.vocab_size or facts.probe.hidden_size),
@@ -188,6 +181,19 @@ def example(
         field_slots=lambda field: (pools[field], tuple(range(len(pools[field])))),
         slot_matrix=lambda: ("", np.repeat(np.arange(len(roots), dtype=np.int64)[:, None], len(pools), axis=1)),
     )
+    resources: dict[StateResource, TensorBatch] = {}
+    for group in selection.groups:
+        selected = selection.scoped(group.resource)
+        fields = resource_pools[group.resource]
+        resources[group.resource] = replace(
+            batch,
+            selection=selected,
+            roots=tuple(roots[int(index)] for index in selection.refs.positions(selected.refs)),
+            after_refs=selected.refs,
+            field_slots=partial(_example_field_slots, fields),
+            slot_matrix=partial(_example_slot_matrix, group.resource, fields),
+        )
+    batch = replace(batch, resources=resources)
     host_batch = None
     if binding.graph.training_mode == "weighted_batch":
         keys = tuple(key for key in selection.keys if key is not None)
@@ -435,7 +441,14 @@ def derive_host_resources(binding: TensorBinding, config: HostConfig) -> Schedul
     host_batch = WeightedRowBatch(meta(rows, config.hidden_size), meta(rows, *config.target_shape), meta(rows))
     (layout,) = binding.layouts.layouts
     refs = StateRefs.of((StateRef(LayoutId(1), LineageId(1), VersionId(1)),))
-    selection = RequestStateSelection((), (ResourceSelection(StateResource(layout.resource), (None,), refs, ()),))
+    selection = RequestStateSelection(
+        PackedPhaseRowBatch.from_rows(0, 0, ()).rows,
+        (
+            ResourceSelection(
+                StateResource(layout.resource), {int(refs.lineages[0]): None}, refs, np.empty(0, dtype=np.int64)
+            ),
+        ),
+    )
     pools = tuple(meta(1, *field.shape, dtype=field.dtype.torch) for field in layout.layout.fields)
     batch = TensorBatch(
         selection,
@@ -444,7 +457,7 @@ def derive_host_resources(binding: TensorBinding, config: HostConfig) -> Schedul
         None,
         field_slots=lambda field: (pools[field], (0,)),
     )
-    data = TensorFrame(StepInput.of_batch(host_batch), ())
+    data = TensorFrame(StepInput.of_batch(host_batch), PackedPhaseRowBatch.from_rows(0, 0, ()).rows)
     operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
         **binding.executables(None, ()),
         **binding.publications,

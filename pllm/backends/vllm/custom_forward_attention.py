@@ -4,7 +4,7 @@ vLLM owns the cache and FA2 attention. Peek merges strictly earlier cached
 attention with the fresh diagonal without writing any cache slots.
 """
 
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
@@ -77,7 +77,7 @@ def attention_metadata(
 
 
 def attention_paged_access(
-    context: ForwardContext, attentions: tuple[Attention, ...], rows: tuple[PackedPhaseRow, ...]
+    context: ForwardContext, attentions: tuple[Attention, ...], rows: Sequence[PackedPhaseRow]
 ) -> PagedAccessPlan:
     return bind_paged_access(
         rows,
@@ -172,7 +172,7 @@ def _wave_context(context: ForwardContext, metadata: dict[str, FlashAttentionMet
 def span_context(
     context: ForwardContext,
     attentions: tuple[Attention, ...],
-    groups: tuple[tuple[PackedPhaseRow, ...], ...],
+    groups: tuple[Sequence[PackedPhaseRow], ...],
     packed: torch.Tensor,
     requests: torch.Tensor,
     starts: list[int],

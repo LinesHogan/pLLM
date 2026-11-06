@@ -16,6 +16,8 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from pllm import _core
+from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.semantic_graph import StateResource, StateSelectionInputSource, TaskSymbol
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.state_execution import StateTaskContext
@@ -223,22 +225,27 @@ class TensorExecutor:
 
     def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan, layout: TableLayout) -> None:
         """Stage a RowPlan and row-input addresses into the zeroed fixed table."""
-        rows, sources, destinations, inputs = layout.split(host)
-        count = len(plan.packed)
         assert (
             all(name == "input_tokens" for name in self.row_input_names[: layout.row_inputs]) or -1 not in plan.sampler
         )
-        rows[2] = layout.states
-        rows[:5, :count] = plan.columns
-        rows[0, :count] = np.maximum(rows[0, :count], 0)
-        rows[5, :count] = 1
-        sources[:] = destinations[:] = -1
-        sources[:, : len(plan.sources)] = plan.sources.T
-        if plan.writes is not None:
-            updated, slots = plan.writes
-            destinations[:, list(updated)] = slots.T
-        for row, value in zip(inputs, self.row_input_values[: layout.row_inputs], strict=True):
-            row[:] = (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
+        updated, slots = plan.writes if plan.writes is not None else ((), np.empty((0, layout.fields), dtype=np.int64))
+        inputs = np.array(
+            [
+                (value.data_ptr(), value.stride(0), value.stride(1) if value.ndim > 1 else 1)
+                for value in self.row_input_values[: layout.row_inputs]
+            ],
+            dtype=np.int64,
+        ).reshape(-1, 3)
+        _core.fill_table(
+            host,
+            plan.columns,
+            plan.sources,
+            np.asarray(updated, dtype=np.int64),
+            slots,
+            inputs,
+            layout.rows,
+            layout.states,
+        )
 
     def _split(self) -> None:
         """Bind the table's resource views and hidden slot columns."""
@@ -267,12 +274,12 @@ class TensorExecutor:
         table = tables.pop(self.task.resource)
         frame = replace(
             data,
-            rows=(data.rows[0],) * self.rows,
+            rows=PackedRows(data.rows.batch, np.repeat(data.rows.indices[:1], self.rows)),
             fixed=replace(table, resources=tables),
             input_gradients={},
             parameter_gradient_fields={},
         )
-        return frame, replace(batches[self.task.resource], select_resource=batches.__getitem__)
+        return frame, replace(batches[self.task.resource], resources=batches)
 
     def _resource_rows(
         self,
@@ -285,7 +292,7 @@ class TensorExecutor:
         # The eager optimizer updates gathered copies of its fields in place.
         copied = frozenset(range(ADAM)) if self.optimizer is not None and not self.paged else frozenset[int]()
         reads = self.read_fields | copied
-        instance = batch.selection.keys == (None,)
+        instance = batch.selection.instance
         gather = _cuda_gather if pools and pools[0].is_cuda else _gather_field
         # A single-page instance has no alternate slot; borrow its pool instead of copying the network.
         fields = tuple(
@@ -443,7 +450,7 @@ class TensorExecutor:
         if self.rowwise:
             addresses = self._inputs(data, batch)
             plan = row_plan(data, batch)
-            self.updated = () if self.optimizer is None else tuple(sorted(plan.last))
+            self.updated = () if self.optimizer is None else tuple(plan.updated.tolist())
             if context is not None and self.optimizer is not None:
                 slots = context.owned_write_slots(batch.selection.refs.take(self.updated), copy_fields=())
                 plan = replace(plan, writes=(self.updated, slots))
@@ -467,8 +474,8 @@ class TensorExecutor:
         output = self.write_outputs(data, batch, source_rows)
         frame.parameter_gradient_fields = data.parameter_gradient_fields
         if batch.selection is not parent.selection:
-            positions = tuple(parent.selection.refs.index(ref) for ref in batch.selection.refs)
-            output = replace(output, changed=tuple(positions[i] for i in output.changed))
+            positions = parent.selection.refs.positions(batch.selection.refs)
+            output = replace(output, changed=tuple(positions[list(output.changed)].tolist()))
         return output
 
     def _inputs(self, data: TensorFrame, batch: TensorBatch) -> tuple[int, ...]:
@@ -495,7 +502,7 @@ class TensorExecutor:
                 elif self.capture is None:
                     states = len(selected.roots)
                 else:  # A captured reader of another resource: one instance root or one slot per row.
-                    states = 1 if selected.selection.keys == (None,) else self.rows
+                    states = 1 if selected.selection.instance else self.rows
                 self.resource_pools[resource] = pools
                 self.layouts[resource] = TableLayout(
                     self.rows, states, len(pools), len(self.row_input_names) if resource == self.task.resource else 0
@@ -627,7 +634,7 @@ class FieldWriteExecutor:
         parent = batch
         if any(group.resource == writer.resource for group in batch.selection.groups):
             batch = batch.for_resource(writer.resource)
-        updated = tuple(batch.selection.refs.index(parent.selection.refs[i]) for i in selected)
+        updated = tuple(batch.selection.refs.positions(parent.selection.refs.take(selected)).tolist())
         states = len(batch.roots) if self.capture is None else self.capture.states
         if not self.buffers or len(self.buffers[0]) != states:
             self.buffers = tuple(value.new_zeros((states, *value.shape[1:])) for value in values)

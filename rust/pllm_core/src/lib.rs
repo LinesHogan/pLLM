@@ -4,12 +4,14 @@
 
 use pyo3::prelude::*;
 
+mod host_step;
 mod packed_rows;
 mod planning;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     packed_rows::register(m)?;
+    host_step::register(m)?;
     planning::register(m)?;
     planning::scheduler::register(m)?;
     planning::tensor_layout::register(m)?;

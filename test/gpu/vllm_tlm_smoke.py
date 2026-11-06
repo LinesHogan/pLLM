@@ -20,6 +20,7 @@ from vllm import SamplingParams
 import pllm
 from pllm.authoring import CausalTrainBatch
 from pllm.config import ModelConfig
+from pllm.contracts.packed_rows import PackedRows
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 
@@ -49,7 +50,7 @@ def main() -> None:
     checks = [0]
 
     try:
-        (initial,) = execution.directory.select(()).refs
+        (initial,) = execution.directory.select(PackedRows.from_rows(())).refs
         outputs = handle.generate(
             ["The sky is", "Water freezes at"],
             SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True),
@@ -61,7 +62,7 @@ def main() -> None:
         assert diagnostics.active_states == 1 and diagnostics.inference_pins == 0
         assert diagnostics.pending_state_releases == 0
         assert (handle.runner.require_session().updated_apply_count == 0) == (args.mode == TLMMode.ONLINE)
-        (current,) = execution.directory.select(()).refs
+        (current,) = execution.directory.select(PackedRows.from_rows(())).refs
         assert current.version_id == initial.version_id + 1
         fields = execution.snapshot(current, torch.cuda.current_stream(device))
         factors = tuple(
@@ -99,7 +100,7 @@ def main() -> None:
         )
         diagnostics = execution.diagnostics()
         assert checks[0] >= 2 * len(handle.runner.model.model.layers)
-        assert tuple(execution.directory.select(()).refs) == (current,)
+        assert tuple(execution.directory.select(PackedRows.from_rows(())).refs) == (current,)
         assert diagnostics.update_count == 1 and diagnostics.trained_rows > 0
         assert handle.runner.require_session().updated_apply_count > 0
         assert diagnostics.inference_pins == diagnostics.pending_state_releases == 0
