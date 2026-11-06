@@ -43,7 +43,7 @@ class MiniESamp(pllm.Workload):
     def trained(self, versions: torch.Tensor = pllm.version("distiller")) -> torch.Tensor:
         return versions > 0
 
-    @pllm.train(state="distiller", reduction="state_mean")
+    @pllm.train(state="distiller")
     def loss(self, shallow: torch.Tensor = pllm.hidden(0), deep: torch.Tensor = pllm.hidden(-1),
              f: Distiller = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow) - deep).square().mean(-1)
