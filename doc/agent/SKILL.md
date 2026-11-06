@@ -50,7 +50,7 @@ class Distill(pllm.Workload):
     )
 
     # What the result does: a loss to minimize (decorator); what it reads: markers as defaults.
-    @pllm.train(state="distiller", reduction="state_mean")
+    @pllm.train(state="distiller")
     def loss(self, shallow: torch.Tensor = pllm.hidden(0), deep: torch.Tensor = pllm.hidden(-1),
              f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow.float()) - deep.float()).square().mean(-1)  # [rows]
@@ -218,7 +218,7 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | `activation patches run outside CUDA graphs; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | The workload needs eager execution; do not force `cuda_graphs=True`. |
 | `worker processes cannot send X defined in __main__ or a notebook; move it into an importable .py module, ...` | Move the class to a module, or keep `multiprocessing=False`. |
 | ContractError `method 'm' mixes rows: equal inputs for this request produced different outputs. Dimension 0 holds request rows; reduce features (dim=-1), not requests (dim=0).` | The method computes across rows (`mean(0)`, `sum(0)`, batch norm, sorting rows) or keeps Python state between calls (`self.count += 1`). Make each row depend only on its own inputs. |
-| ContractError `pllm misrouted rows ... Report this message as a framework bug.` | Rule out your code first: in-place writes to inputs or parameters (`w.add_(1)`), or request-state training with `reduction="mean"` (its gradient depends on the batch; use `reduction="state_mean"`). |
+| ContractError `pllm misrouted rows ... Report this message as a framework bug.` | Rule out your code first: in-place writes to inputs or parameters (`w.add_(1)`), or tensor math that mixes different states' rows. |
 | ContractError `[neutral] ...: add_logits must return exactly zero` / `[neutral] guide_sampling still declares a sampler stage; set its beta to zero.` | Make the strength setting multiply the whole result, and pass the workload with strength 0 as `neutral=`. |
 
 ## Escape hatches and what they cost
@@ -256,8 +256,9 @@ requests; each item says what to do instead.
   dicts keyed by request, `self.x += 1`, hooks on vLLM modules, monkey-patching the engine. Per-request
   memory is a `pllm.RequestState`; progress is `pllm.version(state)`; observation is `@pllm.export`.
 - **Computing across rows.** `mean(0)`, `softmax(dim=0)`, row sorting or batch statistics mix requests.
-- **Request-state training with `reduction="mean"`.** The mean runs over every request's rows, so one
-  request's update depends on its batch neighbours; use `reduction="state_mean"`.
+- **Reducing request-row losses yourself.** Return `[rows]`; `@pllm.train` defaults to the mean of each
+  state's selected rows in this step. Use `reduction="sum"` for each token's full contribution. Host batches
+  return one scalar and own their reduction; non-default `reduction=` is rejected.
 - **Wrong shapes for sampler methods.** `@pllm.add_logits` must return `[rows, vocab]`, `@pllm.guide_sampling`
   `[rows, hidden]`. The CPU check does not verify the vocabulary width; on the GPU a wrong width fails with a
   bare `AssertionError` in the sampler.

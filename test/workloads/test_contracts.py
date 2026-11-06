@@ -107,8 +107,8 @@ class PositionStack(pllm.Workload):
     loop: StepLoopWorkload = StepLoopWorkload()
 
 
-class BatchMeanTrainer(PrefillTrainer):
-    """An explicit batch mean breaks independent request updates."""
+class MeanTrainer(PrefillTrainer):
+    """An explicit mean preserves independent request updates."""
 
     @pllm.train(state="learned", reduction="mean")
     def learn(self, x=pllm.hidden(0), w=pllm.parameter("learned", "w")):
@@ -206,6 +206,7 @@ class PromptMask(pllm.Workload):
             Stack(),
             PositionStack(),
             PrefillTrainer(),
+            MeanTrainer(),
             DoLaWorkload(layers=(0, 2, 4, 6, 8)),
             ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)),
             FactorAdapterWorkload(),
@@ -238,7 +239,6 @@ class PromptMask(pllm.Workload):
         (workload, None, error)
         for workload, error in (
             (CoupledAttention(), r"\[isolation\]"),
-            (BatchMeanTrainer(), 'method `learn`.*couples RequestState.*reduction="state_mean"'),
             (BorrowedMutation(False), "method `change` mutates borrowed input `h`.*clone"),
             (BorrowedMutation(True), "method `change` mutates borrowed input `w`.*clone"),
             (BadLogits(), r"@pllm.add_logits.*\[rows, vocab_size\].*got \(3, 8\)"),
@@ -437,7 +437,7 @@ class ImportedTrainer(ImportedRows):
     def learned(self) -> pllm.RequestState:
         return pllm.RequestState({"w": (8,)}, optimizer=pllm.AdamW(lr=0.01))
 
-    @pllm.train(state="learned", reduction="state_mean")
+    @pllm.train(state="learned")
     def learn(self, hidden=pllm.hidden(0), w=pllm.parameter("learned", "w"), vector=pllm.parameter("steer", "vector")):
         return (w - vector + hidden * 0).square().mean(-1)
 
@@ -525,3 +525,28 @@ def test_check_detects_chunk_local_token_history(model_config):
 
     with patch.object(testing_contracts, "_step", shifted), pytest.raises(testing.ContractError, match="mixed"):
         testing.check(TokenHistory(), model_config)
+
+
+@pytest.mark.parametrize(
+    "field", ("targets", "input_ids", "base_logits"), ids=("weighted-row", "causal", "weighted-ce")
+)
+def test_host_batch_rejects_reduction_at_declaration(field) -> None:
+    """Every host-batch input schema owns its reduction, before tracing or execution."""
+
+    class HostTrainer(pllm.Workload):
+        """A scalar host loss cannot delegate its reduction to the request-row framework."""
+
+        learned = pllm.InstanceState(
+            {"w": (4,)}, optimizer=pllm.SGD(0.01) if field == "base_logits" else pllm.AdamW(0.01)
+        )
+
+        @pllm.train(state="learned", reduction="sum")
+        def learn(self, values=pllm.batch(field), w=pllm.parameter("learned", "w")):
+            """Return a scalar loss owned by the batch method."""
+            return values.sum() * w.sum()
+
+    facts = testing.backend_facts(4, (), model_timeline(torch.device("cpu")))
+    with pytest.raises(
+        ValueError, match="host-batch training returns one scalar and owns its reduction; remove reduction="
+    ):
+        HostTrainer().build(facts)

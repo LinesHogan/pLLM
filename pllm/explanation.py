@@ -58,6 +58,7 @@ class MemberCost:
     tasks: tuple[TaskCost, ...]
     eager_reason: str
     host_batch: str
+    training: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +154,7 @@ class ExplainResult:
                     f"{member.name}  {member.effect}  {task.anchor} / {task.lane} / "
                     f"{'captured' if task.captured else 'eager'}  "
                     f"{', '.join(task.reads) or '-'} ({task.read_origin}, {task.read_distance})"
+                    + (f"; {member.training}" if member.training else "")
                 )
                 if task.capture_resident_bytes:
                     lines.append(
@@ -294,7 +296,15 @@ def _members(
             if causal
             else ""
         )
-        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch))
+        training = (
+            "one AdamW step per state per engine step; prompt rows train once per prefill chunk"
+            if any(
+                task.training is not None and name in binding.task_members.get(task.symbol, ())
+                for task in binding.tensor_tasks.values()
+            )
+            else ""
+        )
+        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch, training))
     return tuple(result)
 
 

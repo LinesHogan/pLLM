@@ -82,7 +82,7 @@ class OverRIDEWorkload(pllm.Workload):
     def eligible(self, samples: torch.Tensor = SAMPLES) -> torch.Tensor:
         return (samples < self.config.num_iterations - 1) & self.config.enabled
 
-    @pllm.train(state="iteration_heads", rows="eligible", reduction="mean")
+    @pllm.train(state="iteration_heads", rows="eligible")
     def train(
         self,
         hidden: torch.Tensor = HIDDEN,

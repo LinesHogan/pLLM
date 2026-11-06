@@ -111,7 +111,7 @@ class ESamp(pllm.Workload):
         return ((x.unsqueeze(1) @ a.transpose(-1, -2)) @ b.transpose(-1, -2)).squeeze(1)
 
     @pllm.on(pllm.Phase.AFTER_SAMPLE)
-    @pllm.train(state="student", reduction="state_mean")
+    @pllm.train(state="student")
     def loss(
         self,
         x: torch.Tensor = pllm.hidden(0),

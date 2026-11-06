@@ -44,7 +44,7 @@ class MeanFit(pllm.Workload):
     ) -> torch.Tensor:
         return hidden * weight
 
-    @pllm.train(state="weights", reduction="mean")
+    @pllm.train(state="weights")
     def loss(
         self,
         hidden: torch.Tensor = pllm.hidden(0),
@@ -123,7 +123,7 @@ def mean_capture(publish_lag: int = 0) -> None:
                 target.fill_(999)
                 tokens.fill_(999)
             result = execution.finish_step(invocation, stream)
-        torch.testing.assert_close(result.loss, oracle.detach())
+        torch.testing.assert_close(result.loss[0], oracle.detach())
         torch.testing.assert_close(execution.snapshot(result.publication.after_refs[0], stream)[0], parameter)
     if overlap is not None:
         execution.release_history()

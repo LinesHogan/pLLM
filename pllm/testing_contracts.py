@@ -939,18 +939,6 @@ def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool 
                 for name in missing
             ),
         )
-    for task in declaration.tensor_tasks.values():
-        if (
-            task.training is not None
-            and task.training.declaration.scope is StateScope.REQUEST
-            and task.policy.reduction == "mean"
-        ):
-            failures.append(
-                f'[training] method `{task.symbol}` uses reduction="mean", which couples RequestState updates '
-                'across requests; use @pllm.train(..., reduction="state_mean") or omit reduction=.'
-            )
-    if failures:
-        raise ContractError(tuple(failures))
     if device_equivalence and declaration.custom_forward_programs:
         _, gpu = workload.specialize(
             replace(facts, probe=replace(facts.probe, device_kind=StateDeviceKind.CUDA)), config.execution

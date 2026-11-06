@@ -272,7 +272,7 @@ class Distillation(pllm.Workload):
     ) -> torch.Tensor:
         return torch.bmm(source.unsqueeze(1), weight).squeeze(1)
 
-    @pllm.train(state="heads", reduction="state_mean")
+    @pllm.train(state="heads")
     def train(
         self,
         source: torch.Tensor = pllm.carry(pllm.hidden(0), state="heads", field="carry"),
@@ -402,7 +402,7 @@ class ModuleDistillation(pllm.Workload):
     def predict(self, source: torch.Tensor = pllm.hidden(0), head: Head = pllm.module("head")) -> torch.Tensor:
         return head(source)
 
-    @pllm.train(state="head", reduction="state_mean")
+    @pllm.train(state="head")
     def train(
         self,
         source: torch.Tensor = pllm.hidden(0),
@@ -444,3 +444,55 @@ def _module_request_distillation(device_name) -> None:
             torch.testing.assert_close(execution.snapshot(after, stream)[0], flat)
             latest[index] = after
     execution.retire(identities)
+
+
+@pytest.mark.parametrize("reduction", ("mean", "sum"))
+@pytest.mark.parametrize("request_state", (True, False), ids=("shared-key", "instance"))
+def test_multirow_state_reduction_matches_adamw(reduction, request_state, device_name) -> None:
+    """Unequal state row counts scale losses, gradients and optimizer moments independently."""
+
+    class RowTrainer(pllm.Workload):
+        """Train several rows together through a shared key or one instance state."""
+
+        weights = (
+            pllm.RequestState({"w": (4,)}, optimizer=pllm.AdamW(lr=0.03), key_fields=("prompt_index",))
+            if request_state
+            else pllm.InstanceState({"w": (4,)}, optimizer=pllm.AdamW(lr=0.03))
+        )
+
+        @pllm.add_logits()
+        def bias(self, x=pllm.hidden(0)):
+            """Enable instance training with a neutral additive sampler effect."""
+            return torch.zeros_like(x)
+
+        @pllm.train(state="weights", reduction=reduction)
+        def learn(self, x=pllm.hidden(0), w=pllm.parameter("weights", "w")):
+            """Return one loss per row for the framework to reduce."""
+            return (w - x).square().mean(-1)
+
+    device = torch.device(device_name)
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    facts = replace(facts_for(device, 4, 12, lineages=4, memory_bytes=1 << 20), vocab_size=4)
+    execution = RowTrainer().compile_backend(facts, ExecutionOptions(capture_memory_bytes=16 << 20)).execution
+    identities = tuple(RequestIdentity(str(i), group, i) for i, group in enumerate((0, 1, 0, 0)))
+    execution.admit((), stream)
+    initial = execution.admit(identities, stream)
+    source = torch.linspace(-0.7, 1.2, 16, device=device).reshape(4, 4)
+    owners = (0, 1, 0, 0) if request_state else (0, 0, 0, 0)
+    parameters = [execution.snapshot(ref, stream)[0].requires_grad_() for ref in initial]
+    optimizers = [torch.optim.AdamW((p,), lr=0.03, weight_decay=0) for p in parameters]
+    row_losses = (torch.stack([parameters[owner] for owner in owners]) - source).square().mean(-1)
+    losses = [row_losses[[i for i, owner in enumerate(owners) if owner == state]] for state in range(len(initial))]
+    expected = torch.stack([loss.mean() if reduction == "mean" else loss.sum() for loss in losses])
+    expected.sum().backward()
+    result = execution.step(step_input(identities, source, source, 0, stream=stream), stream)
+    for before, after, loss in zip(
+        result.publication.before_refs, result.publication.after_refs, result.loss, strict=True
+    ):
+        index = initial.index(before)
+        torch.testing.assert_close(loss, expected[index])
+        optimizers[index].step()
+        assert_roots(execution.snapshot(after, stream), adamw_roots(optimizers[index], parameters[index]))
+    execution.retire(identities, wait=True)
+    execution.retire((), wait=True)
+    assert execution.diagnostics().loss_count == len(initial)

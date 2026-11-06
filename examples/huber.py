@@ -44,7 +44,7 @@ class HuberWorkload(pllm.Workload):
     ) -> torch.Tensor:
         return self.forward(source, a, b)
 
-    @pllm.train(state="adapter", reduction="state_mean")
+    @pllm.train(state="adapter")
     def loss(
         self,
         source: torch.Tensor = pllm.hidden(0),

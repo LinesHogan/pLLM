@@ -76,7 +76,7 @@ class Distill(pllm.Workload):
         optimizer=pllm.AdamW(1e-3),
     )
 
-    @pllm.train(state="distiller", reduction="state_mean")
+    @pllm.train(state="distiller")
     def loss(
         self,
         shallow: torch.Tensor = pllm.hidden(0),
@@ -393,7 +393,7 @@ class SelectiveBias(pllm.Workload):
 > **实用建议与限制**
 > * **优先用 `@pllm.guide_sampling`，慎用多层 `pllm.layer_logits`**：`pllm.layer_logits`（如 `DoLa` 读取多个中间层的词表分布）走独立的 GEMM，每多读一层就要多读一遍 $272\text{ MB}$ 的 LM Head 权重。在 0.5B 模型（32 请求 $\times n=4$）上，`DoLa` 的吞吐仅为原生的 **25%**（见[教程 06](../tutorials/06_reading_inside.ipynb)）。
 > * **模型越大，引导采样的相对代价越小**：在 0.5B 小模型上，词表投影和重加权占整步时间的 $\sim 10\%$；但在 7B 模型上，主干每步要读十几 GB 权重，同样的词表开销占比很小——在 RTX 4090 上跑 7B 模型时，`ESamp`（$\beta=0.5$）吞吐约为原生 vLLM 的 **94%**（$\beta=0$ 约 **97%**）。
-> * **每请求训练必须用 `reduction="state_mean"`**（也是默认值）：如果改成 `reduction="mean"`，均值会跨所有请求的行求，一个请求的更新会受同批其他请求影响；`pllm.testing.check` 会以 `ContractError` 报出这类行间混合。
+> * **逐行训练默认 `reduction="mean"`**：只平均本步每个状态选中的行；`reduction="sum"` 则求和。两者都不会跨状态归约。宿主批次自己归约，非默认 `reduction=` 会在声明期报错。
 
 ---
 

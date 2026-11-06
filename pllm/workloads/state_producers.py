@@ -137,7 +137,7 @@ class DecodeFactorsWorkload(FactorAdapterWorkload):
 
     optimizer = pllm.AdamW(lr=1e-3)
 
-    @pllm.train(state="factors", reduction="state_mean")
+    @pllm.train(state="factors")
     def learn(
         self,
         x: torch.Tensor = pllm.hidden(0),

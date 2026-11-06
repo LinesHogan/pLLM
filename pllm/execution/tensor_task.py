@@ -363,7 +363,7 @@ class TensorTask:
         observed_inputs = self.observation_inputs(inputs)
         loss = self.call(inputs)
         if not isinstance(loss, torch.Tensor) or loss.shape != (len(data.rows),):
-            raise ValueError("training methods return one loss per row; pllm averages the selected rows")
+            raise ValueError("training methods return one loss per row; pllm reduces the selected rows per state")
         if self.observe is not None:
             self.observe(data, observed_inputs, (loss,))
         loss, objective = self._loss(loss, data, rows)
@@ -383,14 +383,13 @@ class TensorTask:
         `torch.where`, not a product, drops unselected rows, so a NaN or Inf there cannot reach the sums.
         """
         loss = torch.where(rows, loss.to(torch.promote_types(loss.dtype, torch.float32)), 0)
-        if self.policy.reduction == "state_mean":
-            states = data.table.index.states
-            size = data.table.states + 1
+        states = data.table.index.states
+        size = data.table.states + 1
+        totals = loss.new_zeros(size).index_add(0, states, loss)
+        if self.policy.reduction == "mean":
             counts = loss.new_zeros(size).index_add(0, states, rows.to(loss.dtype))
-            loss = loss.new_zeros(size).index_add(0, states, loss) / counts.clamp_min(1)
-            return loss, loss.sum()
-        loss = loss.sum() / rows.sum().clamp_min(1)
-        return loss, loss
+            totals = totals / counts.clamp_min(1)
+        return totals, totals.sum()
 
 
 __all__ = ["TensorTask"]

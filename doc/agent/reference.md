@@ -204,7 +204,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
 
 | Name | Meaning |
 | --- | --- |
-| `@pllm.train(*, state, reduction="state_mean", rows="", update_rows="", steps=1, reset="")` | Minimize the returned loss with the optimizer declared on `state`; the framework masks padding, averages, backpropagates, applies the optimizer and publishes the new version. Return a `[rows]` loss (or a scalar). The default `reduction="state_mean"` averages each state's rows, then sums over states; `"mean"` averages over all rows. |
+| `@pllm.train(*, state, reduction="mean", rows="", update_rows="", steps=1, reset="")` | Minimize the returned loss with the optimizer declared on `state`; the framework masks padding, reduces, backpropagates, applies the optimizer and publishes the new version. Request-row training returns a `[rows]` loss. The default `reduction="mean"` averages each state's selected rows in this step; `"sum"` sums them. Host-batch training returns one scalar and owns its reduction; remove non-default `reduction=`. |
 | `pllm.AdamW(lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0)` | The optimizer for training on request rows and on `WeightedRowBatch` / `CausalTrainBatch` host batches. Declared on the state: `optimizer=pllm.AdamW(1e-3)`. |
 | `pllm.SGD(lr)` | The optimizer for `WeightedCEBatch` training (`steps=`, `reset=`) and for `@pllm.train_in_forward`. |
 | `@pllm.differentiate(*, inputs=(), parameters=False, input_rows="", parameter_rows="")` | Keep gradient edges through a non-loss method: `inputs` names its arguments whose gradients flow, `parameters=True` lets its parameters train too. A training method reads its result with `pllm.result(name)`. |
@@ -232,7 +232,7 @@ class ShallowDistiller(pllm.Workload):
     def trained(self, versions: torch.Tensor = pllm.version("distiller")) -> torch.Tensor:
         return versions > 0
 
-    @pllm.train(state="distiller", reduction="state_mean")
+    @pllm.train(state="distiller")
     def loss(self, shallow: torch.Tensor = pllm.hidden(0), deep: torch.Tensor = pllm.hidden(-1),
              f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow.float()) - deep.float()).square().mean(-1)
@@ -629,7 +629,7 @@ pllm.add_logits(*, rows: 'str' = '') -> 'Callable[[F], F]'
     Add the returned tensor to the logits before sampling.
 pllm.guide_sampling(*, beta: 'float | Attr', rows: 'str' = '') -> 'Callable[[F], F]'
     Push sampling away from the returned hidden-state prediction for positive `beta`.
-pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction' = 'state_mean', steps: 'int | Attr' = 1, reset: 'str' = '', rows: 'str' = '') -> 'Callable[[F], F]'
+pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction' = 'mean', steps: 'int | Attr' = 1, reset: 'str' = '', rows: 'str' = '') -> 'Callable[[F], F]'
     Minimize the returned loss with `state`'s optimizer; updates publish after sampling by default.
 pllm.differentiate(*, inputs: 'tuple[str, ...]' = (), parameters: 'bool' = False, input_rows: 'str' = '', parameter_rows: 'str' = '') -> 'Callable[[F], F]'
     Keep derivative edges; parameters may stay frozen while inputs differentiate.

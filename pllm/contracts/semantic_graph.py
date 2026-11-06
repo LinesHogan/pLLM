@@ -166,9 +166,9 @@ class TokenProgramEffect:
     adaptive: bool = False
 
 
-# How a request-training loss averages its rows: the author's @pllm.train choice ("mean", "state_mean"), or "none".
+# How a request-training loss reduces each state's rows: the author's @pllm.train choice, or "none".
 # Batch training still sets "custom" (its method reduces the loss); nothing reads it.
-LossReduction = Literal["none", "mean", "state_mean", "custom"]
+LossReduction = Literal["none", "mean", "sum", "custom"]
 # What a workload's @pllm.train method trains on, read from its inputs: the rows of running requests, a host batch
 # with one AdamW step, or a WeightedCEBatch with SGD steps per state.
 TrainingMode = Literal["request", "batch", "weighted_batch"]

@@ -124,10 +124,11 @@ class CenteredHidden(pllm.Workload):
 
 ### 按状态归约与 `StateIndex` / `StateVersion`
 
-`@train(state=..., reduction="state_mean")` 改为返回每个原始选中状态一个均值 loss。
-绑定器对它们求**和**再微分，而不是跨状态求均值；loss 与优化器在原始图中
-分阶段成为独立任务，保持声明的时机。这个形式目前要求无条件的
-forward/update 域。`StateIndex` 给出每行在本次调用内的状态索引，用于归约；
+`@train(state=...)` 的逐行方法返回 `[rows]` loss。框架默认用 `reduction="mean"`
+平均本步每个状态选中的行，`reduction="sum"` 则求和；再对各状态的 loss 求**和**后微分，
+不会跨状态求均值。宿主批次方法自己归约，非默认 `reduction=` 在声明期报错。
+loss 与优化器在原始图中分阶段成为独立任务，保持声明的时机。
+`StateIndex` 给出每行在本次调用内的状态索引，用于归约；
 `StateVersion` 给出该行的原始输入 pin 版本 —— 永远不是 latest 或优化器步数。
 两者都不可微。显式的 `RequestState.keys` 仍是原始隔离键；省略则按请求 ID。
 ESamp 保留其仅请求 ID 的后端限制。

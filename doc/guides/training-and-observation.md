@@ -21,7 +21,7 @@ import torch
 import pllm
 
 @pllm.on(pllm.Phase.AFTER_SAMPLE)
-@pllm.train(state="head", reduction="state_mean")
+@pllm.train(state="head")
 def learn(
     self,
     h: torch.Tensor = pllm.hidden(0),
@@ -47,10 +47,11 @@ def learn(
 都随状态走。你不需要写 `backward()`，也不需要自己管优化器。
 
 第二个约定在返回值上：逐请求训练的方法**每行返回一个 loss**，不要自己把行
-压成一个数，归约交给框架。`reduction="mean"` 对所有行取均值；
-`reduction="state_mean"` 先对每个状态的行取均值，再把各状态的均值**相加**后
-微分——每个请求的状态各自按自己的行数归一，不被别的请求稀释。在宿主批次
-（`WeightedRowBatch`、`CausalTrainBatch`）上训练的方法则返回一个标量 loss。
+压成一个数，归约交给框架。默认 `reduction="mean"` 对本步每个状态选中的行取均值；
+`reduction="sum"` 对这些行求和。各状态的 loss **相加**后微分，不会把不同状态的行一起平均。
+每个状态每个引擎步更新一次，prompt 行每个 prefill 分块训练一次。在宿主批次
+（`WeightedRowBatch`、`CausalTrainBatch`、`WeightedCEBatch`）上训练的方法自己归约；
+非默认的 `reduction=` 会在声明期报错。
 
 第三个约定容易踩坑：**零梯度不等于不更新**。被授权的状态即使梯度为零，也会
 推进优化器的步数、动量与衰减。如果你真的想跳过某些行的更新，不要靠让梯度
@@ -172,7 +173,7 @@ no preceding COW copy. Other written fields are copied inside the graph.
 
 Captured methods must compute independently along their first (row) axis. They see the
 maximum operation row count, including padding. Return **one loss per row** for
-both `reduction="mean"` and `reduction="state_mean"`; do not reduce the row axis in Python
+both `reduction="mean"` and `reduction="sum"`; do not reduce the row axis in Python
 or mix rows with batch normalization, attention, or another cross-row operation. The
 framework gives padding zero weight and a sink parameter row that is never optimized.
 Shared instance parameters use one live state; request parameters use the admitted state

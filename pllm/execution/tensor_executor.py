@@ -542,8 +542,7 @@ class TensorExecutor:
 
     def write_outputs(self, data: TensorFrame, batch: TensorBatch, source_rows: int) -> TaskOutput:
         """Record results, gradients, losses and observations of the last body."""
-        state_mean = self.task.policy.reduction == "state_mean"
-        count = len(batch.roots) if self.optimizer is not None and state_mean else len(data.rows)
+        count = len(batch.roots) if self.optimizer is not None else len(data.rows)
         # Results without row inputs have no row axis to trim.
         values = tuple(
             retain_rows(
@@ -575,7 +574,7 @@ class TensorExecutor:
         return TaskOutput(
             loss=values[0],
             changed=self.updated,
-            loss_count=count if state_mean else 1,
+            loss_count=count,
             update_count=len(self.updated) if self.counters is None else 0,
             trained_rows=len(data.rows) if self.counters is None else 0,
             counters=None if self.counters is None else self.counters.clone(),

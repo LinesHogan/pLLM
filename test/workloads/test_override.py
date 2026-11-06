@@ -137,7 +137,7 @@ def _reweight_oracle():
         optimizer.step()
         assert tuple(result.publication.before_refs) == (latest,)
         (latest,) = result.publication.after_refs
-        torch.testing.assert_close(result.loss, loss.detach())
+        torch.testing.assert_close(result.loss[0], loss.detach())
         assert_roots(execution.snapshot(latest), adam_roots(optimizer, down, up))
     assert_roots(execution.arena.snapshot(held, initial), original, exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
@@ -180,7 +180,7 @@ def _request_heads() -> None:
         def eligible(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
             return samples == 0
 
-        @pllm.train(state="heads", rows="eligible", reduction="mean")
+        @pllm.train(state="heads", rows="eligible")
         def train(
             self,
             hidden: torch.Tensor = pllm.final_hidden(),
@@ -202,10 +202,14 @@ def _request_heads() -> None:
     assert_roots(requests.snapshot(result.publication.after_refs[1]), untouched, exact=True)
     weights = torch.nn.Parameter(torch.zeros((2, 4, 7)))
     optimizer = torch.optim.Adam((weights,), lr=0.03, foreach=False)
-    loss = F.cross_entropy(BASE[[0, 2]] + torch.bmm(HIDDEN[[0, 2]].unsqueeze(1), weights).squeeze(1), TOKENS[[0, 2]])
-    loss.backward()
+    loss = F.cross_entropy(
+        BASE[[0, 2]] + torch.bmm(HIDDEN[[0, 2]].unsqueeze(1), weights).squeeze(1),
+        TOKENS[[0, 2]],
+        reduction="none",
+    )
+    loss.sum().backward()
     optimizer.step()
-    torch.testing.assert_close(result.loss, loss.detach())
+    torch.testing.assert_close(result.loss, torch.stack((loss[0], loss.new_zeros(()), loss[1])).detach())
     for index, ref in enumerate(result.publication.after_refs[::2]):
         torch.testing.assert_close(requests.snapshot(ref)[0].reshape(4, 7), weights[index])
     requests.retire(identities)
@@ -241,7 +245,7 @@ def _chained_heads(facts) -> None:
         def eligible(self, samples: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
             return samples == 0
 
-        @pllm.train(state="heads", rows="eligible", reduction="mean")
+        @pllm.train(state="heads", rows="eligible")
         @pllm.differentiate(inputs=("features",))
         def train(
             self,
@@ -265,7 +269,7 @@ def _chained_heads(facts) -> None:
     optimizer.step()
     result = run(chain, samples((0, 2, 0), 9))
     torch.testing.assert_close(result.guidance[0].values, predicted.detach())
-    torch.testing.assert_close(result.loss, loss.detach())
+    torch.testing.assert_close(result.loss[0], loss.detach())
     torch.testing.assert_close(result.input_gradients["reweight", "hidden"], oracle_input.grad)
     torch.testing.assert_close(chain.snapshot(result.publication.after_refs[0])[0].reshape(4, 7), weight)
     latest = result.publication.after_refs[0]
@@ -323,7 +327,7 @@ class Domains(pllm.Workload):
     ) -> torch.Tensor:
         return torch.bmm(hidden.unsqueeze(1), weight).squeeze(1)
 
-    @pllm.train(state="heads", update_rows="updates", rows="forward_rows", reduction="mean")
+    @pllm.train(state="heads", update_rows="updates", rows="forward_rows")
     @pllm.differentiate(inputs=("features",))
     def train(
         self,
@@ -391,7 +395,7 @@ def _domains_oracle(device, request, identities) -> None:
             {row if request else 0 for row, flags in enumerate(bits) if flags & 8 and not no_feedback_update}
         )
         expected_output = torch.zeros((4, 7), device=device)
-        loss = None
+        loss = torch.zeros(len(initial), device=device)
         if forward:
             predictions = []
             for row in forward:
@@ -399,8 +403,12 @@ def _domains_oracle(device, request, identities) -> None:
                 x = source[row] if bits[row] & 2 else source[row].detach()
                 predictions.append(x @ (parameter if bits[row] & 4 else parameter.detach()))
                 expected_output[row] = predictions[-1].detach()
-            loss = torch.stack(predictions).square().mean()
-            loss.backward()
+            row_losses = torch.stack(predictions).square().mean(1)
+            if request:
+                loss[forward] = row_losses
+            else:
+                loss = row_losses.mean().reshape(1)
+            loss.sum().backward()
         gradients = tuple(torch.zeros_like(p) if p.grad is None else p.grad.clone() for p in parameters)
         for index in active:
             parameters[index].grad = gradients[index]
@@ -410,10 +418,10 @@ def _domains_oracle(device, request, identities) -> None:
         tokens = torch.full((4,), int(no_feedback_update), device=device, dtype=torch.long)
         result = run(execution, value, torch.zeros((4, 7), device=device), tokens, stream)
         torch.testing.assert_close(result.guidance[0].values, expected_output)
-        if loss is None:
-            assert result.loss.item() == 0 and not result.input_gradients["reweight", "hidden"].any()
+        torch.testing.assert_close(result.loss, loss.detach())
+        if not forward:
+            assert not result.input_gradients["reweight", "hidden"].any()
         else:
-            torch.testing.assert_close(result.loss, loss.detach())
             expected_input = torch.zeros_like(source) if source.grad is None else source.grad
             torch.testing.assert_close(result.input_gradients["reweight", "hidden"], expected_input)
             for ref, gradient in zip(latest, gradients, strict=True):

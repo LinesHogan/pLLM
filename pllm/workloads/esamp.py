@@ -71,7 +71,7 @@ class ESampWorkload(pllm.Workload):
     ) -> torch.Tensor:
         return distiller(source)
 
-    @pllm.train(state="distiller", reduction="state_mean")
+    @pllm.train(state="distiller")
     def loss(
         self,
         source: torch.Tensor = pllm.hidden(pllm.Attr("config.source_layer")),

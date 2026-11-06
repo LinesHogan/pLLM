@@ -137,8 +137,8 @@ from pllm.kernels.adamw import AdamWConfig
 F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | UpdateOutput | None])
 Initializer = Callable[[Tensors, torch.Generator], None]
 C = TypeVar("C")
-# How @pllm.train averages per-row losses: over all rows, or per state and then summed over states.
-TrainReduction = Literal["mean", "state_mean"]
+# How @pllm.train reduces the selected per-row losses within each state in this step.
+TrainReduction = Literal["mean", "sum"]
 L = TypeVar("L", bound=str)
 # The tokens whose projection operands train a @pllm.train_in_forward state.
 _TOKEN_PHASES: dict[str, tuple[HiddenPhase, ...]] = {
@@ -1018,7 +1018,7 @@ class _Effect:
 
     state: str = ""
     update_rows: str = ""
-    reduction: TrainReduction = "mean"
+    reduction: TrainReduction
 
     def description(self, owner: Workload) -> MemberDeclaration:
         """The public effect name, with timing settings resolved at the authoring boundary."""
@@ -1155,6 +1155,8 @@ class _Train(_Effect):
         arguments, carries = operation.arguments()
         definition = operation.context.state_definition(self.state, "@pllm.train needs a declared state")
         mode = _training_mode(arguments)
+        if mode != "request" and self.reduction != "mean":
+            raise ValueError("host-batch training returns one scalar and owns its reduction; remove reduction=")
         if mode != "request" and operation.phase is Phase.AUTOMATIC:
             operation = replace(operation, phase=Phase.AFTER_SAMPLE)
         match mode, definition.optimizer:
@@ -2004,7 +2006,7 @@ def train(
     *,
     state: str,
     update_rows: str = "",
-    reduction: TrainReduction = "state_mean",
+    reduction: TrainReduction = "mean",
     steps: int | Attr = 1,
     reset: str = "",
     rows: str = "",
@@ -2020,14 +2022,22 @@ def train(
     step on the host batch. WeightedCEBatch fields run `steps` SGD steps per state, each state first restored by
     the `reset` method (pllm.SGD).
 
-    The default `reduction="state_mean"` averages each state's rows, then sums over states, so RequestState
-    updates are independent of neighboring requests. `"mean"` averages over all rows and couples request updates.
-    Host-batch training ignores it. `rows=` names a selector whose mask picks the rows that count; the method
-    still runs on every row. For request training, rows= and update_rows= require a model effect without sampler
-    guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state.
+    Request-row methods return a [rows] loss. The default `reduction="mean"` averages each state's selected
+    rows in this engine step; `"sum"` sums them. Both keep states independent. Each state takes one optimizer
+    step per engine step; prompt rows train once per prefill chunk, so prompt training depends on chunking.
+    Reduction matters for prompt rows, shared key_fields states, InstanceState, or any step with several rows
+    per state. Plain request_id decode training has one row per state, so both reductions are equal.
+    Choose mean for AdamW by default; choose sum for a per-token SGD learning rate or shared-key online group
+    training, where each surviving token should contribute without division by the group's current row count.
+
+    Host-batch methods return one scalar and own their reduction; a non-default reduction= is rejected.
+    `rows=` names a selector whose mask picks the rows that count; zero-weight losses still count toward the
+    mean, and the method still runs on every row. For request training, rows= and update_rows= require a model
+    effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update
+    every selected state.
     """
-    if reduction not in ("mean", "state_mean"):
-        raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'state_mean'")
+    if reduction not in ("mean", "sum"):
+        raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'sum'")
     return _mark(
         effect=_Train(state=state, update_rows=update_rows, reduction=reduction, steps=steps, reset=reset), rows=rows
     )
