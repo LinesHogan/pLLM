@@ -1,7 +1,7 @@
 """Slot-addressed field storage shared by versioned PTTS state and transient hidden rows.
 
-SlotPools owns the page tensors of one layout and their holders, generations and reuse fences.
-PageBundleArena (versioned state) and the vLLM hidden-row capture use it; nothing here knows versions.
+SlotPools keeps the field tensors and CUDA event objects; Rust owns holds, generations and reuse fences.
+PageBundleArena and vLLM hidden-row capture share the same numeric pool implementation.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from pllm import _core
 from pllm.contracts.tensor_layout import TensorLayoutSpec
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
@@ -27,6 +28,42 @@ class PageSlot:
 
 
 Slots = npt.NDArray[np.int64]
+
+
+class PageEvents:
+    """Keep CUDA objects alive for the numeric event IDs retained by a Rust ledger."""
+
+    def __init__(self) -> None:
+        self._events: dict[int, torch.cuda.Event] = {}
+
+    def add(self, event: torch.cuda.Event | None) -> int:
+        """Register a completion without querying or waiting on it."""
+        if event is None:
+            return 0
+        key = id(event)
+        self._events[key] = event
+        return key
+
+    def get(self, key: int) -> torch.cuda.Event | None:
+        """Resolve a retained event for an explicit page snapshot."""
+        return self._events[key] if key else None
+
+    def completed(self) -> Slots:
+        """Poll fences; queries never wait for device work."""
+        return np.fromiter((key for key, event in self._events.items() if event.query()), dtype=np.int64)
+
+    def order(self, keys: Slots, stream: torch.cuda.Stream | None) -> None:
+        """Enqueue the ledger's reuse and producer dependencies on the consuming stream."""
+        for key in keys.tolist():
+            assert stream is not None
+            stream.wait_event(self._events[key])
+
+    def retain(self, keys: Slots) -> None:
+        """Discard event objects only after the ledger stops referring to them."""
+        retained = set(keys.tolist())
+        for key in tuple(self._events):
+            if key not in retained:
+                del self._events[key]
 
 
 class SlotPools:
@@ -81,50 +118,26 @@ class SlotPools:
                 ) from error
             tensors.append(pool)
         self.tensors = tuple(tensors)
-        # Per field and slot: how many owners share the page (0 = free), and how often it was reused.
-        self.holders = np.zeros((len(layout.fields), capacity), dtype=np.int32)
-        self.generations = np.zeros((len(layout.fields), capacity), dtype=np.int64)
-        self._field_offsets = np.arange(len(layout.fields), dtype=np.int64) * capacity
-        # Each completion fences a mask of field slots, independent of current holders.
-        self._readiness: dict[torch.cuda.Event, npt.NDArray[np.bool_]] = {}
+        self.ledger = _core.SlotLedger(len(layout.fields), capacity)
+        self._events = PageEvents()
 
     def free_count(self, field: int) -> int:
         """Slots available for allocation, possibly still awaiting GPU completion."""
-        return int(np.count_nonzero(self.holders[field] == 0))
+        return self.ledger.free_count(field)
 
     def allocate(self, field: int, count: int, stream: torch.cuda.Stream | None) -> tuple[Slots, Slots]:
-        """Lease free pages, preferring ready slots before ordering reuse behind pending readers."""
-        free = np.flatnonzero(self.holders[field] == 0)
-        if len(free) < count:
-            raise WindowBackpressure("Slot capacity is exhausted; release current holders before retrying")
-        self._collect_completed()
-        slots = free[:count]
-        if self._readiness:
-            fenced = np.zeros(len(free), dtype=np.bool_)
-            for pending in self._readiness.values():
-                fenced |= pending[field, free]
-            ready = free[~fenced][:count]
-            reuse = free[fenced][: count - len(ready)]
-            slots = np.concatenate((ready, reuse))
-            if reuse.size:
-                for event, pending in tuple(self._readiness.items()):
-                    if pending[field, reuse].any():
-                        assert stream is not None
-                        stream.wait_event(event)
-                        # Other slots may be reused on another stream and still need this fence.
-                        pending[field, reuse] = False
-                        if not pending.any():
-                            del self._readiness[event]
-        self.holders[field, slots] = 1
-        return slots, self.generations[field, slots]
-
-    def share(self, field: int, slots: Slots) -> None:
-        """Let more versions hold these pages (fields a transition does not write)."""
-        np.add.at(self.holders[field], slots, 1)
+        """Lease free pages and enqueue the Rust ledger's prior-reader dependencies."""
+        try:
+            slots, generations, waits, retained = self.ledger.allocate(field, count, self._events.completed())
+        except _core.PageCapacity as error:
+            raise WindowBackpressure(str(error)) from error
+        self._events.order(waits, stream)
+        self._events.retain(retained)
+        return slots, generations
 
     def tensor(self, field: int, page: PageSlot) -> torch.Tensor:
         """Borrow one live allocation; the caller retains its hold while using the view."""
-        assert self.generations[field, page.slot_id] == page.generation and self.holders[field, page.slot_id] >= 1
+        self.ledger.check_page(field, page.slot_id, page.generation)
         return self.tensors[field][page.slot_id]
 
     def copy_from(self, field: int, source: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor) -> None:
@@ -133,33 +146,16 @@ class SlotPools:
 
     def views(self, slots: Slots, generations: Slots, *, host: bool = False) -> tuple[torch.Tensor, ...]:
         """One tensor view per field of a version, after checking none of its pages was reclaimed."""
-        fields = np.arange(len(slots))
-        assert (self.generations[fields, slots] == generations).all() and (self.holders[fields, slots] >= 1).all()
+        self.ledger.check(slots, generations)
         tensors = self.host_tensors if host and self.host_tensors else self.tensors
         return tuple(tensor[slot] for tensor, slot in zip(tensors, slots.tolist()))
 
-    def _counts(self, slots: Slots) -> Slots:
-        return np.bincount((slots + self._field_offsets).ravel(), minlength=self.holders.size).reshape(
-            self.holders.shape
-        )
-
-    def _collect_completed(self) -> None:
-        for event in tuple(self._readiness):
-            if event.query():
-                del self._readiness[event]
-
     def hold(self, slots: Slots) -> None:
         """Add a batch of holders, including repeated shared pages."""
-        self.holders += self._counts(slots)
+        self.ledger.hold(slots)
 
     def release(self, slots: Slots, completion: torch.cuda.Event | None = None) -> None:
-        """Drop a batch of holders; only the last holder advances the allocation generation."""
-        counts = self._counts(slots)
-        if completion is not None:
-            self._collect_completed()
-            if completion in self._readiness:
-                self._readiness[completion] |= counts != 0
-            else:
-                self._readiness[completion] = counts != 0
-        self.holders -= counts
-        self.generations += (counts != 0) & (self.holders == 0)
+        """Drop holders, retaining completion objects until Rust permits physical reuse."""
+        completed = self._events.completed()
+        retained = self.ledger.release(slots, self._events.add(completion), completed)
+        self._events.retain(retained)

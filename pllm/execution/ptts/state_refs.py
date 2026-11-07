@@ -80,10 +80,6 @@ class StateRefs(Sequence[StateRef]):
             np.fromiter((ref.version_id for ref in refs), np.int64, len(refs)),
         )
 
-    def resolved(self, rows: Indices) -> StateRefs:
-        """The same identities with their arena rows attached."""
-        return StateRefs(self.layouts, self.lineages, self.versions, rows)
-
     @classmethod
     def join(cls, groups: Sequence[StateRefs]) -> StateRefs:
         """Concatenate resource selections, preserving their order."""
@@ -125,7 +121,3 @@ class StateRefs(Sequence[StateRef]):
         return StateRefs(
             self.layouts, self.lineages, _core.replace_versions(self.versions, positions, after.versions), self.rows
         )
-
-    def next_versions(self) -> StateRefs:
-        """The successor of every selected version, in the same arena rows."""
-        return StateRefs(self.layouts, self.lineages, self.versions + 1, self.rows)

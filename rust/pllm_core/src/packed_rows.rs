@@ -1,6 +1,9 @@
 //! Bulk packed-token labels and hidden-tap rank maps for the Python runners.
 
-use numpy::{Element, IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1};
+use numpy::{
+    ndarray::Dimension, Element, IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray,
+    PyReadonlyArray1,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -209,7 +212,9 @@ impl RowLabeler {
     }
 }
 
-pub(crate) fn column<'a, T: Element>(array: &'a PyReadonlyArray1<'_, T>) -> PyResult<&'a [T]> {
+pub(crate) fn column<'a, T: Element, D: Dimension>(
+    array: &'a PyReadonlyArray<'_, T, D>,
+) -> PyResult<&'a [T]> {
     // rust-numpy 0.23 checks contiguity but does not check pointer alignment before making a slice.
     if array.data().is_null() || !array.data().is_aligned() {
         return Err(PyValueError::new_err(

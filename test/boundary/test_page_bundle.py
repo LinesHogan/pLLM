@@ -77,9 +77,19 @@ def test_versions_stack_until_pool_exhaustion_and_pins_keep_their_version() -> N
     published = arena.publish(write)
     current, idle = published.after_refs
     retained = []
+    sequence = []
     for value in range(5):
         held = arena.pin_exact(StateRefs.of((current,)))
         retained.append(held)
+        sequence.append(
+            (
+                published.operation_id,
+                held.pin_id,
+                current.version_id,
+                int(arena.slot_matrix(held, held.refs)[1][0, 0]),
+                arena.root(current).pages[0].generation,
+            )
+        )
         borrowed = arena.borrow_field(held, current, F0)
         torch.testing.assert_close(borrowed, torch.full_like(borrowed, float(value)))
         if value < 4:
@@ -87,6 +97,8 @@ def test_versions_stack_until_pool_exhaustion_and_pins_keep_their_version() -> N
             arena.write_field(update, 0, F0).fill_(value + 1)
             published = arena.publish(update)
             (current,) = published.after_refs
+    # Recorded from the Python ledger: exact publication/pin/version/slot/generation order.
+    assert sequence == [(1, 1, 0, 0, 0), (2, 2, 1, 2, 0), (3, 3, 2, 3, 0), (4, 4, 3, 4, 0), (5, 5, 4, 5, 0)]
     assert current.version_id == 4 and arena.free_pages == 0
     with pytest.raises(RuntimeError):
         arena.prepare_transition(StateRefs.of((current,)), fields=((F0,),))

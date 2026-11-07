@@ -112,10 +112,13 @@ def test_engram_placements_and_capture(tmp_path, logits):
     execute = StateExecution._execute_task
     fill_versions = PageBundleArena._fill_versions
 
-    def delay_admission(arena, write, fields):
-        if not write.sources and any(target.table.pools.host_tensors for target in write.targets):
+    def delay_admission(arena, copies):
+        if any(
+            not len(source) and arena._pools[arena._resources[resource]].host_tensors
+            for resource, _, source, _ in copies
+        ):
             torch.cuda._sleep(100_000_000)
-        fill_versions(arena, write, fields)
+        fill_versions(arena, copies)
 
     complete = VllmSession.complete_forward
 
