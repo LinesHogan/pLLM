@@ -499,9 +499,8 @@ def _execute_step(
     _check_idle_state(execution, versions, run, observed, value)
     for event in execution.trace.snapshot().events:
         if event.kind is TraceEventKind.TENSOR and event.step_id == value.rows.step_id:
-            for identity, tensor in zip(event.identities, event.tensor(), strict=True):
-                row = next(row for row in value.rows.request_rows if row.identity == identity)
-                run.values[identity.request_id, row.token_offset, f"export {event.tensor_name}"] = tensor
+            for identity, position, tensor in zip(event.identities, event.positions, event.tensor(), strict=True):
+                run.values[identity.request_id, position, f"export {event.tensor_name}"] = tensor
 
 
 def _imported_batch(

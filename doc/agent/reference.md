@@ -641,14 +641,14 @@ pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Attr',
     Train a request state inside the forward and add its residual at each target projection.
 pllm.Attr(name: 'str')
     A reference to a workload attribute by dotted path, e.g. pllm.Attr("config.chunk_size"), resolved once when the workload is built.
-pllm.hidden(layer: 'int | Attr' = 0, *, tokens: "Literal['decode', 'prefill']" = 'decode') -> 'Any'
+pllm.hidden(layer: 'int | Attr' = 0, *, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
     The MLP output before the residual add in decoder layer `layer` (negative from the end).
-pllm.residual(layer: 'int | Attr', *, after: "Literal['layer', 'attention']" = 'layer', tokens: "Literal['decode', 'prefill']" = 'decode') -> 'Any'
-    The residual stream after decoder layer `layer` (negative from the end): the embedding plus every earlier sublayer's output, which the next sublayer normalizes. This is what steering vectors, sparse autoencoders and the logit lens read; pllm.hidden(layer) is only the layer's MLP output before it is added to this stream. after="attention" reads the stream between the layer's attention and its MLP. One row per request, chosen as in pllm.hidden.
+pllm.residual(layer: 'int | Attr', *, after: "Literal['layer', 'attention']" = 'layer', tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
+    The residual stream after decoder layer `layer` (negative from the end): the embedding plus every earlier sublayer's output, which the next sublayer normalizes. This is what steering vectors, sparse autoencoders and the logit lens read; pllm.hidden(layer) is only the layer's MLP output before it is added to this stream. after="attention" reads the stream between the layer's attention and its MLP. Rows are chosen by `tokens` as in pllm.hidden.
 pllm.layer_logits(layers: 'tuple[int, ...] | Attr') -> 'Any'
     The model's final norm and LM head applied to the residual stream after each of `layers` (negative from the end), as float32 [rows, len(layers), vocab]: the logit lens. The last layer's logits are the model's own. One row for each token the sampler draws: a prompt's last token and every decode token.
-pllm.final_hidden(*, tokens: "Literal['decode', 'prefill']" = 'decode') -> 'Any'
-    The hidden state after the model's final norm, which the LM head reads (Hugging Face's last_hidden_state); one row per request, chosen as in pllm.hidden.
+pllm.final_hidden(*, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
+    The hidden state after the model's final norm, which the LM head reads (Hugging Face's last_hidden_state); rows are chosen by `tokens` as in pllm.hidden.
 pllm.parameter(state: 'str', field: 'str', *, per_row: 'bool' = False) -> 'Any'
     One tensor field of a declared state, aligned to the operation's rows for request state.
 pllm.module(state: 'str') -> 'Any'
@@ -744,10 +744,10 @@ pllm.io.Feed(plan: 'PlanBundle', binding: 'FeedBinding', control: 'Connection', 
     Publish complete tensor fields into a declared state, with bounded backpressure.
 pllm.io.StateImport(values: tuple[~T, ...])
     External tensors in field order, visible from the importing call's first step.
-pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
+pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), positions: 'tuple[int, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
 pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
     Explicit observations only; empty filters match all, disabled flags retain nothing.
-pllm.io.TraceSnapshot(execution_id: 'str', process_id: 'int', events: 'tuple[TraceEvent, ...]', dropped: 'int', capacity: 'int', pending_device_timings: 'int' = 0, export_dropped: 'int' = 0, schema_version: 'int' = 9)
+pllm.io.TraceSnapshot(execution_id: 'str', process_id: 'int', events: 'tuple[TraceEvent, ...]', dropped: 'int', capacity: 'int', pending_device_timings: 'int' = 0, export_dropped: 'int' = 0, schema_version: 'int' = 10)
 pllm.io.load_tensor_fields(path: 'Path', fields: 'tuple[str, ...]') -> 'tuple[torch.Tensor, ...]'
     Decode a weights-only checkpoint into the caller's explicit tensor field order.
 ```

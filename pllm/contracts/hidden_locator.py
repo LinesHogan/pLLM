@@ -34,11 +34,13 @@ class HiddenSite(StrEnum):
 
 
 class HiddenPhase(StrEnum):
-    """Signed hidden-activation execution phases."""
+    """Which rows a hidden input reads: each request's completed prompt ending (PREFILL), its latest decode token
+    (DECODE), or every token computed fresh this step (ALL), prompt chunks included."""
 
     NONE = ""
     PREFILL = "prefill"
     DECODE = "decode"
+    ALL = "all"
 
 
 def logit_layers(layers: tuple[int, ...], layer_count: int) -> tuple[int, ...]:

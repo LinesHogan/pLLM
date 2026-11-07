@@ -531,10 +531,14 @@ class _Carried(_Source):
 # source marker typed `Any`, so the annotation can name the value the method body receives.
 
 
-def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill"] = "decode") -> Any:
+def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
     """The MLP output before the residual add in decoder layer `layer` (negative from the end).
 
     One row per request: the latest decode token, or with tokens="prefill" the last prompt token of completed prefill.
+    tokens="all" reads one row per token the step computes, prompt chunks included, in token order within each
+    request; tokens a preempted request recomputes are read once. Only @pllm.export methods read these rows: each
+    step can carry max_num_batched_tokens of them, so give the export max_rows that large (pllm.explain reports the
+    host copy volume).
     """
     return Hidden(layer, HiddenSite.BLOCK_OUTPUT, HiddenPhase(tokens))
 
@@ -543,12 +547,12 @@ def residual(
     layer: int | Attr,
     *,
     after: Literal["layer", "attention"] = "layer",
-    tokens: Literal["decode", "prefill"] = "decode",
+    tokens: Literal["decode", "prefill", "all"] = "decode",
 ) -> Any:
     """The residual stream after decoder layer `layer` (negative from the end): the embedding plus every earlier
     sublayer's output, which the next sublayer normalizes. This is what steering vectors, sparse autoencoders and the
     logit lens read; pllm.hidden(layer) is only the layer's MLP output before it is added to this stream.
-    after="attention" reads the stream between the layer's attention and its MLP. One row per request, chosen as in
+    after="attention" reads the stream between the layer's attention and its MLP. Rows are chosen by `tokens` as in
     pllm.hidden."""
     if after not in ("layer", "attention"):
         raise ValueError(f'pllm.residual(after={after!r}): use "layer" or "attention"')
@@ -564,9 +568,9 @@ def layer_logits(layers: tuple[int, ...] | Attr) -> Any:
     return LayerLogits(layers)
 
 
-def final_hidden(*, tokens: Literal["decode", "prefill"] = "decode") -> Any:
+def final_hidden(*, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
     """The hidden state after the model's final norm, which the LM head reads (Hugging Face's last_hidden_state);
-    one row per request, chosen as in pllm.hidden."""
+    rows are chosen by `tokens` as in pllm.hidden."""
     return Hidden(-1, HiddenSite.MODEL_OUTPUT, HiddenPhase(tokens))
 
 
@@ -2011,8 +2015,9 @@ def export(
 ) -> Callable[[F], F]:
     """Deliver bounded observations of executed forward rows to on_export.
 
-    Async scheduling can execute one extra decode row before learning that a request
-    stopped at EOS; that row is observed too. Callbacks run asynchronously and close()
+    A step delivers at most max_rows rows, split into events of whole rows of at most 32 KiB; each event lists
+    every row's request identity and token position. Async scheduling can execute one extra decode row before
+    learning that a request stopped at EOS; that row is observed too. Callbacks run asynchronously and close()
     drains their delivery. Block on a full export queue only when explicitly requested.
     """
     if overflow not in ("drop", "block"):

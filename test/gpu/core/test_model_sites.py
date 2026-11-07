@@ -1,8 +1,9 @@
 """Model sites on Qwen2.5-0.5B against independent FP32 Hugging Face oracles: residual readouts and layer logits
 under CUDA graphs, and DoLa through pllm.layer_logits."""
 
+import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 
 import pytest
@@ -123,6 +124,84 @@ def test_layer_logits_and_residuals_match_fp32_oracle():
     # Earlier layers' logits deviate from FP32 truth no more than vLLM's own bf16 final logits do.
     assert (lens_error[:-1] <= lens_error[-1]).all()
     assert stream_error < 0.1
+
+
+# Contrast pairs for a steering vector (CAA); longer than a 16-token step, so every prompt is prefilled in chunks.
+PAIRS = (
+    (
+        "I love this movie, the story was wonderful and the actors were brilliant",
+        "I hate this movie, the story was awful and the actors were terrible",
+    ),
+    (
+        "What a fantastic day, everything went perfectly and everyone was happy",
+        "What a miserable day, everything went wrong and everyone was upset",
+    ),
+    (
+        "The food was delicious and the staff were kind and welcoming to us all",
+        "The food was disgusting and the staff were rude and dismissive to us all",
+    ),
+)
+CHUNKED = replace(CONFIG, max_num_batched_tokens=16, enable_chunked_prefill=True)
+
+
+@dataclass(frozen=True)
+class Residuals(pllm.Workload):
+    """Export the residual stream after layer 12 for every computed token, the activations CAA averages."""
+
+    events: list[pllm.io.TraceEvent] = field(default_factory=lambda: [], compare=False)
+
+    def on_export(self, event: pllm.io.TraceEvent) -> None:
+        self.events.append(event)
+
+    @pllm.export(name="residual", max_rows=16, max_cols=896, overflow="block")
+    def residual(self, h: torch.Tensor = pllm.residual(12, tokens="all")) -> torch.Tensor:
+        return h
+
+
+def _relative(value: torch.Tensor, truth: torch.Tensor) -> float:
+    """The largest per-row relative L2 error."""
+    return ((value - truth).norm(dim=-1) / truth.norm(dim=-1)).max().item()
+
+
+def _steering_vector(streams: list[torch.Tensor]) -> torch.Tensor:
+    """CAA: the mean over pairs of (positive - negative) prompt activations, each averaged over its tokens."""
+    means = torch.stack([stream.mean(0) for stream in streams])
+    return (means[0::2] - means[1::2]).mean(0)
+
+
+def test_all_token_residuals_give_the_fp32_oracle_steering_vector():
+    workload, tokenizer = Residuals(), AutoTokenizer.from_pretrained(MODEL)
+    prompts = [text for pair in PAIRS for text in pair]
+    with pllm.make_llm(CHUNKED, workload=workload) as handle:
+        assert handle.diagnostics().eager_reason == ""
+        handle.generate(prompts, SamplingParams(max_tokens=1, temperature=0.0))
+    rows: dict[tuple[int, int], torch.Tensor] = {}
+    for event in workload.events:
+        assert event.dropped_rows == 0
+        for identity, position, row in zip(event.identities, event.positions, event.tensor(), strict=True):
+            assert (identity.prompt_index, position) not in rows  # every token once, across chunks
+            rows[identity.prompt_index, position] = row
+    rounded_model = copy.deepcopy(_reference()).to(torch.bfloat16)
+    exported, truth, rounded = [], [], []
+    for index, prompt in enumerate(prompts):
+        ids = tokenizer(prompt).input_ids
+        exported.append(torch.stack([rows.pop((index, position)) for position in range(len(ids))]))
+        truth.append(_hidden(ids)[0][13].cpu())
+        with torch.no_grad():
+            output = rounded_model(torch.tensor([ids], device="cuda"), output_hidden_states=True)
+        rounded.append(output.hidden_states[13][0].float().cpu())
+    # Async scheduling may compute one decode token past max_tokens; prompt tokens are all accounted for above.
+    assert all(position >= len(tokenizer(prompts[index]).input_ids) for index, position in rows)
+    errors = {
+        name: (
+            max(_relative(value, oracle) for value, oracle in zip(streams, truth, strict=True)),
+            _relative(_steering_vector(streams), _steering_vector(truth)),
+        )
+        for name, streams in (("pllm", exported), ("HF bf16", rounded))
+    }
+    print(f"relative error vs FP32 (worst token, steering vector): {errors}; {len(workload.events)} export events")
+    # bf16 rounding is the reference: pllm's error is within twice that of the same model run by Hugging Face.
+    assert all(ours <= 2 * theirs for ours, theirs in zip(errors["pllm"], errors["HF bf16"], strict=True))
 
 
 def _dola_scores(logits: torch.Tensor, plausibility: float) -> torch.Tensor:

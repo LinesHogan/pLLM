@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import ceil
 from typing import TYPE_CHECKING
 
 from pllm.backends.vllm.kv_layout import layout_capacity
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, AttachmentGraphMode, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch
 from pllm.contracts.kv_layout import KVCapacity
 from pllm.contracts.semantic_graph import (
@@ -24,6 +25,7 @@ from pllm.cost_estimates import CostEstimate, OpCost, estimate_tasks
 from pllm.execution.attention_methods import AttentionCost
 from pllm.execution.preemption import preemption_policy
 from pllm.execution.ptts.page_bundle_planning import page_stride_bytes
+from pllm.execution.trace import EVENT_CAPACITY, MAX_SNAPSHOT_BYTES
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.hidden_taps import HiddenTapLayout
@@ -128,6 +130,23 @@ class TapCost:
 
 
 @dataclass(frozen=True, slots=True)
+class ExportCost:
+    """One export's device-to-host copy per step, against the trace's bounded event buffer.
+
+    `rows` is what the export keeps of the `source_rows` a step can carry (max_num_batched_tokens for
+    tokens="all", else max_num_seqs); bytes and events assume 8-byte values, an upper bound.
+    """
+
+    name: str
+    rows: int
+    source_rows: int
+    columns: int
+    bytes: int
+    events: int
+    overflow: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExplainResult:
     """Exact reservations and labelled arithmetic estimates; asdict is JSON-ready, with no latency prediction."""
 
@@ -149,7 +168,7 @@ class ExplainResult:
     preemption: str
     recompute_rejection: str | None
     workload_host_syncs: int | None
-    exports: tuple[str, ...]
+    exports: tuple[ExportCost, ...]
     escape_hatches: tuple[EscapeHatch, ...]
     limitations: tuple[str, ...]
     custom_ops: tuple[OpCost, ...]
@@ -225,7 +244,14 @@ class ExplainResult:
             f"preempt  state {self.preemption}; replay rejection: {self.recompute_rejection if self.preemption == 'reset' else 'not applicable to kept state'}"
         )
         lines.append(
-            f"host     {self.workload_host_syncs if self.workload_host_syncs is not None else 'unverified'} syncs in traced workload math; exports: {', '.join(self.exports) or 'none'}"
+            f"host     {self.workload_host_syncs if self.workload_host_syncs is not None else 'unverified'} syncs in traced workload math"
+        )
+        lines.extend(
+            f"export   {item.name}: {item.rows} of up to {item.source_rows} rows x {item.columns} columns / step, "
+            f"<= {item.bytes} bytes device-to-host in {item.events} trace events [8-byte values; the trace buffers "
+            f"{EVENT_CAPACITY} events of <= {MAX_SNAPSHOT_BYTES} bytes]; overflow={item.overflow}"
+            + ("; rows beyond max_rows are dropped" if item.rows < item.source_rows else "")
+            for item in self.exports
         )
         lines.extend(
             f"timing   {item.member + ': ' if item.member else ''}{item.setting}={item.value} "
@@ -259,6 +285,21 @@ class ExplainResult:
                 "prompt sink worst case]; prefix caching disabled"
             )
         return "\n".join(lines)
+
+
+def _exports(binding: TensorDeclaration, facts: BackendCompileFacts) -> tuple[ExportCost, ...]:
+    result: list[ExportCost] = []
+    for task in binding.tensor_tasks.values():
+        if task.export is None:
+            continue
+        export = task.export
+        source = facts.probe.max_packed_rows if task.phase is HiddenPhase.ALL else facts.max_admitted_lineages
+        rows = min(export.max_rows, source)
+        events = ceil(rows / (MAX_SNAPSHOT_BYTES // (export.max_cols * 8)))
+        result.append(
+            ExportCost(export.name, rows, source, export.max_cols, rows * export.max_cols * 8, events, export.overflow)
+        )
+    return tuple(result)
 
 
 def _task_costs(plan: PlanBundle, estimates: dict[str, CostEstimate]) -> dict[str, TaskCost]:
@@ -522,7 +563,7 @@ def _settings(
                     "tokens",
                     ",".join(phases),
                     phases == ("decode",),
-                    "hidden taps select completed prompt endings or latest decode rows",
+                    "hidden taps select completed prompt endings, latest decode rows or every fresh token",
                 )
             )
     if config.cuda_graphs is False:
@@ -601,14 +642,13 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
     from pllm.backends.vllm.compile_facts import compile_facts
     from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
     from pllm.backends.vllm.model_shape import ModelShape
-    from pllm.contracts.tensor_layout import TensorDType
 
     requirements = workload.backend_requirements()
     reason = admit_workload(config, requirements)
     shape = ModelShape.of_config(config, requirements.parameter_targets)
-    layouts = HiddenTapAnnouncement(
-        requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype), requirements.layer_logits
-    ).resolve(shape.layer_count, shape.hidden_size, shape.vocab_size)
+    layouts = HiddenTapAnnouncement.declared(requirements, config).resolve(
+        shape.layer_count, shape.hidden_size, shape.vocab_size
+    )
     facts = compile_facts(
         shape,
         requirements,
@@ -688,7 +728,7 @@ def explain_facts(
         None
         if plan.semantic_graph.trains_on_batch or binding.sites.rewrites or binding.attention.methods or ops
         else 0,
-        tuple(attachment.spec.exports),
+        _exports(binding, facts),
         _settings(binding, config, plan, facts),
         (
             "Hidden taps, route math and PositionState are replicated across TP ranks; pllm issues no tensor collectives. PositionState uses each rank's KV budget.",

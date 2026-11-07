@@ -107,13 +107,15 @@ def _example_slot_matrix(resource: str, fields: tuple[torch.Tensor, ...]) -> tup
 
 
 def example(
-    binding: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions
+    binding: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions, *, tokens: bool = False
 ) -> tuple[TensorFrame, TensorBatch]:
-    """Construct metadata and borrowed operands; execution itself constructs all task scratch."""
+    """Construct metadata and borrowed operands; execution itself constructs all task scratch.
+
+    `tokens` gives every scheduled token its own row, as readers of tokens="all" see them."""
     # Hidden taps keep one row per request (its prompt end or decode token), as do request states.
     count = (
         facts.max_admitted_lineages
-        if binding.graph.states or facts.probe.hidden_resources
+        if (binding.graph.states or facts.probe.hidden_resources) and not tokens
         else facts.probe.max_packed_rows
     )
     rows = tuple(
@@ -274,8 +276,9 @@ def producers_first(graph: SemanticGraph, symbols: tuple[TaskSymbol, ...]) -> tu
 
 
 def task_example(data: TensorFrame, phase: HiddenPhase | None) -> TensorFrame:
-    """Select a method's token phase for shared memory and arithmetic shape tracing."""
-    if phase is None:
+    """Select a method's token phase for shared memory and arithmetic shape tracing; example rows are all fresh,
+    so every-token readers keep them all."""
+    if phase in (None, HiddenPhase.ALL):
         return data
     packed = PackedPhaseRowBatch.from_rows(
         data.step.rows.step_id,
@@ -346,7 +349,12 @@ def derive_resources(
         )
         for symbol in (*binding.operations, *binding.tensor_tasks)
     )
-    data, batch = example(binding, facts, options)
+    requests = example(binding, facts, options)
+    tokens = (
+        example(binding, facts, options, tokens=True)
+        if any(task.phase is HiddenPhase.ALL for task in binding.tensor_tasks.values())
+        else requests
+    )
     tasks: list[TaskResourceFact] = []
     values: list[ValueResourceFact] = []
     required_capture = 0
@@ -358,7 +366,7 @@ def derive_resources(
         operation = operations[symbol]
         task = binding.tensor_tasks.get(symbol)
         phase = None if task is None else task.phase
-        data = task_example(data, phase)
+        data, batch = tokens if phase is HiddenPhase.ALL else (task_example(requests[0], phase), requests[1])
         tables = tuple(
             (str(address.resource), tensor, state.placement == "host")
             for address, root in zip(batch.selection.addresses, batch.roots, strict=True)

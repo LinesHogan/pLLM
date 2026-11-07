@@ -1,4 +1,6 @@
 //! Bulk packed-token labels and hidden-tap rank maps for the Python runners.
+//!
+//! Tap selections are latest decode rows, completed prompt endings, both, and every fresh token.
 
 use numpy::{
     ndarray::Dimension, Element, IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray,
@@ -148,7 +150,7 @@ impl RowLabeler {
         let total: usize = scheduled.iter().map(|&n| n as usize).sum();
         let mut rows = vec![0; 7 * total];
         let mut links = Vec::with_capacity(ids.len());
-        let (mut prefill, mut decode) = (Vec::new(), Vec::new());
+        let (mut prefill, mut decode, mut fresh) = (Vec::new(), Vec::new(), Vec::new());
         let mut start = 0;
         for (request, (((&count, &length), &done), &id)) in scheduled
             .iter()
@@ -176,6 +178,9 @@ impl RowLabeler {
                 {
                     rows[column * total + packed] = value;
                 }
+                if !replay {
+                    fresh.push(packed as i64);
+                }
                 if !replay && offset == i64::from(length) - 1 {
                     prefill.push(packed as i64);
                 }
@@ -192,7 +197,7 @@ impl RowLabeler {
         }
         // HiddenPhase sorts decode before prefill; preserve that order for taps reading both.
         let both: Vec<i64> = decode.iter().chain(&prefill).copied().collect();
-        let selected = vec![decode, prefill, both];
+        let selected = vec![decode, prefill, both, fresh];
         let ranks = selected
             .iter()
             .map(|selection| {

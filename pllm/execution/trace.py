@@ -31,8 +31,10 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.admission import WindowBackpressure
 
-TRACE_SCHEMA_VERSION = 9
+TRACE_SCHEMA_VERSION = 10
 MAX_SNAPSHOT_BYTES = 32768
+# Events an execution trace retains; pending exports are never evicted, so this bounds their host copies.
+EVENT_CAPACITY = 256
 
 
 class _KernelEvent(Protocol):
@@ -74,6 +76,8 @@ class TraceEvent:
     task_id: TaskId | None = None
     identities: tuple[RequestIdentity, ...] = ()
     refs: tuple[StateRef, ...] = ()
+    # An export row's token position within its request, beside its identity.
+    positions: tuple[int, ...] = ()
     operation_id: int | None = None
     pin_id: int | None = None
     release_id: int | None = None
@@ -204,7 +208,10 @@ class _TraceEntry:
 
 class ExecutionTrace:
     def __init__(
-        self, plan: ScheduleDecision, capacity: int = 256, on_export: Callable[[TraceEvent], None] | None = None
+        self,
+        plan: ScheduleDecision,
+        capacity: int = EVENT_CAPACITY,
+        on_export: Callable[[TraceEvent], None] | None = None,
     ) -> None:
         assert capacity >= 1
         self.plan = plan
@@ -415,6 +422,7 @@ class ExecutionTrace:
         *,
         task_id: TaskId | None = None,
         identities: tuple[RequestIdentity, ...] = (),
+        positions: tuple[int, ...] = (),
         refs: Sequence[StateRef] = (),
         operation_id: int | None = None,
         pin_id: int | None = None,
@@ -479,6 +487,7 @@ class ExecutionTrace:
                         task_id,
                         identities,
                         (),
+                        positions,
                         operation_id,
                         pin_id,
                         release_id,

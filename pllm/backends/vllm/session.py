@@ -473,6 +473,7 @@ class VllmSession(Generic[DataT, ResultT]):
             step.context is None
             and not operands
             and self.input_tokens is None
+            and HiddenPhase.ALL not in self._hidden_phases
             and not any(
                 (step.rows.row_batch.columns[3] == int(phase is HiddenPhase.PREFILL)).any()
                 for phase in self._hidden_phases

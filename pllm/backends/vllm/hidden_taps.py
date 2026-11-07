@@ -16,14 +16,16 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from pllm.authoring import BackendRequirements
 from pllm.backends.vllm.architecture import hidden_binding
+from pllm.config import ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, logit_layers
 from pllm.contracts.packed_hidden import (
     HiddenRowBatch,
     HiddenRows,
     PackedHiddenResourceBinding,
 )
-from pllm.contracts.packed_rows import PackedPhaseRowBatch
+from pllm.contracts.packed_rows import PackedPhaseRowBatch, tap_selection
 from pllm.contracts.semantic_graph import HiddenInputSource
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec, TensorLayoutSpec
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging, upload
@@ -36,7 +38,7 @@ TAPS_ENV = "PLLM_HIDDEN_TAPS"
 
 @dataclass(frozen=True, slots=True)
 class HiddenTapLayout:
-    """One module output's union of latest-decode and completed-prompt-ending rows.
+    """One module output's union of the rows its readers select (see tap_selection).
 
     All consumers share each tapped row. Two generations fund a producer and an
     outstanding reader; reuse must wait for every reader's completion, regardless of
@@ -76,16 +78,25 @@ class HiddenTapAnnouncement:
 
     inputs: tuple[HiddenInputSource, ...] = ()
     max_num_seqs: int = 1
+    max_num_batched_tokens: int = 1
     dtype: TensorDType = TensorDType.FLOAT32
     # The layers pllm.layer_logits reads; the residual stream after each is tapped.
     layer_logits: tuple[int, ...] = ()
 
-    def resolve(self, layer_count: int, hidden_size: int, vocab_size: int) -> tuple[HiddenTapLayout, ...]:
-        """Merge aliases and consumers before capture; phases share one request bound.
+    @classmethod
+    def declared(cls, requirements: BackendRequirements, config: ModelConfig) -> HiddenTapAnnouncement:
+        """The hidden inputs `requirements` declares, bounded by `config`'s request and token capacities."""
+        return cls(
+            requirements.hidden_inputs,
+            config.max_num_seqs,
+            config.max_num_batched_tokens,
+            TensorDType(config.dtype),
+            requirements.layer_logits,
+        )
 
-        Prefill here selects prompt endings, never all prompt tokens. An all-token
-        declaration needs its own token bound rather than this request capacity.
-        """
+    def resolve(self, layer_count: int, hidden_size: int, vocab_size: int) -> tuple[HiddenTapLayout, ...]:
+        """Merge aliases and consumers before capture. Prompt endings and decode rows need one row per request;
+        a tap any reader of every token shares needs one per scheduled token."""
         layers = logit_layers(self.layer_logits, layer_count)
         sources = (
             *(source for source in self.inputs if source.site is not HiddenSite.LAYER_LOGITS),
@@ -100,7 +111,14 @@ class HiddenTapAnnouncement:
             binding = hidden_binding(source.layer, source.site, layer_count)
             taps.setdefault(binding.tap, (binding.site, set()))[1].add(source.phase)
         layouts = tuple(
-            HiddenTapLayout(tap, site, tuple(sorted(phases)), self.max_num_seqs, (hidden_size,), self.dtype)
+            HiddenTapLayout(
+                tap,
+                site,
+                tuple(sorted(phases)),
+                self.max_num_batched_tokens if HiddenPhase.ALL in phases else self.max_num_seqs,
+                (hidden_size,),
+                self.dtype,
+            )
             for tap, (site, phases) in sorted(taps.items())
         )
         if not layers:
@@ -200,7 +218,7 @@ class HiddenTaps:
         offset = 0
         for layout in self.layouts:
             tap = layout.tap
-            kind = 2 if len(layout.phases) == 2 else int(layout.phases[0] is HiddenPhase.PREFILL)
+            kind = tap_selection(layout.phases)
             selected = rows.tap_selected[kind]
             slots, _ = self.pools[tap].allocate(0, len(selected), stream)
             self._slots[tap] = slots[:, None]

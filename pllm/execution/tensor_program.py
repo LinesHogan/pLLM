@@ -112,6 +112,8 @@ class Observation:
     step_id: int | None = None
     gradient: bool = False
     identities: tuple[RequestIdentity, ...] = ()
+    # Each exported row's token position within its request.
+    positions: tuple[int, ...] = ()
     iteration: int = 0
     export: Literal["drop", "block"] | None = None
     dropped_rows: int = 0
@@ -605,6 +607,7 @@ class TensorOperation(Generic[D]):
                             context.invocation_id,
                             task_id=task.task_id,
                             identities=observation.identities,
+                            positions=observation.positions,
                             step_id=observation.step_id,
                             tensor=observation.value,
                             tensor_name=observation.name,

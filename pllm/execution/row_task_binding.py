@@ -454,6 +454,14 @@ def declare_tensor(
     if len(domains) > 1 or domains and when is When.BEFORE_FORWARD:
         raise ValueError("tensor inputs need one phase; hidden inputs become available after model forward")
     phase = next(iter(domains), None)
+    if phase is HiddenPhase.ALL and (
+        export is None or any(isinstance(source, TaskResultInputSource) for source in sources.values())
+    ):
+        # Other methods run on one row per request and are funded and captured for that many rows.
+        raise ValueError(
+            f'`{name}` reads tokens="all" rows; only @pllm.export methods read them, and without pllm.result inputs. '
+            'Export the rows, or read tokens="prefill" or "decode"'
+        )
     sources = {
         key: replace(source, phase=phase or HiddenPhase.DECODE)
         if isinstance(source, StateSelectionInputSource)

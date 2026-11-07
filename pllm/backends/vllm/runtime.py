@@ -697,11 +697,7 @@ def create_vllm_llm(
     if config.cuda_graphs == "auto" and eager_reason:
         _logger.warning("running the model without CUDA graphs: %s", eager_reason)
     environment = {
-        TAPS_ENV: encode_boundary(
-            HiddenTapAnnouncement(
-                requirements.hidden_inputs, config.max_num_seqs, TensorDType(config.dtype), requirements.layer_logits
-            )
-        ),
+        TAPS_ENV: encode_boundary(HiddenTapAnnouncement.declared(requirements, config)),
         POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
         LAYOUT_ENV: encode_boundary(requirements.kv_layouts),
     }

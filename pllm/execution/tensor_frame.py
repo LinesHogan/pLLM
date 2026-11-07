@@ -333,7 +333,10 @@ class TensorFrame:
     weighted: WeightedBatch | None = None
 
     def producer_rows(self, phase: HiddenPhase | None) -> PackedRows:
-        """Select the producer's eligible rows in this frame's order without inspecting records."""
+        """Select the producer's eligible rows in this frame's order without inspecting records. The frame holds
+        one row per request, so every-token readers take all of the step's fresh tokens instead."""
+        if phase is HiddenPhase.ALL:
+            return self.step.rows.producer_rows(phase)
         return self.rows.producer(phase)
 
     @property

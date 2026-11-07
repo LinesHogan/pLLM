@@ -98,7 +98,11 @@ class FieldWriter:
 
 @dataclass(frozen=True, slots=True)
 class TensorExport:
-    """Bounded observation settings carried by an exported TensorTask."""
+    """Bounded observation settings carried by an exported TensorTask.
+
+    A step delivers at most max_rows rows, split into events of at most MAX_SNAPSHOT_BYTES so the trace's
+    bounded host buffers hold a step of every-token rows too.
+    """
 
     name: str
     every: int
@@ -108,10 +112,10 @@ class TensorExport:
     overflow: Literal["drop", "block"]
 
     def __post_init__(self) -> None:
-        if min(self.every, self.max_rows, self.max_cols) < 1 or self.max_rows * self.max_cols * 8 > MAX_SNAPSHOT_BYTES:
+        if min(self.every, self.max_rows, self.max_cols) < 1 or self.max_cols * 8 > MAX_SNAPSHOT_BYTES:
             raise ValueError(
                 f"tensor export needs positive every, max_rows and max_cols, with "
-                f"max_rows * max_cols * 8 <= {MAX_SNAPSHOT_BYTES} bytes (32 KiB)"
+                f"max_cols * 8 <= {MAX_SNAPSHOT_BYTES} bytes (32 KiB), so one row fits an export event"
             )
 
     def prepare(self, data: TensorFrame) -> TensorFrame | None:
@@ -121,17 +125,22 @@ class TensorExport:
         return replace(data, rows=data.rows[: self.max_rows], plan=None)
 
     def output(self, value: torch.Tensor, data: TensorFrame, source_rows: int) -> TaskOutput:
-        """Publish the bounded result with its row identities and delivery policy."""
+        """Publish the bounded result with each row's request and token position, in events of whole rows."""
+        value = value[: self.max_rows, : self.max_cols]
+        identities, positions = data.rows.identities, tuple(data.rows.columns[2].tolist())
+        rows = MAX_SNAPSHOT_BYTES // value[0].nbytes
         return TaskOutput(
-            observations=(
+            observations=tuple(
                 Observation(
                     self.name,
-                    value[: self.max_rows, : self.max_cols],
+                    value[start : start + rows],
                     step_id=data.step.rows.step_id,
-                    identities=tuple(row.identity for row in data.rows),
+                    identities=identities[start : start + rows],
+                    positions=positions[start : start + rows],
                     export=self.overflow,
-                    dropped_rows=source_rows - len(data.rows),
-                ),
+                    dropped_rows=source_rows - len(data.rows) if start == 0 else 0,
+                )
+                for start in range(0, len(value), rows)
             )
         )
 

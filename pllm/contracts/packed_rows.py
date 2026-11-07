@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import overload
 
@@ -14,6 +14,14 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.request_identity import RequestIdentity
 
 Slots = npt.NDArray[np.int64]
+
+
+def tap_selection(phases: Collection[HiddenPhase]) -> int:
+    """Which of PackedPhaseRowBatch.tap_selected holds the rows a tap reading `phases` keeps: latest decode rows,
+    completed prompt endings, both, or every fresh token (a superset of the others)."""
+    if HiddenPhase.ALL in phases:
+        return 3
+    return 2 if len(phases) == 2 else int(HiddenPhase.PREFILL in phases)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +105,7 @@ class PackedRows(Sequence[PackedPhaseRow]):
         """Select a producer phase without inspecting records."""
         if phase is None:
             return self
-        selected = self.batch.tap_selected[int(phase is HiddenPhase.PREFILL)]
+        selected = self.batch.tap_selected[tap_selection((phase,))]
         return PackedRows(self.batch, self.indices[np.isin(self.indices, selected)])
 
 
@@ -106,8 +114,8 @@ class PackedPhaseRowBatch:
     """Numeric labels inspected by task execution and diagnostics.
 
     Columns are packed index, request ordinal, token offset, phase (decode=0/prefill=1),
-    identity-table index, prompt length and retained-replay flag. Tap maps index the
-    allocated slot vector; index zero supplies the same unused-row fill as before.
+    identity-table index, prompt length and retained-replay flag. Tap selections are ordered as in
+    tap_selection; tap maps index the allocated slot vector, and index zero fills unselected rows.
     """
 
     step_id: int
@@ -156,7 +164,7 @@ class PackedPhaseRowBatch:
         fresh = columns[6] == 0
         prefill = np.flatnonzero((columns[3] == 1) & (columns[2] == columns[5] - 1) & fresh)
         decode = np.sort(ordinal_last[(columns[3, ordinal_last] == 0) & fresh[ordinal_last]])
-        selected = (decode, prefill, np.concatenate((decode, prefill)))
+        selected = (decode, prefill, np.concatenate((decode, prefill)), np.flatnonzero(fresh))
         ranks = tuple(np.zeros(total_rows, dtype=np.int64) for _ in selected)
         for indices, mapping in zip(selected, ranks, strict=True):
             mapping[indices] = np.arange(len(indices))
@@ -214,10 +222,10 @@ class PackedPhaseRowBatch:
         return PackedRows(self, self.request_indices)
 
     def producer_rows(self, phase: HiddenPhase | None) -> PackedRows:
-        """Fresh prompt endings or latest decode rows."""
+        """Fresh prompt endings, latest decode rows or every fresh token; None: each request's fresh final row."""
         if phase is None:
             return PackedRows(self, self.request_indices[self.columns[6, self.request_indices] == 0])
-        return PackedRows(self, self.tap_selected[int(phase is HiddenPhase.PREFILL)])
+        return PackedRows(self, self.tap_selected[tap_selection((phase,))])
 
     @property
     def prefill_rows(self) -> PackedRows:
@@ -354,6 +362,7 @@ def label_rows(
 
 __all__ = [
     "label_rows",
+    "tap_selection",
     "RowLabeler",
     "PackedRows",
     "PackedPhaseRow",

@@ -144,6 +144,16 @@ class TokenHistory(pllm.Workload):
         return ids
 
 
+class AllTokens(pllm.Workload):
+    """Every prompt and decode token's residual, exported once per token across chunks and replay."""
+
+    @pllm.export(max_rows=64, max_cols=8, overflow="block")
+    def residual(self, h=pllm.residual(3, tokens="all"), w=pllm.parameter("scale", "w")):
+        return h + w
+
+    scale = pllm.InstanceState({"w": (8,)})
+
+
 class BadLogits(pllm.Workload):
     """Hidden width is not vocabulary width."""
 
@@ -203,6 +213,7 @@ class PromptMask(pllm.Workload):
             SharedWindowAttention(),
             Forward(),
             TokenHistory(),
+            AllTokens(),
             Stack(),
             PositionStack(),
             PrefillTrainer(),

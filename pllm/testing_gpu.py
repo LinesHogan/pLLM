@@ -17,6 +17,7 @@ from vllm.v1.request import Request
 
 import pllm
 from pllm.backends.vllm.checkpoint import load_options
+from pllm.backends.vllm.hidden_taps import HiddenTaps
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.backends.vllm.overlay_graph import GraphOptions, graph_options
 from pllm.backends.vllm.runtime import VllmLlm, probe_backend, vllm_engine
@@ -230,18 +231,14 @@ class _Generation:
             operands.append(replace(operand, hidden=torch.stack(inputs), desired=torch.stack(targets)))
         return replace(value, operands=tuple(operands))
 
-    def hidden(self, value: StepInput, reference: _Generation | None) -> StepInput:
+    def hidden(self, value: StepInput, reference: _Generation | None, taps: HiddenTaps) -> StepInput:
         """Keep per-token tap inputs fixed, as in the CPU schedule script, despite base-model rounding."""
         hidden = value.hidden
         assert hidden is not None
         for tap in hidden.taps:
             # Preserve the producer pool addresses that the workload CUDA graphs captured.
             storage = tap.storage
-            for row in value.rows.rows:
-                if row.recomputed:
-                    continue
-                if row.phase is HiddenPhase.PREFILL and row.token_offset != row.prompt_length - 1:
-                    continue
+            for row in value.rows.inspect(taps.selected(tap.resource.tap)):
                 key = tap.resource, row.identity.prompt_index % len(CHECK_PROMPTS), row.token_offset
                 slot = int(tap.slots[row.packed_row_index])
                 if reference is not None and key in reference.taps:
@@ -316,14 +313,15 @@ def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Genera
         if session.hidden_taps is None:
             result.tokens = _tokens(handle)
         else:
-            publish = session.hidden_taps.publish
+            taps = session.hidden_taps
+            publish = taps.publish
 
             def hidden(value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
                 return result.hidden(
-                    publish(value, resources), None if session.custom_forward is not None else reference
+                    publish(value, resources), None if session.custom_forward is not None else reference, taps
                 )
 
-            with patch.object(session.hidden_taps, "publish", hidden):
+            with patch.object(taps, "publish", hidden):
                 result.tokens = _tokens(handle)
     return result
 

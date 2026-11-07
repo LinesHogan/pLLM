@@ -3,7 +3,7 @@
 import pytest
 
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import label_rows
+from pllm.contracts.packed_rows import label_rows, tap_selection
 from pllm.contracts.request_identity import RequestIdentity
 
 
@@ -76,19 +76,26 @@ def test_bulk_labels_links_and_tap_slots_match_retained_replay_and_slot_reuse():
             frontiers[identity] = max(frontiers.get(identity, 0), start + count)
         assert actual.row_batch.rows == tuple(rows) and actual.links == tuple(links)
         last = {row.request_ordinal: row for row in rows}
-        for kind, phases in enumerate(
-            ((HiddenPhase.DECODE,), (HiddenPhase.PREFILL,), (HiddenPhase.DECODE, HiddenPhase.PREFILL))
+        for phases in (
+            (HiddenPhase.DECODE,),
+            (HiddenPhase.PREFILL,),
+            (HiddenPhase.DECODE, HiddenPhase.PREFILL),
+            (HiddenPhase.ALL,),
         ):
+            kind = tap_selection(phases)
             selected = [
                 row.packed_row_index
                 for phase in phases
                 for row in rows
-                if row.phase is phase
-                and not row.recomputed
+                if not row.recomputed
                 and (
-                    row is last[row.request_ordinal]
-                    if phase is HiddenPhase.DECODE
-                    else row.token_offset == row.prompt_length - 1
+                    phase is HiddenPhase.ALL
+                    or row.phase is phase
+                    and (
+                        row is last[row.request_ordinal]
+                        if phase is HiddenPhase.DECODE
+                        else row.token_offset == row.prompt_length - 1
+                    )
                 )
             ]
             np.testing.assert_array_equal(actual.row_batch.tap_selected[kind], selected)
