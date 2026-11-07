@@ -58,7 +58,7 @@ from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType
 from pllm.contracts.visibility import VisibilityKind
 from pllm.execution.attention_methods import AttentionFact, AttentionMethod, Fact
-from pllm.execution.binding_base import SGD as SGD, Field as Field, layout_field, overlay_fields
+from pllm.execution.binding_base import SGD as SGD, Field as Field, TargetRows, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder, CausalModel, CausalPort, TrainingBatch, declare_batch_train
 from pllm.execution.checkpoint import PretrainedFile, initialize_checkpoint
 from pllm.execution.compile_facts import BackendCompileFacts
@@ -1436,10 +1436,12 @@ def _chunked_in_forward(
                 "a chunked update without an optimizer takes the weight carry, then input/target/embedding operands"
             )
         pending = {
-            f"_pending_rows_{name}": Field(
-                lambda inputs, outputs, source=source: (
+            f"_pending_rows_{name}": TargetRows((chunk,), dtype=None)
+            if source == "target"
+            else Field(
+                lambda inputs, _outputs, source=source: (
                     chunk,
-                    hidden_size if source == "embedding" else inputs if source == "input" else outputs,
+                    inputs if source == "input" else hidden_size,
                 ),
                 dtype=None,
             )

@@ -568,12 +568,12 @@ def m4_reference():
     return error
 
 
-@pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train"])
+@pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train", "dense_chunk_train"])
 @pytest.mark.parametrize("targets", [("down_proj",), ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")])
 def test_tp_projection(kind, targets, monkeypatch, m4_reference):
     from time import perf_counter
 
-    from test.tp_overlays import DenseTraining, LowRankTraining, ProjectionAdapter
+    from test.tp_overlays import DenseChunkTraining, DenseTraining, LowRankTraining, ProjectionAdapter
 
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     workload = {
@@ -581,6 +581,7 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
         "low_rank": ProjectionAdapter("low_rank"),
         "dense_train": DenseTraining(),
         "low_rank_train": LowRankTraining(),
+        "dense_chunk_train": DenseChunkTraining(),
     }[kind]
     workload = replace(workload, targets=tuple(pllm.model.Projection(name, 0) for name in targets))
     row = targets == ("down_proj",)
@@ -613,12 +614,15 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
         roots = []
         for snapshot in range(1):
             values = []
+            stride = len(report.states[0].fields) // len(targets)
             for index, spec in enumerate(report.states[0].fields):
+                if index % stride >= arity:
+                    continue
                 parts = [
                     torch.frombuffer(bytearray(rank[snapshot][index]), dtype=torch.float32).reshape(spec.shape)
                     for rank in fields
                 ]
-                sharded = index % arity == sharded_index
+                sharded = index % stride == sharded_index
                 value = torch.cat(parts, dim=-1 if row else 0) if sharded else parts[0]
                 if not sharded:
                     assert all(torch.equal(parts[0], part) for part in parts[1:])

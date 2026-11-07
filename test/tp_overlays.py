@@ -69,6 +69,19 @@ class DenseTraining(ProjectionState):
 
 
 @dataclass(frozen=True)
+class DenseChunkTraining(ProjectionState):
+    """Retain replicated target rows across chunk boundaries while updating dense shards."""
+
+    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="all", chunk=2)
+    def update(
+        self, value=pllm.parameter("weights", "value"), inputs=pllm.operand("input"), target=pllm.operand("target")
+    ):
+        output = inputs.float() @ value.T
+        signal = target.float() if self.targets[0].name == "down_proj" else target.float() @ value.T
+        return value + 1e-6 * (signal.T @ inputs.float()), output
+
+
+@dataclass(frozen=True)
 class LowRankTraining(ProjectionState):
     """Update the sharded factor while the replicated factor stays frozen."""
 

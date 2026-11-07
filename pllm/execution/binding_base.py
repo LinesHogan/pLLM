@@ -40,6 +40,21 @@ class Field:
         """The shape for one target projection's widths, or for the hidden width outside adapters."""
         return self.shape(in_features, out_features) if callable(self.shape) else self.shape
 
+    def at_projection(self, projection: ProjectionShape) -> Field:
+        """Bind a field before computing its global and rank-local storage."""
+        return self
+
+
+@dataclass(frozen=True)
+class TargetRows(Field):
+    """Pending target rows append their projection's target width at layout binding."""
+
+    shape: tuple[int, ...]
+
+    def at_projection(self, projection: ProjectionShape) -> Field:
+        """Keep target rows replicated when column output rows are partitioned."""
+        return Field((*self.shape, projection.target_size), self.dtype)
+
 
 def layout_field(
     name: str, field: Field, dimensions: Callable[[Dimensions], tuple[int, int]], dtype: TensorDType
@@ -102,6 +117,7 @@ def overlay_fields(
 
 def overlay_field(name: str, field: Field, projection: ProjectionShape, size: int, dtype: TensorDType) -> LayoutField:
     """Partition the projection's feature axis; constant-sized fields remain replicated."""
+    field = field.at_projection(projection)
     shape = field.size(*projection.global_shape)
     local = field.size(projection.input_size, projection.output_size)
     axes = tuple(i for i, (whole, part) in enumerate(zip(shape, local, strict=True)) if whole != part)

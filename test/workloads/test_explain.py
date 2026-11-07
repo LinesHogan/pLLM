@@ -431,12 +431,16 @@ def test_tp_projection_shard_costs(model_config, kind, target):
                 assert torch.equal(part, reference)
 
 
-def test_tp_down_admission(model_config):
+def test_tp_projection_admission(model_config):
     from pllm.backends.vllm import compat
 
     if compat.VLLM_027:
         pytest.skip("TP needs vLLM 0.32")
-    from test.tp_overlays import TrainColumnA
+    from test.tp_overlays import DenseChunkTraining, TrainColumnA
+
+    chunked = replace(DenseChunkTraining(), targets=(pllm.model.Projection("q_proj", 0),))
+    state = pllm.explain(chunked, replace(model_config, tensor_parallel_size=2)).states[0]
+    assert state.fields[2].shape == (2, 8)  # Pending targets retain the replicated hidden width.
 
     with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):
         pllm.explain(TrainColumnA(), replace(model_config, tensor_parallel_size=2))
