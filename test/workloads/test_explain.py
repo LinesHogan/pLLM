@@ -436,12 +436,17 @@ def test_tp_projection_admission(model_config):
 
     if compat.VLLM_027:
         pytest.skip("TP needs vLLM 0.32")
-    from test.tp_overlays import DenseChunkTraining, TrainColumnA
+    from test.tp_overlays import DenseChunkTraining, DenseGradientTraining, TensorConstantUpdate, TrainColumnA
 
     chunked = replace(DenseChunkTraining(), targets=(pllm.model.Projection("q_proj", 0),))
     state = pllm.explain(chunked, replace(model_config, tensor_parallel_size=2)).states[0]
     assert state.fields[2].shape == (2, 8)  # Pending targets retain the replicated hidden width.
 
+    pllm.explain(
+        replace(DenseGradientTraining(), targets=chunked.targets), replace(model_config, tensor_parallel_size=2)
+    )
+    with pytest.raises(ValueError, match="tensor constants"):
+        pllm.explain(TensorConstantUpdate(), replace(model_config, tensor_parallel_size=2))
     with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):
         pllm.explain(TrainColumnA(), replace(model_config, tensor_parallel_size=2))
     with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):

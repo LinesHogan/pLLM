@@ -458,7 +458,10 @@ def _m4_instrument(worker):
             pin = execution.arena.pin_exact(selected, torch.cuda.current_stream())
             try:
                 test._M4_FIELDS.extend(
-                    tuple(field.float().cpu().numpy().tobytes() for field in execution.arena.snapshot(pin, ref))
+                    tuple(
+                        field.cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
+                        for field in execution.arena.snapshot(pin, ref)
+                    )
                     for ref in selected
                 )
             finally:
@@ -501,7 +504,7 @@ def _projection_reference(kind, fields, row):
     fields = tuple(value.cuda() for value in fields)
     base_truth = hidden.double() @ weight.double().T
     truth = base_truth + parameter_correction(hidden.double(), tuple(value.double() for value in fields), operator)
-    dtype = torch.float32 if kind.endswith("train") else torch.bfloat16
+    dtype = torch.float32 if kind.endswith("train") and kind != "dense_sgd_train" else torch.bfloat16
     partials, bases = [], []
     sharded_index = int(operator is ParameterOverlayOperator.LOW_RANK_ADD and not row)
     axis = -1 if row else 0
@@ -568,13 +571,23 @@ def m4_reference():
     return error
 
 
-@pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train", "dense_chunk_train"])
+@pytest.mark.parametrize(
+    "kind", ["dense", "low_rank", "dense_train", "low_rank_train", "dense_chunk_train", "dense_sgd_train"]
+)
 @pytest.mark.parametrize("targets", [("down_proj",), ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")])
 def test_tp_projection(kind, targets, monkeypatch, m4_reference):
     from time import perf_counter
 
-    from test.tp_overlays import DenseChunkTraining, DenseTraining, LowRankTraining, ProjectionAdapter
+    from test.tp_overlays import (
+        DenseChunkTraining,
+        DenseGradientTraining,
+        DenseTraining,
+        LowRankTraining,
+        ProjectionAdapter,
+    )
 
+    if kind == "dense_sgd_train" and targets == ("down_proj",):
+        pytest.skip("a down reconstruction gradient needs the global row output")
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     workload = {
         "dense": ProjectionAdapter(),
@@ -582,12 +595,14 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
         "dense_train": DenseTraining(),
         "low_rank_train": LowRankTraining(),
         "dense_chunk_train": DenseChunkTraining(),
+        "dense_sgd_train": DenseGradientTraining(),
     }[kind]
     workload = replace(workload, targets=tuple(pllm.model.Projection(name, 0) for name in targets))
     row = targets == ("down_proj",)
     sharded_index = int(kind.startswith("low_rank") and not row)
     arity = 2 if kind.startswith("low_rank") else 1
     observed = []
+    initials = []
     rates = []
     params = _m4_params()
     for tp in (1, 2):
@@ -612,6 +627,7 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
             if kind.endswith("train"):
                 assert diagnostics.update_count > 0
         roots = []
+        initial_norms = []
         for snapshot in range(1):
             values = []
             stride = len(report.states[0].fields) // len(targets)
@@ -619,17 +635,29 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
                 if index % stride >= arity:
                     continue
                 parts = [
-                    torch.frombuffer(bytearray(rank[snapshot][index]), dtype=torch.float32).reshape(spec.shape)
+                    torch.frombuffer(bytearray(rank[snapshot][index]), dtype=spec.dtype.torch)
+                    .reshape(spec.shape)
+                    .float()
                     for rank in fields
                 ]
                 sharded = index % stride == sharded_index
                 value = torch.cat(parts, dim=-1 if row else 0) if sharded else parts[0]
                 if not sharded:
                     assert all(torch.equal(parts[0], part) for part in parts[1:])
+                if kind == "dense_sgd_train":
+                    norms = [
+                        torch.frombuffer(bytearray(rank[snapshot][index + 1]), dtype=torch.float64) for rank in fields
+                    ]
+                    assert all(torch.equal(norms[0], norm) for norm in norms[1:])
+                    rows = torch.stack((value[0], value[len(value) // 2])).double()
+                    assert ((rows.square().sum(-1) - norms[0]).abs() > 1e-14).all()
+                    initial_norms.append(norms[0])
                 values.append(value)
             roots.append(values)
+        initials.append(initial_norms)
         observed.append((tokens(output), roots, _m4_scores(output)))
     assert observed[0][0] == observed[1][0]
+    assert all(torch.equal(a, b) for a, b in zip(*initials))
     # Use native TP drift plus one model-precision ULP; the FP64 oracle checks the projection arithmetic.
     torch.testing.assert_close(
         observed[1][2], observed[0][2], rtol=0, atol=m4_reference.max().item() + _m4_rounding_unit(observed[0][2])

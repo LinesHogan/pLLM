@@ -1000,6 +1000,7 @@ class Adapter:
     reduction sums corrected down partials; no extra collective is added. Updates must be shard-local: training
     replicated A from column-sharded outputs, or B from row-sharded inputs, requires tensor_parallel_size=1.
     Sharded fields are read only in projection transitions; replicated factors remain available to other methods.
+    TP updates reject captured tensor constants; use Python scalars, new_full/new_ones or replicated state fields.
     per_head deltas, imported/checkpoint adapters and side-lane adapter training still require TP=1.
     """
 

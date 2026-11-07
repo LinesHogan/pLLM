@@ -1,6 +1,6 @@
 """Projection deltas with shard-local updates, shared by CPU admission and multi-GPU parity checks."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -16,6 +16,7 @@ class ProjectionState(pllm.Workload):
 
     operator: Literal["dense", "low_rank"] = "dense"
     targets: tuple[pllm.model.Projection, ...] = TARGETS
+    optimizer: pllm.SGD | None = None
 
     @property
     def weights(self) -> pllm.RequestState:
@@ -28,7 +29,7 @@ class ProjectionState(pllm.Workload):
                 "b": pllm.Field(lambda inputs, outputs: (outputs, 4)),
             }
         )
-        return pllm.RequestState(fields, dtype=torch.float32, initialize=self.initialize)
+        return pllm.RequestState(fields, dtype=torch.float32, initialize=self.initialize, optimizer=self.optimizer)
 
     def initialize(self, fields, generator):
         """Consume the same global random stream in TP1 and TP2."""
@@ -79,6 +80,30 @@ class DenseChunkTraining(ProjectionState):
         output = inputs.float() @ value.T
         signal = target.float() if self.targets[0].name == "down_proj" else target.float() @ value.T
         return value + 1e-6 * (signal.T @ inputs.float()), output
+
+
+@dataclass(frozen=True)
+class DenseGradientTraining(ProjectionState):
+    """Differentiate a sum over independent output rows and let the framework apply SGD."""
+
+    optimizer: pllm.SGD | None = pllm.SGD(1e-6)
+
+    @property
+    def weights(self) -> pllm.RequestState:
+        """Retain an initialization checksum to detect a silent zero-gradient update."""
+        state = super().weights
+        return replace(state, fields={**state.fields, "initial_norm": pllm.Field((2,), dtype=torch.float64)})
+
+    def initialize(self, fields, generator):
+        """Measure the full initialized matrix before the framework slices its output rows."""
+        fields["value"].normal_(std=0.002, generator=generator)
+        value = fields["value"]
+        rows = torch.stack((value[0], value[len(value) // 2])).double()
+        fields["initial_norm"].copy_(rows.square().sum(-1))
+
+    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="decode", chunk=2)
+    def loss(self, value=pllm.parameter("weights", "value"), inputs=pllm.operand("input")):
+        return (inputs.float() @ value.T).square().sum(-1)
 
 
 @dataclass(frozen=True)
@@ -156,13 +181,25 @@ class TrainColumnA(ProjectionState):
 
     operator: Literal["dense", "low_rank"] = "low_rank"
     targets: tuple[pllm.model.Projection, ...] = (pllm.model.Projection("q_proj", 0),)
+    optimizer: pllm.SGD | None = pllm.SGD(1e-6)
 
     @pllm.train_in_forward(
-        state="weights", targets=pllm.Attr("targets"), operator="low_rank", visibility="exact", tokens="all"
+        state="weights", targets=pllm.Attr("targets"), operator="low_rank", visibility="exact", tokens="all", chunk=2
     )
-    def update(self, a=pllm.parameter("weights", "a"), b=pllm.parameter("weights", "b"), inputs=pllm.operand("input")):
-        output = (inputs.float() @ a.T) @ b.T
-        a.add_(1e-6 * ((output @ b).T @ inputs.float()))
+    def loss(self, a=pllm.parameter("weights", "a"), b=pllm.parameter("weights", "b"), inputs=pllm.operand("input")):
+        return ((inputs.float() @ a.T) @ b.T).square().sum(-1)
+
+
+@dataclass(frozen=True)
+class TensorConstantUpdate(ProjectionState):
+    """Tensor literals can hide shape-dependent values behind identical FX attribute names."""
+
+    targets: tuple[pllm.model.Projection, ...] = (pllm.model.Projection("q_proj", 0),)
+
+    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="all")
+    def update(self, value=pllm.parameter("weights", "value"), inputs=pllm.operand("input")):
+        value.add_(torch.tensor(1.0 if value.shape[0] > value.shape[1] // 2 else 2.0))
+        output = inputs.float() @ value.T
         return pllm.UpdateOutput(
             output,
             output.new_ones((), dtype=torch.bool),

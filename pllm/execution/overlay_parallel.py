@@ -58,6 +58,11 @@ def _check_graphs(whole: tuple[Node, ...], local: tuple[Node, ...], size: int) -
         op = a.target
         if a.op != b.op or a.target != b.target:
             raise _reject(label)
+        # FX can give different tensor literals identical names after shape-dependent branches.
+        if a.op == "get_attr":
+            raise _reject(
+                "tensor constants; use Python scalars, new_full/new_ones, or declared replicated state fields"
+            )
         if isinstance(op, OpOverload) and torch.Tag.nondeterministic_seeded in op.tags:
             raise _reject("random updates; use deterministic shard-local math")
         value: torch.Tensor | tuple[torch.Tensor, ...] | None = a.meta.get("val")
@@ -92,9 +97,19 @@ def _check_graphs(whole: tuple[Node, ...], local: tuple[Node, ...], size: int) -
             assert source_axis is not None
             if prod(tensor.shape[:source_axis]) != prod(value.shape[:axis]):
                 raise _reject(label)
+        elif name == "expand":
+            # Autograd broadcasts replicated output gradients over each rank's output slice.
+            source = a.all_input_nodes[0]
+            source_axis = axes.get(source)
+            if source_axis is not None:
+                source_value: torch.Tensor = source.meta["val"]
+                if axis != source_axis + value.ndim - source_value.ndim:
+                    raise _reject(label)
+            if a.args[2:] != b.args[2:] or a.kwargs != b.kwargs:
+                raise _reject(label)
         elif (
             name in structural
-            or name in ("mm", "bmm", "addmm", "sum", "mean", "slice", "copy_", "expand")
+            or name in ("mm", "bmm", "addmm", "sum", "mean", "slice", "copy_")
             or torch.Tag.pointwise in op.tags
         ):
             if str(a.args) != str(b.args) or str(a.kwargs) != str(b.kwargs):
