@@ -1,4 +1,4 @@
-"""Prove down-overlay updates commute with input-feature slicing before backend installation.
+"""Prove projection updates commute with feature slicing before backend installation.
 
 Authoring calls this with global and rank-local fake tensors. Only a conservative
 set of ATen operations is admitted; execution adds no checks or collectives.
@@ -13,7 +13,7 @@ from torch._ops import OpOverload
 from torch.fx import Node
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from pllm.contracts.parameter_overlay import ProjectionDelta
+from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ProjectionDelta
 from pllm.execution.binding_base import Field
 from pllm.execution.declaration import Dimensions
 from pllm.execution.tensor_frame import UpdateOutput
@@ -24,23 +24,26 @@ def _axis(whole: torch.Tensor, local: torch.Tensor, size: int) -> int | None:
     if not axes:
         return None
     if len(axes) != 1 or whole.shape[axes[0]] != local.shape[axes[0]] * size:
-        raise ValueError("TP down updates must preserve one contiguous input-feature shard")
+        raise ValueError("TP updates must preserve one contiguous feature shard")
     return axes[0]
 
 
 def _reject(operation: str) -> ValueError:
     return ValueError(
-        f"TP down update is not shard-local at {operation}; its update/gradient needs other ranks' shards "
+        f"TP projection update is not shard-local at {operation}; its update/gradient needs other ranks' shards "
         "or an unproved operation. Use a shard-local update or tensor_parallel_size=1"
     )
+
+
+def _shape_factory(node: Node) -> bool:
+    """Factories borrow shape/device metadata without consuming the source's values."""
+    return str(node.target).startswith(("aten.new_", "aten.zeros_like", "aten.ones_like", "aten.full_like"))
 
 
 def _live_nodes(nodes: tuple[Node, ...]) -> tuple[Node, ...]:
     live = {node for node in nodes if node.op == "output" or node.is_impure()}
     for node in reversed(nodes):
-        if node in live and not str(node.target).startswith(
-            ("aten.new_", "aten.zeros_like", "aten.ones_like", "aten.full_like")
-        ):
+        if node in live and not _shape_factory(node):
             live.update(node.all_input_nodes)
     return tuple(node for node in nodes if node in live)
 
@@ -64,6 +67,11 @@ def _check_graphs(whole: tuple[Node, ...], local: tuple[Node, ...], size: int) -
         axis = _axis(value, part, size)
         axes[a] = axis
         if a.op != "call_function":
+            continue
+        if _shape_factory(a):
+            start = 2 if str(a.target).startswith("aten.new_") else 1
+            if str(a.args[start:]) != str(b.args[start:]) or str(a.kwargs) != str(b.kwargs):
+                raise _reject(label)
             continue
         inputs = tuple(node for node in a.all_input_nodes if axes.get(node) is not None)
         if not inputs and axis is None:
@@ -143,7 +151,7 @@ def admit_update(
     gradient: bool,
     chunked: bool,
 ) -> None:
-    """Reject an update whose fields or gradients depend on another input-feature shard.
+    """Reject an update whose fields or gradients depend on another feature shard.
 
     Trace just the updated fields, pruning the projection readout. In particular a
     reconstruction error contracts the input shard before updating either factor,
@@ -152,19 +160,19 @@ def admit_update(
     if dimensions.tensor_parallel_size == 1:
         return
     update = _Update(function, arguments, tuple(fields), effect.applied_fields, gradient, chunked)
-    for index, (inputs, outputs) in enumerate(dimensions.target_shapes):
+    for index, projection in enumerate(dimensions.projections):
         samples: list[tuple[torch.Tensor, ...]] = []
-        for size in (1, dimensions.tensor_parallel_size):
+        for inputs, outputs in (projection.global_shape, (projection.input_size, projection.output_size)):
             widths = {
-                "input": (3, inputs // size),
-                "target": (3, outputs),
-                "weight": (outputs, inputs // size),
+                "input": (3, inputs),
+                "target": (3, projection.target_size),
+                "weight": (outputs, inputs),
                 "embedding": (3, dimensions.hidden_size),
                 "prompt_end": (),
             }
             values = {
                 key: torch.empty(
-                    field.size(inputs // size, outputs),
+                    field.size(inputs, outputs),
                     device="meta",
                     dtype=dimensions.dtype.torch if field.dtype in (None, "auto") else field.dtype,
                 )
@@ -179,6 +187,13 @@ def admit_update(
         graphs = [make_fx(update, tracing_mode="fake")(*sample).graph for sample in samples]
         for graph in graphs:
             graph.eliminate_dead_code()
-        _check_graphs(
-            _live_nodes(tuple(graphs[0].nodes)), _live_nodes(tuple(graphs[1].nodes)), dimensions.tensor_parallel_size
-        )
+        try:
+            _check_graphs(
+                _live_nodes(tuple(graphs[0].nodes)), _live_nodes(tuple(graphs[1].nodes)), projection.partitions
+            )
+        except ValueError as error:
+            message = f"{projection.target}: {error}"
+            if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD:
+                factor = effect.factors[0 if projection.output_partitions > 1 else 1]
+                message += f". Keep replicated factor {factor!r} frozen when its gradient reduces feature shards"
+            raise ValueError(message) from error

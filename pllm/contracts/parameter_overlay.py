@@ -22,7 +22,7 @@ class ParameterOverlayOperator(StrEnum):
 
 
 # Hugging Face module names of the projections pllm can adapt, in their order inside one decoder layer.
-ProjectionName = Literal["q_proj", "v_proj", "down_proj"]
+ProjectionName = Literal["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
 _PROJECTION_ORDER: tuple[ProjectionName, ...] = get_args(ProjectionName)
 
 
@@ -38,7 +38,7 @@ class Projection:
             raise ValueError(f"Projection needs name in {_PROJECTION_ORDER} and layer >= 0 or None; got {self}")
 
     def __lt__(self, other: Projection) -> bool:
-        """Model order: by layer, then q_proj, v_proj, down_proj within a layer."""
+        """Model order: by layer, then attention and MLP projections within a layer."""
         assert self.layer is not None and other.layer is not None
         return (self.layer, _PROJECTION_ORDER.index(self.name)) < (other.layer, _PROJECTION_ORDER.index(other.name))
 
@@ -58,10 +58,28 @@ def expand_targets(targets: tuple[Projection, ...], layers: int) -> tuple[Projec
 
 @dataclass(frozen=True, slots=True)
 class ProjectionShape:
+    """Rank-local projection widths and their partitions, shared by model probes and workload planning."""
+
     target: Projection
     input_size: int
     output_size: int
     input_partitions: int = 1
+    output_partitions: int = 1
+
+    @property
+    def global_shape(self) -> tuple[int, int]:
+        """Input and output widths before tensor parallel partitioning."""
+        return self.input_size * self.input_partitions, self.output_size * self.output_partitions
+
+    @property
+    def target_size(self) -> int:
+        """Width of operand('target'): MLP input for down, projection input for columns."""
+        return self.output_size if self.target.name == "down_proj" else self.input_size
+
+    @property
+    def partitions(self) -> int:
+        """Number of distinct shards; KV heads can replicate across adjacent ranks."""
+        return max(self.input_partitions, self.output_partitions)
 
 
 @dataclass(frozen=True, slots=True)

@@ -26,3 +26,6 @@ class LinearBase(Module):
     forward: Callable[[torch.Tensor], _LinearOutput]
 
 class RowParallelLinear(LinearBase): ...
+
+class QKVParallelLinear(LinearBase):
+    num_kv_head_replicas: int

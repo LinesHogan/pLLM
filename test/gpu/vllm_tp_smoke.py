@@ -487,7 +487,7 @@ def _m4_rounding_unit(values):
     return (torch.nextafter(scale, torch.full_like(scale, float("inf"))).float() - scale.float()).item()
 
 
-def _m4_projection_reference(kind, fields):
+def _projection_reference(kind, fields, row):
     from pllm.contracts.parameter_overlay import ParameterOverlayOperator
     from pllm.execution.parameter_projection import parameter_correction
 
@@ -503,22 +503,39 @@ def _m4_projection_reference(kind, fields):
     truth = base_truth + parameter_correction(hidden.double(), tuple(value.double() for value in fields), operator)
     dtype = torch.float32 if kind.endswith("train") else torch.bfloat16
     partials, bases = [], []
-    for x, w, a in zip(hidden.chunk(2, -1), weight.chunk(2, -1), fields[0].chunk(2, -1)):
-        x, w, a = x.contiguous(), w.contiguous(), a.contiguous()
+    sharded_index = int(operator is ParameterOverlayOperator.LOW_RANK_ADD and not row)
+    axis = -1 if row else 0
+    for rank in range(2):
+        x = hidden.chunk(2, -1)[rank].contiguous() if row else hidden
+        w = weight.chunk(2, axis)[rank].contiguous()
         base = x @ w.T
-        weights = tuple(
-            value.to(dtype).unsqueeze(0).expand(len(x), *value.shape).contiguous() for value in (a, *fields[1:])
-        )
+        weights = [
+            value.chunk(2, axis)[rank] if index == sharded_index else value for index, value in enumerate(fields)
+        ]
+        weights = tuple(value.to(dtype).unsqueeze(0).expand(len(x), *value.shape).contiguous() for value in weights)
         delta = parameter_correction(x.to(dtype)[:, None], weights, operator, batched=True)[:, 0]
         bases.append(base.float())
         partials.append(base.float() + delta.float())
-    native_error = sum(bases).bfloat16().double() - base_truth
-    error = sum(partials).bfloat16().double() - truth
+    native = sum(bases) if row else torch.cat(bases, -1)
+    adapted = sum(partials) if row else torch.cat(partials, -1)
+    native_error = native.bfloat16().double() - base_truth
+    error = adapted.bfloat16().double() - truth
     native_rms = native_error.square().mean().sqrt().item()
+    # Column overlays retain TP1's base-output rounding before adding the delta.
+    # Compare to that same reader, so TP2 cannot add error beyond its current arithmetic.
+    weights = tuple(value.to(dtype).unsqueeze(0).expand(len(hidden), *value.shape).contiguous() for value in fields)
+    delta = parameter_correction(hidden.to(dtype)[:, None], weights, operator, batched=True)[:, 0]
+    tp1 = ((hidden @ weight.T).float() + delta.float()).bfloat16().double()
+    reference_error = native_error if row else tp1 - truth
+    reference_rms = reference_error.square().mean().sqrt().item()
     rms = error.square().mean().sqrt().item()
-    assert rms <= 1.05 * native_rms
-    assert error.abs().max() <= native_error.abs().max() + _m4_rounding_unit(truth)
-    print(f"M4 {kind} FP64 projection: native RMS={native_rms:.6g}, adapter RMS={rms:.6g}", flush=True)
+    assert rms <= 1.05 * reference_rms
+    assert error.abs().max() <= reference_error.abs().max() + _m4_rounding_unit(truth)
+    print(
+        f"TP row={row} {kind} FP64 projection: native RMS={native_rms:.6g}, "
+        f"reference RMS={reference_rms:.6g}, adapter RMS={rms:.6g}",
+        flush=True,
+    )
 
 
 def _m4_scores(output):
@@ -552,18 +569,23 @@ def m4_reference():
 
 
 @pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train"])
-def test_m4_down(kind, monkeypatch, m4_reference):
+@pytest.mark.parametrize("targets", [("down_proj",), ("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")])
+def test_tp_projection(kind, targets, monkeypatch, m4_reference):
     from time import perf_counter
 
-    from test.tp_overlays import DenseDownTraining, DownAdapter, LowRankDownTraining
+    from test.tp_overlays import DenseTraining, LowRankTraining, ProjectionAdapter
 
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     workload = {
-        "dense": DownAdapter(),
-        "low_rank": DownAdapter("low_rank"),
-        "dense_train": DenseDownTraining(),
-        "low_rank_train": LowRankDownTraining(),
+        "dense": ProjectionAdapter(),
+        "low_rank": ProjectionAdapter("low_rank"),
+        "dense_train": DenseTraining(),
+        "low_rank_train": LowRankTraining(),
     }[kind]
+    workload = replace(workload, targets=tuple(pllm.model.Projection(name, 0) for name in targets))
+    row = targets == ("down_proj",)
+    sharded_index = int(kind.startswith("low_rank") and not row)
+    arity = 2 if kind.startswith("low_rank") else 1
     observed = []
     rates = []
     params = _m4_params()
@@ -589,15 +611,16 @@ def test_m4_down(kind, monkeypatch, m4_reference):
             if kind.endswith("train"):
                 assert diagnostics.update_count > 0
         roots = []
-        for row in range(1):
+        for snapshot in range(1):
             values = []
             for index, spec in enumerate(report.states[0].fields):
                 parts = [
-                    torch.frombuffer(bytearray(rank[row][index]), dtype=torch.float32).reshape(spec.shape)
+                    torch.frombuffer(bytearray(rank[snapshot][index]), dtype=torch.float32).reshape(spec.shape)
                     for rank in fields
                 ]
-                value = torch.cat(parts, dim=-1) if index == 0 else parts[0]
-                if index:
+                sharded = index % arity == sharded_index
+                value = torch.cat(parts, dim=-1 if row else 0) if sharded else parts[0]
+                if not sharded:
                     assert all(torch.equal(parts[0], part) for part in parts[1:])
                 values.append(value)
             roots.append(values)
@@ -607,14 +630,15 @@ def test_m4_down(kind, monkeypatch, m4_reference):
     torch.testing.assert_close(
         observed[1][2], observed[0][2], rtol=0, atol=m4_reference.max().item() + _m4_rounding_unit(observed[0][2])
     )
-    _m4_projection_reference(kind, observed[0][1][0])
+    for index in range(len(targets)):
+        _projection_reference(kind, observed[0][1][0][index * arity : (index + 1) * arity], row)
     for whole, sharded in zip(observed[0][1], observed[1][1]):
         for index, (value, reference) in enumerate(zip(sharded, whole)):
             torch.testing.assert_close(
-                value, reference, rtol=0, atol=1e-6 if kind.endswith("train") and index == 0 else 0
+                value, reference, rtol=0, atol=1e-6 if kind.endswith("train") and index % arity == sharded_index else 0
             )
     print(
-        f"M4 {kind}: TP1={rates[0]:.1f} TP2={rates[1]:.1f} tok/s; "
+        f"TP {targets} {kind}: TP1={rates[0]:.1f} TP2={rates[1]:.1f} tok/s; "
         f"logprob max_abs={(observed[1][2] - observed[0][2]).abs().max():.6g}; "
         f"field max_abs={max((a - b).abs().max().item() for x, y in zip(observed[1][1], observed[0][1]) for a, b in zip(x, y)):.6g}; "
         "zero host syncs",

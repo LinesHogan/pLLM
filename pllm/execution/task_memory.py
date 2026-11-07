@@ -218,7 +218,7 @@ def example(
             target.target,
             HiddenPhase.PREFILL,
             meta(length, target.input_size, dtype=dtype),
-            meta(length, target.output_size, dtype=dtype),
+            meta(length, target.target_size, dtype=dtype),
             meta(target.output_size, target.input_size, dtype=dtype),
             meta(dtype=torch.bool),
             meta(length, facts.probe.hidden_size, dtype=dtype),

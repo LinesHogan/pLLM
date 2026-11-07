@@ -22,6 +22,7 @@ from pllm.contracts.parameter_overlay import (
     Projection,
     ProjectionDelta,
     ProjectionOperands,
+    ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerRowBatch
@@ -412,7 +413,7 @@ class OverlayTransition:
     """
 
     buffers: tuple[str, ...]
-    targets: tuple[Projection, ...]
+    projections: tuple[ProjectionShape, ...]
     phases: tuple[HiddenPhase, ...]
     apply: Callable[[torch.Tensor, Tensors], torch.Tensor]
     function: Callable[..., UpdateOutput]
@@ -424,6 +425,11 @@ class OverlayTransition:
     invariants: Mapping[str, tuple[str, tuple[FieldView, ...]]]
     chunk: ChunkUpdate | GradientUpdate | None = None
     executor: OverlayBatch | None = None
+
+    @property
+    def targets(self) -> tuple[Projection, ...]:
+        """The model-order targets of this transition's rank-local projections."""
+        return tuple(projection.target for projection in self.projections)
 
     def invariant_values(self, target: int, batch: TensorBatch) -> Tensors:
         """Borrow each shared field at this projection's layer without request copies."""
@@ -610,11 +616,11 @@ class OverlayTransition:
         )
         return self.validate(result, operand)
 
-    @staticmethod
-    def validate(result: UpdateOutput, operand: ProjectionOperands) -> UpdateOutput:
+    def validate(self, result: UpdateOutput, operand: ProjectionOperands) -> UpdateOutput:
         """Check authored results at the same boundary for eager and batched execution."""
+        projection = self.projections[self.targets.index(operand.target)]
         if (
-            result.output.shape != operand.desired.shape
+            result.output.shape != (len(operand.hidden), projection.output_size)
             or result.output.dtype not in (operand.hidden.dtype, torch.float32)
             or result.output.device != operand.hidden.device
         ):

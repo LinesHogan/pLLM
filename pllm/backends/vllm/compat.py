@@ -41,7 +41,6 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
         raise ValueError('multi-GPU needs vLLM 0.32.0 and runner="mrv2"; otherwise use tensor_parallel_size=1')
     for used, feature, milestone in (
         (requirements.causal_training, "causal_model training", "M5"),
-        (any(target.name != "down_proj" for target in requirements.parameter_targets), "q/v parameter overlays", "M3"),
         (requirements.feeds, "state feeds", "E1"),
         (requirements.custom_residual, "@pllm.custom_residual", "post-M2 model-site support"),
     ):

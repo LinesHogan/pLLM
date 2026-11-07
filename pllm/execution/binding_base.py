@@ -12,6 +12,7 @@ import torch
 from pllm.contracts.parameter_overlay import (
     ParameterOverlayOperator,
     ProjectionDelta,
+    ProjectionShape,
 )
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.declaration import Dimensions, FieldShard, LayoutField
@@ -78,45 +79,37 @@ def overlay_fields(
             {key: dtype(f"{key}_{index}", value) for key, value in fields.items()},
         )
     if dimensions.tensor_parallel_size > 1:
-        if any(inputs % dimensions.tensor_parallel_size for inputs, _ in dimensions.target_shapes):
-            raise ValueError("down input features must divide tensor_parallel_size evenly")
         if effect.operator is ParameterOverlayOperator.HEAD_ADD:
-            raise ValueError(
-                "per_head down adapters need tensor_parallel_size=1; M4 admits dense and low_rank down deltas"
-            )
-        for inputs, outputs in dimensions.target_shapes:
+            raise ValueError("per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP")
+        for projection in dimensions.projections:
             _check_target_fields(
                 effect,
                 fields,
-                "rank-local down projection",
-                inputs // dimensions.tensor_parallel_size,
-                outputs,
+                "rank-local projection",
+                projection.input_size,
+                projection.output_size,
                 dimensions.dtype,
                 {key: dtype(key, value) for key, value in fields.items()},
             )
     return tuple(
-        overlay_field(f"{key}_{index}", field, inputs, outputs, dimensions, dtype(f"{key}_{index}", field))
-        for index, (inputs, outputs) in enumerate(dimensions.target_shapes)
+        overlay_field(
+            f"{key}_{index}", field, projection, dimensions.tensor_parallel_size, dtype(f"{key}_{index}", field)
+        )
+        for index, projection in enumerate(dimensions.projections)
         for key, field in fields.items()
     )
 
 
-def overlay_field(
-    name: str, field: Field, inputs: int, outputs: int, dimensions: Dimensions, dtype: TensorDType
-) -> LayoutField:
-    """Partition input-feature axes; constant-sized fields remain replicated."""
-    shape = field.size(inputs, outputs)
-    size = dimensions.tensor_parallel_size
-    local = field.size(inputs // size, outputs) if size > 1 else shape
+def overlay_field(name: str, field: Field, projection: ProjectionShape, size: int, dtype: TensorDType) -> LayoutField:
+    """Partition the projection's feature axis; constant-sized fields remain replicated."""
+    shape = field.size(*projection.global_shape)
+    local = field.size(projection.input_size, projection.output_size)
     axes = tuple(i for i, (whole, part) in enumerate(zip(shape, local, strict=True)) if whole != part)
     shard = None
     if axes:
-        if len(axes) != 1 or shape[axes[0]] != local[axes[0]] * size:
-            raise ValueError(
-                f"{name}: TP down fields must partition one input-feature axis evenly; use tensor_parallel_size=1"
-            )
-        axis = axes[0]
-        shard = FieldShard(shape, axis)
+        if len(axes) != 1 or shape[axes[0]] != local[axes[0]] * projection.partitions:
+            raise ValueError(f"{name}: TP fields must partition one feature axis evenly; use tensor_parallel_size=1")
+        shard = FieldShard(shape, axes[0], size // projection.partitions)
     return LayoutField(name, local, dtype, 8 if dtype is TensorDType.INT64 else 16, shard)
 
 

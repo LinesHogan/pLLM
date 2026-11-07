@@ -374,45 +374,61 @@ def test_guidance_head_selection(model_config, metadata, reason):
 @pytest.mark.parametrize(
     "kind", ["dense", "low_rank", "dense_train", "low_rank_train", "dense_shared", "low_rank_shared"]
 )
-def test_tp_down_shard_costs(model_config, kind):
+@pytest.mark.parametrize("target", ["down_proj", "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"])
+def test_tp_projection_shard_costs(model_config, kind, target):
     from pllm.backends.vllm import compat
-    from test.tp_overlays import DenseDownTraining, DownAdapter, LowRankDownTraining, SharedDownAdapter
+    from test.tp_overlays import DenseTraining, LowRankTraining, ProjectionAdapter, SharedProjectionAdapter
 
     if compat.VLLM_027:
         pytest.skip("TP needs vLLM 0.32")
     workload = {
-        "dense": DownAdapter(),
-        "low_rank": DownAdapter("low_rank"),
-        "dense_train": DenseDownTraining(),
-        "low_rank_train": LowRankDownTraining(),
-        "dense_shared": SharedDownAdapter(),
-        "low_rank_shared": SharedDownAdapter("low_rank"),
+        "dense": ProjectionAdapter(),
+        "low_rank": ProjectionAdapter("low_rank"),
+        "dense_train": DenseTraining(),
+        "low_rank_train": LowRankTraining(),
+        "dense_shared": SharedProjectionAdapter(),
+        "low_rank_shared": SharedProjectionAdapter("low_rank"),
     }[kind]
+    workload = replace(workload, targets=(pllm.model.Projection(target, 0),))
     whole = pllm.explain(workload, model_config).states[0]
     sharded = pllm.explain(workload, replace(model_config, tensor_parallel_size=2)).states[0]
-    assert sharded.fields[0].shape == (*whole.fields[0].shape[:-1], whole.fields[0].shape[-1] // 2)
-    assert sharded.fields[1:] == whole.fields[1:]
+    row = target == "down_proj"
+    sharded_index = int(kind.startswith("low_rank") and not row)
+    axis = -1 if row else 0
+    # The config has one KV head: both ranks own the full key/value delta.
+    partitions = 1 if target in ("k_proj", "v_proj") else 2
+    for index, (part, full) in enumerate(zip(sharded.fields, whole.fields)):
+        shape = list(full.shape)
+        if index == sharded_index:
+            shape[axis] //= partitions
+        assert part.shape == tuple(shape)
     assert sharded.bytes_per_root == sum(field.dtype.itemsize * prod(field.shape) for field in sharded.fields)
     from pllm.contracts.parameter_overlay import ProjectionShape
-    from test.tp_overlays import TARGETS
 
-    initialized = []
-    for tp in (1, 2):
-        facts = testing.backend_facts(
-            8, layer_count=10, memory_bytes=1 << 20, targets=(ProjectionShape(TARGETS[0], 8 // tp, 8, tp),)
+    whole = ()
+    for tp in (1, 2, 4):
+        # Two global KV heads at TP4 exercise adjacent-rank replica grouping.
+        partitions = min(tp, 2) if target in ("k_proj", "v_proj") else tp
+        projection = ProjectionShape(
+            workload.targets[0],
+            8 // partitions if row else 8,
+            8 if row else 8 // partitions,
+            partitions if row else 1,
+            1 if row else partitions,
         )
+        facts = testing.backend_facts(8, layer_count=10, memory_bytes=1 << 20, targets=(projection,))
         binding = workload.build(replace(facts, probe=replace(facts.probe, tensor_parallel_size=tp)))
-        ranks = []
         for rank in range(tp):
             binding.tensor_parallel_rank = rank
             root = tuple(
                 torch.zeros(spec.shape, dtype=spec.dtype.torch) for spec in binding.layouts.layouts[0].layout.fields
             )
             binding.initializer("weights", torch.device("cpu"), 7)((root,), (None,))
-            ranks.append(root)
-        initialized.append((torch.cat([rank[0] for rank in ranks], -1), *ranks[0][1:]))
-        assert all(all(torch.equal(a, b) for a, b in zip(ranks[0][1:], rank[1:])) for rank in ranks)
-    assert all(torch.equal(a, b) for a, b in zip(*initialized))
+            if tp == 1:
+                whole = root
+            for index, (part, full) in enumerate(zip(root, whole)):
+                reference = full.chunk(partitions, axis)[rank // (tp // partitions)] if index == sharded_index else full
+                assert torch.equal(part, reference)
 
 
 def test_tp_down_admission(model_config):
@@ -420,19 +436,16 @@ def test_tp_down_admission(model_config):
 
     if compat.VLLM_027:
         pytest.skip("TP needs vLLM 0.32")
-    from pllm.authoring import BackendRequirements
+    from test.tp_overlays import TrainColumnA
 
-    with pytest.raises(ValueError, match="q/v parameter overlays.*M3"):
-        compat.admit_parallel(
-            replace(model_config, tensor_parallel_size=2),
-            BackendRequirements(parameter_targets=(pllm.model.Projection("q_proj", 0),)),
-        )
+    with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):
+        pllm.explain(TrainColumnA(), replace(model_config, tensor_parallel_size=2))
     with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):
         pllm.explain(PrefillAdaptersWorkload(rank=2, chunk_size=4), replace(model_config, tensor_parallel_size=2))
 
     from test.tp_overlays import ExportB, ExportDown, ReadDown
 
     for workload in (ExportDown(), ReadDown()):
-        with pytest.raises(ValueError, match="input shards are projection-local.*tensor_parallel_size=1"):
+        with pytest.raises(ValueError, match="sharded fields are projection-local.*tensor_parallel_size=1"):
             pllm.explain(workload, replace(model_config, tensor_parallel_size=2))
     pllm.explain(ExportB(), replace(model_config, tensor_parallel_size=2))

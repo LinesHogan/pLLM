@@ -11,7 +11,7 @@ import torch
 
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.parameter_overlay import FieldView
+from pllm.contracts.parameter_overlay import FieldView, ProjectionShape
 from pllm.contracts.semantic_graph import (
     ImplementationId,
     SemanticEffect,
@@ -39,12 +39,19 @@ OperationMode = Literal["read", "transition", "update", "gradient"]
 
 @dataclass(frozen=True, slots=True)
 class Dimensions:
+    """Model geometry used by workload declarations; target_shapes exposes global projection widths."""
+
     hidden_size: int
     vocab_size: int
-    target_shapes: tuple[tuple[int, int], ...] = ()
+    projections: tuple[ProjectionShape, ...] = ()
     dtype: TensorDType = TensorDType.FLOAT32
     layer_count: int = 0
     tensor_parallel_size: int = 1
+
+    @property
+    def target_shapes(self) -> tuple[tuple[int, int], ...]:
+        """Global projection widths supplied to workload field and module declarations."""
+        return tuple(projection.global_shape for projection in self.projections)
 
 
 Shape = tuple[int, ...] | Callable[[Dimensions], tuple[int, ...]]
@@ -75,10 +82,11 @@ class FieldShard:
 
     shape: tuple[int, ...]
     axis: int
+    replicas: int = 1
 
     def read(self, tensor: torch.Tensor, shape: tuple[int, ...], rank: int) -> torch.Tensor:
         """Borrow this rank's slice of a full tensor."""
-        return tensor.narrow(self.axis, rank * shape[self.axis], shape[self.axis])
+        return tensor.narrow(self.axis, (rank // self.replicas) * shape[self.axis], shape[self.axis])
 
 
 @dataclass(frozen=True, slots=True)

@@ -798,7 +798,7 @@ class InstanceState:
                 or self.module is not None
             ):
                 raise ValueError(
-                    "TP down Adapter fields use initialize= and shard-local @pllm.train_in_forward updates; "
+                    "TP Adapter fields use initialize= and shard-local @pllm.train_in_forward updates; "
                     "optimizer/import/checkpoint/module-backed adapters need tensor_parallel_size=1"
                 )
         context.states[name], ports = declare_parameters(
@@ -992,13 +992,15 @@ class Adapter:
     receive no correction. Native QKV propagation for skipped layers still applies the Q/V deltas when it runs.
     This lets custom depth schedules use the same adapted model as the standard forward.
 
-    At TP>1 (vLLM 0.32 MRv2), M4 admits dense/low_rank down projections. Declare input-sized fields with
-    Field(lambda inputs, outputs: ...): dense weights and low-rank A partition their input axis; B and small
-    fields replicate. Initialization runs globally before slicing, and explain reports rank-local storage.
-    vLLM sums each rank's corrected partial output in its existing all-reduce. Updates must be shard-local;
-    reconstruction losses and updates to B that need the full projected input require TP=1. per_head and q/v
-    overlays remain deferred, as do imported/checkpoint adapters and side-lane adapter training at TP>1.
-    Input-shard fields are read only in projection transitions; replicated factors remain available to other methods.
+    At TP>1 (vLLM 0.32 MRv2), dense and low_rank deltas follow each projection's shards.
+    Declare fields with Field(lambda inputs, outputs: ...). Down deltas partition dense weights and A
+    by input columns, with replicated B. Attention q/k/v and MLP gate/up deltas partition dense weights and B
+    by output rows, with replicated A; KV head replicas follow vLLM's head placement. Small fields replicate.
+    Initialization runs globally before slicing, and explain reports per-rank storage. vLLM's existing row
+    reduction sums corrected down partials; no extra collective is added. Updates must be shard-local: training
+    replicated A from column-sharded outputs, or B from row-sharded inputs, requires tensor_parallel_size=1.
+    Sharded fields are read only in projection transitions; replicated factors remain available to other methods.
+    per_head deltas, imported/checkpoint adapters and side-lane adapter training still require TP=1.
     """
 
     state: str
@@ -1987,7 +1989,9 @@ def train_in_forward(
     `tokens` picks the tokens whose projection operands train the state: "prefill", "decode" or "all";
     `operator`, `weight`, `factors` and `scale` say how the state changes each projection, as in
     pllm.model.Adapter. visibility="forward_pinned" reads the state the forward started with; "exact" also reads
-    every chunk already trained in this forward.
+    every chunk already trained in this forward. Column projections expose their replicated input as
+    operand("target"); readouts have the projection's output width, which can differ from that input width.
+    At TP>1, state initialization and shard-local update rules are the same as pllm.model.Adapter.
 
     With ``chunk``, the function takes the weight carry followed by input/target/embedding row operands and returns
     (next carry, readouts). Pending rows belong to the framework. When ``state`` declares
@@ -2751,7 +2755,7 @@ class _Reflection:
             raise ValueError(f"pllm.parameter({state!r}, {field!r}) names no declared field; declared: {declared}")
         if self.binding.field_views[state, field].field in self.binding.field_shards.get(state, {}):
             raise ValueError(
-                f"{state}.{field}: TP down input shards are projection-local; other readers need tensor_parallel_size=1"
+                f"{state}.{field}: TP sharded fields are projection-local; other readers need tensor_parallel_size=1"
             )
         return self.parameters[state, field]
 
@@ -3101,7 +3105,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                     if b.field_shards.get(str(effect.resource)) and effect.kind is not StateEffectKind.READ:
                         if b.effects.in_forward is None:
                             raise ValueError(
-                                "TP down Adapter updates need shard-local @pllm.train_in_forward; "
+                                "TP Adapter updates need shard-local @pllm.train_in_forward; "
                                 "side-lane updates need tensor_parallel_size=1"
                             )
         if all(
@@ -3117,7 +3121,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         dimensions = Dimensions(
             facts.probe.hidden_size,
             facts.vocab_size,
-            tuple((target.input_size * target.input_partitions, target.output_size) for target in facts.probe.targets),
+            facts.probe.targets,
             facts.probe.tensor_dtype,
             facts.layer_count,
             facts.probe.tensor_parallel_size,

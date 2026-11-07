@@ -49,7 +49,7 @@ class _ConfigShape:
         parameters = self.num_hidden_layers * self.hidden_size * (2 * query + 2 * kv + 3 * self.intermediate_size)
         return 2 * (parameters + self.hidden_size * pad_vocab_size(self.vocab_size))
 
-    def projections(self, targets: tuple[Projection, ...]) -> tuple[ProjectionShape, ...]:
+    def projections(self, targets: tuple[Projection, ...], size: int) -> tuple[ProjectionShape, ...]:
         if targets and self.architectures[0] not in _DENSE_ARCHITECTURES:
             raise ValueError(
                 "projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks"
@@ -58,13 +58,37 @@ class _ConfigShape:
         kv_heads = self.num_key_value_heads or self.num_attention_heads
         sizes = {
             "q_proj": (self.hidden_size, head * self.num_attention_heads),
+            "k_proj": (self.hidden_size, head * kv_heads),
             "v_proj": (self.hidden_size, head * kv_heads),
+            "gate_proj": (self.hidden_size, self.intermediate_size),
+            "up_proj": (self.hidden_size, self.intermediate_size),
             "down_proj": (self.intermediate_size, self.hidden_size),
         }
         expanded = expand_targets(targets, self.num_hidden_layers)
         if any(target.layer is None or target.layer >= self.num_hidden_layers for target in expanded):
             raise ValueError("choose projection layers below the model's num_hidden_layers")
-        return tuple(ProjectionShape(target, *sizes[target.name]) for target in expanded)
+        projections: list[ProjectionShape] = []
+        for target in expanded:
+            inputs, outputs = sizes[target.name]
+            partitions = min(size, kv_heads) if target.name in ("k_proj", "v_proj") else size
+            heads = kv_heads if target.name in ("k_proj", "v_proj") else self.num_attention_heads
+            if target.name in ("q_proj", "k_proj", "v_proj") and max(heads, size) % min(heads, size):
+                raise ValueError(f"{target.name} heads must divide tensor_parallel_size or partition evenly across it")
+            row = target.name == "down_proj"
+            if (inputs if row else outputs) % partitions:
+                raise ValueError(f"{target.name} features must divide tensor_parallel_size evenly")
+            if target.name == "q_proj" and heads < size:
+                raise ValueError("q_proj needs at least tensor_parallel_size query heads")
+            projections.append(
+                ProjectionShape(
+                    target,
+                    inputs // partitions if row else inputs,
+                    outputs if row else outputs // partitions,
+                    input_partitions=partitions if row else 1,
+                    output_partitions=1 if row else partitions,
+                )
+            )
+        return tuple(projections)
 
 
 def _head_rejection(model: VllmModelConfig, shape: _ConfigShape, architecture: str) -> str | None:
@@ -129,17 +153,7 @@ class ModelShape:
             shape.num_hidden_layers,
             shape.vocab_size,
             pad_vocab_size(shape.vocab_size),
-            tuple(
-                ProjectionShape(
-                    target.target,
-                    target.input_size // config.tensor_parallel_size,
-                    target.output_size,
-                    config.tensor_parallel_size,
-                )
-                if target.target.name == "down_proj"
-                else target
-                for target in shape.projections(targets)
-            ),
+            shape.projections(targets, config.tensor_parallel_size),
             read_only,
             shape.forward_flops(),
             shape.num_attention_heads,

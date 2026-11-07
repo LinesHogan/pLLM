@@ -11,7 +11,7 @@ from functools import partial
 import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
-from vllm.model_executor.layers.linear import LinearBase, RowParallelLinear
+from vllm.model_executor.layers.linear import LinearBase, QKVParallelLinear, RowParallelLinear
 
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, frozen_weight
 from pllm.contracts.hidden_locator import HiddenPhase
@@ -49,20 +49,28 @@ from pllm.execution.torch_private import blas_workspace_bytes
 def inspect_parameter_targets(
     decoder: Decoder, targets: tuple[Projection, ...], dtype: torch.dtype
 ) -> tuple[ProjectionShape, ...]:
+    """Inspect fused output slices and vLLM's feature/head partitions before installation."""
     specs: list[ProjectionShape] = []
     for index, target in enumerate(targets):
         module, offset, size, _ = decoder.projection(target)
         if (
             target in targets[:index]
-            or (module.tp_size != 1 and target.name != "down_proj")
             or not module.return_bias
             or module.params_dtype is not dtype
             or offset + size > module.output_size_per_partition
         ):
-            raise ValueError("parameter overlay needs unique q/v or row-parallel down projections matching model dtype")
+            raise ValueError("parameter overlay needs unique attention or dense MLP projections matching model dtype")
+        row = target.name == "down_proj"
+        partitions = module.tp_size
+        if isinstance(module, QKVParallelLinear) and target.name in ("k_proj", "v_proj"):
+            partitions //= module.num_kv_head_replicas
         specs.append(
             ProjectionShape(
-                target, module.input_size_per_partition, size, module.tp_size if target.name == "down_proj" else 1
+                target,
+                module.input_size_per_partition,
+                size,
+                input_partitions=partitions if row else 1,
+                output_partitions=1 if row else partitions,
             )
         )
     return tuple(specs)
@@ -187,9 +195,6 @@ class _ExactProjection:
         self.transition: ProjectionTransition | None = None
         self.row_overlays: tuple[ProgramOverlay, ...] = ()
 
-    def reads_operands(self, binding: ParameterOverlayFieldBinding) -> bool:
-        return self.original_mlp_forward is not None or binding.operator is ParameterOverlayOperator.HEAD_ADD
-
     def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
         assert self.original_mlp_forward is not None
         self.mlp_input = value.detach()
@@ -233,9 +238,7 @@ class _ExactProjection:
     ) -> None:
         inputs = tuple(hidden.index_select(0, item.rows) for item in prepared)
         operands = tuple(
-            self.operands_of(item, selected, weight)
-            for item, selected in zip(prepared, inputs, strict=True)
-            if self.reads_operands(item.binding)
+            self.operands_of(item, selected, weight) for item, selected in zip(prepared, inputs, strict=True)
         )
         if self.row_overlays:
             residuals = {
@@ -263,7 +266,7 @@ class _ExactProjection:
             self.operand_count += len(operands)
 
     def operands_of(self, item: _PreparedRows, selected: torch.Tensor, weight: torch.Tensor) -> ProjectionOperands:
-        if item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
+        if self.mlp is None or item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
             desired = selected
         else:
             assert self.mlp_input is not None and self.mlp_input.shape[0] == self.total_rows
@@ -394,8 +397,7 @@ class ExactParameterOverlay:
         for handle in self._modules:
             if handle.row_overlays:
                 continue
-            expected = sum(handle.reads_operands(item.binding) for item in handle.prepared)
-            assert handle.operand_count == expected
+            assert handle.operand_count == len(handle.prepared)
             handle.operand_count = 0
         return ()
 

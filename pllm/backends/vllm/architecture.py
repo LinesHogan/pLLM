@@ -222,18 +222,21 @@ class Decoder:
 
         assert target.layer is not None
         layer = self.writable("a parameter overlay").model.layers[target.layer]
-        if target.name == "down_proj":
+        if target.name in ("gate_proj", "up_proj", "down_proj"):
             mlp = layer.mlp
             if isinstance(mlp, (Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
                 raise ValueError(
-                    f"layer {target.layer} routes tokens to experts; MLP down overlays need a dense MLP, "
+                    f"layer {target.layer} routes tokens to experts; MLP overlays need a dense MLP, "
                     "so overlay the attention query or value projection instead"
                 )
-            return mlp.down_proj, 0, mlp.down_proj.output_size_per_partition, mlp
-        if target.name in ("q_proj", "v_proj"):
+            if target.name == "down_proj":
+                return mlp.down_proj, 0, mlp.down_proj.output_size_per_partition, mlp
+            width = mlp.gate_up_proj.output_size_per_partition // 2
+            return mlp.gate_up_proj, 0 if target.name == "gate_proj" else width, width, None
+        if target.name in ("q_proj", "k_proj", "v_proj"):
             if isinstance(layer, Qwen3_5DecoderLayer) and layer.layer_type != "full_attention":
                 raise ValueError(
-                    f"layer {target.layer} is a Gated DeltaNet layer without q/v projections; choose a full-attention "
+                    f"layer {target.layer} is a Gated DeltaNet layer without q/k/v projections; choose a full-attention "
                     "layer (see layer_types in the model config)"
                 )
             attention = layer.self_attn
@@ -246,10 +249,11 @@ class Decoder:
                         "overlay the value projection instead"
                     )
                 return attention.qkv_proj, 0, attention.q_size, None
+            start = (2 if gated else 1) * attention.q_size
             if target.name == "v_proj":
-                start = (2 if gated else 1) * attention.q_size + attention.kv_size
-                return attention.qkv_proj, start, attention.kv_size, None
-        raise ValueError("parameter overlay requires an MLP down or attention q/v projection")
+                start += attention.kv_size
+            return attention.qkv_proj, start, attention.kv_size, None
+        raise ValueError("parameter overlay requires an attention q/k/v or dense MLP gate/up/down projection")
 
     def value_rows(self, layer: int) -> tuple[LinearBase, int, int, int]:
         """A full-attention layer's value slice of its qkv projection and the width of one head."""
