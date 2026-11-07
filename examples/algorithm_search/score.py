@@ -28,11 +28,8 @@ import torch  # noqa: E402
 from vllm import SamplingParams  # noqa: E402
 
 import pllm  # noqa: E402
-from pllm.backends.vllm.compile_facts import compile_facts  # noqa: E402
-from pllm.backends.vllm.model_shape import ModelShape  # noqa: E402
 from pllm.benchmark import BenchmarkOptions, compare  # noqa: E402
 from pllm.execution.checkpoint import checkpoint_directory  # noqa: E402
-from pllm.execution.freeze import fingerprint  # noqa: E402
 from pllm.testing import check, check_on_gpu  # noqa: E402
 from tools.ai_eval.score import load_submission  # noqa: E402
 
@@ -51,22 +48,6 @@ def config() -> pllm.ModelConfig:
         cuda_graphs="auto",
         execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=OPTIONS.cuda_graph_pool_budget_bytes),
     )
-
-
-def identity(workload: pllm.Workload) -> str:
-    """Use pllm's signed declaration, which includes method code and workload values."""
-    requirements = workload.backend_requirements()
-    shape = ModelShape.of_config(config(), requirements.parameter_targets)
-    facts = compile_facts(
-        shape,
-        requirements,
-        config(),
-        model_identity=shape.architecture,
-        hidden_layouts=(),
-        overlay_graph_bytes=0,
-        memory_bytes=1 << 40,
-    )
-    return workload.build(facts).graph.execution_parameters_digest
 
 
 def cpu(candidate: Path, known: Path, result: dict[str, Any]) -> None:
@@ -93,22 +74,15 @@ def cpu(candidate: Path, known: Path, result: dict[str, Any]) -> None:
     neutral: object = submission.NEUTRAL
     if not isinstance(workload, pllm.Workload) or not isinstance(neutral, pllm.Workload):
         raise ValueError("define WORKLOAD and NEUTRAL as pllm.Workload instances")
-    result["fingerprint"] = fingerprint((identity(workload), identity(neutral)))
+    report = pllm.explain(workload, config())
+    digests = report.workload_digest + pllm.explain(neutral, config()).workload_digest
+    result["fingerprint"] = hashlib.sha256(digests.encode()).hexdigest()
     for line in known.read_text().splitlines() if known.exists() else ():
         record = json.loads(line)
         if record.get("fingerprint") == result["fingerprint"]:
             result.update(record, duplicate_of=record["fingerprint"], source=candidate.read_text())
             return
-    report = pllm.explain(workload, config())
-    result.update(explain=str(report), explain_details=asdict(report))
-    estimates = [task.estimate for member in report.members for task in member.tasks]
-    base_flops = report.model.base_forward_flops_per_token_estimate
-    assert base_flops is not None
-    result["flops"] = base_flops + sum(
-        (cost.matmul_flops_estimate + cost.projection_flops_estimate) / cost.rows
-        for cost in estimates
-        if cost is not None
-    )
+    result.update(explain=str(report), explain_details=asdict(report), flops=report.flops_per_token_estimate)
     if report.budget_errors:
         raise ValueError(report.budget_errors)
     result["check"] = str(check(workload, config(), neutral=neutral))

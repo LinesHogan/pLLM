@@ -175,6 +175,10 @@ class ExplainResult:
     attention: tuple[AttentionCost, ...]
     kv_capacity: tuple[KVCapacity, ...]
     kernels: KernelEstimate
+    # Signs the declaration, method code and workload values; equal digests run the same workload.
+    workload_digest: str
+    # Base forward plus every task's matmul and projection FLOPs per row; None when the base is unknown.
+    flops_per_token_estimate: float | None
 
     def __str__(self) -> str:
         forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
@@ -377,6 +381,16 @@ def _members(
             MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch, training, kernels)
         )
     return tuple(result)
+
+
+def _flops_per_token(base: int | None, tasks: tuple[TaskCost, ...]) -> float | None:
+    if base is None:
+        return None
+    return base + sum(
+        (task.estimate.matmul_flops_estimate + task.estimate.projection_flops_estimate) / task.estimate.rows
+        for task in tasks
+        if task.estimate is not None
+    )
 
 
 def _kernel_sum(tasks: tuple[TaskCost, ...], sites: tuple[KernelEstimate, ...]) -> KernelEstimate:
@@ -743,4 +757,6 @@ def explain_facts(
         binding.attention.costs,
         layout_capacity(shape, config, workload.backend_requirements().kv_layouts) if binding.attention.methods else (),
         _kernel_sum(tuple(costs.values()), tuple(sites.values())),
+        binding.graph.execution_parameters_digest,
+        _flops_per_token(shape.base_forward_flops_per_token_estimate, tuple(costs.values())),
     )
