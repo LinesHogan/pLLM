@@ -55,10 +55,14 @@ class ExecutionOptions:
     These measurements do not guarantee that other workloads fit the capacity.
     """
 
-    max_training_rows: int = 1
-    capture_memory_bytes: int | None = None  # None derives tensor-task reservations from the workload.
-    state_memory_bytes: int = 0  # Zero uses the backend's observed available capacity.
-    memory_budget_bytes: int | None = None  # Original AER declared-memory limit, not total CUDA residency.
+    # Host-fed training rows per state per step; decode rows are separate.
+    max_host_training_rows: int = 1
+    # Per task/model CUDA-graph pool; None derives task reservations from tracing.
+    cuda_graph_pool_budget_bytes: int | None = None
+    # PTTS device state pages; zero uses backend-observed free capacity.
+    state_page_budget_bytes: int = 0
+    # PTTS pages, task workspace/outputs, anchor and capture reservations at peak.
+    execution_peak_budget_bytes: int | None = None
     allow_numerical_transforms: bool = True
     # Deterministic preparation and funded stream overlap by default.
     # Only "measured" searches and times additional implementations.
@@ -70,9 +74,9 @@ class ExecutionOptions:
     guidance_capacity: int | None = 4096
 
     @property
-    def model_capture_bytes(self) -> int:
-        """Model-graph reservation; backend capture, unlike tensor tracing, needs a loaded model."""
-        return self.capture_memory_bytes or 64 << 20
+    def model_cuda_graph_pool_budget_bytes(self) -> int:
+        """Model CUDA-graph pool budget: explicit pool budget or 64 MiB before backend overlay allowances."""
+        return self.cuda_graph_pool_budget_bytes or 64 << 20
 
     def __post_init__(self) -> None:
         if self.guidance_capacity is not None and self.guidance_capacity not in (
@@ -90,10 +94,10 @@ class ExecutionOptions:
             raise ValueError("publish_lag must be >= 0; use 0 for strict ordering")
         if self.tuning not in ("heuristic", "measured"):
             raise ValueError("tuning must be heuristic or measured")
-        if self.max_training_rows < 1:
-            raise ValueError("max_training_rows must be >= 1")
-        if self.capture_memory_bytes is not None and self.capture_memory_bytes < 1:
-            raise ValueError("capture_memory_bytes must be positive")
+        if self.max_host_training_rows < 1:
+            raise ValueError("max_host_training_rows must be >= 1")
+        if self.cuda_graph_pool_budget_bytes is not None and self.cuda_graph_pool_budget_bytes < 1:
+            raise ValueError("cuda_graph_pool_budget_bytes must be positive")
 
 
 @dataclass(frozen=True, slots=True)

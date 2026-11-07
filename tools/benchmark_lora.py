@@ -27,12 +27,12 @@ def main() -> None:
         for scope in ("instance", "request"):
             subprocess.run([sys.executable, "-m", "tools.benchmark_lora", *sys.argv[1:], "--scope", scope], check=True)
         return
-    if args.max_training_rows < 1 or not 0 < args.training_fraction <= 1:
+    if args.max_host_training_rows < 1 or not 0 < args.training_fraction <= 1:
         parser.error("training rows must be positive and training fraction in (0, 1]")
     groups = options.batch if args.state_groups is None else args.state_groups
     if not 1 <= groups <= options.batch:
         parser.error("state groups must be between one and the request batch size")
-    active = ceil(args.max_training_rows * args.training_fraction)
+    active = ceil(args.max_host_training_rows * args.training_fraction)
     for scope in ("instance", "request"):
         if args.scope not in ("both", scope):
             continue
@@ -45,12 +45,12 @@ def main() -> None:
         print(f"Output LoRA scope: {scope}")
 
         def prepare(hidden_size: int, vocab_size: int, device: torch.device) -> pllm.host.WeightedCEBatch[torch.Tensor]:
-            shape = (states, args.max_training_rows) if scope == "request" else (args.max_training_rows,)
+            shape = (states, args.max_host_training_rows) if scope == "request" else (args.max_host_training_rows,)
             generator = torch.Generator(device=device).manual_seed(7)
             hidden = torch.randn((*shape, hidden_size), device=device, generator=generator)
             logits = torch.zeros((*shape, vocab_size), device=device)
             labels = torch.zeros(shape, device=device, dtype=torch.long)
-            weights = (torch.arange(args.max_training_rows, device=device) < active).float().expand(shape)
+            weights = (torch.arange(args.max_host_training_rows, device=device) < active).float().expand(shape)
             return (
                 pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, tuple(range(states)))
                 if scope == "request"
@@ -59,13 +59,13 @@ def main() -> None:
 
         config = OutputLoRAConfig(rank=args.rank, steps=2, scope=scope)
         print(
-            f"rank={config.rank}, max_training_rows={args.max_training_rows}, active_rows={active}, steps={config.steps}, state_groups={states}"
+            f"rank={config.rank}, max_host_training_rows={args.max_host_training_rows}, active_rows={active}, steps={config.steps}, state_groups={states}"
         )
         compare(
             OutputLoRAWorkload(config),
             replace(options, profile=None if options.profile is None else options.profile / scope),
             prepare=lambda handle: prepare(handle.hidden_size, handle.vocab_size, handle.device),
-            max_training_rows=args.max_training_rows,
+            max_host_training_rows=args.max_host_training_rows,
             require_training=True,
             prompt_indices=indices,
         )

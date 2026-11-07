@@ -12,13 +12,13 @@ from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch, validate
 from pllm.contracts.semantic_graph import HostServiceInputSource
 from pllm.execution.shared_tensor import SharedTensor
 from test.workloads.grpo_workload import GRPO
-from test.workloads.test_tlm import TinyCausalPort, _facts, _input
+from test.workloads.test_tlm import TinyCausalPort, batch_input, causal_facts
 
 
 def test_weighted_causal_loss_and_adamw_match_torch() -> None:
     model = TinyCausalPort()
     workload = GRPO(optimizer=AdamW(0.01, (0.8, 0.95), 1e-7, 0.1))
-    execution = workload.compile_backend(_facts(model), causal=model.bind).execution
+    execution = workload.compile_backend(causal_facts(model), causal=model.bind).execution
     (initial,) = execution.admit(())
     plan = execution.arena.plan
     ports = [
@@ -67,7 +67,7 @@ def test_weighted_causal_loss_and_adamw_match_torch() -> None:
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        result = execution.step(_input(delivered))
+        result = execution.step(batch_input(delivered))
         assert result.publication is not None
         (current,) = result.publication.after_refs
         assert current.version_id == version

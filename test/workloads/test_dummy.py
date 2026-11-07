@@ -284,7 +284,7 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
         release.set()
         trace.close()
         execution.close()
-    assert trace._thread is not None and not trace._thread.is_alive()
+    assert trace.thread is not None and not trace.thread.is_alive()
 
 
 def test_export_failure_and_meta() -> None:

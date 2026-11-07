@@ -13,12 +13,12 @@ from typing import overload
 import torch
 from torch import Tensor
 
-from pllm.backends.vllm.model_sites import ModelSites, _Boundary, _Value  # pyright: ignore[reportPrivateUsage]
+from pllm.backends.vllm.model_sites import ModelSites, SublayerBoundary, ValueProjection
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.model_sites import PatchInput, Place, ResidualRewrite, StateInput, position
 from pllm.execution.site_memory import SiteMemorySchedule
 from pllm.execution.task_memory import site_state
-from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.torch_private import KernelCountMode
 
 
@@ -33,7 +33,7 @@ class _PortNorm:
 
 
 class _MemoryExample(SiteMemorySchedule):
-    def __init__(self, rewrite: ResidualRewrite, binding: TensorBinding, rows: int) -> None:
+    def __init__(self, rewrite: ResidualRewrite, binding: TensorDeclaration, rows: int) -> None:
         memory = rewrite.memory
         assert memory is not None
         self.memory = memory
@@ -54,7 +54,7 @@ class _MemoryExample(SiteMemorySchedule):
 
 
 class _SiteExample(ModelSites):
-    def __init__(self, binding: TensorBinding, facts: BackendCompileFacts) -> None:
+    def __init__(self, binding: TensorDeclaration, facts: BackendCompileFacts) -> None:
         rewrites = binding.sites.rewrites
         self.streams = max((rewrite.streams for rewrite in rewrites), default=1)
         self.hidden, self.count = facts.probe.hidden_size, facts.max_admitted_lineages
@@ -62,7 +62,7 @@ class _SiteExample(ModelSites):
         self._prefetch = {}
         self._requests_of = torch.empty(self.count, dtype=torch.long, device="meta")
         carries = {rewrite.memory.carry for rewrite in rewrites if rewrite.memory is not None}
-        self._sources = tuple(
+        self.state_inputs = tuple(
             dict.fromkeys(
                 source
                 for rewrite in rewrites
@@ -70,18 +70,18 @@ class _SiteExample(ModelSites):
                 if isinstance(source, StateInput) and source not in carries
             )
         )
-        self._states = {}
-        for source in self._sources:
+        self.state_values = {}
+        for source in self.state_inputs:
             value = site_state(binding, replace(source, module=None), self.count if source.request else None, None)
             assert isinstance(value, Tensor)
-            self._states[source] = value
+            self.state_values[source] = value
         self._result_sources = tuple(dict.fromkeys(source for rewrite in rewrites for source in rewrite.results))
-        self._results = {
+        self.result_values = {
             source: torch.empty((self.count, *source.shape), dtype=source.dtype, device="meta")
             for source in self._result_sources
         }
         head, heads = facts.probe.head_dim, facts.probe.kv_heads
-        self._earlier = {
+        self.earlier_values = {
             source: torch.empty(
                 (self.count, heads, head)
                 if source.kind == "value"
@@ -109,17 +109,17 @@ def _identity(value: Tensor) -> Tensor:
     return value
 
 
-def _boundaries(sites: _SiteExample, binding: TensorBinding, facts: BackendCompileFacts) -> list[_Boundary]:
+def _boundaries(sites: _SiteExample, binding: TensorDeclaration, facts: BackendCompileFacts) -> list[SublayerBoundary]:
     owners = {place: rewrite for rewrite in binding.sites.rewrites for place in rewrite.places}
-    earlier = tuple(sites._earlier)  # pyright: ignore[reportPrivateUsage]
-    result: list[_Boundary] = []
+    earlier = tuple(sites.earlier_values)
+    result: list[SublayerBoundary] = []
     for index in range(2 * facts.layer_count + 1):
         layer, mlp = divmod(index, 2)
         before: Place | None = ("attention", layer) if mlp else ("mlp", layer - 1) if layer else None
         after: Place | None = None if layer == facts.layer_count else ("mlp" if mlp else "attention", layer)
         reader = owners.get(after) if after is not None else None
         result.append(
-            _Boundary(
+            SublayerBoundary(
                 sites,
                 _PortNorm(),
                 before,
@@ -138,7 +138,7 @@ def _boundaries(sites: _SiteExample, binding: TensorBinding, facts: BackendCompi
     return result
 
 
-def estimate_sites(binding: TensorBinding, facts: BackendCompileFacts) -> dict[str, tuple[int, int]]:
+def estimate_sites(binding: TensorDeclaration, facts: BackendCompileFacts) -> dict[str, tuple[int, int]]:
     """Trace added hook operators and eager staging copies once per decode step.
 
     Shared boundaries and retained values are charged to their first consumer.
@@ -179,7 +179,7 @@ def estimate_sites(binding: TensorBinding, facts: BackendCompileFacts) -> dict[s
 
 def _estimate_values(
     sites: _SiteExample,
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     facts: BackendCompileFacts,
     sample: Tensor,
     counts: dict[str, tuple[int, int]],
@@ -188,15 +188,15 @@ def _estimate_values(
 
     owners = {place: rewrite for rewrite in binding.sites.rewrites for place in rewrite.places}
     layers = {layer for kind, layer in owners if kind == "value"} | {
-        source.layer
-        for source in sites._earlier  # pyright: ignore[reportPrivateUsage]
-        if source.kind == "value"
+        source.layer for source in sites.earlier_values if source.kind == "value"
     }
     width = facts.probe.kv_heads * facts.probe.head_dim
     for layer in sorted(layers):
         source = EarlierInput("value", layer)
-        keeps = source if source in sites._earlier else None  # pyright: ignore[reportPrivateUsage]
-        hook = _Value(sites, _identity, layer, owners.get(("value", layer)), keeps, 0, width, facts.probe.head_dim)
+        keeps = source if source in sites.earlier_values else None
+        hook = ValueProjection(
+            sites, _identity, layer, owners.get(("value", layer)), keeps, 0, width, facts.probe.head_dim
+        )
         sites.count = 1
         hook.bind(sample[0], {})
         if hook.owner is None and keeps is None:
@@ -212,16 +212,16 @@ def _estimate_values(
 
 def _estimate_staging(
     sites: _SiteExample,
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     counts: dict[str, tuple[int, int]],
 ) -> None:
-    for source in sites._sources:  # pyright: ignore[reportPrivateUsage]
+    for source in sites.state_inputs:
         name = next(
             rewrite.name
             for rewrite in binding.sites.rewrites
             if any(value == source for _, value in (*rewrite.inputs, *rewrite.read_inputs))
         )
-        value = sites._states[source]  # pyright: ignore[reportPrivateUsage]
+        value = sites.state_values[source]
         with KernelCountMode() as counter:
             if source.request:
                 for row in value:
@@ -230,7 +230,7 @@ def _estimate_staging(
                 value.copy_(torch.empty_like(value))
         graph, eager = counts[name]
         counts[name] = graph, eager + counter.count
-    for source, value in sites._results.items():  # pyright: ignore[reportPrivateUsage]
+    for source, value in sites.result_values.items():
         name = next(rewrite.name for rewrite in binding.sites.rewrites if source in rewrite.results)
         with KernelCountMode() as counter:
             value.copy_(torch.empty_like(value))

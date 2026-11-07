@@ -13,7 +13,7 @@ def main() -> None:
     compare(
         ESampWorkload(ESampConfig(rank=4, intervention_beta=args.beta)),
         options,
-        max_training_rows=1,
+        max_host_training_rows=1,
         require_training=True,
     )
 

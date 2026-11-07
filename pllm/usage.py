@@ -115,7 +115,7 @@ from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import StepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources, shape_site_results
-from pllm.execution.tensor_binding import TensorBinding, TensorOutput as TensorOutput
+from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput as TensorOutput
 from pllm.execution.tensor_frame import (
     TensorFrame,
     TensorPort,
@@ -2384,7 +2384,7 @@ class _Reflection:
     """Own the binding, reflected owner and ordered definitions during one build."""
 
     owner: Workload
-    binding: TensorBinding = field(init=False)
+    binding: TensorDeclaration = field(init=False)
     prefix: str = ""
     components: tuple[_Reflection, ...] = ()
     # The owner's values, signed; the declared states and model values among them, by type.
@@ -3020,7 +3020,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
 
     def specialize(
         self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
-    ) -> tuple[BackendCompileFacts, TensorBinding]:
+    ) -> tuple[BackendCompileFacts, TensorDeclaration]:
         """Check component timing requirements against the single engine setting."""
         for path, component in component_workloads(self):
             required = component.required_publish_lag
@@ -3030,7 +3030,9 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 )
         return super().specialize(facts, options, causal=causal)
 
-    def _export_handler(self, declaration: TensorBinding, graph: SemanticGraph) -> Callable[[TraceEvent], None] | None:
+    def _export_handler(
+        self, declaration: TensorDeclaration, graph: SemanticGraph
+    ) -> Callable[[TraceEvent], None] | None:
         """Bind export ownership by task identity; author labels may contain dots."""
         if not declaration.has_exports:
             return None
@@ -3059,7 +3061,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         Tensor-parallel execution delivers exports only from the output rank (rank 0).
         """
 
-    def _declare(self, b: TensorBinding, *, capabilities: tuple[str, ...] = ()) -> None:
+    def _declare(self, b: TensorDeclaration, *, capabilities: tuple[str, ...] = ()) -> None:
         """Declare owner values and operations, then compose and sign their graph."""
         context = _Reflection.read(self)
         adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
@@ -3094,7 +3096,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         context.validate_pretrained()
         context.sign_composition()
 
-    def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+    def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorDeclaration:
         """Build the graph and tensor tasks against the backend's model dimensions."""
         dimensions = Dimensions(
             facts.probe.hidden_size,
@@ -3104,7 +3106,9 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             facts.layer_count,
             facts.probe.tensor_parallel_size,
         )
-        b = TensorBinding(type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions)
+        b = TensorDeclaration(
+            type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions
+        )
         b.probe = facts.probe
         b.checkpoint = facts.checkpoint
         b.causal = causal
@@ -3227,14 +3231,14 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         )
 
     def resource_facts(
-        self, declaration: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
+        self, declaration: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions
     ) -> SchedulerTimeline:
         """Reserve ordinary tensor scratch and each requested graph's private pool."""
         if declaration.graph.trains_on_batch:
-            if options.memory_budget_bytes is not None and not facts.timeline.task_resources:
+            if options.execution_peak_budget_bytes is not None and not facts.timeline.task_resources:
                 raise ValueError(
                     "training on CausalTrainBatch/WeightedRowBatch inputs cannot be funded under "
-                    "ExecutionOptions.memory_budget_bytes yet; leave memory_budget_bytes unset"
+                    "ExecutionOptions.execution_peak_budget_bytes yet; leave execution_peak_budget_bytes unset"
                 )
             timeline = facts.timeline
         else:
@@ -3259,7 +3263,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         self,
         facts: BackendCompileFacts,
         plan: PlanBundle,
-        declaration: TensorBinding,
+        declaration: TensorDeclaration,
         *,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> MathBinding[StepInput, TensorFrame, TensorOutput]:
@@ -3276,7 +3280,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
 
     def compile_host(self, config: HostConfig) -> StateExecution[StepInput, TensorFrame, TensorOutput]:
         """Build, plan and bind the graph without a model (see pllm.host.make_host); training reads host batches."""
-        b = TensorBinding(
+        b = TensorDeclaration(
             type(self).__qualname__,
             boundary_digest(config.hidden_size, config.seed),
             Dimensions(config.hidden_size, 0),
@@ -3284,7 +3288,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         )
         self._declare(b)
         timeline = config.timeline()
-        if config.memory_budget_bytes is not None and b.graph.states:
+        if config.execution_peak_budget_bytes is not None and b.graph.states:
             timeline = derive_host_resources(b, config)
         math = b.function_math(config.device, config.seed)
         prepare = math.prepare_data

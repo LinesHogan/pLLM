@@ -58,7 +58,7 @@ def test_gpu_contracts(workload, neutral, capacity):
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
-        execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20, guidance_capacity=capacity),
+        execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20, guidance_capacity=capacity),
     )
     result = check_on_gpu(workload, config, neutral=neutral)
     assert "explain/probe" in result.passed
@@ -108,9 +108,9 @@ def test_inplace_neutral_contract(tmp_path):
 @pytest.mark.parametrize("runner", ("mrv1", "mrv2"))
 def test_distribution_contract(monkeypatch, runner):
     from pllm.testing import check_distribution
-    from pllm.testing_distribution import _Observation
+    from pllm.testing_distribution import SamplerObservation
 
-    record = _Observation.record
+    record = SamplerObservation.record
 
     def without_sync(self, sampled, logits):
         mode = torch.cuda.get_sync_debug_mode()
@@ -120,7 +120,7 @@ def test_distribution_contract(monkeypatch, runner):
         finally:
             torch.cuda.set_sync_debug_mode(mode)
 
-    monkeypatch.setattr(_Observation, "record", without_sync)
+    monkeypatch.setattr(SamplerObservation, "record", without_sync)
     config = pllm.ModelConfig(
         "Qwen/Qwen2.5-0.5B-Instruct",
         max_model_len=64,

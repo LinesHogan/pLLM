@@ -162,10 +162,12 @@ def test_recirculation_declaration_fits_reference_budget_and_crosses_the_wire() 
         + sum(f.workspace_bytes + f.resident_bytes for f in reference.timeline.task_resources)
         + sum(f.bytes for f in reference.timeline.value_resources)
     )
-    tight = workload.compile_backend(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget, tuning="measured"))
-    assert tight.attachment.plan.timeline.memory_budget_bytes == reference_budget
+    tight = workload.compile_backend(
+        FACTS, ExecutionOptions(execution_peak_budget_bytes=reference_budget, tuning="measured")
+    )
+    assert tight.attachment.plan.timeline.execution_peak_budget_bytes == reference_budget
     with pytest.raises(ValueError):
-        workload.specialize(FACTS, ExecutionOptions(memory_budget_bytes=reference_budget - 1))
+        workload.specialize(FACTS, ExecutionOptions(execution_peak_budget_bytes=reference_budget - 1))
     restored = decode_workload(encode_workload(workload))
     assert (
         isinstance(restored, RecirculationWorkload) and restored.build(FACTS).finish() == workload.build(FACTS).finish()

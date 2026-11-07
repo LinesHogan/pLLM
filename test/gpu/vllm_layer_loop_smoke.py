@@ -26,7 +26,7 @@ def main():
         workload=LayerLoop(),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 1, 64, 0.25, seed=7),
     )
-    primitive = handle.runner.require_session()._custom_forward
+    primitive = handle.runner.require_session().custom_forward
     native_replay, checked = torch.cuda.CUDAGraph.replay, []
 
     def replay(graph):

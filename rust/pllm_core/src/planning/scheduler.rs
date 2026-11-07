@@ -529,10 +529,10 @@ fn plan_memory(
     }
     peak = peak.max(resident + exported);
     let peak = u64::try_from(peak).map_err(|_| "placement memory envelope overflows u64")?;
-    if let Some(budget) = timeline.memory_budget_bytes.filter(|&budget| peak > budget) {
+    if let Some(budget) = timeline.execution_peak_budget_bytes.filter(|&budget| peak > budget) {
         return Err(format!(
-            "workload tasks need {peak} bytes at their peak but only {budget} fit; lower \
-             max_num_batched_tokens or raise ExecutionOptions.memory_budget_bytes; \
+            "pllm execution needs {peak} bytes at its peak but only {budget} fit; lower \
+             max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; \
              reduce device tables or explicitly declare placement=\"host\" for read-only lookup tables"
         ));
     }
@@ -764,15 +764,15 @@ mod tests {
         }).to_string()).unwrap();
         let side = compile(&graph, &timeline, None).unwrap();
         assert_eq!(side.tasks[1].lane, super::Lane::Side);
-        timeline.memory_budget_bytes = Some(side.peak_memory_bytes - 1);
+        timeline.execution_peak_budget_bytes = Some(side.peak_memory_bytes - 1);
         let inline = compile(&graph, &timeline, None).unwrap();
         assert!(inline.tasks.iter().all(|t| t.lane == super::Lane::Main));
         assert_eq!(inline.tasks[0].read_distance, 2);
         assert_eq!(inline.tasks[0].read_origin, super::ReadOrigin::Boundary);
         assert_eq!(inline.tasks[1].read_origin, super::ReadOrigin::Latest);
-        timeline.memory_budget_bytes = Some(inline.peak_memory_bytes - 1);
+        timeline.execution_peak_budget_bytes = Some(inline.peak_memory_bytes - 1);
         assert!(compile(&graph, &timeline, None).is_err());
-        timeline.memory_budget_bytes = None;
+        timeline.execution_peak_budget_bytes = None;
         graph.tasks[1].math = Some(serde_json::from_value(json!({"input_gradients":[],"parameter_gradients":[],"detached_inputs":[],"forward_rows":"","input_gradient_rows":"","parameter_gradient_rows":"","update_rows":"","reduction":"none"})).unwrap());
         let main = compile(&graph, &timeline, None).unwrap();
         assert!(main.tasks.iter().all(|t| t.lane == super::Lane::Main));
@@ -872,12 +872,12 @@ mod tests {
                 })
                 .max()
                 .unwrap();
-            timeline.memory_budget_bytes = Some(expected);
+            timeline.execution_peak_budget_bytes = Some(expected);
             assert_eq!(
                 compile(&graph, &timeline, None).unwrap().peak_memory_bytes,
                 expected
             );
-            timeline.memory_budget_bytes = Some(expected - 1);
+            timeline.execution_peak_budget_bytes = Some(expected - 1);
             assert!(compile(&graph, &timeline, None).is_err());
         }
     }
@@ -1009,7 +1009,7 @@ mod tests {
             }])).unwrap();
         }
         let timeline = decode_timeline(&json!({
-            "capabilities": [], "memory_budget_bytes": 100,
+            "capabilities": [], "execution_peak_budget_bytes": 100,
             "reserved_bytes": [0, 0, 24, 0],
             "anchors": (0..4).map(|anchor| json!({"symbol": format!("a{anchor}"), "ordinal": anchor})).collect::<Vec<_>>(),
             "value_resources": (0..3).map(|task| json!({"task": format!("t{task}"), "output": "value", "bytes": if task == 0 {8} else {32}})).collect::<Vec<_>>(),
@@ -1025,7 +1025,7 @@ mod tests {
             vec![vec![], vec![0], vec![1, 2]]
         );
         let mut roomy = timeline.clone();
-        roomy.memory_budget_bytes = Some(200);
+        roomy.execution_peak_budget_bytes = Some(200);
         graph.tasks[1].timing.before = "a2".into();
         graph.tasks[2].timing.after = "a2".into();
         graph.tasks[2].outputs[0].kind = super::super::semantic_graph::OutputKind::Host;
@@ -1048,7 +1048,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![], vec![], vec![0, 1]]
         );
-        roomy.memory_budget_bytes = Some(111);
+        roomy.execution_peak_budget_bytes = Some(111);
         assert!(compile(&graph, &roomy, None).is_err());
     }
 

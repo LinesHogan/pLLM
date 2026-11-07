@@ -56,7 +56,9 @@ def bind_host(
         if layouts.layouts
         else ()
     )
-    plan = compile_page_bundle_plan((graph, layouts), timeline, providers, 1, config.state_memory_bytes, config.device)
+    plan = compile_page_bundle_plan(
+        (graph, layouts), timeline, providers, 1, config.state_page_budget_bytes, config.device
+    )
     (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == "host.next")
     return math.bind(PageBundleArena(plan, device=config.device), anchor)
 
@@ -147,9 +149,9 @@ class HostConfig:
     hidden_size: int = 0
     target_shape: tuple[int, ...] = ()
     seed: int = 0
-    state_memory_bytes: int = 64 * 1024 * 1024
+    state_page_budget_bytes: int = 64 * 1024 * 1024
     max_input_rows: int | None = None
-    memory_budget_bytes: int | None = None
+    execution_peak_budget_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -157,21 +159,21 @@ class HostConfig:
             or self.hidden_size < 0
             or any(size < 1 for size in self.target_shape)
             or self.seed < 0
-            or self.state_memory_bytes < 0
+            or self.state_page_budget_bytes < 0
             or self.max_input_rows is not None
             and self.max_input_rows < 0
-            or self.memory_budget_bytes is not None
-            and self.memory_budget_bytes < 0
+            or self.execution_peak_budget_bytes is not None
+            and self.execution_peak_budget_bytes < 0
         ):
             raise ValueError(
                 "HostConfig needs a cpu or cuda device, positive target_shape sizes and nonnegative hidden_size, "
-                f"seed, state_memory_bytes, max_input_rows and memory_budget_bytes; got {self}"
+                f"seed, state_page_budget_bytes, max_input_rows and execution_peak_budget_bytes; got {self}"
             )
 
     def timeline(self) -> SchedulerTimeline:
         compute_capability = "compute/cpu@1" if self.device.type == "cpu" else "compute/cuda@1"
         return SchedulerTimeline(
-            memory_budget_bytes=self.memory_budget_bytes,
+            execution_peak_budget_bytes=self.execution_peak_budget_bytes,
             anchors=(
                 TimelineAnchor(AnchorSymbol("host.input.ready"), 0),
                 TimelineAnchor(AnchorSymbol("host.compute.end"), 1),

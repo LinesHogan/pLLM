@@ -169,7 +169,7 @@ class ProgramWave(Generic[DataT, ResultT]):
             )
             if resident > self.custom_forward.resident_bytes:
                 raise ValueError(
-                    f"custom-forward CUDA graphs need {resident} bytes; raise ExecutionOptions.capture_memory_bytes above {self.custom_forward.resident_bytes}"
+                    f"custom-forward CUDA graphs need {resident} bytes; raise ExecutionOptions.cuda_graph_pool_budget_bytes above {self.custom_forward.resident_bytes}"
                 )
         finally:
             restore()

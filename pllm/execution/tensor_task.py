@@ -3,7 +3,7 @@
 A TensorTask reads the method's inputs for the current rows, calls it, and stores the result. A
 training task also differentiates its loss with respect to the selected states' parameters and
 hands the per-state gradients to the optimizer. Export and sampler settings adapt the stored result
-after execution. TensorBinding builds one per declared method.
+after execution. TensorDeclaration builds one per declared method.
 """
 
 from __future__ import annotations
@@ -343,14 +343,14 @@ class TensorTask:
                 for borrowed in batch.borrowed_roots:
                     borrowed.check_output(result)
                 if self.policy.forward_rows:
-                    result = self._selected(result, inputs[self.policy.forward_rows])
+                    result = self.selected_rows(result, inputs[self.policy.forward_rows])
                 batch.results[self.symbol, name] = result
             if self.observe is not None:
                 self.observe(data, observed_inputs, tuple(batch.results[self.symbol, name] for name in self.outputs))
         return sources
 
     @staticmethod
-    def _selected(result: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def selected_rows(result: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Give unselected rows a zero result, on the device."""
         if result.ndim == 0 or result.shape[0] != len(mask):
             raise ValueError("selected forward functions must preserve their row axis")

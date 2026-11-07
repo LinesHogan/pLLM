@@ -21,7 +21,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.freeze import fingerprint
 from pllm.execution.task_memory import example, producers_first, site_arguments, task_example
-from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TensorBatch, TensorOperation
 from pllm.execution.token_program import Cell
@@ -76,7 +76,7 @@ def _op_cost(name: str, entries: list[tuple[str, float | None, float, CustomOpDe
 
 
 def _estimate_ops(
-    binding: TensorBinding, facts: BackendCompileFacts, calls: OpCalls
+    binding: TensorDeclaration, facts: BackendCompileFacts, calls: OpCalls
 ) -> tuple[tuple[OpCost, ...], dict[str, int]]:
     """Add model-site math that task tracing leaves to the native model driver."""
     kwargs = site_arguments(binding, facts)
@@ -157,7 +157,7 @@ class CostEstimate:
     label: str = "estimate: matmuls, logical bytes and source kernels per decode step; ignores cache reuse and fusion"
 
 
-def _traffic(binding: TensorBinding, facts: BackendCompileFacts, symbol: TaskSymbol) -> tuple[int, int]:
+def _traffic(binding: TensorDeclaration, facts: BackendCompileFacts, symbol: TaskSymbol) -> tuple[int, int]:
     task = next(task for task in binding.graph.tasks if task.symbol == symbol)
     scopes = {str(state.resource): state.scope for state in binding.graph.states}
     sizes = {
@@ -208,7 +208,7 @@ def _copy_kernels(operation: TensorOperation[TensorFrame], batch: TensorBatch) -
 
 
 def _sampler_kernels(
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     facts: BackendCompileFacts,
     symbol: TaskSymbol,
     batch: TensorBatch,
@@ -257,14 +257,14 @@ def _sampler_kernels(
                 )
             else:
                 dense = torch.mm(prediction.to(dtype), weights.T)[:, : facts.vocab_size]
-                SamplerGuidance._reweight_finite_survivors(logits, SignedSamplerGuidance(guidance, dense))  # pyright: ignore[reportPrivateUsage]
+                SamplerGuidance.reweight_finite_survivors(logits, SignedSamplerGuidance(guidance, dense))
         elif task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
             add_logits(logits, SignedSamplerGuidance(guidance, prediction))
     return counter.count
 
 
 def estimate_tasks(
-    binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions, *, padded_vocab_size: int
+    binding: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions, *, padded_vocab_size: int
 ) -> tuple[dict[str, CostEstimate], tuple[OpCost, ...], dict[str, int]]:
     """Trace the production shape-only operation, including training backward and optimizer work."""
     # Decode has one row per request even for stateless layer-logit readers.

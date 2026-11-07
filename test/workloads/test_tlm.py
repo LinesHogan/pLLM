@@ -62,7 +62,7 @@ class TinyCausalPort:
         return torch.tanh((hidden @ weights[0].T) + (hidden @ weights[1].T)) @ self.head
 
 
-def _facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
+def causal_facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
     """Single-device facts before workload template reservations."""
     kind = StateDeviceKind(model.device.type)
     timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
@@ -82,10 +82,11 @@ def _facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
 
 
 def _compile(model, config: TLMConfig):
-    return TLMWorkload(config, 2, 2).compile_backend(_facts(model), causal=model.bind).execution
+    return TLMWorkload(config, 2, 2).compile_backend(causal_facts(model), causal=model.bind).execution
 
 
-def _input(batch):
+def batch_input(batch):
+    """Wrap a host training batch in a rowless step input."""
     rows = PackedPhaseRowBatch.from_rows(0, 0, ())
     return StepInput(rows, PackedSamplerRowBatch.from_links(rows, ()), batch=batch)
 
@@ -132,7 +133,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        result = execution.step(_input(batch))
+        result = execution.step(batch_input(batch))
         (current,) = result.publication.after_refs
         assert current.version_id == version and result.metrics["selected_count"] == 2
         if version == 1:
@@ -166,10 +167,10 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
     for mode in TLMMode:
         config = TLMConfig(mode=mode, threshold=0.0)
         limits = (TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),)),)
-        workload, facts = TLMWorkload(config, 2, 2), _facts(model)
+        workload, facts = TLMWorkload(config, 2, 2), causal_facts(model)
         timeline = workload.resource_facts(workload.build(facts), facts, ExecutionOptions())
         assert min(timeline.reserved_bytes) == model.resident_bytes
-        execution = workload.compile_backend(_facts(model, task_resources=limits), causal=model.bind).execution
+        execution = workload.compile_backend(causal_facts(model, task_resources=limits), causal=model.bind).execution
         (initial,) = execution.admit(())
         tokens = torch.zeros((2, 3), dtype=torch.int64)
         with pytest.raises(ValueError):  # Larger than the planned input shape.
@@ -199,13 +200,13 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
             batch,
             config,
         )
-        result = execution.step(_input(batch))
+        result = execution.step(batch_input(batch))
         torch.testing.assert_close(result.loss, expected)
         assert result.publication is not None and result.metrics["selected_count"] == 1
         execution.retire(())
         skipped = _compile(model, replace(config, threshold=1e6))
         (initial,) = skipped.admit(())
-        result = skipped.step(_input(batch))
+        result = skipped.step(batch_input(batch))
         assert result.publication is not None and result.metrics["selected_count"] == 0
         assert skipped.arena.latest(initial.lineage_id).version_id == initial.version_id + 1
         skipped.retire(())

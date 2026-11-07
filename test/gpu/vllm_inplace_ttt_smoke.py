@@ -182,10 +182,10 @@ def _check_cancelled_projection(handle):
     from pllm.contracts.hidden_locator import HiddenPhase
     from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 
-    execution = handle.runner.require_session()._deployment.execution
+    execution = handle.runner.require_session().deployment.execution
     from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay
 
-    overlay = handle.runner.require_session()._overlay
+    overlay = handle.runner.require_session().parameter_overlay
     if isinstance(overlay, HybridParameterOverlay):
         overlay = overlay.pinned
     reader = overlay.readers[0]
@@ -228,19 +228,19 @@ def _check_cancelled_projection(handle):
 
 def _check_graph(handle):
     """Pinned graph operands reach training as row counts and request order change."""
-    from pllm.backends.vllm.parameter_overlay import PinnedParameterOverlay, _ProjectionReader
+    from pllm.backends.vllm.parameter_overlay import PinnedParameterOverlay, ProjectionReader
 
-    overlay = handle.runner.require_session()._overlay
+    overlay = handle.runner.require_session().parameter_overlay
     assert isinstance(overlay, PinnedParameterOverlay)
     reader = overlay.readers[0]
-    arena = handle.runner.require_session()._deployment.execution.arena
+    arena = handle.runner.require_session().deployment.execution.arena
     assert all(
         pool.untyped_storage() == arena.field_pool(reader.binding.resource, view.field).untyped_storage()
         for pool, view in zip(reader.pools, reader.binding.fields, strict=True)
     )
     pointers = (reader.table.data_ptr(), reader.captured.data_ptr(), reader.pools[0].data_ptr())
     prompts = ["The sky is blue. " * 8, "Water freezes when it is cold. " * 2]
-    with patch.object(_ProjectionReader, "emit", side_effect=AssertionError("warm replay called Python projection")):
+    with patch.object(ProjectionReader, "emit", side_effect=AssertionError("warm replay called Python projection")):
         first = texts(handle.generate(prompts, SAMPLING))
         assert texts(handle.generate(list(reversed(prompts)), SAMPLING)) == first[::-1]
         assert texts(handle.generate(prompts[:1], SAMPLING)) == first[:1]
@@ -256,10 +256,10 @@ def _check_hybrid(handle):
     """Prefill selects source execution; decode replays the bound projection kernels."""
     from vllm.config import CUDAGraphMode
 
-    from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay, _ProjectionReader
+    from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay, ProjectionReader
     from pllm.contracts.hidden_locator import HiddenPhase
 
-    overlay = handle.runner.require_session()._overlay
+    overlay = handle.runner.require_session().parameter_overlay
     assert isinstance(overlay, HybridParameterOverlay)
     manager = handle.runner.cudagraph_manager
     dispatch = manager.dispatch
@@ -273,7 +273,7 @@ def _check_hybrid(handle):
     prompts = ["The sky is blue. " * 18, "Water is cold. " * 8]
     with (
         patch.object(manager, "dispatch", record),
-        patch.object(_ProjectionReader, "emit", side_effect=AssertionError("warm hybrid called Python pinned reader")),
+        patch.object(ProjectionReader, "emit", side_effect=AssertionError("warm hybrid called Python pinned reader")),
     ):
         first = texts(handle.generate(prompts, SAMPLING))
         assert texts(handle.generate(list(reversed(prompts)), SAMPLING)) == first[::-1]
@@ -395,7 +395,9 @@ def checkpoint_ttt() -> None:
                 max_num_seqs=2,
                 max_model_len=32,
                 max_num_batched_tokens=32,
-                execution=pllm.ExecutionOptions(allow_numerical_transforms=False, capture_memory_bytes=512 << 20),
+                execution=pllm.ExecutionOptions(
+                    allow_numerical_transforms=False, cuda_graph_pool_budget_bytes=512 << 20
+                ),
             )
             with (
                 patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=32 << 20)),
@@ -452,7 +454,7 @@ def community_t2(checkpoint: str) -> None:
         max_num_seqs=1,
         max_num_batched_tokens=options.chunk_size + 8,
         cuda_graphs=False,
-        execution=pllm.ExecutionOptions(allow_numerical_transforms=False, memory_budget_bytes=5 << 30),
+        execution=pllm.ExecutionOptions(allow_numerical_transforms=False, execution_peak_budget_bytes=5 << 30),
     )
     with (
         patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=512 << 20)),
@@ -505,17 +507,17 @@ def main() -> int:
     scenarios = (
         (
             "dense_strict",
-            lambda: open_llm(dense, memory_budget_bytes=1 << 30, allow_numerical_transforms=False),
+            lambda: open_llm(dense, execution_peak_budget_bytes=1 << 30, allow_numerical_transforms=False),
             lambda h: _check(h, "dense strict"),
         ),
         (
             "dense_768",
-            lambda: open_llm(dense, memory_budget_bytes=768 << 20),
+            lambda: open_llm(dense, execution_peak_budget_bytes=768 << 20),
             lambda h: _check(h, "dense window"),
         ),
         (
             "dense_1536",
-            lambda: open_llm(dense, memory_budget_bytes=1536 << 20),
+            lambda: open_llm(dense, execution_peak_budget_bytes=1536 << 20),
             lambda h: _check(h, "dense tree"),
         ),
         (
@@ -524,7 +526,7 @@ def main() -> int:
                 headwise,
                 tokens=2048,
                 model_length=1024,
-                memory_budget_bytes=256 << 20,
+                execution_peak_budget_bytes=256 << 20,
                 allow_numerical_transforms=True,
             ),
             lambda h: _check(h, "gated strict"),
@@ -535,7 +537,7 @@ def main() -> int:
                 replace(headwise, config=replace(headwise.config, visibility="forward_pinned")),
                 tokens=2048,
                 model_length=1024,
-                memory_budget_bytes=256 << 20,
+                execution_peak_budget_bytes=256 << 20,
             ),
             lambda h: _check(h, "gated tree"),
         ),
@@ -549,8 +551,8 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=256 << 20,
-                memory_budget_bytes=1 << 30,
+                cuda_graph_pool_budget_bytes=256 << 20,
+                execution_peak_budget_bytes=1 << 30,
             ),
             lambda h: _check_graph(h),
         ),
@@ -564,8 +566,8 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=256 << 20,
-                memory_budget_bytes=1 << 30,
+                cuda_graph_pool_budget_bytes=256 << 20,
+                execution_peak_budget_bytes=1 << 30,
                 allow_numerical_transforms=False,
             ),
             _check_graph,
@@ -577,8 +579,8 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=512 << 20,
-                memory_budget_bytes=3 << 30,
+                cuda_graph_pool_budget_bytes=512 << 20,
+                execution_peak_budget_bytes=3 << 30,
             ),
             _check_graph,
         ),
@@ -589,8 +591,8 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=512 << 20,
-                memory_budget_bytes=2 << 30,
+                cuda_graph_pool_budget_bytes=512 << 20,
+                execution_peak_budget_bytes=2 << 30,
             ),
             _check_hybrid,
         ),
@@ -601,8 +603,8 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=512 << 20,
-                memory_budget_bytes=2 << 30,
+                cuda_graph_pool_budget_bytes=512 << 20,
+                execution_peak_budget_bytes=2 << 30,
             ),
             _check_hybrid,
         ),
@@ -613,8 +615,8 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=512 << 20,
-                memory_budget_bytes=3 << 30,
+                cuda_graph_pool_budget_bytes=512 << 20,
+                execution_peak_budget_bytes=3 << 30,
             ),
             _check_hybrid,
         ),
@@ -626,17 +628,20 @@ def main() -> int:
                 tokens=128,
                 model_length=128,
                 cuda_graphs=True,
-                capture_memory_bytes=512 << 20,
-                memory_budget_bytes=1 << 30,
+                cuda_graph_pool_budget_bytes=512 << 20,
+                execution_peak_budget_bytes=1 << 30,
             ),
             _check_graph,
         ),
         ("low_rank", lambda: open_llm(RequestLowRankTTT()), lambda h: _check(h, "request low-rank")),
-        ("imported", lambda: open_llm(ImportedLowRank(), memory_budget_bytes=1 << 30), _check_imported),
+        ("imported", lambda: open_llm(ImportedLowRank(), execution_peak_budget_bytes=1 << 30), _check_imported),
         (
             "graph_imported",
             lambda: open_llm(
-                ImportedLowRank(), cuda_graphs=True, capture_memory_bytes=512 << 20, memory_budget_bytes=1 << 30
+                ImportedLowRank(),
+                cuda_graphs=True,
+                cuda_graph_pool_budget_bytes=512 << 20,
+                execution_peak_budget_bytes=1 << 30,
             ),
             _check_imported,
         ),
@@ -719,12 +724,12 @@ def preemption_replays():
                 max_num_batched_tokens=64,
                 enable_chunked_prefill=True,
                 seed=7,
-                execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+                execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
             ),
         ) as handle,
     ):
         session = handle.runner.require_session()
-        with patch.object(session, "_preempt", wraps=session._preempt) as preempt:
+        with patch.object(session, "preempt_requests", wraps=session.preempt_requests) as preempt:
             outputs = handle.generate(
                 ["The number is"] * 8, SamplingParams(max_tokens=80, temperature=0, ignore_eos=True)
             )

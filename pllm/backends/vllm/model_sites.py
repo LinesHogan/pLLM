@@ -94,7 +94,7 @@ class ModelSites:
         self.count = 0  # rows of the current hook call (vLLM may pad the step's rows)
         self._requests_of = torch.zeros(rows, dtype=torch.long, device=weight.device)
         carries = {rewrite.memory.carry for rewrite in rewrites if rewrite.memory is not None}
-        self._sources = tuple(
+        self.state_inputs = tuple(
             dict.fromkeys(
                 source
                 for rewrite in rewrites
@@ -103,10 +103,10 @@ class ModelSites:
             )
         )
         if attention_program is not None:
-            self._sources = tuple(
+            self.state_inputs = tuple(
                 dict.fromkeys(
                     (
-                        *self._sources,
+                        *self.state_inputs,
                         *(
                             source
                             for method in attention_program.methods.values()
@@ -122,7 +122,7 @@ class ModelSites:
             if rewrite.memory is not None
         }
         self._result_sources = tuple(dict.fromkeys(source for rewrite in rewrites for source in rewrite.results))
-        self._results = {
+        self.result_values = {
             source: torch.zeros((rows, *source.shape), device=weight.device, dtype=source.dtype)
             for source in self._result_sources
         }
@@ -139,14 +139,14 @@ class ModelSites:
         # An uncreated event makes wait_event a no-op, so create it before model graph capture.
         for ready in self._prefetch.values():
             ready.record()
-        self._states: dict[StateInput, Tensor] = {}
-        for source in self._sources:
+        self.state_values: dict[StateInput, Tensor] = {}
+        for source in self.state_inputs:
             field = source.view.read(arena.field_pool(source.resource, source.view.field), pooled=True)[0]
             leading = (requests,) if source.request else ()
-            self._states[source] = field.new_zeros((*leading, *field.shape))
-        self.hooks: list[_Boundary | _Value] = []
+            self.state_values[source] = field.new_zeros((*leading, *field.shape))
+        self.hooks: list[SublayerBoundary | ValueProjection] = []
         self._installed: list[tuple[torch.nn.Module, Forward]] = []
-        self._ends: dict[int, _Boundary] = {}
+        self._ends: dict[int, SublayerBoundary] = {}
         values = {
             layer: decoder.value_rows(layer)
             for layer in sorted(
@@ -156,7 +156,7 @@ class ModelSites:
         }
         # Each earlier value in the shape methods read: value rows [rows, kv_heads, head_dim] or the stream.
         stream_shape = (self.streams, self.hidden) if self.streams > 1 else (self.hidden,)
-        self._earlier = {
+        self.earlier_values = {
             source: weight.new_zeros(
                 (rows, values[source.layer][2] // values[source.layer][3], values[source.layer][3])
                 if source.kind == "value"
@@ -182,7 +182,7 @@ class ModelSites:
                 if layer == count
                 else f"model.layers.{layer}.{'post_attention_layernorm' if attention else 'input_layernorm'}"
             )
-            boundary = _Boundary(
+            boundary = SublayerBoundary(
                 self,
                 kernel,
                 before,
@@ -213,7 +213,7 @@ class ModelSites:
                 self.hooks.append(boundary)
         for layer, (module, start, width, head_dim) in values.items():
             keeps = EarlierInput("value", layer)
-            hook = _Value(
+            hook = ValueProjection(
                 self,
                 module.forward,
                 layer,
@@ -240,14 +240,14 @@ class ModelSites:
     @property
     def needs_step(self) -> bool:
         """Whether hooks consume versioned state, task results or retained request memory."""
-        return bool(self._sources or self._result_sources or self._memories)
+        return bool(self.state_inputs or self._result_sources or self._memories)
 
     def run_hook(self, hook: int, inputs: list[Tensor], outputs: list[Tensor]) -> None:
         """Keep orchestration opaque to Dynamo; declare only scratch and private pools writable."""
-        reads = [self._requests_of, *self._states.values(), *self._results.values()]
+        reads = [self._requests_of, *self.state_values.values(), *self.result_values.values()]
         if self._activation is not None:
             reads.extend(self._activation.buffers)
-        writes = [*self._earlier.values()]
+        writes = [*self.earlier_values.values()]
         for memory in self._memories.values():
             reads.extend((memory.table, memory.rows))
             writes.extend(memory.pools)
@@ -272,16 +272,16 @@ class ModelSites:
             if source in self._prefetch:
                 assert context.prefetch_stream is not None
                 with torch.cuda.stream(context.prefetch_stream):
-                    self._results[source][: len(value)].copy_(value)
+                    self.result_values[source][: len(value)].copy_(value)
                     self._prefetch[source].record(context.prefetch_stream)
             else:
-                self._results[source][: len(value)].copy_(value)
+                self.result_values[source][: len(value)].copy_(value)
         requests = tuple(dict.fromkeys(row.identity for row in rows.rows))
         # Each packed row's index into `requests`, the order request state is staged in below.
         index = {identity: position for position, identity in enumerate(requests)}
         positions = tuple(index[row.identity] for row in rows.rows)
         self._requests_of[: len(positions)].copy_(upload(positions, self._requests_of.device))
-        for source in self._sources:
+        for source in self.state_inputs:
             versions = (
                 context.read_versions(requests, source.resource, directory)
                 if source.request
@@ -289,7 +289,7 @@ class ModelSites:
             )
             for index, (pin, ref) in enumerate(versions):
                 field = source.view.read(context.arena.borrow_field(pin, ref, source.view.field))
-                (self._states[source][index] if source.request else self._states[source]).copy_(field)
+                (self.state_values[source][index] if source.request else self.state_values[source]).copy_(field)
         for memory in self._memories.values():
             memory.prepare(rows, context)
 
@@ -304,16 +304,16 @@ class ModelSites:
         return values[: self.count] if self.rows is None else values.index_select(0, self.rows)
 
     def state(self, source: StateInput) -> Tensor:
-        staged = self._states[source]
+        staged = self.state_values[source]
         return staged.index_select(0, self.current_rows(self._requests_of)) if source.request else staged
 
     def result(self, source: ResultInput) -> Tensor:
         if source in self._prefetch:
             torch.cuda.current_stream().wait_event(self._prefetch[source])
-        return self.current_rows(self._results[source])
+        return self.current_rows(self.result_values[source])
 
     def earlier(self, source: EarlierInput) -> Tensor:
-        return self.current_rows(self._earlier[source])
+        return self.current_rows(self.earlier_values[source])
 
     def patch(self, source: PatchInput, layer: int) -> Callable[[Tensor], Tensor]:
         assert self._activation is not None
@@ -332,11 +332,11 @@ class ModelSites:
 
     def keep(self, source: EarlierInput, values: Tensor) -> None:
         """Copy the current rows' value at an earlier place for methods later in this forward."""
-        self.store_rows(self._earlier[source], values)
+        self.store_rows(self.earlier_values[source], values)
 
     def frozen(self, start: int, stop: int, hidden: Tensor) -> None:
         """Seed skipped layers' readouts with the frozen stream before computed rows overwrite them."""
-        for source in self._earlier:
+        for source in self.earlier_values:
             if source.kind != "value" and start <= source.layer < stop:
                 self.keep(source, hidden)
         if self.taps is not None:
@@ -362,7 +362,7 @@ class ModelSites:
 
 
 @dataclass
-class _Boundary:
+class SublayerBoundary:
     """One norm between sublayers: completes the sublayer `before` it, normalizes the input of the one `after` it."""
 
     sites: ModelSites
@@ -551,7 +551,7 @@ class _Boundary:
 
 
 @dataclass
-class _Value:
+class ValueProjection:
     """A layer's qkv projection: the owner rewrites its value rows before attention reads and caches them."""
 
     sites: ModelSites

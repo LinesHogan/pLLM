@@ -773,7 +773,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             assert context.next_task == len(plan.tasks) or dense_anchor <= plan.tasks[context.next_task].anchor_id
             while context.next_task < len(plan.tasks) and int(plan.tasks[context.next_task].anchor_id) == dense_anchor:
                 task = plan.tasks[context.next_task]
-                self._execute_task(context, task)
+                self.execute_task(context, task)
                 context.next_task += 1
             context.last_anchor_id = dense_anchor
         except WindowBackpressure:
@@ -782,7 +782,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         except Exception as exc:
             self._failed(context, exc)
 
-    def _execute_task(self, context: StateTaskContext[DataT], task: PhysicalTask) -> None:
+    def execute_task(self, context: StateTaskContext[DataT], task: PhysicalTask) -> None:
         """Borrow the same exact versions on the chosen lane until its kernels finish."""
         prefetch = task.lane == "side" and task.read_origin != "latest"
         stream = self.side_stream if prefetch else context.pin.stream

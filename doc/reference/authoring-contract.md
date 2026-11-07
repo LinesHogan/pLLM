@@ -264,7 +264,7 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 请求状态按每行所属请求的版本读取。框架用模型自己的融合 add+norm kernel 归一化方法写出的流，
 所以恒等方法与原模型逐位相同。定制残差在模型的 CUDA graph 里运行：vLLM 捕获模型原本的算子而不是 inductor
 融合后的算子，所以恒等方法与 eager 模式的原生 vLLM 逐位相同（与默认的融合版原生 vLLM 有舍入差异）。带状态的
-方法需要更大的 `ExecutionOptions(capture_memory_bytes=...)`。定制残差需要 `tensor_parallel_size=1`，且要求关闭前缀缓存。它与 `@pllm.custom_forward` 组合：
+方法需要更大的 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`。定制残差需要 `tensor_parallel_size=1`，且要求关闭前缀缓存。它与 `@pllm.custom_forward` 组合：
 custom forward 运行的每一层也经过这些方法。
 
 带 `state=` 与 `chunk=` 的方法是一个**状态子层**（TTT / Titans 风格的快权重记忆）：`state` 是只有一个
@@ -505,7 +505,7 @@ loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独
 描述数学函数的真实访问，撒谎不会被当场发现，但会产生错误的计划。
 
 自定义高级数据流：继承 `a.BackendWorkload[Data, Result]`，从 `declaration` 返回持有原始
-图/布局/附着的 `TensorBinding`，带原生 `bind_math` 与 `backend_requirements`。旧的 `a.Workload`
+图/布局/附着的 `TensorDeclaration`，带原生 `bind_math` 与 `backend_requirements`。旧的 `a.Workload`
 build 包装已移除。新的局部操作获得基于负载/名字的 ID，除非绑定了显式实现。
 持久布局命名空间与实现标识不做机械重命名。
 
@@ -589,7 +589,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 之后的 monkey patch 只影响新绑定的执行。TTRL 是维护中的范例：多数投票、
 平局规则、采样限制与重试/栅栏构造是 `ttrl_vote` 的数学，原始 completion 对象保留。
 
-有界宿主执行使用 `HostConfig(max_input_rows=..., memory_budget_bytes=...)`。框架用
+有界宿主执行使用 `HostConfig(max_input_rows=..., execution_peak_budget_bytes=...)`。框架用
 最大形状的 `WeightedRowBatch`（含 `target_shape`）执行实际 loss/update 路径来推导资源，不要求负载申报字节；
 超过 `max_input_rows` 的输入在 `step` 前被拒绝。
 
@@ -756,7 +756,7 @@ AdamW 直接更新页池；CPU 和其他 dtype 共享 PyTorch 优化器路径。
 永不写入；发布、跨流排序、回滚与页生命周期仍归 PTTS。
 
 捕获使用固定输入上限和私有图池；绑定前检查表容量，捕获后核对真实池大小与
-`capture_memory_bytes`。负载不计算槽表、校正张量或优化器临时空间的字节公式。
+`cuda_graph_pool_budget_bytes`。负载不计算槽表、校正张量或优化器临时空间的字节公式。
 
 ### 资源事实与内存预算
 
@@ -764,15 +764,15 @@ AdamW 直接更新页池；CPU 和其他 dtype 共享 PyTorch 优化器路径。
 不另写一套数学或字节公式。它追踪真实的 StepCapture/TensorTask、加权训练、
 原生 overlay 与区域扫描；Triton 内核使用 Torch 注册的 fake 实现。存储别名共享
 计数，autograd 保存值和返回后保留值持续计入；分配按 512 字节对齐，并计入大块不拆分余量。
-输入页另行计账，捕获池仍使用 `capture_memory_bytes`，规划不初始化 CUDA。
+输入页另行计账，捕获池仍使用 `cuda_graph_pool_budget_bytes`，规划不初始化 CUDA。
 
 任务对象提供自己的资源投影，发布只改变已有页的所有权元数据。并发生产者声明
 可执行 `TensorComputation` 与输入形状，框架将其峰值保留到每个 worker anchor。
 In-Place-TTT 的区域源码留在负载，TensorScan 负责区域预算和恢复生命周期。
 宿主有限训练需要 `max_input_rows`；有宿主选择条件时提供最大形状样例。
 
-`memory_budget_bytes` 约束 AER 中的状态、驻留、工作区和结果，不等于整个进程
-显存或 arena 的 `state_memory_bytes`。原时间轴与用户预算求交，不能放松限制；
+`execution_peak_budget_bytes` 约束 AER 中的状态、驻留、工作区和结果，不等于整个进程
+显存或 arena 的 `state_page_budget_bytes`。原时间轴与用户预算求交，不能放松限制；
 `None` 不加限制，零就是零字节。未声明的模型/KV、分配器及外部库内存仍不在此界内。
 
 输入与导出结果仍遵循原有生命周期：连续行可借用视图，不规则行会打包；
@@ -803,7 +803,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | GTTA | Python 字典中的动力学记忆；FIFO 轨迹、update-before-query，查询失败保留更新 |
 | TTRL | 宿主 `ttrl_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
-`Builder.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
+`TensorDeclaration.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
 的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Adapter/激活绑定与两种原始 replay 效果保持彼此独立。
 可表达不等于支持任意组合：后端能力检查仍拒绝不支持的组合。表中所有条目都执行
 通过这个接口构造的声明。它们既有的数学 oracle 独立于构建器；本次迁移不蕴含

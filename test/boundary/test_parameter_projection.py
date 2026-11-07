@@ -102,7 +102,7 @@ def test_row_weight_operand_bypasses_overlay():
     """An identity dequantization borrows base weights and restores the installed projection hook."""
     from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
 
-    from pllm.backends.vllm.parameter_overlay import _ProjectionHook, base_weight
+    from pllm.backends.vllm.parameter_overlay import ProjectionHook, base_weight
 
     class IdentityMethod(LinearMethodBase):
         def create_weights(self, *args, **kwargs):
@@ -117,7 +117,7 @@ def test_row_weight_operand_bypasses_overlay():
     module.params_dtype = torch.float32
     module.input_size_per_partition = module.output_size_per_partition = module.tp_size = 2
     module.quant_method = IdentityMethod()
-    hook = _ProjectionHook(module)
+    hook = ProjectionHook(module)
 
     def overlay(hidden):
         return hidden @ module.weight.T + 1, None

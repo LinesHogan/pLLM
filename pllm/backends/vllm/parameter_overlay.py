@@ -73,7 +73,7 @@ def _row_parallel(module: LinearBase) -> bool:
     return isinstance(module, RowParallelLinear) and module.tp_size > 1
 
 
-class _ProjectionHook:
+class ProjectionHook:
     """Put a down delta inside vLLM's GEMM, before its own row all-reduce.
 
     TP1 keeps the established forward hook. TP>1 intercepts only quant_method.apply;
@@ -176,7 +176,7 @@ class _ExactProjection:
         self.embedding = embedding
         self.module, self.mlp = module, mlp
         self.bindings = slices
-        self.hook = _ProjectionHook(module)
+        self.hook = ProjectionHook(module)
         self.original_forward = self.hook.base
         self.original_mlp_forward = None if mlp is None else mlp.forward
         self.prepared: tuple[_PreparedRows, ...] = ()
@@ -306,7 +306,7 @@ class ExactParameterOverlay:
             _ExactProjection(module, mlp, tuple(slices), self.embedding) for module, mlp, slices in modules.values()
         )
         self.device = device
-        self._staging = PinnedStaging()
+        self.operand_staging = PinnedStaging()
         for handle in self._modules:
             handle.hook.install(handle.forward)
             if handle.mlp is not None:
@@ -335,12 +335,12 @@ class ExactParameterOverlay:
         for row in rows.rows:
             grouped.setdefault((row.identity, row.phase), []).append(row)
         table = torch.empty((rows.total_rows + len(grouped),), dtype=torch.long, device=self.device)
-        host = self._staging.take(table.numel())
+        host = self.operand_staging.take(table.numel())
         host[: rows.total_rows] = [row.packed_row_index for source in grouped.values() for row in source]
         host[rows.total_rows :] = [
             source[-1].token_offset == source[-1].prompt_length - 1 for source in grouped.values()
         ]
-        self._staging.copy_to(table)
+        self.operand_staging.copy_to(table)
         indices = torch.split(table[: rows.total_rows], [len(source) for source in grouped.values()])
         prompt_ends = table[rows.total_rows :].bool().unbind()
         requests = tuple(
@@ -422,7 +422,7 @@ def uniform_decode(prefill: bool, counts: tuple[int, ...]) -> bool:
     return not prefill and all(count == 1 for count in counts)
 
 
-_READERS: dict[int, "_ProjectionReader"] = {}
+_READERS: dict[int, "ProjectionReader"] = {}
 
 
 @torch.library.custom_op("pllm::pinned_projection", mutates_args={"output", "captured", "desired_capture", "pools"})
@@ -454,7 +454,7 @@ def _projection_meta(
 pinned_projection.register_fake(_projection_meta)  # pyright: ignore[reportUnknownMemberType]
 
 
-class _ProjectionReader:
+class ProjectionReader:
     """A target's stable tensor ports; the invocation supplies all pin-authorized indices."""
 
     def __init__(
@@ -470,7 +470,7 @@ class _ProjectionReader:
         in_program: bool = False,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
-        self.hook = _ProjectionHook(self.module)
+        self.hook = ProjectionHook(self.module)
         self.forward_base = self.hook.base
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
@@ -657,7 +657,7 @@ class PinnedParameterOverlay:
         in_program: bool = False,
     ) -> None:
         self.readers = tuple(
-            _ProjectionReader(decoder, binding, arena, rows, requests, budget, math=math, in_program=in_program)
+            ProjectionReader(decoder, binding, arena, rows, requests, budget, math=math, in_program=in_program)
             for binding in bindings
         )
         self.phases = phases

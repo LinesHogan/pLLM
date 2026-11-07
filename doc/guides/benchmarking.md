@@ -23,8 +23,8 @@
 ## 我要调整形状与预算
 
 共享 CLI 接受 `--model`、`--batch`、`--tokens`、`--rounds`、`--warmup`、
-`--gpu-memory-utilization`、`--capture-memory-mib`、`--state-memory-mib`、
-可选的 `--execution-memory-mib` 与 `--profile DIRECTORY`。默认
+`--gpu-memory-utilization`、`--cuda-graph-pool-budget-mib`、`--state-page-budget-mib`、
+可选的 `--execution-peak-budget-mib` 与 `--profile DIRECTORY`。默认
 Qwen2.5-0.5B、批次 8、256 token、三轮、一轮预热与 0.25 GPU 显存利用率。
 输入固定为种子 7、温度 0.8、top-p 0.95、忽略 EOS、禁用前缀缓存、`n=sampling_n`
 （每个 prompt 的样本是独立请求，各有自己的样本序号）——
@@ -32,17 +32,17 @@ Qwen2.5-0.5B、批次 8、256 token、三轮、一轮预热与 0.25 GPU 显存�
 
 三个内存参数容易被误读，逐个说清：
 
-- `--capture-memory-mib`（默认 256）：每任务捕获的驻留上限，原样传给公共
+- `--cuda-graph-pool-budget-mib`（默认 256）：每个任务及模型捕获池的预算，原样传给公共
   `ExecutionOptions`。更大的形状可能需要更大的显式上限；资金不足的捕获会
   失败，而不是改变形状、禁用捕获或选择回退。失败是设计行为，别当成 bug 修。
-- `--state-memory-mib`（默认 256）：固定的基准状态容量，经
-  `ExecutionOptions.state_memory_bytes` 进入原始签名计划。它必须放得下后端
+- `--state-page-budget-mib`（默认 256）：固定的基准状态容量，经
+  `ExecutionOptions.state_page_budget_bytes` 进入原始签名计划。它必须放得下后端
   观测到的可用内存；Rust 拒绝不足的状态容量。注意这是 arena 预算，不是
-  模型/KV/scratch 总内存。正常执行默认取观测容量（`state_memory_bytes=0`），
+  模型/KV/scratch 总内存。正常执行默认取观测容量（`state_page_budget_bytes=0`），
   其变化合法地改变计划签名；固定基准容量的意义在于让精确计时与性能分析的
   重建可复现。
-- `--execution-memory-mib`（可选）：把有限的
-  `ExecutionOptions.memory_budget_bytes` 传给原始 AER timeline。省略即不加
+- `--execution-peak-budget-mib`（可选）：把有限的
+  `ExecutionOptions.execution_peak_budget_bytes` 传给原始 AER timeline。省略即不加
   限制，零即零容量。它包含所有声明的状态/驻留/预留/工作区/存活结果成本，
   但不约束未声明的模型/KV、分配器或库内存。缺失任务/输出成本或容量不足会
   拒绝规划——同样不减少工作量、不禁用捕获。

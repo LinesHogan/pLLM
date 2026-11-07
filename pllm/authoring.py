@@ -38,7 +38,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.step_input import StepInput as StepInput
-from pllm.execution.tensor_binding import StepResult as StepResult, TensorBinding
+from pllm.execution.tensor_declaration import StepResult as StepResult, TensorDeclaration
 from pllm.execution.tensor_program import FunctionMath as FunctionMath
 from pllm.kernels.adamw import AdamWConfig
 
@@ -108,14 +108,14 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
 
     @abstractmethod
     def resource_facts(
-        self, declaration: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
+        self, declaration: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions
     ) -> SchedulerTimeline:
         """Measure the declaration's task resources and reserve its retained state templates."""
         ...
 
     def specialize(
         self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
-    ) -> tuple[BackendCompileFacts, TensorBinding]:
+    ) -> tuple[BackendCompileFacts, TensorDeclaration]:
         """Measure and fund the declaration on this backend, then declare against the funded facts as workers do;
         planning and binding reuse both."""
         facts = _apply_options(facts, options)
@@ -126,7 +126,9 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         declaration.gather_bytes = measured.gather_bytes
         return facts, declaration
 
-    def funded_declaration(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+    def funded_declaration(
+        self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
+    ) -> TensorDeclaration:
         """The declaration on funded facts: tensor tasks funded resident memory run as captured CUDA graphs. The
         driver and every worker process declare here, so their graphs agree."""
         declaration = self.build(facts, causal=causal)
@@ -134,11 +136,11 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         return declaration
 
     @abstractmethod
-    def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorBinding:
+    def build(self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None) -> TensorDeclaration:
         """Declare the graph, logical layouts, effects and tensor tasks; never a physical plan."""
         ...
 
-    def plan_backend(self, facts: BackendCompileFacts, declaration: TensorBinding) -> BackendAttachment:
+    def plan_backend(self, facts: BackendCompileFacts, declaration: TensorDeclaration) -> BackendAttachment:
         """Plan the specialized declaration; binding reuses the same declaration."""
         graph, layouts, attachment = declaration.finish()
         plan = compile_page_bundle_plan(
@@ -146,7 +148,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             facts.timeline,
             facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
-            facts.state_memory_budget_bytes,
+            facts.state_page_budget_bytes,
             facts.device,
         )
         return bind_backend_attachment(
@@ -158,7 +160,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         self,
         facts: BackendCompileFacts,
         plan: PlanBundle,
-        declaration: TensorBinding,
+        declaration: TensorDeclaration,
         *,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> MathBinding[StepInput, DataT, ResultT]:
@@ -169,7 +171,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         self,
         facts: BackendCompileFacts,
         attachment: BackendAttachment,
-        declaration: TensorBinding,
+        declaration: TensorDeclaration,
         *,
         is_output_rank: bool = True,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
@@ -179,7 +181,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
         if not is_output_rank:
             math = replace(math, on_export=None)
         arena = PageBundleArena(
-            plan, device=facts.device, _owned_resources=math.local_resources(plan), map_host=map_host
+            plan, device=facts.device, owned_resources=math.local_resources(plan), map_host=map_host
         )
         (sampler,) = (
             AnchorId(anchor.ordinal) for anchor in plan.timeline.anchors if anchor.symbol == "sampler.pre_draw"
@@ -203,10 +205,10 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
     """The execution options the declaration and plan depend on: capabilities, budgets, tensor policy, visibility."""
     from pllm.contracts.tensor_policy import TensorPolicy
 
-    if options.state_memory_bytes > facts.state_memory_budget_bytes:
+    if options.state_page_budget_bytes > facts.state_page_budget_bytes:
         raise ValueError(
-            f"ExecutionOptions.state_memory_bytes={options.state_memory_bytes} exceeds the "
-            f"{facts.state_memory_budget_bytes} bytes free on the device; lower it, or lower gpu_memory_utilization "
+            f"ExecutionOptions.state_page_budget_bytes={options.state_page_budget_bytes} exceeds the "
+            f"{facts.state_page_budget_bytes} bytes free on the device; lower it, or lower gpu_memory_utilization "
             "so vLLM leaves more memory free"
         )
     capabilities = set(facts.timeline.capabilities)
@@ -215,8 +217,12 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
     timeline = replace(
         facts.timeline,
         capabilities=tuple(sorted(capabilities)),
-        memory_budget_bytes=min(
-            (n for n in (facts.timeline.memory_budget_bytes, options.memory_budget_bytes) if n is not None),
+        execution_peak_budget_bytes=min(
+            (
+                n
+                for n in (facts.timeline.execution_peak_budget_bytes, options.execution_peak_budget_bytes)
+                if n is not None
+            ),
             default=None,
         ),
         tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.tuning),
@@ -225,13 +231,13 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
     return replace(
         facts,
         timeline=timeline,
-        state_memory_budget_bytes=options.state_memory_bytes or facts.state_memory_budget_bytes,
+        state_page_budget_bytes=options.state_page_budget_bytes or facts.state_page_budget_bytes,
         guidance_capacity=options.guidance_capacity if facts.guidance_rejection is None else None,
     )
 
 
 def _fund_attachment(
-    declaration: TensorBinding, probe: ModelProbe, timeline: SchedulerTimeline, options: ExecutionOptions
+    declaration: TensorDeclaration, probe: ModelProbe, timeline: SchedulerTimeline, options: ExecutionOptions
 ) -> SchedulerTimeline:
     """Reserve the attachment's effect buffers and fund the custom-forward task."""
     from pllm.execution.task_memory import custom_forward_capture_bytes
@@ -245,5 +251,5 @@ def _fund_attachment(
                 value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
             ),
         )
-    capture = options.capture_memory_bytes or custom_forward_capture_bytes(declaration, probe)
-    return derive_attachment_resources(probe, graph, timeline, capture_memory_bytes=capture)
+    capture = options.cuda_graph_pool_budget_bytes or custom_forward_capture_bytes(declaration, probe)
+    return derive_attachment_resources(probe, graph, timeline, cuda_graph_pool_budget_bytes=capture)

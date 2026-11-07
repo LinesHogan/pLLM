@@ -8,8 +8,8 @@ import torch
 
 import pllm
 from pllm import testing
-from pllm.execution.tensor_binding import TensorBinding
-from pllm.testing_contracts import _facts  # pyright: ignore[reportPrivateUsage]
+from pllm.execution.tensor_declaration import TensorDeclaration
+from pllm.testing_contracts import contract_facts
 from tools.ai_eval import reference
 
 
@@ -22,7 +22,7 @@ def declarations(task: str, workload: pllm.Workload, config: pllm.ModelConfig) -
     """Require the requested effects, state scopes, inputs, optimizer and model sites."""
     expected = reference.WORKLOADS[task]()
     assert workload.backend_requirements() == expected.backend_requirements(), "wrong model inputs/effects/targets"
-    _, facts = _facts(expected, config)
+    _, facts = contract_facts(expected, config)
     actual, wanted = workload.build(facts), expected.build(facts)
     assert actual.graph.states == wanted.graph.states, "wrong state scope, keys or mutability"
     actual_fields = {layout.resource: layout.layout.fields for layout in actual.layouts.layouts}
@@ -66,7 +66,7 @@ def declarations(task: str, workload: pllm.Workload, config: pllm.ModelConfig) -
             assert observed.memory is not None and observed.memory.chunk == 2, "memory needs request chunk=2"
 
 
-def initial_state(actual: TensorBinding, expected: TensorBinding) -> None:
+def initial_state(actual: TensorDeclaration, expected: TensorDeclaration) -> None:
     """Compare declared initialization, including memory zeros and optimizer slots."""
     for layout in actual.layouts.layouts:
         observed = tuple(torch.zeros(field.shape, dtype=field.dtype.torch) for field in layout.layout.fields)
@@ -287,7 +287,7 @@ def ttrl(submission: ModuleType, device: str) -> None:
         close(torch.autograd.grad(actual.output, weight)[0], torch.autograd.grad(expected, weight)[0])
         return  # Host readiness/stream protocols are outside the optional tensor-only CUDA oracle.
     hidden = torch.randn(8, 8)
-    config = pllm.host.HostConfig(torch.device("cpu"), hidden_size=8, max_input_rows=8, state_memory_bytes=1 << 20)
+    config = pllm.host.HostConfig(torch.device("cpu"), hidden_size=8, max_input_rows=8, state_page_budget_bytes=1 << 20)
     execution = pllm.host.make_host(config, submission.Workload())
     refs = execution.admit(())
     weight = torch.nn.Parameter(torch.zeros(8))

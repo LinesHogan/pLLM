@@ -36,7 +36,7 @@ class PagedKV:
     seq_lens: torch.Tensor
     query_start: torch.Tensor
     query_count: int
-    _read: AttentionRead
+    read_attention: AttentionRead
     storage_window: int = 0
     prompt_lens: torch.Tensor | None = None
 
@@ -95,7 +95,7 @@ class PagedKV:
             )
         if self.storage_window and self.prompt_lens is None:
             window = min(window, self.storage_window) if window else self.storage_window
-        return self._read(q, window, topk)
+        return self.read_attention(q, window, topk)
 
 
 def selected_attention(

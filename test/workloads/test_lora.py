@@ -33,7 +33,7 @@ def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
         4, (BINDING,), model_timeline(device), provider, max_lineages=lineages, memory_bytes=32 * 1024**2
     )
     workload = OutputLoRAWorkload(config)
-    return workload.compile_backend(replace(facts, vocab_size=7), ExecutionOptions(max_training_rows=4)).execution
+    return workload.compile_backend(replace(facts, vocab_size=7), ExecutionOptions(max_host_training_rows=4)).execution
 
 
 def step_input(identities, hidden, batch, stream=None):

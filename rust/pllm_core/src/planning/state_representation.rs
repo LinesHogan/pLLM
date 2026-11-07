@@ -43,7 +43,7 @@ struct StateLayoutRequirement {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateRepresentationRequest {
-    memory_budget_bytes: u64,
+    state_page_budget_bytes: u64,
     states: Vec<StateLayoutRequirement>,
     pub(crate) candidates: Vec<StateProviderPlan>,
 }
@@ -137,7 +137,7 @@ pub(super) fn compile(
         best: &mut Option<(StateRepresentationDecision, ScheduleDecision)>,
         failure: &mut Option<String>,
     ) -> Result<(), String> {
-        if request.memory_budget_bytes != 0 && reserved_bytes > request.memory_budget_bytes {
+        if request.state_page_budget_bytes != 0 && reserved_bytes > request.state_page_budget_bytes {
             return Ok(());
         }
         if plans.len() < request.states.len() {
@@ -209,13 +209,13 @@ pub(super) fn compile(
                 })
                 .sum();
             format!(
-                "state needs at least {required} bytes, but the state memory budget is {} bytes; \
+                "state pages need at least {required} bytes, but the state-page budget is {} bytes; \
                  lower gpu_memory_utilization to leave at least {} more bytes free, \
                  or lower max_num_seqs to reduce request-state storage. \
-                 If you set ExecutionOptions.state_memory_bytes, raise it to at least {required}; \
+                 If you set ExecutionOptions.state_page_budget_bytes, raise it to at least {required}; \
                  for a read-only pretrained lookup table, reduce it or explicitly set placement=\"host\"",
-                request.memory_budget_bytes,
-                required.saturating_sub(request.memory_budget_bytes),
+                request.state_page_budget_bytes,
+                required.saturating_sub(request.state_page_budget_bytes),
             )
         })
     })
@@ -257,14 +257,14 @@ mod tests {
             }).to_string()).unwrap();
             for arena_budget in [0, 8, 16, 24, 32] {
                 let request = decode_request(&json!({
-                    "memory_budget_bytes": arena_budget,
+                    "state_page_budget_bytes": arena_budget,
                     "states": [requirement("state"), requirement("unused")],
                     "candidates": [undersized, candidate("state", "cow", 16, true), candidate("state", "mutable", 8, false),
                         candidate("unused", "large", 5, false), candidate("unused", "small", 3, false)]
                 }).to_string()).unwrap();
                 for memory_budget in [8, 16, 20, 24, 28, 32, 40] {
                     let timeline = decode_timeline(&json!({
-                        "capabilities": [], "memory_budget_bytes": memory_budget,
+                        "capabilities": [], "execution_peak_budget_bytes": memory_budget,
                         "anchors": (0..3).map(|i| json!({"symbol": format!("a{i}"), "ordinal": i})).collect::<Vec<_>>(),
                         "task_resources": (["read", "update"].map(|task| json!({"task": task, "workspace_bytes": 4}))),
                         "reserved_bytes": [5, 0, 0]

@@ -308,7 +308,7 @@ class SchedulerTimeline:
     capabilities: tuple[str, ...] = ()
     value_resources: tuple[ValueResourceFact, ...] = ()
     task_resources: tuple[TaskResourceFact, ...] = ()
-    memory_budget_bytes: int | None = None
+    execution_peak_budget_bytes: int | None = None
     reserved_bytes: tuple[int, ...] = ()
     tensor_policy: TensorPolicy = TensorPolicy()
     visibility: VisibilitySource | None = None

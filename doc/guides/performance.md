@@ -325,20 +325,20 @@ class Probe(pllm.Workload):
 
 ```python
 exec_opts = pllm.ExecutionOptions(
-    state_memory_bytes=256 << 20,  # 状态池（PTTS）上限：256 MiB
-    memory_budget_bytes=1024 << 20,  # 任务工作区峰值上限：1024 MiB
-    capture_memory_bytes=128 << 20,  # CUDA Graph 捕获池上限：128 MiB
+    state_page_budget_bytes=256 << 20,  # 状态池（PTTS）上限：256 MiB
+    execution_peak_budget_bytes=1024 << 20,  # 执行峰值上限（含状态页、任务与捕获池）：1024 MiB
+    cuda_graph_pool_budget_bytes=128 << 20,  # 每个任务/模型的 CUDA Graph 池预算：128 MiB
 )
 config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=exec_opts)
 ```
 
 这四个旋钮的行为如下：
-1. **`memory_budget_bytes`（两级优雅降级）**：旁路重叠（`side` lane）需要同时保留两步缓冲，因此峰值更高。以 128 并发的 `ESamp`（$\beta=0.5$）为例，旁路重叠计划峰值约为 **$1,041\text{ MiB}$**，内联（inline）下限约为 **$973\text{ MiB}$**。
-   * 如果你设置的 `memory_budget_bytes` 介于两者之间，规划器**不会报错，而是自动把旁路任务退回主 stream 内联执行**（`explain` 里该任务的 lane 从 `side` 变为 `main`），用一点重叠吞吐换取显存装得下。
-   * 如果低于内联下限，规划失败，`explain(...).budget_errors` 会写明峰值需要多少字节、预算只有多少，并建议调小 `max_num_batched_tokens`、调大 `memory_budget_bytes`，或把只读大表声明为 `placement="host"`。
-2. **`state_memory_bytes`**：状态总预留（`roots × bytes/root`）超过该值时，`explain` 把缺口写进 `budget_errors`（建议调小 `max_num_seqs` 或调大预算），`make_llm` 在绑定阶段抛出 `ValueError`。默认 `0` 表示用后端实际可用的显存。
-3. **`capture_memory_bytes`**：控制 CUDA Graph 私有内存池预算（模型图默认池为 **$64\text{ MiB}$**；像状态化 `@pllm.custom_residual` 子层或 `@pllm.custom_forward` 可能需要调大到几百 MiB 乃至 $1\text{ GiB}$）。**捕获预算不足时会直接报错并给出所需字节数，绝不静默退回 eager。**
-4. **`max_training_rows`**：只用于主机批训练（`llm.generate(..., batch=...)` 传入的 `WeightedCEBatch`、`CausalTrainBatch`），表示每个状态每步最多训练多少行，训练工作区按它规划；默认 `1`，批次超过时会报错提示调大。它不限制 decode 时 `@pllm.train` 在请求行上的训练。
+1. **`execution_peak_budget_bytes`（两级优雅降级）**：包含 PTTS 状态页、任务工作区与存活结果、anchor 缓冲和捕获池预留；不含模型权重与 KV 池。旁路重叠（`side` lane）需要同时保留两步缓冲，因此峰值更高。以 128 并发的 `ESamp`（$\beta=0.5$）为例，旁路重叠计划峰值约为 **$1,041\text{ MiB}$**，内联（inline）下限约为 **$973\text{ MiB}$**。
+   * 如果你设置的 `execution_peak_budget_bytes` 介于两者之间，规划器**不会报错，而是自动把旁路任务退回主 stream 内联执行**（`explain` 里该任务的 lane 从 `side` 变为 `main`），用一点重叠吞吐换取显存装得下。
+   * 如果低于内联下限，规划失败，`explain(...).budget_errors` 会写明峰值需要多少字节、预算只有多少，并建议调小 `max_num_batched_tokens`、调大 `execution_peak_budget_bytes`，或把只读大表声明为 `placement="host"`。
+2. **`state_page_budget_bytes`**：状态总预留（`roots × bytes/root`）超过该值时，`explain` 把缺口写进 `budget_errors`（建议调小 `max_num_seqs` 或调大预算），`make_llm` 在绑定阶段抛出 `ValueError`。默认 `0` 表示用后端实际可用的显存。
+3. **`cuda_graph_pool_budget_bytes`**：控制每个任务/模型的 CUDA Graph 私有内存池预算，不是所有池的合计上限。默认 `None` 按负载追踪任务预留（模型图默认池为 **$64\text{ MiB}$**，exact decode overlay 另按形状计入工作区；像状态化 `@pllm.custom_residual` 子层或 `@pllm.custom_forward` 可能需要调大到几百 MiB 乃至 $1\text{ GiB}$）。**捕获预算不足时会直接报错并给出所需字节数，绝不静默退回 eager。**
+4. **`max_host_training_rows`**：只用于主机批训练（`llm.generate(..., batch=...)` 传入的 `WeightedCEBatch`、`CausalTrainBatch`），表示每个状态每步最多训练多少行，训练工作区按它规划；默认 `1`，批次超过时会报错提示调大。它不限制 decode 时 `@pllm.train` 在请求行上的训练。
 
 > **实用建议：生命周期与 Prefix Caching**
 > * **用 `with pllm.make_llm(...) as llm:` 管理生命周期**：退出 `with` 块时，框架会按序清理 vLLM、cuBLAS 工作区、CUDA Graph 池与编译缓存，归还显存。唯一的例外是使用了 `@pllm.train_in_forward(visibility="exact")` 捕获的引擎，关闭时暂不能归还全部显存，后续引擎请在新的子进程中启动。
@@ -582,11 +582,11 @@ class ScaleResidual(pllm.Workload):
 在 RTX 4090（0.5B，8 条 prompt $\times n=4$，生成 256 tokens）下的实测吞吐占原生图模式比例：
 * **Value Residual**：**85%**（同样的改写在 eager 下只有 34.4%）
 * **Hyper-Connections（$n=4$）**：**65%–66.6%**（eager 下 19.2%）
-* **带状态记忆子层**：在设置 `capture_memory_bytes=1 << 30`（1 GiB）进图后为 **41%**（eager 下 11.6%）。
+* **带状态记忆子层**：在设置 `cuda_graph_pool_budget_bytes=1 << 30`（1 GiB）进图后为 **41%**（eager 下 11.6%）。
 
 > **实用建议与限制**
 > * `@pllm.custom_residual` 要求 `tensor_parallel_size=1` 并关闭 prefix caching。`explain` 中它的 `host` 行显示 `unverified`，CPU 上的 `pllm.testing.check` 也会跳过模型层内的执行；要用 `check_on_gpu` 验证。
-> * 如果你的残差改写带有可读写状态（`state=` 的状态化子层），录制模型图时需要更多捕获池空间，请调大 `ExecutionOptions(capture_memory_bytes=...)`，不够时报错信息会给出所需字节数。
+> * 如果你的残差改写带有可读写状态（`state=` 的状态化子层），录制模型图时需要更多捕获池空间，请调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`，不够时报错信息会给出所需字节数。
 > * 挂了 `custom_residual` 的模型图里，vLLM 录的是原始算子而不是 Inductor 融合后的算子，所以即使是恒等改写（`x + y`）也只有原生图模式的约 **66%**。只在真正需要改写的层上挂载（用 `layers=...` 指定），不要无故挂满所有层；评估改写本身的代价时，可以和 eager 模式的原生 vLLM 对比，或直接用 `check_on_gpu`（它会构建匹配的原生引擎）。
 
 ---
@@ -653,7 +653,7 @@ class SkipMiddle(pllm.Workload):
 > **实用建议与限制**
 > * `active=` 仅支持 `@pllm.custom_forward(tokens="decode")`，跳层不会释放被跳层的 KV 显存。
 > * **为什么 `active=` 只用于生成的 token？** 一个 token 跳过某些层时，pllm 用它“停下时”的隐藏状态补算这些层的 K/V。这些 K/V 只是近似值，后面的 token 读到的就是这份近似。对生成的 token，这份近似只影响同一请求接下来的几个 token，而且它跳层的前提是“已经算够了”（CALM、LayerSkip 等早退方法也只让生成的 token 退出）。prompt token 不一样：它不需要输出任何东西，唯一的作用就是给后面所有 token 提供 K/V；它的深层 K/V 被近似之后，影响的是整段回答，还会通过 prefix cache 和 n 个样本扩散出去。Ouro 论文的实测也是：prefill 阶段的 K/V 用近似值会掉 10 个以上的 GSM8K 点，decode 阶段却几乎不掉。另外，prompt 是整块并行计算的，被压紧后的行位置不连续，原生的 FlashAttention 无法直接计算它们，省下的矩阵乘大多会被额外的 attention 开销抵消。所以 prompt 默认按原模型完整深度运行，你不需要为它另写方法；只有当你要改变 prompt 的计算方式（例如固定的层循环）时，才写一个不带 `active=` 的 `tokens="prefill"` 方法，并优先用 `over="span"`（逐 token 的程序在 prefill 上会按位置串行执行）。
-> * 使用 `@pllm.custom_forward` 时，同一个 workload 内不能再声明读取 `pllm.hidden` / `pllm.final_hidden` 的方法（请改用 `pllm.residual` 或 `pllm.layer_logits`），也不能用 `pllm.model.Adapter`。按层切片的图可能需要调大 `ExecutionOptions(capture_memory_bytes=...)`（例如 0.5B 模型在 32 并发下捕获池约需 $748\text{ MiB}$，128 并发约需 $1,392\text{ MiB}$）；`explain` 不估算这部分，预算不够时报错信息会给出所需字节数。
+> * 使用 `@pllm.custom_forward` 时，同一个 workload 内不能再声明读取 `pllm.hidden` / `pllm.final_hidden` 的方法（请改用 `pllm.residual` 或 `pllm.layer_logits`），也不能用 `pllm.model.Adapter`。按层切片的图可能需要调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`（例如 0.5B 模型在 32 并发下捕获池约需 $748\text{ MiB}$，128 并发约需 $1,392\text{ MiB}$）；`explain` 不估算这部分，预算不够时报错信息会给出所需字节数。
 
 ---
 
@@ -707,11 +707,11 @@ class Monitor(pllm.Workload):
 
 | 你遇到的症状或问题 | 第一步：看 `pllm.explain(workload, config)` | 第二步：可调的配置开关或代码改动 | 第三步：运行时查 `llm.diagnostics()` / `llm.trace_snapshot()` |
 | :--- | :--- | :--- | :--- |
-| **启动时报显存不足，或可用 KV 并发太低** | 看 `state` 行（`roots`、`bytes/root`、`dtype`）；看 `memory peak`；看 `budget_errors` | 大只读表改 `placement="host"`；注意力改静态 `keep="window"` 或 `source=k`；只读字段让 `dtype="auto"` 自动选 BF16；调 `state_memory_bytes` / `memory_budget_bytes` / `capture_memory_bytes`；主机批训练时调小 `max_training_rows` | 查 `state_usage`（对比逻辑存活字节与物理分配字节，以及 `admission_capacity_failures`）、`kv_cache_blocks`、`kv_cache_max_concurrency` |
+| **启动时报显存不足，或可用 KV 并发太低** | 看 `state` 行（`roots`、`bytes/root`、`dtype`）；看 `memory peak`；看 `budget_errors` | 大只读表改 `placement="host"`；注意力改静态 `keep="window"` 或 `source=k`；只读字段让 `dtype="auto"` 自动选 BF16；调 `state_page_budget_bytes` / `execution_peak_budget_bytes` / `cuda_graph_pool_budget_bytes`；主机批训练时调小 `max_host_training_rows` | 查 `state_usage`（对比逻辑存活字节与物理分配字节，以及 `admission_capacity_failures`）、`kv_cache_blocks`、`kv_cache_max_concurrency` |
 | **步时明显变慢，怀疑退回了 eager 或有 CPU 同步** | 看 `forward` 行是否显示 `eager: ...`；看 `member` 行是否 `captured`；看 `host` 行是 `0 syncs` 还是 `unverified` | 方法里的 `.item()` / `if tensor:` 改用 `torch.where`；设 `ModelConfig(cuda_graphs=True)` 让任何 eager 原因直接报错；跑 `testing.check_on_gpu` 抓模型层内的隐式同步 | 查 `eager_reason`（为空字符串表示运行在整图模式） |
 | **加了引导采样或额外计算后吞吐下降明显** | 看 `member` 行在哪个阶段运行；看每个方法的 `projection FLOP`、`sampler ... bytes`；检查是否声明了多层 `pllm.layer_logits` | 用 `@pllm.guide_sampling` 替代独立读多层 `layer_logits`（共用 LM Head GEMM）；用 `rows=` 选择器缩小 `@pllm.add_logits` 或 `@pllm.guide_sampling` 的作用行数 | 查 `trace_snapshot()` 中的任务耗时 |
 | **大表设了 `placement="host"` 但吞吐依然很低** | 看查表方法的 `anchor / lane` 是否为 `request.prepare / side`；看 `logical transfer bytes/row` | 把查表写成只读 `pllm.input_tokens` 和不可变状态的独立方法，经 `pllm.result` 交给效果方法（不要混读 `pllm.hidden`，否则无法提前到步首与前向重叠）；检查每步总传输字节除以 $22\text{ GB/s}$ 是否已经超过了模型单步前向时间 | — |
-| **旁路训练（`side`）没有和前向重叠** | 看 `member` 的 lane 是 `side` 还是退回了 `main`；看 `timing` 行的 `publish_lag` | 保持默认 `publish_lag=1`；如果预算介于 `memory` 行的两个阈值之间导致退回内联，调大 `ExecutionOptions(memory_budget_bytes=...)` | 查 `trace_snapshot()` 中主干流与旁路流的耗时分布 |
+| **旁路训练（`side`）没有和前向重叠** | 看 `member` 的 lane 是 `side` 还是退回了 `main`；看 `timing` 行的 `publish_lag` | 保持默认 `publish_lag=1`；如果预算介于 `memory` 行的两个阈值之间导致退回内联，调大 `ExecutionOptions(execution_peak_budget_bytes=...)` | 查 `trace_snapshot()` 中主干流与旁路流的耗时分布 |
 | **长序列递推或在线训练出现数值发散 / NaN** | 看 `state` 行各字段解析出的 `dtype`（累加器/carry 是否为 `float32`） | 在 `pllm.Field(..., dtype=torch.float32)` 显式指定 FP32；检查 `pllm.scan` 系数是否为 FP32 | 查 `numeric_health` |
 
 #### 自测小问题（第 4–7 节）

@@ -1,7 +1,7 @@
 """@pllm.custom_residual methods as the model sees them: the sublayer residual adds (or value rows) each owns, the
 inputs it reads, and the owner table that makes two methods of one site a conflict.
 
-usage.py declares them into a TensorBinding; the vLLM backend's model_sites module installs them on the model's
+usage.py declares them into a TensorDeclaration; the vLLM backend's model_sites module installs them on the model's
 norm modules and value projections and asks `SiteValues` for their inputs at every call.
 """
 

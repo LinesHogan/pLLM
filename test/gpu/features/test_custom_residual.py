@@ -26,7 +26,7 @@ CONFIG = pllm.ModelConfig(
     # These tiny schedules need little KV; leave room for the resident FP32 oracle on a 24 GiB GPU.
     gpu_memory_utilization=0.2,
     cuda_graphs=False,
-    execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+    execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
 )
 # The largest per-token logprob gap of bf16 vLLM to an FP32 oracle over these prompts: one near-tie dominates it, so it
 # varies by GPU (0.24 on an RTX 4090, 0.06 on an A100) while a wrong residual update moves logprobs by more than 1.
@@ -197,7 +197,7 @@ class FastWeightMemory(pllm.Workload):
         return (x.float() + y.float() + self.gate * read).to(x.dtype), M - self.lr / len(x) * (read - y.float()).T @ k
 
 
-def _generate(workload: pllm.Workload, config: pllm.ModelConfig = CONFIG) -> list[tuple[list[int], list[float]]]:
+def generate_tokens(workload: pllm.Workload, config: pllm.ModelConfig = CONFIG) -> list[tuple[list[int], list[float]]]:
     """Greedy tokens and their logprobs."""
     with pllm.make_llm(config, workload=workload) as handle:
         outputs = handle.generate(list(PROMPTS), SAMPLING)
@@ -214,8 +214,9 @@ def _generate(workload: pllm.Workload, config: pllm.ModelConfig = CONFIG) -> lis
 
 
 @cache
-def _vanilla() -> list[tuple[list[int], list[float]]]:
-    return _generate(Observe())
+def vanilla_tokens() -> list[tuple[list[int], list[float]]]:
+    """Generate the baseline tokens and log probabilities without a residual rewrite."""
+    return generate_tokens(Observe())
 
 
 @pytest.mark.parametrize(
@@ -224,7 +225,7 @@ def _vanilla() -> list[tuple[list[int], list[float]]]:
 @pytest.mark.parametrize("graphs", (False, "auto"))
 def test_identity_rewrites_reproduce_the_model_bitwise(workload: pllm.Workload, graphs: bool | Literal["auto"]) -> None:
     config = replace(CONFIG, cuda_graphs=graphs)
-    assert _generate(workload, config) == _vanilla()
+    assert generate_tokens(workload, config) == vanilla_tokens()
 
 
 def test_site_compile_failure_names_method_and_allows_opt_out() -> None:
@@ -243,7 +244,7 @@ def test_site_compile_failure_names_method_and_allows_opt_out() -> None:
         with pllm.make_llm(CONFIG, workload=Untraceable()):
             pass
     eager = replace(CONFIG, execution=replace(CONFIG.execution, allow_numerical_transforms=False))
-    assert _generate(Untraceable(), eager) == _vanilla()
+    assert generate_tokens(Untraceable(), eager) == vanilla_tokens()
 
 
 @cache
@@ -255,7 +256,7 @@ Rewrite = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
 
 
 @torch.no_grad()
-def _oracle_logprobs(
+def oracle_logprobs(
     tokens: list[int],
     *,
     attention: Rewrite | None = None,
@@ -300,7 +301,7 @@ def _oracle_logprobs(
     return model.lm_head(body.norm(stream)).log_softmax(-1)
 
 
-def _deviation(
+def logprob_deviation(
     runs: list[tuple[list[int], list[float]]], oracle: Callable[[list[int]], torch.Tensor]
 ) -> tuple[float, int]:
     """The largest logprob gap to the oracle over the greedy tokens, and how many tokens are not its argmax."""
@@ -316,7 +317,7 @@ def _deviation(
 
 
 def test_rewrites_follow_fp32_oracle() -> None:
-    baseline, _ = _deviation(_vanilla(), _oracle_logprobs)
+    baseline, _ = logprob_deviation(vanilla_tokens(), oracle_logprobs)
     laurel = Laurel(scale=0.05)
     workloads: dict[str, tuple[pllm.Workload, Callable[[list[int]], torch.Tensor]]] = {}
     # The same initial values, built with each workload's own initializer, drive the oracle.
@@ -334,7 +335,7 @@ def test_rewrites_follow_fp32_oracle() -> None:
 
     workloads["laurel"] = (
         laurel,
-        lambda tokens: _oracle_logprobs(
+        lambda tokens: oracle_logprobs(
             tokens,
             attention=lambda x, y, layer: laurel_add(x, y, 2 * layer),
             mlp=lambda x, y, layer: laurel_add(x, y, 2 * layer + 1),
@@ -342,7 +343,7 @@ def test_rewrites_follow_fp32_oracle() -> None:
     )
     workloads["value"] = (
         ValueResidual(mixing=0.3),
-        lambda tokens: _oracle_logprobs(
+        lambda tokens: oracle_logprobs(
             tokens, value=lambda v, values, layer: v if layer == 0 else v + 0.3 * (values[0] - v)
         ),
     )
@@ -359,7 +360,7 @@ def test_rewrites_follow_fp32_oracle() -> None:
 
     workloads["hyper-connections"] = (
         hc,
-        lambda tokens: _oracle_logprobs(
+        lambda tokens: oracle_logprobs(
             tokens,
             attention=lambda x, y, layer: hc_update(x, y, 2 * layer),
             mlp=lambda x, y, layer: hc_update(x, y, 2 * layer + 1),
@@ -369,10 +370,10 @@ def test_rewrites_follow_fp32_oracle() -> None:
         ),
     )
     for name, (workload, oracle) in workloads.items():
-        eager = _generate(workload)
-        captured = _generate(workload, replace(CONFIG, cuda_graphs=True))
+        eager = generate_tokens(workload)
+        captured = generate_tokens(workload, replace(CONFIG, cuda_graphs=True))
         assert captured == eager
-        deviation, misses = _deviation(captured, oracle)
+        deviation, misses = logprob_deviation(captured, oracle)
         print(
             f"{name}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
@@ -381,7 +382,7 @@ def test_rewrites_follow_fp32_oracle() -> None:
 
 
 def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
-    baseline, _ = _deviation(_vanilla(), _oracle_logprobs)
+    baseline, _ = logprob_deviation(vanilla_tokens(), oracle_logprobs)
     for chunk in (1, 16):
         workload = FastWeightMemory(chunk=chunk)
 
@@ -401,12 +402,12 @@ def test_memory_sublayer_follows_fp32_chunk_oracle() -> None:
                     state = state - workload.lr / workload.chunk * (k @ state.T - v).T @ k
             return x + y + workload.gate * torch.cat(reads)
 
-        eager = _generate(workload)
-        captured = _generate(workload, replace(CONFIG, cuda_graphs=True))
+        eager = generate_tokens(workload)
+        captured = generate_tokens(workload, replace(CONFIG, cuda_graphs=True))
         for (tokens, logprobs), (expected_tokens, expected_logprobs) in zip(captured, eager, strict=True):
             assert tokens == expected_tokens
             torch.testing.assert_close(torch.tensor(logprobs), torch.tensor(expected_logprobs), rtol=0, atol=BF16_NOISE)
-        deviation, misses = _deviation(captured, lambda tokens: _oracle_logprobs(tokens, mlp=memory))
+        deviation, misses = logprob_deviation(captured, lambda tokens: oracle_logprobs(tokens, mlp=memory))
         print(
             f"memory chunk={chunk}: max logprob gap to FP32 {deviation:.4f} (plain bf16 vLLM {baseline:.4f}), {misses} non-argmax tokens"
         )
@@ -540,8 +541,8 @@ def _check_request_token_history(config: pllm.ModelConfig) -> None:
             session.input_tokens = buffer.clone()
             prepare(rows)
             # Inspect private buffers on their producer lane, before a model consumer waits on its event.
-            with torch.cuda.stream(session._deployment.execution.side_stream):
-                for value in session._sites._results.values():
+            with torch.cuda.stream(session.deployment.execution.side_stream):
+                for value in session.model_sites.result_values.values():
                     torch.testing.assert_close(
                         value[: rows.row_batch.total_rows], session.input_tokens[: rows.row_batch.total_rows]
                     )
@@ -555,7 +556,7 @@ def _check_request_token_history(config: pllm.ModelConfig) -> None:
             assert ids == [tokens[row.token_offset - j] if row.token_offset >= j else -1 for j in range(3)]
         assert any(row.token_offset > 0 and row.phase.value == "prefill" for row, _ in seen)
         assert any(row.phase.value == "decode" for row, _ in seen)
-        assert session._token_capture.graph is not None
+        assert session.token_capture.graph is not None
 
 
 def test_input_tokens_match_request_history() -> None:

@@ -13,7 +13,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.model import Projection
-from test.gpu.features.test_custom_residual import BF16_NOISE, _deviation, _oracle_logprobs, _vanilla
+from test.gpu.features.test_custom_residual import BF16_NOISE, logprob_deviation, oracle_logprobs, vanilla_tokens
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")
@@ -24,7 +24,7 @@ CONFIG = pllm.ModelConfig(
     max_num_seqs=4,
     max_num_batched_tokens=128,
     gpu_memory_utilization=0.3,
-    execution=pllm.ExecutionOptions(capture_memory_bytes=512 << 20),
+    execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=512 << 20),
 )
 
 
@@ -220,7 +220,7 @@ def _oracle(tokens: list[int], workload: LoopedTTT) -> torch.Tensor:
 
 def test_custom_forward_custom_residual_and_ttt_compose_on_qwen() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    baseline, _ = _deviation(_vanilla(), _oracle_logprobs)
+    baseline, _ = logprob_deviation(vanilla_tokens(), oracle_logprobs)
     sampling = SamplingParams(max_tokens=10, temperature=0.0, ignore_eos=True, logprobs=4)
     for chunk in (1, 4):
         workload = LoopedTTT(chunk=chunk)
@@ -238,7 +238,7 @@ def test_custom_forward_custom_residual_and_ttt_compose_on_qwen() -> None:
             ]
             worst = max(worst, (chosen.cpu() - torch.tensor(actual)).abs().max().item())
             misses += int((expected.argmax(-1).cpu() != torch.tensor(generated)).sum())
-            composed = max(composed, (chosen - _oracle_logprobs(sequence)[rows][index]).abs().max().item())
+            composed = max(composed, (chosen - oracle_logprobs(sequence)[rows][index]).abs().max().item())
             untrained = _oracle(sequence, replace(workload, learning_rate=0.0))[rows][index]
             trained = max(trained, (chosen - untrained).abs().max().item())
         print(

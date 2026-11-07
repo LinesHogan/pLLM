@@ -18,7 +18,7 @@ from torch.nn import functional as F
 import pllm
 from pllm.execution.cuda_stream import upload
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_binding import StepResult
+from pllm.execution.tensor_declaration import StepResult
 from pllm.host import CompletionInput, HostConfig, WeightedRowBatch, make_host
 from pllm.workloads.fttt.feedback_queue import FTTTFeedbackQueue
 from pllm.workloads.fttt.math import feedback_rows

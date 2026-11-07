@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from pllm.authoring import BackendRequirements
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.admission import model_capture_bytes, model_hooks
+from pllm.backends.vllm.admission import model_cuda_graph_pool_budget_bytes, model_hooks
 from pllm.backends.vllm.architecture import DecoderBody, bind_model
 from pllm.backends.vllm.parameter_overlay import capacities, uniform_decode
 from pllm.config import ModelConfig
@@ -83,7 +83,7 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
     # Conditional subgraphs own library scratch; all decode counts share one capacity.
     sizes = (capacity,) if HiddenPhase.DECODE in requirements.exact_phases else capacities(capacity)
     return {
-        "additional_config": {_BUDGET: model_capture_bytes(config, requirements)},
+        "additional_config": {_BUDGET: model_cuda_graph_pool_budget_bytes(config, requirements)},
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
@@ -243,5 +243,5 @@ class OverlayGraphRunner(compat.ModelRunner):
         used = cuda_graph_pool_bytes(pool, self.device.index or 0) - before
         if used > self.overlay_graph_bytes:
             raise ValueError(
-                f"CUDA graphs of the adapted model need {used} bytes; raise ExecutionOptions.capture_memory_bytes"
+                f"CUDA graphs of the adapted model need {used} bytes; raise ExecutionOptions.cuda_graph_pool_budget_bytes"
             )

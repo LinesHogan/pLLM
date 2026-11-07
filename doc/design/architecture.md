@@ -48,7 +48,7 @@ FTTT 的编辑同样是宿主路径的 `pllm.Workload`，由 `FTTTFeedback` 这�
 StateTaskContext 里，按原始 `(task, output)` 作键。TensorBatch 借用该字典；
 TensorFrame 不再缓存结果或并行的最后值。Rust 在 PhysicalTask 中签名每个值的
 最后使用释放，包括下游声明的梯度消费者。执行只应用这些释放；导出的值存续到
-结果构造与结算。Builder 引用是内部图构造 API；`FunctionMath` 与
+结果构造与结算。TensorDeclaration 引用是内部图构造 API；`FunctionMath` 与
 `TensorOperation` 把普通数学函数绑定到同一 StateTaskContext。没有额外的任务
 游标、参数银行或发布所有者。AdamW 字段与私有更新由共享绑定生成，直接迁移与
 发布/replay 保持为单独声明的效果。原始 SemanticTask 的可选 `MathContract`

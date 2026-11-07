@@ -14,7 +14,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
 

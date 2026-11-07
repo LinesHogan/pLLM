@@ -62,7 +62,7 @@ def config(graphs=True, lag=1):
         gpu_memory_utilization=0.35,
         seed=7,
         cuda_graphs=graphs,
-        execution=ExecutionOptions(publish_lag=lag, capture_memory_bytes=32 << 20),
+        execution=ExecutionOptions(publish_lag=lag, cuda_graph_pool_budget_bytes=32 << 20),
     )
 
 
@@ -81,7 +81,7 @@ def _record_retirement(worker):
     from test.gpu.vllm_tp_smoke import _FINAL, _digest
 
     _FINAL.clear()
-    arena = worker.workload_runner.require_session()._deployment.execution.arena
+    arena = worker.workload_runner.require_session().deployment.execution.arena
     retire = arena.retire
 
     def record(refs):
@@ -98,7 +98,7 @@ def _final(worker):
 
 
 def _head(worker):
-    execution = worker.workload_runner.require_session()._deployment.execution
+    execution = worker.workload_runner.require_session().deployment.execution
     refs = execution.directory.latest_refs(())
     return _digest(execution.arena, StateRefs.of(refs))
 
@@ -112,7 +112,7 @@ def test_j1_tokens(graphs):
     settings = config(graphs)
     sampling = [SamplingParams(max_tokens=64, temperature=t, seed=7, ignore_eos=True) for t in (0.0, 0.8)]
     plain_handle = pllm.make_llm(replace(settings, execution=ExecutionOptions()))
-    plain = plain_handle._require_open()
+    plain = plain_handle.require_llm()
     try:
         expected = []
         for params in sampling:
@@ -140,7 +140,7 @@ def test_j1_tokens(graphs):
             assert counters.active_states == counters.inference_pins == 0
             assert len(handle.trace_snapshots()) == 2
             if isinstance(workload, ExportingDummy):
-                exports = handle._require_open().collective_rpc(_exports)
+                exports = handle.require_llm().collective_rpc(_exports)
                 assert len(exports[0]) == len(set(exports[0])) == 126  # Two runs of 63 decode steps.
                 assert exports[1] == []
             print(
@@ -170,7 +170,9 @@ def test_j1_ttrl(monkeypatch):
 
     # Only the test digest callback crosses EngineCore via pickle; production commands remain JSON.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    settings = replace(config(), multiprocessing=True, execution=ExecutionOptions(max_training_rows=8, publish_lag=0))
+    settings = replace(
+        config(), multiprocessing=True, execution=ExecutionOptions(max_host_training_rows=8, publish_lag=0)
+    )
     with pllm.make_llm(settings, workload=TTRLWorkload(TTRLConfig(rank=4))) as handle:
 
         def feedback(completed):
@@ -198,7 +200,7 @@ def test_j1_ttrl(monkeypatch):
         assert len(rounds) == 2
         assert all(torch.isfinite(batch.hidden).all() and batch.hidden.abs().sum() > 0 for batch, _ in rounds)
         assert handle.diagnostics().update_count == 2
-        digests = handle._require_open().collective_rpc(_head)
+        digests = handle.require_llm().collective_rpc(_head)
         assert digests[0] == digests[1]
         print(f"J1 TTRL: two feedback rounds, two updates, equal head fields {digests[0]}", flush=True)
 
@@ -210,7 +212,7 @@ def test_j2(lag):
         with pllm.make_llm(
             config(lag=lag), workload=ESampWorkload(ESampConfig(rank=4, intervention_beta=0.2))
         ) as handle:
-            llm = handle._require_open()
+            llm = handle.require_llm()
             llm.collective_rpc(_record_retirement)
             output = handle.generate(PROMPTS, SamplingParams(max_tokens=64, temperature=0.8, seed=7, ignore_eos=True))
             counters = handle.diagnostics()
@@ -300,7 +302,7 @@ def _record_routes(worker, forced=()):
     _ROUTE.clear()
     _SAMPLES.clear()
     runner = worker.workload_runner
-    primitive = runner.require_session()._custom_forward
+    primitive = runner.require_session().custom_forward
     forward = primitive.model.forward
     sample = runner.sampler._sample_random
 
@@ -363,7 +365,7 @@ _ROUTE_PROMPTS = ["Continue the alphabet: A, B, C,", "One plus one is", "Water i
 
 def _route_generation(settings, workload, forced, native):
     with pllm.make_llm(settings, workload=workload) as handle:
-        llm = handle._require_open()
+        llm = handle.require_llm()
         if native:
             llm.collective_rpc(_native_steps, args=(True,))
         try:
@@ -395,7 +397,7 @@ def test_j5_routes(route, graphs):
     from pllm.workloads.step_loop import StepLoopWorkload
 
     workloads = {"step_loop": StepLoopWorkload(), "recirculation": RecirculationWorkload(), "early_exit": EarlyExit()}
-    settings = replace(config(graphs=graphs), execution=ExecutionOptions(capture_memory_bytes=256 << 20))
+    settings = replace(config(graphs=graphs), execution=ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20))
     reference = repeated = None
     forced = reference_scores = ()
     tolerance = 1.0 if route == "step_loop" else 0.5
@@ -434,18 +436,18 @@ _M4_RETIRE = None
 def _m4_instrument(worker):
     from types import SimpleNamespace
 
-    from pllm.testing_gpu import _SyncCheck
+    from pllm.testing_gpu import SynchronizationCheck
     from test.gpu import vllm_tp_smoke as test
 
     runner = worker.workload_runner
     session = runner.require_session()
-    execution = session._deployment.execution
-    sync = _SyncCheck(SimpleNamespace(runner=runner))
+    execution = session.deployment.execution
+    sync = SynchronizationCheck(SimpleNamespace(runner=runner))
     test._M4_SYNC = sync
     execution.execute_anchor = sync.anchor
     execution.execute_part = sync.part
     session.prepare_input = sync.input
-    session._forward_overlay.prepare = sync.overlay
+    session.forward_overlay.prepare = sync.overlay
     test._M4_FIELDS.clear()
     retire = execution.arena.retire
     test._M4_RETIRE = retire
@@ -471,12 +473,12 @@ def _m4_fields(worker):
 
     assert len(_M4_SYNC.input_checked) >= 8
     session = worker.workload_runner.require_session()
-    execution = session._deployment.execution
+    execution = session.deployment.execution
     execution.arena.retire = _M4_RETIRE
     execution.execute_anchor = _M4_SYNC.execute
     execution.execute_part = _M4_SYNC.execute_part
     session.prepare_input = _M4_SYNC.prepare_input
-    session._forward_overlay.prepare = _M4_SYNC.prepare_overlay
+    session.forward_overlay.prepare = _M4_SYNC.prepare_overlay
     return _M4_FIELDS
 
 
@@ -539,7 +541,7 @@ def m4_reference():
     for tp in (1, 2):
         settings = replace(config(), tensor_parallel_size=tp, multiprocessing=True)
         with pllm.make_llm(settings) as handle:
-            plain = handle._require_open()
+            plain = handle.require_llm()
             plain.sleep(level=0, mode="keep")
             plain.enqueue(PROMPTS, _m4_params(), use_tqdm=False)
             plain.wake_up(tags=["scheduling"])
@@ -570,11 +572,11 @@ def test_m4_down(kind, monkeypatch, m4_reference):
             config(),
             tensor_parallel_size=tp,
             multiprocessing=True,
-            execution=ExecutionOptions(capture_memory_bytes=256 << 20),
+            execution=ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
         )
         report = pllm.explain(workload, settings)
         with pllm.make_llm(settings, workload=workload) as handle:
-            llm = handle._require_open()
+            llm = handle.require_llm()
             llm.collective_rpc(_m4_instrument)
             output = handle.generate(PROMPTS, params)
             fields = llm.collective_rpc(_m4_fields)

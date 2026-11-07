@@ -1,6 +1,6 @@
 """TensorExecutor: one tensor task's body over a fixed int64 row table, eager or captured, and how it writes its outputs.
 
-TensorBinding.executables builds one per tensor task. Row-reading tasks gather every input through the
+TensorDeclaration.executables builds one per tensor task. Row-reading tasks gather every input through the
 table and mask unselected rows on the device; tasks without row inputs evaluate directly.
 """
 
@@ -339,7 +339,8 @@ class TensorExecutor:
         executor = replace(self, task=task, compiled=None, resource_pools={}, layouts={}, views={})
         measure(partial(executor, data, batch))
 
-    def _body(self, data: TensorFrame, batch: TensorBatch) -> None:
+    def execute_body(self, data: TensorFrame, batch: TensorBatch) -> None:
+        """Evaluate the tensor task body with its staged inputs and result buffers."""
         task = (
             replace(self.task, function=self.compiled)
             if self.compiled is not None and MemoryTrace.active.get() is None
@@ -454,12 +455,12 @@ class TensorExecutor:
             else:
                 self._prepare(plan, data, batch)
         if self.capture is None or context is None:
-            self._body(data, batch)
+            self.execute_body(data, batch)
         else:
             assert self.table is not None
             table = self.table
             self.capture.run(
-                lambda: self._body(data, batch),
+                lambda: self.execute_body(data, batch),
                 self.table,
                 self.views[self.task.resource][2],
                 addresses,

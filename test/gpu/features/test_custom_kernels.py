@@ -21,7 +21,7 @@ CONFIG = pllm.ModelConfig(
     # These tiny schedules need little KV; leave room for the resident FP32 oracle on a 24 GiB GPU.
     gpu_memory_utilization=0.2,
     cuda_graphs=True,
-    execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+    execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
 )
 
 
@@ -67,14 +67,14 @@ def test_wrong_reference_fails_device_equivalence():
 
     try:
         # Fail before an engine is loaded; the same helper is check_on_gpu's first contract.
-        from pllm.testing_contracts import _check
+        from pllm.testing_contracts import check_contracts
 
         with pytest.raises(AssertionError, match="device equivalence"):
-            _check(Residual(), replace(CONFIG, cuda_graphs=False), device_equivalence=True)
+            check_contracts(Residual(), replace(CONFIG, cuda_graphs=False), device_equivalence=True)
     finally:
-        from test.workloads.kernel_workloads import _cpu
+        from test.workloads.kernel_workloads import add_cpu
 
-        add.register_kernel("cpu")(_cpu)
+        add.register_kernel("cpu")(add_cpu)
 
 
 if __name__ == "__main__":

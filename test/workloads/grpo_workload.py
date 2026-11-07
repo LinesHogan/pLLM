@@ -11,7 +11,7 @@ from vllm import RequestOutput, SamplingParams
 
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
-from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.host import CausalTrainBatch
 from pllm.workloads.ttrl import boxed_label

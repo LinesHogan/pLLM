@@ -41,7 +41,7 @@ def test_explicit_placement_and_engram_contracts(tmp_path):
         str(tmp_path),
         max_num_seqs=2,
         max_num_batched_tokens=16,
-        execution=pllm.ExecutionOptions(state_memory_bytes=1024),
+        execution=pllm.ExecutionOptions(state_page_budget_bytes=1024),
     )
     host = EngramLite(str(path), buckets=1024, width=2, placement="host", layers=(0,))
     report = pllm.explain(host, config)

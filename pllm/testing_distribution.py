@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 # Like testing_gpu, diagnostics inspect the in-process engine and sampler.
-# pyright: reportPrivateUsage=false
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -20,7 +19,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler as Mrv2Sampler
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ModelConfig
-from pllm.testing_gpu import _PROMPTS, _plain_model, _release_models
+from pllm.testing_gpu import CHECK_PROMPTS, plain_model, release_models
 from pllm.usage import Workload
 
 _Sample = ParamSpec("_Sample")
@@ -90,7 +89,7 @@ class DistributionResult:
         )
 
 
-def _distances(log_plain: torch.Tensor, log_workload: torch.Tensor) -> torch.Tensor:
+def distribution_distances(log_plain: torch.Tensor, log_workload: torch.Tensor) -> torch.Tensor:
     """Reduce FP32 log probabilities over the entire vocabulary, preserving support mismatches."""
     p, q = log_plain.exp(), log_workload.exp()
     delta = log_plain - log_workload
@@ -99,7 +98,9 @@ def _distances(log_plain: torch.Tensor, log_workload: torch.Tensor) -> torch.Ten
     return torch.stack((forward, reverse, 0.5 * (p - q).abs().sum(-1)), dim=-1)
 
 
-def _summaries(values: torch.Tensor, positions: list[tuple[int, int]], worst: int) -> tuple[DistanceSummary, ...]:
+def distance_summaries(
+    values: torch.Tensor, positions: list[tuple[int, int]], worst: int
+) -> tuple[DistanceSummary, ...]:
     """Reduce on device and transfer only final summaries and worst-position indices."""
     count = values.shape[0]
     largest, indices = values.topk(min(worst, count), dim=0)
@@ -122,7 +123,7 @@ def _summaries(values: torch.Tensor, positions: list[tuple[int, int]], worst: in
 
 
 @dataclass
-class _Observation:
+class SamplerObservation:
     """Device-only recordings at the native sampler boundary, with optional teacher forcing."""
 
     temperature: float = 1
@@ -141,14 +142,14 @@ class _Observation:
             if self.greedy:
                 sampled = logits.argmax(-1).reshape_as(sampled)
         else:
-            self.distances.append(_distances(self.reference[self.step], log_probs))
+            self.distances.append(distribution_distances(self.reference[self.step], log_probs))
             sampled = self.forced[self.step].expand_as(sampled)
         self.step += 1
         return sampled
 
 
 def _record_sample(
-    observation: _Observation,
+    observation: SamplerObservation,
     sample: Callable[_Sample, tuple[torch.Tensor, torch.Tensor | None]],
 ) -> Callable[_Sample, tuple[torch.Tensor, torch.Tensor | None]]:
     """Observe the native result without depending on a release's sample argument list."""
@@ -162,13 +163,13 @@ def _record_sample(
 
 
 @contextmanager
-def _observe_mrv2(sampler: Mrv2Sampler, observation: _Observation) -> Generator[None]:
+def _observe_mrv2(sampler: Mrv2Sampler, observation: SamplerObservation) -> Generator[None]:
     with patch.object(sampler, "sample", _record_sample(observation, sampler.sample)):
         yield
 
 
 @contextmanager
-def _observe_mrv1(sampler: Mrv1Sampler, observation: _Observation) -> Generator[None]:
+def _observe_mrv1(sampler: Mrv1Sampler, observation: SamplerObservation) -> Generator[None]:
     with (
         patch.object(sampler, "sample", _record_sample(observation, sampler.sample)),
         patch.object(sampler, "logprobs_mode", "processed_logits"),
@@ -178,8 +179,8 @@ def _observe_mrv1(sampler: Mrv1Sampler, observation: _Observation) -> Generator[
 
 
 @contextmanager
-def _observe(llm: VllmLlm[_DataT, _ResultT], config: ModelConfig, observation: _Observation) -> Generator[None]:
-    runner = llm._require_open().llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+def _observe(llm: VllmLlm[_DataT, _ResultT], config: ModelConfig, observation: SamplerObservation) -> Generator[None]:
+    runner = llm.require_llm().llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
     sampler = runner.sampler
     if config.runner == "mrv2":
         assert isinstance(sampler, Mrv2Sampler)
@@ -208,15 +209,15 @@ def _plain_continuations(
 ) -> tuple[tuple[_Reference, ...], float]:
     references: list[_Reference] = []
     seconds = 0.0
-    with _plain_model(workload, config) as plain:
-        tokenizer = plain._require_open().get_tokenizer()
+    with plain_model(workload, config) as plain:
+        tokenizer = plain.require_llm().get_tokenizer()
         for prompt in prompts:
             prompt_length = len(tokenizer.encode(prompt))
             if prompt_length + tokens > config.max_model_len or prompt_length > config.max_num_batched_tokens:
                 raise ValueError(
                     "check_distribution needs each prompt to fit max_num_batched_tokens and prompt + tokens <= max_model_len"
                 )
-            observation = _Observation(temperature=temperature or 1, greedy=temperature == 0)
+            observation = SamplerObservation(temperature=temperature or 1, greedy=temperature == 0)
             params = SamplingParams(temperature=temperature or 1, seed=17, max_tokens=tokens, ignore_eos=True)
             torch.cuda.synchronize()
             start = perf_counter()
@@ -240,7 +241,7 @@ def _workload_distances(
     with pllm.make_llm(config, workload=workload) as handle:
         for index, reference in enumerate(references):
             forced = torch.tensor(reference.continuation, dtype=torch.int64, device="cuda")
-            observation = _Observation(reference=reference.log_probs, forced=forced)
+            observation = SamplerObservation(reference=reference.log_probs, forced=forced)
             params = SamplingParams(temperature=1, seed=17, max_tokens=len(reference.continuation), ignore_eos=True)
             torch.cuda.synchronize()
             start = perf_counter()
@@ -253,11 +254,12 @@ def _workload_distances(
     return torch.cat(distances), seconds
 
 
-def _failures(
+def distribution_failures(
     summaries: tuple[DistanceSummary, ...],
     max_mean_kl: float | None,
     max_p99_kl: float | None,
 ) -> tuple[str, ...]:
+    """Describe non-finite distances and KL summaries that exceed the supplied limits."""
     failures: list[str] = []
     for name, summary in zip(("KL(plain || workload)", "KL(workload || plain)", "TV"), summaries, strict=True):
         if any(value != value for value in (summary.mean, summary.p99, summary.max)):
@@ -315,26 +317,26 @@ def check_distribution(
         or max(config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size) > 1
     ):
         raise ValueError("check_distribution needs multiprocessing=False and all parallel sizes=1")
-    texts = tuple(_PROMPTS if prompts is None else prompts)
+    texts = tuple(CHECK_PROMPTS if prompts is None else prompts)
     if not texts or any(not prompt for prompt in texts) or tokens < 1 or worst < 1:
         raise ValueError("check_distribution needs nonempty prompts, tokens >= 1 and worst >= 1")
     for name, value in (("temperature", temperature), ("max_mean_kl", max_mean_kl), ("max_p99_kl", max_p99_kl)):
         if value is not None and (not isfinite(value) or value < 0):
             raise ValueError(f"{name} must be finite and >= 0")
     start = perf_counter()
-    _release_models()
+    release_models()
     try:
         references, plain_seconds = _plain_continuations(workload, config, texts, tokens, temperature)
-        _release_models()
+        release_models()
         values, workload_seconds = _workload_distances(workload, config, references)
         positions = [
             (index, reference.prompt_length + token)
             for index, reference in enumerate(references)
             for token in range(tokens)
         ]
-        summaries = _summaries(values, positions, worst)
+        summaries = distance_summaries(values, positions, worst)
     finally:
-        _release_models()
+        release_models()
     forward, reverse, tv = summaries
     return DistributionResult(
         forward,
@@ -343,5 +345,5 @@ def check_distribution(
         len(positions),
         plain_seconds + workload_seconds,
         perf_counter() - start,
-        _failures(summaries, max_mean_kl, max_p99_kl),
+        distribution_failures(summaries, max_mean_kl, max_p99_kl),
     )

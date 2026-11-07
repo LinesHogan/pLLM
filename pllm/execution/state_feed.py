@@ -107,7 +107,7 @@ def _restore_feed(
     )
 
 
-class _ConsumerClosed(RuntimeError):
+class ConsumerClosed(RuntimeError):
     """The consumer has proved that no further GPU reads can occur."""
 
 
@@ -130,11 +130,11 @@ class Feed:
         self._fields = dict(zip(binding.fields, self._layout.fields, strict=True))
         self._device = device
         self._peer_exit = _process_exit(peer)
-        self._arena: PageBundleArena | None = None
-        self._current: StateRef | None = None
+        self.arena: PageBundleArena | None = None
+        self.current_ref: StateRef | None = None
         self._pending: dict[int, PageRelease] = {}
         self._credits = 0
-        self._failed = self._ended = self._closed = self._moved = self._quiescent = False
+        self.failed = self._ended = self.closed = self.moved = self._quiescent = False
 
     def __reduce__(
         self,
@@ -142,7 +142,7 @@ class Feed:
         Callable[[PlanBundle, FeedBinding, DupFd, tuple[tuple[DupFd, ...], ...], int, torch.device], Feed],
         tuple[PlanBundle, FeedBinding, DupFd, tuple[tuple[DupFd, ...], ...], int, torch.device],
     ]:
-        if self._arena is not None or self._credits or self._moved or self._closed:
+        if self.arena is not None or self._credits or self.moved or self.closed:
             raise RuntimeError("transfer the feed once, before publishing")
         transfer = (
             self._plan,
@@ -152,7 +152,7 @@ class Feed:
             self._peer,
             self._device,
         )
-        self._moved = True
+        self.moved = True
         self._disconnect()
         return _restore_feed, transfer
 
@@ -165,12 +165,12 @@ class Feed:
 
     @contextmanager
     def _live(self) -> Generator[None]:
-        if self._failed or self._closed or self._moved or self._ended:
+        if self.failed or self.closed or self.moved or self._ended:
             raise RuntimeError("feed is closed, transferred, ended or fail-stopped; start a new session")
         try:
             yield
         except BaseException:
-            self._failed = True
+            self.failed = True
             raise
 
     def _signal(self) -> None:
@@ -185,7 +185,7 @@ class Feed:
         if self._control in wait((self._control, *channels)):
             self._signal()
             if self._quiescent:
-                raise _ConsumerClosed("feed consumer has closed")
+                raise ConsumerClosed("feed consumer has closed")
 
     def _send(self, record: FeedRecord) -> None:
         while self._credits == len(self._channels):
@@ -197,28 +197,28 @@ class Feed:
         receipt = self._pending.get(slot)
         if receipt is None:
             return
-        assert self._arena is not None
-        while not self._arena.release_complete(receipt):
+        assert self.arena is not None
+        while not self.arena.release_complete(receipt):
             channels = tuple(read.connection for read in receipt.remote_reads if not read.query())
             if not channels:
-                self._arena.wait_release(receipt)
+                self.arena.wait_release(receipt)
                 break
             self._wait(channels)
         del self._pending[slot]
 
     def _start(self, stream: torch.cuda.Stream) -> PageBundleArena:
-        if self._arena is None:
-            self._arena = PageBundleArena(self._plan, device=self._device, _owned_resources=(self._binding.resource,))
-            publication = self._arena.publish(self._arena.prepare_admission((self._binding.resource,), stream))
-            (self._current,) = publication.after_refs
-        return self._arena
+        if self.arena is None:
+            self.arena = PageBundleArena(self._plan, device=self._device, owned_resources=(self._binding.resource,))
+            publication = self.arena.publish(self.arena.prepare_admission((self._binding.resource,), stream))
+            (self.current_ref,) = publication.after_refs
+        return self.arena
 
     def publish(self, **fields: torch.Tensor) -> None:
         """Copy all declared fields, then publish one immutable version; block on capacity."""
         if (
-            self._failed
-            or self._closed
-            or self._moved
+            self.failed
+            or self.closed
+            or self.moved
             or self._ended
             or fields.keys() != self._fields.keys()
             or any(
@@ -238,22 +238,22 @@ class Feed:
         with self._live():
             stream = torch.cuda.current_stream(self._device)
             arena = self._start(stream)
-            assert self._current is not None
-            slot = self._current.version_id % len(self._channels)
+            assert self.current_ref is not None
+            slot = self.current_ref.version_id % len(self._channels)
             self._release(slot)
-            write = arena.prepare_transition(StateRefs.of((self._current,)), stream, copy_fields=())
+            write = arena.prepare_transition(StateRefs.of((self.current_ref,)), stream, copy_fields=())
             for name, field in self._fields.items():
                 arena.write_field(write, 0, field.field_id).copy_(fields[name])
             publication = arena.publish(write)
-            (self._current,) = publication.after_refs
+            (self.current_ref,) = publication.after_refs
             pin = arena.pin_exact(publication.after_refs, stream)
             try:
                 for field, channel in zip(self._layout.fields, self._channels[slot], strict=True):
-                    arena.send_field(pin, self._current, field.field_id, channel, self._peer)
+                    arena.send_field(pin, self.current_ref, field.field_id, channel, self._peer)
             finally:
                 self._pending[slot] = arena.release_pin(pin)
             stream.synchronize()  # Returning transfers no source-tensor lifetime obligation to the caller.
-            self._send(FeedRecord(FeedEvent.PUBLISH, slot, self._current))
+            self._send(FeedRecord(FeedEvent.PUBLISH, slot, self.current_ref))
 
     def missing(self) -> None:
         """Submit one explicit absent-input step using the ActivationPatch on_missing policy."""
@@ -262,7 +262,7 @@ class Feed:
 
     def end(self) -> None:
         """End the feed normally; following steps use the declared missing policy."""
-        if self._ended and not self._failed:
+        if self._ended and not self.failed:
             return
         with self._live():
             self._send(FeedRecord(FeedEvent.END))
@@ -280,10 +280,10 @@ class Feed:
 
     def close(self) -> None:
         """Release finished pages; cancellation retains owners until consumer teardown."""
-        if self._closed or self._moved:
+        if self.closed or self.moved:
             return
         try:
-            if not self._ended or self._failed:
+            if not self._ended or self.failed:
                 self._control.send_bytes(encode_boundary(FeedRecord(FeedEvent.CANCEL)).encode())
                 self._await_shutdown()
             else:
@@ -292,14 +292,14 @@ class Feed:
                 while self._credits and not self._quiescent:
                     wait((self._control,))
                     self._signal()
-                if self._arena is not None:
-                    assert self._current is not None
-                    self._arena.retire(StateRefs.of((self._current,)))
-                    self._arena.collect_completed(wait=True)
-        except _ConsumerClosed:
+                if self.arena is not None:
+                    assert self.current_ref is not None
+                    self.arena.retire(StateRefs.of((self.current_ref,)))
+                    self.arena.collect_completed(wait=True)
+        except ConsumerClosed:
             pass
         except (EOFError, OSError, RuntimeError):
-            self._failed = True
+            self.failed = True
             try:
                 self._control.send_bytes(encode_boundary(FeedRecord(FeedEvent.CANCEL)).encode())
             except (EOFError, OSError):
@@ -307,8 +307,8 @@ class Feed:
             self._await_shutdown()
             raise
         finally:
-            self._arena = None
-            self._closed = True
+            self.arena = None
+            self.closed = True
             self._disconnect()
 
 

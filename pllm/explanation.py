@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.hidden_taps import HiddenTapLayout
     from pllm.backends.vllm.model_shape import ModelShape
     from pllm.execution.compile_facts import BackendCompileFacts
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
     from pllm.usage import Workload
 
 
@@ -178,7 +178,7 @@ class ExplainResult:
                 )
                 if task.capture_resident_bytes:
                     lines.append(
-                        f"  capture reservation: {task.capture_resident_bytes} bytes [workload estimate or explicit budget]"
+                        f"  CUDA-graph pool reservation: {task.capture_resident_bytes} bytes [workload estimate or cuda_graph_pool_budget_bytes]"
                     )
                 if task.estimate is not None:
                     estimate = task.estimate
@@ -204,7 +204,7 @@ class ExplainResult:
             f"{tap.resident_bytes} bytes shared by {', '.join(tap.members)}"
             for tap in self.taps
         )
-        lines.append("state  scope  roots  bytes/root  reserved bytes [exact]")
+        lines.append("state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]")
         lines.extend(
             f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}  "
             + ", ".join(f"field {field.field_id}: {field.dtype}" for field in state.fields)
@@ -212,7 +212,9 @@ class ExplainResult:
             + f"logical transfer bytes/row: {state.transfer_bytes_per_row}; decode bytes/step: {state.transfer_bytes_per_step}"
             for state in self.states
         )
-        lines.append(f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}]")
+        lines.append(
+            f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}; execution_peak_budget_bytes]"
+        )
         if self.overlap_threshold_bytes is not None:
             lines.append(
                 f"         below {self.overlap_threshold_bytes} bytes tasks run inline; "
@@ -298,10 +300,10 @@ def _task_costs(plan: PlanBundle, estimates: dict[str, CostEstimate]) -> dict[st
 
 
 def _members(
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     costs: dict[str, TaskCost],
     reasons: dict[str, str],
-    max_training_rows: int,
+    max_host_training_rows: int,
     sites: dict[str, KernelEstimate],
 ) -> tuple[MemberCost, ...]:
     result: list[MemberCost] = []
@@ -316,7 +318,7 @@ def _members(
             for task in binding.graph.tasks
         )
         host_batch = (
-            f"host batch CausalTrainBatch ({', '.join(CausalTrainBatch.names)}), at most {max_training_rows} "
+            f"host batch CausalTrainBatch ({', '.join(CausalTrainBatch.names)}), at most {max_host_training_rows} (max_host_training_rows) "
             "sequences, one AdamW step at the start of generate(batch=...)"
             if causal
             else ""
@@ -349,7 +351,7 @@ def _kernel_sum(tasks: tuple[TaskCost, ...], sites: tuple[KernelEstimate, ...]) 
 
 
 def _taps(
-    binding: TensorBinding, facts: BackendCompileFacts, layouts: tuple[HiddenTapLayout, ...]
+    binding: TensorDeclaration, facts: BackendCompileFacts, layouts: tuple[HiddenTapLayout, ...]
 ) -> tuple[TapCost, ...]:
     from pllm.backends.vllm.architecture import hidden_binding
 
@@ -375,7 +377,7 @@ def _taps(
     return tuple(result)
 
 
-def _states(plan: PlanBundle, binding: TensorBinding, rows: int) -> tuple[StateCost, ...]:
+def _states(plan: PlanBundle, binding: TensorDeclaration, rows: int) -> tuple[StateCost, ...]:
     states = {str(state.resource): state for state in plan.semantic_graph.states}
     layouts = {entry.resource: entry.layout for entry in plan.tensor_layout_request.layouts}
     costs: list[StateCost] = []
@@ -406,7 +408,7 @@ def _states(plan: PlanBundle, binding: TensorBinding, rows: int) -> tuple[StateC
 
 
 def _settings(
-    binding: TensorBinding, config: ModelConfig, plan: PlanBundle, facts: BackendCompileFacts
+    binding: TensorDeclaration, config: ModelConfig, plan: PlanBundle, facts: BackendCompileFacts
 ) -> tuple[EscapeHatch, ...]:
     lag = config.execution.publish_lag
     result = [
@@ -531,7 +533,7 @@ def _settings(
 
 
 def _plans(
-    workload: Workload, facts: BackendCompileFacts, binding: TensorBinding, config: ModelConfig
+    workload: Workload, facts: BackendCompileFacts, binding: TensorDeclaration, config: ModelConfig
 ) -> tuple[BackendAttachment, int | None, int, tuple[str, ...]]:
     preferred = workload.plan_backend(facts, binding)
     peak = preferred.plan.schedule.peak_memory_bytes
@@ -540,7 +542,7 @@ def _plans(
     if peak and any(task.lane == "side" for task in preferred.plan.schedule.tasks):
         try:
             inline = workload.plan_backend(
-                replace(facts, timeline=replace(facts.timeline, memory_budget_bytes=peak - 1)), binding
+                replace(facts, timeline=replace(facts.timeline, execution_peak_budget_bytes=peak - 1)), binding
             )
         except ValueError:
             pass  # No cheaper schedule: overlap costs no extra peak memory.
@@ -549,11 +551,11 @@ def _plans(
     errors: list[str] = []
     selected = preferred
     options = config.execution
-    if options.memory_budget_bytes is not None or options.state_memory_bytes:
+    if options.execution_peak_budget_bytes is not None or options.state_page_budget_bytes:
         limited = replace(
             facts,
-            timeline=replace(facts.timeline, memory_budget_bytes=options.memory_budget_bytes),
-            state_memory_budget_bytes=options.state_memory_bytes or facts.state_memory_budget_bytes,
+            timeline=replace(facts.timeline, execution_peak_budget_bytes=options.execution_peak_budget_bytes),
+            state_page_budget_bytes=options.state_page_budget_bytes or facts.state_page_budget_bytes,
         )
         try:
             selected = workload.plan_backend(limited, binding)
@@ -564,23 +566,23 @@ def _plans(
 
 def _specialize(
     workload: Workload, facts: BackendCompileFacts, config: ModelConfig
-) -> tuple[BackendCompileFacts, TensorBinding, tuple[str, ...]]:
+) -> tuple[BackendCompileFacts, TensorDeclaration, tuple[str, ...]]:
     errors: tuple[str, ...] = ()
     try:
         funded, binding = workload.specialize(facts, config.execution)
     except ValueError as error:
-        if config.execution.memory_budget_bytes is None and not config.execution.state_memory_bytes:
+        if config.execution.execution_peak_budget_bytes is None and not config.execution.state_page_budget_bytes:
             raise
         # If the declaration is invalid independently of a budget, this raises its own error again.
         funded, binding = workload.specialize(
-            facts, replace(config.execution, memory_budget_bytes=None, state_memory_bytes=0)
+            facts, replace(config.execution, execution_peak_budget_bytes=None, state_page_budget_bytes=0)
         )
         errors = (str(error),)
     return (
         replace(
             funded,
-            timeline=replace(funded.timeline, memory_budget_bytes=None),
-            state_memory_budget_bytes=facts.state_memory_budget_bytes,
+            timeline=replace(funded.timeline, execution_peak_budget_bytes=None),
+            state_page_budget_bytes=facts.state_page_budget_bytes,
         ),
         binding,
         errors,
@@ -595,7 +597,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
     Memory excludes base-model weights, KV cache and vLLM activations. GPU fit is decided by make_llm.
     A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.
     """
-    from pllm.backends.vllm.admission import admit_workload, model_capture_bytes, model_hooks
+    from pllm.backends.vllm.admission import admit_workload, model_cuda_graph_pool_budget_bytes, model_hooks
     from pllm.backends.vllm.compile_facts import compile_facts
     from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
     from pllm.backends.vllm.model_shape import ModelShape
@@ -613,7 +615,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
         config,
         model_identity=shape.architecture,
         hidden_layouts=layouts,
-        overlay_graph_bytes=model_capture_bytes(config, requirements)
+        overlay_graph_bytes=model_cuda_graph_pool_budget_bytes(config, requirements)
         if model_hooks(requirements) and not reason
         else 0,
         memory_bytes=1 << 60,
@@ -666,7 +668,9 @@ def explain_facts(
         config.runner,
         config.tensor_parallel_size,
         reason,
-        _members(binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_training_rows, sites),
+        _members(
+            binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_host_training_rows, sites
+        ),
         tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
         _states(plan, binding, config.max_num_seqs),
         tuple(

@@ -65,7 +65,7 @@ def mean_capture(publish_lag: int = 0) -> None:
     provider = PageBundleProviderFacts("test.mean@1", 6, StateDeviceKind.CUDA)
     facts = backend_facts(4, (resource,), timeline, provider, max_lineages=3)
     facts, declaration = workload.specialize(
-        facts, pllm.ExecutionOptions(capture_memory_bytes=16 * 1024**2, publish_lag=publish_lag)
+        facts, pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2, publish_lag=publish_lag)
     )
     # One admitted lineage: the instance state.
     plan = compile_page_bundle_plan(
@@ -73,7 +73,7 @@ def mean_capture(publish_lag: int = 0) -> None:
         facts.timeline,
         facts.providers,
         1,
-        facts.state_memory_budget_bytes,
+        facts.state_page_budget_bytes,
         device,
     )
     execution = workload.bind_math(facts, plan, declaration).bind(PageBundleArena(plan), AnchorId(3))

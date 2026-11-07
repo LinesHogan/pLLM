@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from pllm.execution.attention import DenseAttention, PagedKV
     from pllm.execution.attention_methods import Argument
     from pllm.execution.compile_facts import BackendCompileFacts
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
 
 import torch
 
@@ -20,7 +20,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.custom_forward import CustomForwardTask, SerialCustomForward
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.token_program import KV
 
@@ -83,7 +83,7 @@ class CheckAttention:
     """Tiny dict-backed paged attention for CPU permutation, chunk and recompute checks."""
 
     def __init__(
-        self, binding: "TensorBinding", facts: "BackendCompileFacts", *, device_equivalence: bool = False
+        self, binding: "TensorDeclaration", facts: "BackendCompileFacts", *, device_equivalence: bool = False
     ) -> None:
         from pllm.execution.model_sites import StateInput
         from pllm.execution.task_memory import site_state

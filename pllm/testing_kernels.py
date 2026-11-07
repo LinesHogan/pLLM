@@ -15,7 +15,7 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.model_sites import DepthInput
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.task_memory import SiteArgument, site_arguments
-from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorMath
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.token_program import Cell, TokenProgram
@@ -79,8 +79,8 @@ def _method_result(task: TensorTask, **inputs: torch.Tensor) -> torch.Tensor | t
         return result
     mask = inputs[task.policy.forward_rows]
     if isinstance(result, torch.Tensor):
-        return task._selected(result, mask)  # pyright: ignore[reportPrivateUsage]
-    return tuple(task._selected(value, mask) for value in result)  # pyright: ignore[reportPrivateUsage]
+        return task.selected_rows(result, mask)
+    return tuple(task.selected_rows(value, mask) for value in result)
 
 
 def compare_method(
@@ -93,7 +93,7 @@ def compare_method(
 
 
 def check_sites(
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     facts: BackendCompileFacts,
     x: torch.Tensor,
     y: torch.Tensor,

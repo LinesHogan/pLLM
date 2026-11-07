@@ -1,7 +1,7 @@
 """Model-side tensor effects: parameter overlays, imported overlays, activation patches.
 
 Module functions declare effects that run inside or alongside the model forward and their
-request-state transitions on the TensorBinding supplied by workload authoring.
+request-state transitions on the TensorDeclaration supplied by workload authoring.
 """
 
 from __future__ import annotations
@@ -59,16 +59,16 @@ from pllm.execution.tensor_task import FieldWriter, TensorTask
 from pllm.execution.token_program import ApplyUpdates, Cell, Over, Segment, TokenProgram, Tokens, TokenTensor
 
 if TYPE_CHECKING:
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
 
 
-def _bind_visibility(b: TensorBinding, call: Call, source: VisibilitySource) -> None:
+def _bind_visibility(b: TensorDeclaration, call: Call, source: VisibilitySource) -> None:
     """Attach the read domain; plan validation derives and checks its relation once."""
     b.update_task(call.symbol, lambda task: replace(task, visibility=source))
 
 
 def declare_parameter_overlay(
-    b: TensorBinding,
+    b: TensorDeclaration,
     name: str,
     effect: ProjectionDelta,
     fields: Mapping[str, Field],
@@ -200,7 +200,7 @@ def declare_parameter_overlay(
     b.overlay(views, transition, phases=phases)
 
 
-def declare_site_memory(b: TensorBinding, name: str, state: State) -> None:
+def declare_site_memory(b: TensorDeclaration, name: str, state: State) -> None:
     """A stateful custom residual's transition: before the forward it copies each request's memory into a private
     write, which the method's hook advances chunk by chunk; the publication makes it visible after the forward."""
     transition = b.compute(
@@ -221,7 +221,7 @@ def _open_memory(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
     return TaskOutput()
 
 
-def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:
+def write_result(b: TensorDeclaration, source: Call, state: State, fields: tuple[str, ...], when: When) -> Call:
     """Bind a computed tuple to one atomic private transition."""
     writer = FieldWriter(
         source,
@@ -243,13 +243,13 @@ def write_result(b: TensorBinding, source: Call, state: State, fields: tuple[str
     return update
 
 
-def _write_task(b: TensorBinding, update: Call, writer: FieldWriter) -> None:
+def _write_task(b: TensorDeclaration, update: Call, writer: FieldWriter) -> None:
     b.tensor_tasks[update.symbol] = TensorTask(
         update.symbol, lambda: (), {}, {}, MathContract(), (), {}, writer.phase, writer.resource, writer
     )
 
 
-def import_update(b: TensorBinding, state: State, identity: str) -> Call:
+def import_update(b: TensorDeclaration, state: State, identity: str) -> Call:
     """One BEFORE_FORWARD import of externally produced field values into private roots."""
     writer = FieldWriter(None, b.imports[str(state.declaration.resource)], state.declaration.resource, None)
     update = b.compute(
@@ -266,7 +266,7 @@ def import_update(b: TensorBinding, state: State, identity: str) -> Call:
 
 
 def declare_activation_patch(
-    b: TensorBinding,
+    b: TensorDeclaration,
     name: str,
     state: State,
     *,
@@ -320,7 +320,7 @@ def declare_activation_patch(
 
 
 def _check_activation_fields(
-    b: TensorBinding, state: State, operator: ActivationPatchOperator, views: tuple[FieldView, ...]
+    b: TensorDeclaration, state: State, operator: ActivationPatchOperator, views: tuple[FieldView, ...]
 ) -> None:
     """Reject one layer's activation fields the operator cannot apply, naming the fields to fix."""
     hidden, names = b.dimensions.hidden_size, tuple(state.fields[view.field].name for view in views)
@@ -344,7 +344,7 @@ def _check_activation_fields(
 
 
 def declare_custom_forward(
-    b: TensorBinding,
+    b: TensorDeclaration,
     forwards: tuple[tuple[str, Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
     position_states: tuple[tuple[str, float], ...],
     publications: tuple[Call, ...],
@@ -418,7 +418,7 @@ def declare_custom_forward(
     b.update_task(symbol, lambda task: replace(task, custom_forward=program_effect))
 
 
-def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram], ...]) -> None:
+def _check_adaptive(b: TensorDeclaration, programs: tuple[tuple[Tokens, TokenProgram], ...]) -> None:
     """Reject adaptive declarations that need operands from layers a token skips."""
     for tokens, program in programs:
         if not program.adaptive:
@@ -455,7 +455,7 @@ def _check_adaptive(b: TensorBinding, programs: tuple[tuple[Tokens, TokenProgram
             raise ValueError(f"adaptive forward leaves KV holes at layers {sorted(missing)}; commit every layer")
 
 
-def _check_custom_forward(b: TensorBinding) -> None:
+def _check_custom_forward(b: TensorDeclaration) -> None:
     """Reject output taps that the custom layer loop does not produce."""
     for task in b.graph.tasks:
         if any(
@@ -469,7 +469,7 @@ def _check_custom_forward(b: TensorBinding) -> None:
             )
 
 
-def _read_publications(b: TensorBinding, publications: tuple[Call, ...], task: SemanticTask) -> SemanticTask:
+def _read_publications(b: TensorDeclaration, publications: tuple[Call, ...], task: SemanticTask) -> SemanticTask:
     """Make the custom forward read the published versions of the states its activation patches read."""
     published = tuple(next(item for item in b.graph.tasks if item.symbol == call.symbol) for call in publications)
     return replace(
@@ -488,7 +488,7 @@ def _read_publications(b: TensorBinding, publications: tuple[Call, ...], task: S
     )
 
 
-def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgramEffect) -> TaskSymbol:
+def _attach_custom_forward(b: TensorDeclaration, composed: bool, effect: TokenProgramEffect) -> TaskSymbol:
     """Run the custom forward as the trained overlay's transition, or as a standalone forward; return its task."""
     if not composed:
         forward = b.compute(
@@ -526,7 +526,7 @@ def _attach_custom_forward(b: TensorBinding, composed: bool, effect: TokenProgra
 
 
 def _trace_programs(
-    b: TensorBinding,
+    b: TensorDeclaration,
     forwards: tuple[tuple[str, Tokens, Over, Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]], ...],
     position_states: tuple[tuple[str, float], ...],
 ) -> tuple[tuple[Tokens, TokenProgram], ...]:
@@ -560,7 +560,7 @@ def _trace_programs(
     )
 
 
-def _count_program_work(b: TensorBinding, programs: tuple[TokenProgram, ...]) -> None:
+def _count_program_work(b: TensorDeclaration, programs: tuple[TokenProgram, ...]) -> None:
     """Fund packed rows for each model segment, and note whether apply_updates follows a targeted layer."""
     assert b.probe is not None
     segments = sum(isinstance(step, Segment) for program in programs for step in program.steps)

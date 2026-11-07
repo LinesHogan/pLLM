@@ -32,7 +32,7 @@ from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.scan_analysis import analyze
 from pllm.testing import backend_facts
 from test.dense_update import DenseUpdate, DenseUpdateConfig
-from test.workloads.test_inplace_ttt import _input
+from test.workloads.test_inplace_ttt import projection_input
 
 TARGET = Projection("down_proj", 0)
 
@@ -99,7 +99,7 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
             hidden.new_full((), False, dtype=torch.bool),
             embedding=hidden.new_empty((0, 0)),
         )
-        (result,) = execution.step(_input((operand,)), stream=stream).entries
+        (result,) = execution.step(projection_input((operand,)), stream=stream).entries
         got = result.targets[0].update
         tolerance = {"rtol": 0.02, "atol": 0.001} if numerics else {"rtol": 0, "atol": 0}
         torch.testing.assert_close(got.output, expected.output, **tolerance)
@@ -119,7 +119,9 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
 
 def test_production_tuning_policy_is_signed_into_worker_facts():
     workload = DenseUpdate(DenseUpdateConfig((TARGET,), chunk_size=3))
-    options = pllm.ExecutionOptions(allow_numerical_transforms=False, tuning="measured", memory_budget_bytes=1 << 20)
+    options = pllm.ExecutionOptions(
+        allow_numerical_transforms=False, tuning="measured", execution_peak_budget_bytes=1 << 20
+    )
     facts, _ = workload.specialize(facts_for(torch.device("cpu"), torch.float32), options)
     policy = TensorPolicy(False, "measured")
     assert facts.timeline.tensor_policy == policy
@@ -213,7 +215,7 @@ def test_scan_matches_the_serial_loop_including_carry_views(device):
     run(workload.step, carry=carry, over=(x[:20], y[:20]), chunk=4)
     with (
         patch("pllm.execution.scan.analyze", side_effect=AssertionError("warm C caused a trace")),
-        patch.object(ScanTemplate, "_prepare", side_effect=AssertionError("warm C caused plan preparation")),
+        patch.object(ScanTemplate, "prepare_plan", side_effect=AssertionError("warm C caused plan preparation")),
     ):
         for count in (0, 6, 5, 8, 7):
             expected, outputs = carry, []

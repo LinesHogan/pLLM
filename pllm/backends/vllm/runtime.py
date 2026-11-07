@@ -148,52 +148,53 @@ class _Generation:
 class VllmLlm(Generic[DataT, ResultT]):
     """The engine handle returned by make_llm, with workload diagnostics, traces and feeds when installed."""
 
-    _llm: LLM | None
+    llm: LLM | None
     _runner: WorkloadModelRunner | Mrv1Runner | None = None
-    _attachment: BackendAttachment | None = None
-    _facts: BackendCompileFacts | None = None
-    _cache_policy: CachePolicy | None = None
+    backend_attachment: BackendAttachment | None = None
+    compile_facts: BackendCompileFacts | None = None
+    cache_policy: CachePolicy | None = None
     _sample_limit: int | None = None
     _eager_reason: str = ""
     _closed: bool = False
-    _next_prompt_index: int = 0
+    next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
 
-    def _require_open(self) -> LLM:
-        if self._closed or self._llm is None:
+    def require_llm(self) -> LLM:
+        """Return the live vLLM engine; a closed handle cannot execute operations."""
+        if self._closed or self.llm is None:
             raise RuntimeError("model handle is closed")
-        return self._llm
+        return self.llm
 
     @property
     def hidden_size(self) -> int:
         return (
-            self._facts.probe.hidden_size
-            if self._facts is not None
-            else self._require_open().llm_engine.vllm_config.model_config.get_hidden_size()
+            self.compile_facts.probe.hidden_size
+            if self.compile_facts is not None
+            else self.require_llm().llm_engine.vllm_config.model_config.get_hidden_size()
         )
 
     @property
     def vocab_size(self) -> int:
         return (
-            self._facts.vocab_size
-            if self._facts is not None
-            else self._require_open().llm_engine.vllm_config.model_config.get_vocab_size()
+            self.compile_facts.vocab_size
+            if self.compile_facts is not None
+            else self.require_llm().llm_engine.vllm_config.model_config.get_vocab_size()
         )
 
     @property
     def attachment(self) -> BackendAttachment:
         """The installed workload's plan; workload-only operations require one."""
-        self._require_open()
-        if self._attachment is None:
+        self.require_llm()
+        if self.backend_attachment is None:
             raise ValueError("pass workload= to make_llm to use workload operations")
-        return self._attachment
+        return self.backend_attachment
 
     @property
     def device(self) -> torch.device:
         return self._runner.device if self._runner is not None else torch.device("cuda", 0)
 
     def __enter__(self) -> VllmLlm[DataT, ResultT]:
-        self._require_open()
+        self.require_llm()
         return self
 
     def __exit__(
@@ -208,7 +209,7 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def feed(self, name: str) -> Feed:
         """Return the producer handle for a declared externally fed state."""
-        self._require_open()
+        self.require_llm()
         if self._runner is None:
             raise ValueError(
                 "state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer"
@@ -217,25 +218,25 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def diagnostics(self) -> StateDiagnostics:
         """Read exact workload health and vLLM's allocated KV blocks/max-length concurrency."""
-        self._require_open()
-        return replace(self._worker_state().diagnostics, eager_reason=self._eager_reason)
+        self.require_llm()
+        return replace(self.worker_state().diagnostics, eager_reason=self._eager_reason)
 
     @property
     def runner(self) -> WorkloadModelRunner | Mrv1Runner:
-        self._require_open()
+        self.require_llm()
         if self._runner is None:
             raise RuntimeError("use tensor_parallel_size=1 and multiprocessing=False to access the runner")
         return self._runner
 
-    def _command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
+    def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
+        """Send a workload command to every engine worker and collect their replies."""
         self.attachment
-        replies = self._require_open().collective_rpc(
-            "workload_command", timeout=timeout, args=(command.value, payload)
-        )
+        replies = self.require_llm().collective_rpc("workload_command", timeout=timeout, args=(command.value, payload))
         return replies
 
-    def _worker_state(self) -> BackendWorkerState:
-        states = [decode_boundary(reply, BackendWorkerState) for reply in self._command(BackendCommand.DIAGNOSTICS)]
+    def worker_state(self) -> BackendWorkerState:
+        """Read exact diagnostics and state snapshots from the engine workers."""
+        states = [decode_boundary(reply, BackendWorkerState) for reply in self.command(BackendCommand.DIAGNOSTICS)]
         assert all(state.diagnostics.logical_counts() == states[0].diagnostics.logical_counts() for state in states), (
             "TP worker logical counters diverged",
             states,
@@ -247,30 +248,30 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def trace_snapshots(self) -> tuple[TraceSnapshot, ...]:
         """Return every worker's trace in rank order; trace_snapshot selects the output rank."""
-        return tuple(decode_boundary(reply, TraceSnapshot) for reply in self._command(BackendCommand.TRACE))
+        return tuple(decode_boundary(reply, TraceSnapshot) for reply in self.command(BackendCommand.TRACE))
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
-        self._command(BackendCommand.PROFILE, encode_boundary(tasks))
+        self.command(BackendCommand.PROFILE, encode_boundary(tasks))
 
     def select_trace(self, selection: TraceSelection) -> None:
         """Select what the trace records: bounded tensor/gradient snapshots and opt-in Kineto profiling."""
-        self._command(BackendCommand.SELECT_TRACE, encode_boundary(selection))
+        self.command(BackendCommand.SELECT_TRACE, encode_boundary(selection))
 
     def close(self) -> None:
-        if self._llm is None and self._pending_input is None:
+        if self.llm is None and self._pending_input is None:
             return
         try:
-            if not self._closed and self._attachment is not None:
-                self._command(BackendCommand.DETACH)
+            if not self._closed and self.backend_attachment is not None:
+                self.command(BackendCommand.DETACH)
         finally:
             self._shutdown()
 
     def _shutdown(self) -> None:
         # Closed to new work immediately; retain ownership if shutdown needs a retry.
         self._closed = True
-        if self._llm is not None:
-            self._llm.llm_engine.engine_core.shutdown()
-        self._llm = self._runner = None
+        if self.llm is not None:
+            self.llm.llm_engine.engine_core.shutdown()
+        self.llm = self._runner = None
         if self._pending_input is not None:
             self._pending_input.close()
             self._pending_input = None
@@ -317,7 +318,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 f"{self._sample_limit // sampling_params.n} or raise the workload's limit"
             )
         texts: list[str] = list(prompts)
-        indices: tuple[int, ...] = self._prompt_indices(texts, prompt_indices)
+        indices: tuple[int, ...] = self.resolve_prompt_indices(texts, prompt_indices)
         route_values: list[str] | None = list(routes) if routes is not None else None
         edits: HostBatch[torch.Tensor] | None = None
         for attempt in range(max_rounds):
@@ -385,10 +386,10 @@ class VllmLlm(Generic[DataT, ResultT]):
         `batch` feeds the methods that read pllm.batch fields this call; `sample_index` numbers the first sample of
         each prompt; `routes` gives one routing value per prompt for request states keyed by "route".
         """
-        if self._attachment is None:
+        if self.backend_attachment is None:
             if batch is not None or sample_index or prompt_indices is not None or routes is not None:
                 raise ValueError("batch, sample_index, prompt_indices and routes need workload= in make_llm")
-            return self._require_open().generate(prompts, sampling_params, use_tqdm=use_tqdm)
+            return self.require_llm().generate(prompts, sampling_params, use_tqdm=use_tqdm)
         run = self._generate(prompts, sampling_params, use_tqdm, batch, sample_index, prompt_indices, routes, None)
         return _per_prompt(run.outputs, run.n)
 
@@ -444,7 +445,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         completion_device: torch.device | None,
     ) -> _Generation:
         """Run one generate call; with a `completion_device`, also collect each sample's final hidden row there."""
-        self._require_open()
+        self.require_llm()
         texts = [prompts] if isinstance(prompts, str) else prompts
         if not texts or any(not prompt for prompt in texts):
             raise ValueError("provide non-empty prompts")
@@ -457,7 +458,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 f"pllm.sample_index(limit={self._sample_limit}); keep sample_index + n at most {self._sample_limit} or "
                 "raise the workload's limit"
             )
-        indices = self._prompt_indices(texts, prompt_indices)
+        indices = self.resolve_prompt_indices(texts, prompt_indices)
         # A route value is user-computed (regex, discriminator, tenant); the signed
         # graph only declares whether any request state keys on it.
         signed_route = any(
@@ -478,8 +479,8 @@ class VllmLlm(Generic[DataT, ResultT]):
             prompt_count=len(texts),
             import_fields=self.attachment.spec.import_fields,
         )
-        llm = self._require_open()
-        assert self._cache_policy is not None
+        llm = self.require_llm()
+        assert self.cache_policy is not None
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
         lifetime = ExitStack()
@@ -487,7 +488,7 @@ class VllmLlm(Generic[DataT, ResultT]):
             # Each of a prompt's n samples is its own request, with its own sample index and request state.
             request_ids = llm.enqueue(
                 [prompt for prompt in texts for _ in range(n)],
-                [self._cache_policy.sampling(sample) for _ in texts for sample in _one_per_sample(sampling_params)],
+                [self.cache_policy.sampling(sample) for _ in texts for sample in _one_per_sample(sampling_params)],
                 use_tqdm=use_tqdm,
             )
             identities = self._request_identities(request_ids, indices, sample_index, n, routes)
@@ -497,16 +498,16 @@ class VllmLlm(Generic[DataT, ResultT]):
                 for identity in identities
             }
             destination = self._stage(identities, batch, completion_device, lifetime, n)
-            self._next_prompt_index = max(self._next_prompt_index, max(indices) + 1)
+            self.next_prompt_index = max(self.next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
             # FINISH validates and synchronizes the staged rows before releasing requests.
-            self._command(BackendCommand.FINISH)
+            self.command(BackendCommand.FINISH)
             return _Generation(outputs, identities, external, destination, n)
         except Exception as original:
             try:
                 llm.llm_engine.abort_request(request_ids, internal=True)
-                self._command(BackendCommand.ABORT)
+                self.command(BackendCommand.ABORT)
                 llm.wake_up(tags=["scheduling"])
             except Exception as cleanup:
                 # Borrowed input storage cannot outlive an unacknowledged worker.
@@ -517,14 +518,15 @@ class VllmLlm(Generic[DataT, ResultT]):
                     original.add_note(f"worker shutdown also failed; close() can retry: {shutdown}")
             raise
         finally:
-            if self._closed and self._llm is not None:
+            if self._closed and self.llm is not None:
                 self._pending_input = lifetime
             else:
                 lifetime.close()
 
-    def _prompt_indices(self, texts: list[str], prompt_indices: tuple[int, ...] | None) -> tuple[int, ...]:
+    def resolve_prompt_indices(self, texts: list[str], prompt_indices: tuple[int, ...] | None) -> tuple[int, ...]:
+        """Assign prompt indices when omitted and validate explicitly supplied indices."""
         indices = (
-            tuple(range(self._next_prompt_index, self._next_prompt_index + len(texts)))
+            tuple(range(self.next_prompt_index, self.next_prompt_index + len(texts)))
             if prompt_indices is None
             else prompt_indices
         )
@@ -581,11 +583,11 @@ class VllmLlm(Generic[DataT, ResultT]):
                 else:
                     destination = torch.empty(field.shape, device=output_device, dtype=torch.float32)
         if self._runner is None:
-            tp = self._require_open().llm_engine.vllm_config.parallel_config.tensor_parallel_size
+            tp = self.require_llm().llm_engine.vllm_config.parallel_config.tensor_parallel_size
             batch_wire = map_host_batch(
                 batch, lambda tensor: SharedTensor.export(tensor.cpu() if tp > 1 else tensor, lifetime)
             )
-            self._command(
+            self.command(
                 BackendCommand.STAGE,
                 encode_boundary(BackendStage(identities, batch_wire, completion_wire, samples_per_prompt)),
             )
@@ -720,9 +722,9 @@ def create_vllm_llm(
                 ),
             )
             probes = [decode_boundary(reply, BackendCompileFacts) for reply in replies]
-            budget = min(probe.state_memory_budget_bytes for probe in probes)
-            facts = replace(probes[0], state_memory_budget_bytes=budget)
-            assert all(replace(probe, state_memory_budget_bytes=budget) == facts for probe in probes), (
+            budget = min(probe.state_page_budget_bytes for probe in probes)
+            facts = replace(probes[0], state_page_budget_bytes=budget)
+            assert all(replace(probe, state_page_budget_bytes=budget) == facts for probe in probes), (
                 "TP workers disagree on model or planning facts"
             )
             facts, declaration = workload.specialize(facts, config.execution)

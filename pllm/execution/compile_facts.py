@@ -17,7 +17,7 @@ class BackendCompileFacts:
     timeline: SchedulerTimeline
     providers: tuple[PageBundleProviderFacts, ...]
     max_admitted_lineages: int
-    state_memory_budget_bytes: int
+    state_page_budget_bytes: int
     initialization_seed: int
     vocab_size: int = 0
     layer_count: int = 0

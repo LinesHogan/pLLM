@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from pllm.testing_distribution import _distances, _failures, _summaries
+from pllm.testing_distribution import distance_summaries, distribution_distances, distribution_failures
 
 
 def test_distribution_arithmetic():
@@ -16,24 +16,24 @@ def test_distribution_arithmetic():
         ((p * (p / q).log()).sum(-1), (q * (q / p).log()).sum(-1), (p - q).abs().sum(-1) / 2), dim=-1
     )
     # Exercise the same FP32 normalization from logits as the real sampler observer.
-    actual = _distances(p.log().float().log_softmax(-1), q.log().float().log_softmax(-1))
+    actual = distribution_distances(p.log().float().log_softmax(-1), q.log().float().log_softmax(-1))
     torch.testing.assert_close(actual.double(), expected, atol=2e-7, rtol=2e-6)
-    summaries = _summaries(actual, [(i // 10, i % 10) for i in range(100)], 2)
+    summaries = distance_summaries(actual, [(i // 10, i % 10) for i in range(100)], 2)
     for index, summary in enumerate(summaries):
         assert math.isclose(summary.mean, float(expected[:, index].mean()), abs_tol=2e-7)
         assert math.isclose(summary.p99, float(expected[:, index].sort().values[98]), abs_tol=2e-6)
         assert math.isclose(summary.max, float(expected[:, index].max()), abs_tol=2e-6)
         assert (summary.worst[0].prompt_index, summary.worst[0].token_offset) == (9, 9)
-    assert not _failures(summaries, 0.1, None)
-    assert len(_failures(summaries, 0.1, 0.1)) == 2
-    support = _distances(torch.tensor([[0.0, -torch.inf]]), torch.tensor([[-torch.inf, 0.0]]))
+    assert not distribution_failures(summaries, 0.1, None)
+    assert len(distribution_failures(summaries, 0.1, 0.1)) == 2
+    support = distribution_distances(torch.tensor([[0.0, -torch.inf]]), torch.tensor([[-torch.inf, 0.0]]))
     assert torch.equal(support, torch.tensor([[torch.inf, torch.inf, 1.0]]))
     assert torch.equal(
-        _distances(torch.tensor([[0.0, -torch.inf]]), torch.tensor([[0.0, -torch.inf]])), torch.zeros(1, 3)
+        distribution_distances(torch.tensor([[0.0, -torch.inf]]), torch.tensor([[0.0, -torch.inf]])), torch.zeros(1, 3)
     )
-    tail = _summaries(torch.cat((actual, support)), [(0, i) for i in range(101)], 1)
+    tail = distance_summaries(torch.cat((actual, support)), [(0, i) for i in range(101)], 1)
     assert math.isinf(tail[0].max) and math.isfinite(tail[0].p99)
-    assert _failures(tail, 0.1, None)
-    assert not _failures(tail, None, None)
-    invalid = _summaries(torch.full((1, 3), torch.nan), [(0, 0)], 1)
-    assert len(_failures(invalid, None, None)) == 3
+    assert distribution_failures(tail, 0.1, None)
+    assert not distribution_failures(tail, None, None)
+    invalid = distance_summaries(torch.full((1, 3), torch.nan), [(0, 0)], 1)
+    assert len(distribution_failures(invalid, None, None)) == 3

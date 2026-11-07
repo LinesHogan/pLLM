@@ -15,7 +15,7 @@ from pllm.contracts.semantic_graph import StateResource
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.state_feed import _ConsumerClosed
+from pllm.execution.state_feed import ConsumerClosed
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.video import VideoWorkload, frame_features
 from test.workloads.test_video import frames
@@ -25,10 +25,10 @@ from test.workloads.test_video import frames
 def observe_model(workload):
     from vllm.forward_context import get_forward_context
 
-    from pllm.backends.vllm.model_sites import ModelSites, _Boundary
+    from pllm.backends.vllm.model_sites import ModelSites, SublayerBoundary
 
     original_make, original_read, original_close = pllm.make_llm, BorrowedStateRoot.tensors, BorrowedPage.close
-    original_install, original_emit = ModelSites.__init__, _Boundary.emit
+    original_install, original_emit = ModelSites.__init__, SublayerBoundary.emit
     seen, recordings, caches, history = set(), {}, {}, {}
     fenced = False
     steps, identities, phases = [], set(), []
@@ -73,13 +73,13 @@ def observe_model(workload):
         complete = session.complete_forward
 
         def completed():
-            step = session._step
+            step = session.step
             rows = step.rows.row_batch.rows
             branch, stream, actual, prior_kv, after_kv, access = recordings[
                 min(n for n in recordings if n >= len(rows))
             ]
             (ref,) = step.context.publication.after_refs
-            (delta,) = session._deployment.execution.snapshot(ref, torch.cuda.current_stream())
+            (delta,) = session.deployment.execution.snapshot(ref, torch.cuda.current_stream())
             expected = branch[: len(rows)].clone()
             selected = torch.tensor(sorted({0, len(rows) - 1}), device=expected.device)
             expected.index_add_(0, selected, delta.to(expected).expand(len(selected), -1))
@@ -132,7 +132,7 @@ def observe_model(workload):
         with (
             patch.object(pllm, "make_llm", make),
             patch.object(ModelSites, "__init__", install),
-            patch.object(_Boundary, "emit", emit),
+            patch.object(SublayerBoundary, "emit", emit),
             patch.object(BorrowedStateRoot, "tensors", read),
             patch.object(BorrowedPage, "close", finish),
         ):
@@ -162,7 +162,7 @@ def observe_replay(*, versions):
     def make(*args, **kwargs):
         llm = original_make(*args, **kwargs)
         session = llm.runner.require_session()
-        holder.update(session=session, primitive=session._custom_forward, execution=session._deployment.execution)
+        holder.update(session=session, primitive=session.custom_forward, execution=session.deployment.execution)
         return llm
 
     def capture(item):
@@ -200,7 +200,7 @@ def observe_replay(*, versions):
         torch.testing.assert_close(wave.output, observed["normal"], rtol=0, atol=0)
         if not any(wave.signature[1]):
             return
-        step = holder["session"]._step
+        step = holder["session"].step
         context = step.context
         if context.held_input is None:
             (ref,) = context.publication.after_refs
@@ -210,7 +210,7 @@ def observe_replay(*, versions):
             pin = context.pin
         field = context.arena.borrow_field(pin, ref, LayoutFieldId(0))
         # Captured waves gather the invocation's exact PTTS slot, without per-row field copies.
-        patch = holder["session"]._activation._patches[StateResource("inject"), 1]
+        patch = holder["session"].activation_patch.patches[StateResource("inject"), 1]
         slots = patch.table[1].index_select(0, wave.indices[0])
         staged = patch.pools[0].index_select(0, slots)
         torch.testing.assert_close(staged, field.expand_as(staged), rtol=0, atol=0)
@@ -229,7 +229,7 @@ def observe_replay(*, versions):
                     block, offset = map(int, access.cell(layer.self_attn.attn.layer_name, row))
                     view = layer.self_attn.attn.kv_cache[block, :, offset, :]
                     history[ordinal, row.token_offset] = view, view.clone()
-            step = holder["session"]._step
+            step = holder["session"].step
             seen = {ref for step_id, ref in calls if step_id == step.rows.step_id}
             assert seen == {versions[step.rows.step_id]}
             completed.append(tuple(row.identity for row in self.rows))
@@ -263,7 +263,7 @@ def model_config():
 
 def produce_frames(feed, source, events, teardown):
     # Preemption deliberately closes the consumer while this producer still owns pages.
-    with suppress(BrokenPipeError, _ConsumerClosed) if teardown is not None else nullcontext():
+    with suppress(BrokenPipeError, ConsumerClosed) if teardown is not None else nullcontext():
         previous = source[0].cuda()
         try:
             for index, (kind, frame) in enumerate(zip(events, source, strict=True)):
@@ -345,7 +345,7 @@ def test_video_session_failure_retains_owner_without_fallback():
     def preempt(session, scheduler_output):
         if session.next_step_id == 1:
             assert session.diagnostics().update_count == 1
-            scheduler_output.preempted_req_ids = set(session._identities)
+            scheduler_output.preempted_req_ids = set(session.request_identities)
         return before_execute(session, scheduler_output)
 
     with patch.object(VllmSession, "before_execute", preempt), pytest.raises(RuntimeError, match="preempt"):

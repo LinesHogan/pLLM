@@ -73,7 +73,7 @@ class Runner:
 
     decoder: Decoder
 
-    def _install_model_hooks(self) -> None:
+    def install_model_hooks(self) -> None:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
         model = self.decoder.model
         model.compute_logits = self._compute_logits
@@ -87,7 +87,7 @@ class Runner:
         self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)
 
     overlay_graph_bytes: int = 0
-    _workload_session: VllmSession[Any, Any] | None = None
+    workload_session: VllmSession[Any, Any] | None = None
 
     def attach_workload(
         self,
@@ -110,12 +110,12 @@ class Runner:
             self.cache_config.block_size,
             cache_policy=cache_policy,
         )
-        self._workload_session = session
+        self.workload_session = session
         try:
             self._finish_model_binding()
         except Exception:
             session.close()
-            self._workload_session = None
+            self.workload_session = None
             raise
 
     def _finish_model_binding(self) -> None:
@@ -125,15 +125,15 @@ class Runner:
         session = self.require_session()
         session.require_idle()
         session.close()
-        self._workload_session = None
+        self.workload_session = None
 
     def require_session(self) -> VllmSession[Any, Any]:
-        session = self._workload_session
+        session = self.workload_session
         assert session is not None
         return session
 
     def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        session = self._workload_session
+        session = self.workload_session
         if session is None:
             return self.decoder.compute_logits(hidden_states)
         return session.compute_logits(hidden_states)
@@ -146,7 +146,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         super().load_model(load_dummy_weights)
         assert self.sampler is not None
         self.sampler = self._sampler_guidance = GuidedSampler(self.sampler)
-        self._install_model_hooks()
+        self.install_model_hooks()
         self.position_states = decode_boundary(
             os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
         ).states
@@ -200,7 +200,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         """Bind interned identities to vLLM slots only when requests enter its persistent state."""
         super().add_requests(scheduler_output)
-        session = self._workload_session
+        session = self.workload_session
         if session is not None:
             for request in scheduler_output.scheduled_new_reqs:
                 session.row_labeler.bind(
@@ -213,7 +213,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         vLLM calls this once per real step, right after prepare_inputs built the InputBatch; unlike
         prepare_inputs its signature is the same on every supported vLLM release.
         """
-        session = self._workload_session
+        session = self.workload_session
         if session is not None:
             if session.input_tokens is not None:
                 session.prepare_tokens(
@@ -255,7 +255,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
             valid_dummy_state_slots,
             randomize_inputs,
         )
-        session = self._workload_session
+        session = self.workload_session
         if session is None or dummy_run or is_profile:
             if self.hidden_taps is not None:
                 self.hidden_taps.clear()
@@ -273,7 +273,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        session = self._workload_session
+        session = self.workload_session
         if session is None:
             return super().sample(hidden_states, input_batch, grammar_output)
         try:
@@ -288,7 +288,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         self,
         grammar_output: GrammarOutput | None,
     ) -> AsyncOutput | ModelRunnerOutput | None:
-        session = self._workload_session
+        session = self.workload_session
         if session is None:
             return super().sample_tokens(grammar_output)
         try:
@@ -300,7 +300,7 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
         return output
 
     def shutdown(self) -> None:
-        if self._workload_session is not None:
+        if self.workload_session is not None:
             self.detach_workload()
         super().shutdown()
 

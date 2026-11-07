@@ -31,13 +31,13 @@ class Mrv1Runner(Runner, GPUModelRunner):
             raise ValueError("disable speculative decoding for MRv1 workloads")
         super().load_model(load_dummy_weights)
         self.decoder = bind_model(self.model)
-        self._install_model_hooks()
+        self.install_model_hooks()
 
     def _prepare_inputs(
         self, scheduler_output: SchedulerOutput, num_scheduled_tokens: npt.NDArray[np.int32]
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, *tuple[int, ...]]:
         result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
-        session = self._workload_session
+        session = self.workload_session
         if session is not None:
             if result[1] is not None:
                 raise RuntimeError("MRv1 workload rejects speculative row expansion")
@@ -56,7 +56,7 @@ class Mrv1Runner(Runner, GPUModelRunner):
     def execute_model(
         self, scheduler_output: SchedulerOutput, intermediate_tensors: IntermediateTensors | None = None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        session = self._workload_session
+        session = self.workload_session
         if session is None:
             return super().execute_model(scheduler_output, intermediate_tensors)
         try:
@@ -67,7 +67,7 @@ class Mrv1Runner(Runner, GPUModelRunner):
             raise
 
     def _sample(self, logits: torch.Tensor | None, spec_decode_metadata: SpecDecodeMetadata | None) -> SamplerOutput:
-        session = self._workload_session
+        session = self.workload_session
         if session is None:
             return super()._sample(logits, spec_decode_metadata)
         try:
@@ -81,7 +81,7 @@ class Mrv1Runner(Runner, GPUModelRunner):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        session = self._workload_session
+        session = self.workload_session
         if session is None:
             return super().sample_tokens(grammar_output)
         try:

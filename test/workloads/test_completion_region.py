@@ -47,15 +47,15 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
         device,
         hidden_size=2,
         seed=23,
-        state_memory_bytes=65536,
-        memory_budget_bytes=1 << 20,
+        state_page_budget_bytes=65536,
+        execution_peak_budget_bytes=1 << 20,
         max_input_rows=4,
     )
     workload = TwoGroups()
     execution = make_host(facts, workload)
     peak = execution.arena.plan.schedule.peak_memory_bytes
     with pytest.raises(ValueError):
-        make_host(replace(facts, memory_budget_bytes=peak - 1), workload)
+        make_host(replace(facts, execution_peak_budget_bytes=peak - 1), workload)
     (initial,) = execution.admit((), stream)
     original = execution.snapshot(initial, stream)
     if stream is not None:

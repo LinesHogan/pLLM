@@ -114,7 +114,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
 
 def _cuda_ipc_worker(control, read_channel, wire, outcome):
     try:
-        arena = PageBundleArena(decode_boundary(wire, PlanBundle), _owned_resources=())
+        arena = PageBundleArena(decode_boundary(wire, PlanBundle), owned_resources=())
         stream = torch.cuda.Stream(device=torch.device("cuda", 0))
         with torch.cuda.stream(stream):
             read = receive_field(arena.plan, arena.plan_digest, read_channel, stream=stream)

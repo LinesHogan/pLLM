@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 # Diagnostics deliberately inspect the installed session and in-process engine.
-# pyright: reportPrivateUsage=false
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -36,17 +35,17 @@ from pllm.execution.overlay_task import ProjectionTransition
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import read_batch
 from pllm.explanation import explain, explain_facts
-from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, _check
+from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, check_contracts
 from pllm.usage import Workload
 
 _Allocation = ParamSpec("_Allocation")
 
 # Sequence continuations avoid near-tied prose tokens whose greedy choice changes with vLLM batch geometry.
-_PROMPTS = ["Continue the sequence: 1, 2, 3,", "Continue the alphabet: A, B, C,"]
+CHECK_PROMPTS = ["Continue the sequence: 1, 2, 3,", "Continue the alphabet: A, B, C,"]
 
 
 def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
@@ -57,8 +56,8 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
     shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
     facts = probe_backend(requirements, runner, publish_lag=config.execution.publish_lag)
     # The installed state already consumed memory; replay planning against its load-time capacity.
-    assert handle._facts is not None
-    facts = replace(facts, state_memory_budget_bytes=handle._facts.state_memory_budget_bytes)
+    assert handle.compile_facts is not None
+    facts = replace(facts, state_page_budget_bytes=handle.compile_facts.state_page_budget_bytes)
     actual = explain_facts(workload, config, shape, facts, runner.hidden_layouts)
     failures: list[str] = []
     if expected != actual:
@@ -92,17 +91,17 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
         raise ContractError(tuple(failures))
 
 
-class _SyncCheck:
+class SynchronizationCheck:
     """Check pllm anchors and model-site staging after two decode warmup steps at each packed width."""
 
     def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
         session = handle.runner.require_session()
-        execution = session._deployment.execution
+        execution = session.deployment.execution
         self.prepare_tokens = session.prepare_tokens
         self.prepare_input = session.prepare_input
         self.token_checked = 0
-        self.prepare_sites = None if session._sites is None else session._sites.prepare
-        self.prepare_overlay = None if session._forward_overlay is None else session._forward_overlay.prepare
+        self.prepare_sites = None if session.model_sites is None else session.model_sites.prepare
+        self.prepare_overlay = None if session.forward_overlay is None else session.forward_overlay.prepare
         self.execute = execution.execute_anchor
         self.execute_part = execution.execute_part
         self.steps: dict[int, set[int]] = {}
@@ -194,7 +193,7 @@ class _SyncCheck:
 
 def _tokens(handle: VllmLlm[TensorFrame, TensorOutput], temperature: float = 0) -> tuple[tuple[int, ...], ...]:
     params = SamplingParams(temperature=temperature, seed=17, max_tokens=16, ignore_eos=True)
-    return tuple(tuple(output.outputs[0].token_ids) for output in handle.generate(_PROMPTS, params))
+    return tuple(tuple(output.outputs[0].token_ids) for output in handle.generate(CHECK_PROMPTS, params))
 
 
 @dataclass
@@ -222,7 +221,7 @@ class _Generation:
             inputs: list[torch.Tensor] = []
             targets: list[torch.Tensor] = []
             for index, row in enumerate(rows):
-                key = operand.target, row.identity.prompt_index % len(_PROMPTS), row.token_offset
+                key = operand.target, row.identity.prompt_index % len(CHECK_PROMPTS), row.token_offset
                 pair = operand.hidden[index], operand.desired[index]
                 if reference is not None:
                     pair = reference.projections.get(key, pair)
@@ -244,7 +243,7 @@ class _Generation:
                     continue
                 if row.phase is HiddenPhase.PREFILL and row.token_offset != row.prompt_length - 1:
                     continue
-                key = tap.resource, row.identity.prompt_index % len(_PROMPTS), row.token_offset
+                key = tap.resource, row.identity.prompt_index % len(CHECK_PROMPTS), row.token_offset
                 slot = int(tap.slots[row.packed_row_index])
                 if reference is not None and key in reference.taps:
                     storage[slot].copy_(reference.taps[key])
@@ -281,14 +280,14 @@ class _Generation:
 
 def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generation | None = None) -> _Generation:
     session = handle.runner.require_session()
-    execution = session._deployment.execution
+    execution = session.deployment.execution
     retire = execution.retire
     execute_part = execution.execute_part
     result = _Generation()
 
     def snapshot(identities: tuple[RequestIdentity, ...], *, wait: bool = False) -> tuple[StateRef, ...]:
         for identity in identities:
-            result.states[identity.prompt_index % len(_PROMPTS)] = tuple(
+            result.states[identity.prompt_index % len(CHECK_PROMPTS)] = tuple(
                 tensor.detach().cpu()
                 for ref in execution.latest((identity,))
                 for tensor in execution.snapshot(ref, torch.cuda.current_stream(execution.device))
@@ -315,17 +314,17 @@ def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Genera
         return execute_part(context, result.operands(value, reference), task, complete=complete)
 
     with patch.object(execution, "retire", snapshot), patch.object(execution, "execute_part", part):
-        if session._taps is None:
+        if session.hidden_taps is None:
             result.tokens = _tokens(handle)
         else:
-            publish = session._taps.publish
+            publish = session.hidden_taps.publish
 
             def hidden(value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
                 return result.hidden(
-                    publish(value, resources), None if session._custom_forward is not None else reference
+                    publish(value, resources), None if session.custom_forward is not None else reference
                 )
 
-            with patch.object(session._taps, "publish", hidden):
+            with patch.object(session.hidden_taps, "publish", hidden):
                 result.tokens = _tokens(handle)
     return result
 
@@ -351,7 +350,7 @@ class _Eviction:
 
 
 def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generation) -> _Generation:
-    manager = handle._require_open().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
+    manager = handle.require_llm().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
     eviction = _Eviction()
     with patch.object(manager, "allocate_slots", new=eviction.wrap(manager.allocate_slots)):
         result = _state_tokens(handle, reference)
@@ -360,7 +359,7 @@ def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generati
     return result
 
 
-def _release_models() -> None:
+def release_models() -> None:
     """Drain finished diagnostic engines before vLLM samples free memory for the next one."""
     if torch.cuda.is_initialized():
         torch.cuda.synchronize()
@@ -376,7 +375,7 @@ def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tupl
 
 
 @contextmanager
-def _plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[None, None]]:
+def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[None, None]]:
     """Load vanilla vLLM with the workload's checkpoint and graph/compile options."""
     report = explain(workload, config)
     requirements = workload.backend_requirements()
@@ -394,13 +393,15 @@ def _plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[N
 
 def _neutral(workload: Workload, config: ModelConfig) -> None:
     observed = _neutral_tokens(workload, config)
-    _release_models()
-    with _plain_model(workload, config) as vanilla:
+    release_models()
+    with plain_model(workload, config) as vanilla:
         expected = tuple(
             tuple(
                 tuple(output.outputs[0].token_ids)
                 for output in vanilla.generate(
-                    _PROMPTS, SamplingParams(temperature=temp, seed=17, max_tokens=16, ignore_eos=True), use_tqdm=False
+                    CHECK_PROMPTS,
+                    SamplingParams(temperature=temp, seed=17, max_tokens=16, ignore_eos=True),
+                    use_tqdm=False,
                 )
             )
             for temp in (0, 0.8)
@@ -418,8 +419,8 @@ def _sequence_update(
     handle: VllmLlm[TensorFrame, TensorOutput], batch: CausalTrainBatch[torch.Tensor]
 ) -> tuple[torch.Tensor, ...]:
     """Exercise the host-to-worker path and read the complete published optimizer state."""
-    handle.generate(_PROMPTS, SamplingParams(temperature=0, max_tokens=1, ignore_eos=True), batch=batch)
-    execution = handle.runner.require_session()._deployment.execution
+    handle.generate(CHECK_PROMPTS, SamplingParams(temperature=0, max_tokens=1, ignore_eos=True), batch=batch)
+    execution = handle.runner.require_session().deployment.execution
     return tuple(
         tensor.detach().cpu()
         for ref in execution.directory.select(PackedRows.from_rows(())).refs
@@ -441,7 +442,7 @@ def _sequence_permutation(workload: Workload, config: ModelConfig) -> None:
     labels = torch.tensor([[-100, -100, 3, 4], [-100, 3, 2, -100]])
     batch = CausalTrainBatch(ids, labels, torch.ones_like(ids), torch.tensor([-0.5, 1.5]))
     expected = _sequence_trial(workload, config, batch)
-    _release_models()
+    release_models()
     permuted = map_host_batch(batch, lambda tensor: tensor.flip(0))
     assert isinstance(permuted, CausalTrainBatch)
     actual = _sequence_trial(workload, config, permuted)
@@ -465,10 +466,10 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             passed.append("explain/probe")
         except ContractError as error:
             failures.extend(error.failures)
-        sync = _SyncCheck(handle)
-        sites = handle.runner.require_session()._sites
-        overlay = handle.runner.require_session()._forward_overlay
-        execution = handle.runner.require_session()._deployment.execution
+        sync = SynchronizationCheck(handle)
+        sites = handle.runner.require_session().model_sites
+        overlay = handle.runner.require_session().forward_overlay
+        execution = handle.runner.require_session().deployment.execution
         try:
             with (
                 patch.object(execution, "execute_anchor", sync.anchor),
@@ -513,7 +514,7 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
         and not report.eager_reason
         and baseline is not None
     ):
-        _release_models()
+        release_models()
         try:
             with pllm.make_llm(replace(config, cuda_graphs=False), workload=workload) as eager:
                 baseline.compare_states(_state_tokens(eager, baseline), "exact decode")
@@ -551,7 +552,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     failures: list[str] = []
     if explain(workload, config).custom_ops:
         try:
-            replay = _check(workload, config, device_equivalence=True)
+            replay = check_contracts(workload, config, device_equivalence=True)
             unexecuted = {"CPU schedules", "adaptive decoder"}
             if "custom-residual method math / CPU schedules" not in replay.passed:
                 unexecuted.add("model-site execution")
@@ -562,7 +563,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
                 passed.append("device equivalence: CPU check script method outputs replayed on CUDA")
         except (AssertionError, RuntimeError, ValueError, TypeError) as error:
             failures.append(f"[device equivalence] {error}")
-    _release_models()
+    release_models()
     try:
         result = _workload_checks(workload, config)
         passed.extend(result.passed)
@@ -570,10 +571,10 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     except ContractError as error:
         failures.extend(error.failures)
     finally:
-        _release_models()
+        release_models()
     if any(member.host_batch for member in explain(workload, config).members):
-        if config.execution.max_training_rows < 2:
-            skipped.append(CheckSkip("sequence permutation", "set max_training_rows >= 2"))
+        if config.execution.max_host_training_rows < 2:
+            skipped.append(CheckSkip("sequence permutation", "set max_host_training_rows >= 2"))
         else:
             try:
                 _sequence_permutation(workload, config)
@@ -581,7 +582,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
             except ContractError as error:
                 failures.extend(error.failures)
             finally:
-                _release_models()
+                release_models()
     if neutral is None:
         skipped.append(CheckSkip("neutral", "pass neutral= with the author's disabled settings"))
     else:
@@ -591,7 +592,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         except ContractError as error:
             failures.extend(error.failures)
         finally:
-            _release_models()
+            release_models()
     if failures:
         raise ContractError(tuple(failures))
     return CheckResult(tuple(passed), tuple(skipped))

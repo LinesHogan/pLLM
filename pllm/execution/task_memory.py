@@ -51,10 +51,10 @@ from pllm.execution.token_program import Segment
 from pllm.execution.torch_private import GatherTrace, fixed_shapes
 
 if TYPE_CHECKING:
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
 
 
-def custom_forward_capture_bytes(binding: TensorBinding, probe: ModelProbe) -> int:
+def custom_forward_capture_bytes(binding: TensorDeclaration, probe: ModelProbe) -> int:
     """Estimate native wave graphs from model widths and the workload's traced layer visits.
 
     Source operators use a no-reuse activation envelope. Each adaptive bucket
@@ -107,7 +107,7 @@ def _example_slot_matrix(resource: str, fields: tuple[torch.Tensor, ...]) -> tup
 
 
 def example(
-    binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
+    binding: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> tuple[TensorFrame, TensorBatch]:
     """Construct metadata and borrowed operands; execution itself constructs all task scratch."""
     # Hidden taps keep one row per request (its prompt end or decode token), as do request states.
@@ -197,7 +197,7 @@ def example(
     host_batch = None
     if binding.graph.training_mode == "weighted_batch":
         keys = tuple(key for key in selection.keys if key is not None)
-        shape = (len(keys), options.max_training_rows) if keys else (options.max_training_rows,)
+        shape = (len(keys), options.max_host_training_rows) if keys else (options.max_host_training_rows,)
         batch_dtype = binding.layouts.layouts[0].layout.fields[0].dtype.torch
         host_batch = WeightedCEBatch(
             meta(*shape, facts.probe.hidden_size, dtype=batch_dtype),
@@ -308,7 +308,7 @@ def _site_input_shapes(
     )
 
 
-def shape_site_results(binding: TensorBinding, facts: BackendCompileFacts) -> None:
+def shape_site_results(binding: TensorDeclaration, facts: BackendCompileFacts) -> None:
     """Trace pre-forward result metadata before backends allocate captured hook buffers."""
     if not binding.model_site_tasks:
         return
@@ -328,7 +328,7 @@ def shape_site_results(binding: TensorBinding, facts: BackendCompileFacts) -> No
 
 
 def derive_resources(
-    binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions
+    binding: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions
 ) -> SchedulerTimeline:
     """Ask the executable operations for their memory; framework plumbing is funded separately."""
     # Shape-only steps do not allocate a capture pool or consume its eventual budget.
@@ -398,13 +398,15 @@ def derive_resources(
         # Model overlays capture bounded tiles, not their whole maximum-shape operation.
         required = operation.resident(usage.capture) if task is not None else 0
         required_capture = max(required_capture, required)
-        resident = operation.resident(options.capture_memory_bytes or required or options.model_capture_bytes)
+        resident = operation.resident(
+            options.cuda_graph_pool_budget_bytes or required or options.model_cuda_graph_pool_budget_bytes
+        )
         shapes = operation.input_shapes(
             facts.probe.max_packed_rows if symbol in binding.model_site_tasks else len(data.rows),
             facts.probe.hidden_size,
             (
-                (len(batch.roots), options.max_training_rows, facts.probe.hidden_size),
-                (len(batch.roots), options.max_training_rows, facts.vocab_size),
+                (len(batch.roots), options.max_host_training_rows, facts.probe.hidden_size),
+                (len(batch.roots), options.max_host_training_rows, facts.vocab_size),
             ),
         )
         tasks.append(
@@ -421,10 +423,10 @@ def derive_resources(
             if task.symbol == symbol
             for output in task.outputs
         )
-    if options.capture_memory_bytes is not None and options.capture_memory_bytes < required_capture:
+    if options.cuda_graph_pool_budget_bytes is not None and options.cuda_graph_pool_budget_bytes < required_capture:
         raise ValueError(
-            f"workload needs capture_memory_bytes >= {required_capture} for its conservative task capture "
-            f"reservations; got {options.capture_memory_bytes}; leave it unset to size from the workload"
+            f"workload needs cuda_graph_pool_budget_bytes >= {required_capture} for its conservative task capture "
+            f"reservations; got {options.cuda_graph_pool_budget_bytes}; leave it unset to size from the workload"
         )
     return replace(
         facts.timeline,
@@ -433,10 +435,10 @@ def derive_resources(
     )
 
 
-def derive_host_resources(binding: TensorBinding, config: HostConfig) -> SchedulerTimeline:
+def derive_host_resources(binding: TensorDeclaration, config: HostConfig) -> SchedulerTimeline:
     """Measure a rowless host step over the workload's one instance state at the maximum input rows."""
     if config.max_input_rows is None:
-        raise ValueError("set HostConfig.max_input_rows when memory_budget_bytes is set")
+        raise ValueError("set HostConfig.max_input_rows when execution_peak_budget_bytes is set")
     rows = config.max_input_rows
     host_batch = WeightedRowBatch(meta(rows, config.hidden_size), meta(rows, *config.target_shape), meta(rows))
     (layout,) = binding.layouts.layouts
@@ -483,7 +485,7 @@ def _identity(value: torch.Tensor) -> torch.Tensor:
 
 
 def site_state(
-    binding: TensorBinding, source: StateInput, rows: int | None, seed: int | None
+    binding: TensorDeclaration, source: StateInput, rows: int | None, seed: int | None
 ) -> torch.Tensor | ModuleCall:
     layout = next(item.layout for item in binding.layouts.layouts if item.resource == source.resource)
     root = tuple(
@@ -499,7 +501,7 @@ def site_state(
 
 
 def site_arguments(
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     facts: BackendCompileFacts,
     *,
     seed: int | None = None,

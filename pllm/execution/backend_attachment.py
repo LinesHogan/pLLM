@@ -137,7 +137,7 @@ def derive_attachment_resources(
     graph: SemanticGraph,
     timeline: SchedulerTimeline,
     *,
-    capture_memory_bytes: int = 0,
+    cuda_graph_pool_budget_bytes: int = 0,
 ) -> SchedulerTimeline:
     """Fund the tokenwise reference plan through its task and value resource facts.
 
@@ -151,9 +151,9 @@ def derive_attachment_resources(
     if len(tasks) != 1:
         raise ValueError("custom-forward attachment costs need one custom-forward task")
     (task,) = tasks
-    # Builder._attach composes the custom forward with its publication; a conditional input group keeps
+    # declare_custom_forward composes the custom forward with its publication; a conditional input group keeps
     # all producer facts, so the complete DAG funds the worst case.
-    resident = capture_memory_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
+    resident = cuda_graph_pool_budget_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0
     workspace = probe.max_packed_rows * probe.hidden_size * 8
     existing = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
     if existing is not None:
@@ -163,13 +163,13 @@ def derive_attachment_resources(
         )
     else:
         task_facts = (*timeline.task_resources, TaskResourceFact(task.symbol, workspace, resident))
-    if timeline.memory_budget_bytes is not None and (
+    if timeline.execution_peak_budget_bytes is not None and (
         max(timeline.reserved_bytes, default=0)
         + sum(fact.workspace_bytes + fact.resident_bytes for fact in task_facts)
         + sum(fact.bytes for fact in timeline.value_resources)
-        > timeline.memory_budget_bytes
+        > timeline.execution_peak_budget_bytes
     ):
-        raise ValueError("raise memory_budget_bytes to fund the custom forward's workspace and graphs")
+        raise ValueError("raise execution_peak_budget_bytes to fund the custom forward's workspace and graphs")
     # The output lives in the original adapter's concatenation reservation;
     # the outer task runner does not allocate a second copy of this value.
     known = {(fact.task, fact.output) for fact in timeline.value_resources}

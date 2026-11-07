@@ -58,7 +58,7 @@ class VllmActivationPatch:
 
     def __init__(self, bindings: tuple[ActivationPatchBinding, ...], rows: int, arena: PageBundleArena) -> None:
         self.bindings = bindings
-        self._patches = {
+        self.patches = {
             (binding.resource, binding.layer): _Patch(
                 binding,
                 tuple(
@@ -74,7 +74,7 @@ class VllmActivationPatch:
     @property
     def buffers(self) -> list[torch.Tensor]:
         """Stable read ports of the captured residual hook."""
-        return [buffer for patch in self._patches.values() for buffer in (patch.table, *patch.pools)]
+        return [buffer for patch in self.patches.values() for buffer in (patch.table, *patch.pools)]
 
     def prepare(
         self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
@@ -90,7 +90,7 @@ class VllmActivationPatch:
         # chunked prefill and retained replay as well as the ordinary full prompt.
         windows = self._row_windows(rows)
         versions: dict[tuple[StateResource, RequestIdentity, bool], tuple[PagePin, StateRef]] = {}
-        for ordinal, patch in enumerate(self._patches.values()):
+        for ordinal, patch in enumerate(self.patches.values()):
             binding = patch.binding
             selected = (windows[2] == 1) & (
                 (windows[0] < binding.first_tokens) | (windows[0] >= windows[1] - binding.last_tokens)
@@ -176,7 +176,7 @@ class VllmActivationPatch:
         self, resource: StateResource, layer: int, rows: torch.Tensor | None
     ) -> Callable[[torch.Tensor], torch.Tensor]:
         """The same masked edit for a whole model call or device-indexed wave rows."""
-        return partial(self._patches[resource, layer].apply, rows)
+        return partial(self.patches[resource, layer].apply, rows)
 
     def clear(self) -> None:
         """Forget host wave signatures; device read ports are replaced by the next prepare."""

@@ -1,7 +1,7 @@
 """What one task invocation reads: its row index, input ports and differentiable state parameters.
 
 A TensorFrame carries one step's rows; ports read hidden states, sampler feedback, state metadata and
-parameters through a RowPlan and its per-invocation device RowIndex. Used by TensorBinding and TensorTask.
+parameters through a RowPlan and its per-invocation device RowIndex. Used by TensorDeclaration and TensorTask.
 """
 
 from __future__ import annotations

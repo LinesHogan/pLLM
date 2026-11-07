@@ -18,15 +18,15 @@ def model_hooks(requirements: BackendRequirements) -> bool:
     )
 
 
-def model_capture_bytes(config: ModelConfig, requirements: BackendRequirements) -> int:
+def model_cuda_graph_pool_budget_bytes(config: ModelConfig, requirements: BackendRequirements) -> int:
     """Fund the model pool and each decode conditional's separate library workspace by default."""
-    if HiddenPhase.DECODE in requirements.exact_phases and config.execution.capture_memory_bytes is None:
+    if HiddenPhase.DECODE in requirements.exact_phases and config.execution.cuda_graph_pool_budget_bytes is None:
         from pllm.backends.vllm.model_shape import ModelShape
 
         shape = ModelShape.of_config(config, requirements.parameter_targets)
         # The request bucket reuses each conditional's dense temporaries and library scratch.
         return (64 << 20) + sum(5 * 4 * target.input_size * target.output_size + (64 << 20) for target in shape.targets)
-    return config.execution.model_capture_bytes
+    return config.execution.model_cuda_graph_pool_budget_bytes
 
 
 def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Iterator[tuple[str, str]]:

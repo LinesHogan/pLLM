@@ -44,7 +44,7 @@ from pllm.execution.row_task_binding import (
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import MathBinding, PartialCommitError
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
 from pllm.testing import backend_facts, step_input
@@ -53,7 +53,7 @@ from pllm.workloads.video import VideoWorkload, frame_features
 
 @contextmanager
 def binding_case(*, alias=False, write_failure=False, runtime=False, missing=None):
-    b = TensorBinding("video.binding", "a" * 64, Dimensions(2, 0))
+    b = TensorDeclaration("video.binding", "a" * 64, Dimensions(2, 0))
     features, ports = declare_parameters(
         b,
         "features",
@@ -119,7 +119,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         b.bind_all(plan, operations=b.executables(None, ())),
         feeds=(FeedBinding("features", FeedOrder.ORDERED, ("qp", "residual", "mv", "segmentation")),),
     )
-    arena = PageBundleArena(plan, _owned_resources=("inject",))
+    arena = PageBundleArena(plan, owned_resources=("inject",))
     execution = binding.bind(arena, AnchorId(4))
     if not runtime:
         execution.admit(())
@@ -215,7 +215,7 @@ def _scheduler(session, *identities):
         scheduled_new_reqs=tuple(
             SimpleNamespace(
                 req_id=identity.request_id,
-                sampling_params=SamplingParams(n=1, extra_args={"pllm.prefix_cache": session._cache_envelope}),
+                sampling_params=SamplingParams(n=1, extra_args={"pllm.prefix_cache": session.cache_envelope}),
             )
             for identity in identities
         ),
@@ -270,7 +270,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             received.append(rows.step_id)
             return ReadonlyStepInput(rows.step_id, ((first, second)[rows.step_id],))
 
-        session._feed = Mock(spec=FeedReceiver, side_effect=receive)
+        session.state_feed = Mock(spec=FeedReceiver, side_effect=receive)
         session.stage_input(None, identities)
         for step, (root, peers) in enumerate(((first, first_peers), (second, second_peers))):
             session.before_execute(_scheduler(session, *(identities if step == 0 else ())))
@@ -284,7 +284,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             )
             hidden = torch.arange(8).reshape(4, 2).float()
             for layer, values in enumerate(expected_deltas):
-                actual = session._activation.patch(StateResource("inject"), layer, None)(hidden.clone())
+                actual = session.activation_patch.patch(StateResource("inject"), layer, None)(hidden.clone())
                 torch.testing.assert_close(actual, hidden + torch.tensor(values)[:, None], rtol=0, atol=0)
             session.complete_forward()
             session.complete_sampler()
@@ -325,7 +325,7 @@ def _hold_steps_reuse_the_settled_injection():
             ReadonlyStepInput(2, (second,)),
             ReadonlyStepEnd(3),
         )
-        session._feed = Mock(spec=FeedReceiver, side_effect=lambda batch, stream: outcomes[batch.step_id])
+        session.state_feed = Mock(spec=FeedReceiver, side_effect=lambda batch, stream: outcomes[batch.step_id])
         session.stage_input(None, (identity,))
         refs = []
         for step in range(4):
@@ -338,7 +338,7 @@ def _hold_steps_reuse_the_settled_injection():
             assert current.version_id == (1 if step < 2 else 2)
             for layer in range(3):
                 delta = 20 if step >= 2 and layer == 0 else 10
-                actual = session._activation.patch(StateResource("inject"), layer, None)(torch.full((1, 2), 2.0))
+                actual = session.activation_patch.patch(StateResource("inject"), layer, None)(torch.full((1, 2), 2.0))
                 torch.testing.assert_close(actual, torch.full((1, 2), float(2 + delta)))
             session.complete_forward()
             session.complete_sampler()

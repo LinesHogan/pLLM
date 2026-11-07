@@ -84,7 +84,7 @@ def native(args):
         max_num_seqs=8,
         max_num_batched_tokens=512,
         gpu_memory_utilization=0.75,
-        execution=pllm.ExecutionOptions(capture_memory_bytes=2048 << 20),
+        execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=2048 << 20),
     )
     result = {"model": args.model, "tokens": args.tokens, "prompts": prompts, "runs": []}
     call, capture, replay = AdaptiveSlice.__call__, ProgramWave.capture, torch.cuda.CUDAGraph.replay

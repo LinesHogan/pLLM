@@ -82,7 +82,7 @@ def _worker(connection: Connection) -> None:
             install = decode_boundary(connection.recv_bytes().decode(), BackendInstall)
             runner = Mock()
             try:
-                GPUWorker._install(Mock(rank=0, workload_runner=runner), imported, install)
+                GPUWorker.install_workload(Mock(rank=0, workload_runner=runner), imported, install)
                 arena = runner.attach_workload.call_args.args[0].execution.arena
                 (resource,) = arena.plan.semantic_graph.states
                 write = arena.prepare_admission((resource.resource,))

@@ -185,10 +185,11 @@ class ScanTemplate:
         if tracing:
             return replace(candidates[-1], workspace=max(c.workspace for c in candidates))
         if capacity not in self.plans:
-            self.plans[capacity] = self._prepare(candidates, count)
+            self.plans[capacity] = self.prepare_plan(candidates, count)
         return self.plans[capacity]
 
-    def _prepare(self, candidates: tuple[PreparedScan, ...], count: int) -> PreparedScan:
+    def prepare_plan(self, candidates: tuple[PreparedScan, ...], count: int) -> PreparedScan:
+        """Prepare the selected scan plan for a count bucket, measuring candidates when requested."""
         selected = candidates[-1]
         if self.context.policy.tuning == "measured" and len(candidates) > 1:
             args = self.samples(count)

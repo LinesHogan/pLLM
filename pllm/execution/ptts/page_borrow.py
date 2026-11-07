@@ -45,7 +45,7 @@ class BorrowedPage:
 
     descriptor: PageFieldTransfer
     _tensor: torch.Tensor | None
-    _connection: Connection
+    connection: Connection
     stream: torch.cuda.Stream | None = None
 
     @property
@@ -64,7 +64,7 @@ class BorrowedPage:
         if self.stream is not None:
             self.stream.synchronize()
         self._tensor = None
-        self._connection.send_bytes(encode_boundary(self.descriptor).encode())
+        self.connection.send_bytes(encode_boundary(self.descriptor).encode())
 
 
 def receive_field(

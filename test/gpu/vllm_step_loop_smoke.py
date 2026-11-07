@@ -42,11 +42,11 @@ def record_steps(handle):
     records, active, samples = {}, [], {}
     # Preemption may recompute a position at a different batch width. Replay rounding must not
     # rewrite the sampling oracle for a token that was already emitted.
-    primitive = handle.runner.require_session()._custom_forward
+    primitive = handle.runner.require_session().custom_forward
     stage, replay, span = ProgramWave.stage, torch.cuda.CUDAGraph.replay, VllmCustomForward.save_span
 
     def external(row):
-        return handle._llm.llm_engine.output_processor.request_states[row.identity.request_id].external_req_id
+        return handle.llm.llm_engine.output_processor.request_states[row.identity.request_id].external_req_id
 
     def staged(wave, rows):
         stage(wave, rows)
@@ -147,22 +147,22 @@ def forced_preemption():
 
 def generate_ids(handle, prompts, params=None):
     """Submit exact donor token IDs through the normal workload admission boundary."""
-    llm = handle._llm
+    llm = handle.llm
     llm.sleep(level=0, mode="keep")
     ids = llm.enqueue(
         [{"prompt_token_ids": tokens} for tokens in prompts],
         [
-            handle._cache_policy.sampling(param)
+            handle.cache_policy.sampling(param)
             for param in (params or [SamplingParams(temperature=0, max_tokens=3, ignore_eos=True) for _ in prompts])
         ],
         use_tqdm=False,
     )
-    identities = tuple(RequestIdentity(name, handle._next_prompt_index + i, 0) for i, name in enumerate(ids))
-    handle._command(BackendCommand.STAGE, encode_boundary(BackendStage(identities, None, None)))
-    handle._next_prompt_index += len(ids)
+    identities = tuple(RequestIdentity(name, handle.next_prompt_index + i, 0) for i, name in enumerate(ids))
+    handle.command(BackendCommand.STAGE, encode_boundary(BackendStage(identities, None, None)))
+    handle.next_prompt_index += len(ids)
     llm.wake_up(tags=["scheduling"])
     outputs = llm.wait_for_completion(RequestOutput, use_tqdm=False)
-    handle._command(BackendCommand.FINISH)
+    handle.command(BackendCommand.FINISH)
     return outputs
 
 
@@ -187,7 +187,7 @@ def offload_roundtrips():
 
         def staged(provider, context, rows, requests, positions, generated):
             stage(provider, context, rows, requests, positions, generated)
-            primitive = handle.runner.require_session()._custom_forward
+            primitive = handle.runner.require_session().custom_forward
             for lane, index in enumerate(rows.tolist()):
                 row = primitive.rows[index]
                 if row.token_offset == 32:
@@ -258,9 +258,9 @@ def donor_loss():
         with (
             patch.object(KVCacheManager, "get_computed_blocks", locate),
             patch.object(
-                handle.runner._workload_session._custom_forward.model,
+                handle.runner.workload_session.custom_forward.model,
                 "forward",
-                partial(forwarded, handle.runner._workload_session._custom_forward),
+                partial(forwarded, handle.runner.workload_session.custom_forward),
             ),
             record_steps(handle) as (recorded, sampled),
         ):
@@ -275,7 +275,7 @@ def donor_loss():
         last = len(receiver) + len(received.outputs[0].token_ids) - 2
         torch.testing.assert_close(saved[-1], recorded[received.request_id, last][0], rtol=0, atol=0)
         assert received.outputs[0].token_ids[-1] == sampled[received.request_id, last]
-        handle._llm.reset_prefix_cache()
+        handle.llm.reset_prefix_cache()
         with record_steps(handle) as (_, cold_samples):
             (cold,) = generate_ids(handle, [receiver], [SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)])
         assert all(
@@ -309,7 +309,7 @@ def isolated_multiturn():
         ):
             handle = replay_handle(StepLoopWorkload(), length=128, prefix=True, multiprocessing=multiprocessing)
         try:
-            handle._llm.collective_rpc("begin_native_steps")
+            handle.llm.collective_rpc("begin_native_steps")
             (donor,) = handle.generate(
                 ["One two three four five six seven eight nine ten " * 2],
                 SamplingParams(temperature=0, max_tokens=35, ignore_eos=True),
@@ -317,33 +317,33 @@ def isolated_multiturn():
             receiver = donor.prompt_token_ids + list(donor.outputs[0].token_ids)
             (warm,) = generate_ids(handle, [receiver])
             assert warm.num_cached_tokens == len(donor.prompt_token_ids) // 16 * 16 > 0
-            handle._llm.reset_prefix_cache()
+            handle.llm.reset_prefix_cache()
             (cold,) = generate_ids(handle, [receiver])
             # Prefix hits change prefill GEMM widths; BF16 near-ties need not choose the same token.
             # Both schedules just passed exact native carry, tap-norm and KV checks in the worker.
             assert cold.num_cached_tokens == 0
-            handle._llm.collective_rpc("end_native_steps")
-            namespace = handle._cache_policy.namespace
+            handle.llm.collective_rpc("end_native_steps")
+            namespace = handle.cache_policy.namespace
             workload = ImportedStepLoop()
             # The worker's install path: build against the driver's specialized facts.
-            assert handle._facts is not None
-            declaration = workload.funded_declaration(handle._facts)
-            handle._attachment = workload.plan_backend(handle._facts, declaration)
-            handle._cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
-            handle._command(BackendCommand.DETACH)
+            assert handle.compile_facts is not None
+            declaration = workload.funded_declaration(handle.compile_facts)
+            handle.backend_attachment = workload.plan_backend(handle.compile_facts, declaration)
+            handle.cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
+            handle.command(BackendCommand.DETACH)
             if multiprocessing:
-                handle._command(
+                handle.command(
                     BackendCommand.INSTALL,
                     encode_boundary(
                         BackendInstall(
-                            handle._facts, handle.attachment, encode_workload(workload), handle._cache_policy
+                            handle.compile_facts, handle.attachment, encode_workload(workload), handle.cache_policy
                         )
                     ),
                 )
             else:
-                deployment = workload.bind_backend(handle._facts, handle.attachment, declaration)
-                handle.runner.attach_workload(deployment, handle._cache_policy)
-            assert handle._cache_policy.namespace != namespace
+                deployment = workload.bind_backend(handle.compile_facts, handle.attachment, declaration)
+                handle.runner.attach_workload(deployment, handle.cache_policy)
+            assert handle.cache_policy.namespace != namespace
             (changed,) = generate_ids(handle, [receiver])
             assert changed.num_cached_tokens == 0
             print(
@@ -361,7 +361,7 @@ def isolated_multiturn():
 def main():
     isolated_multiturn()
     handle = replay_handle(StepLoopWorkload(), length=128, prefix=True, generated_kv="reuse")
-    primitive = handle.runner._workload_session._custom_forward
+    primitive = handle.runner.workload_session.custom_forward
     stage, replay = ProgramWave.stage, torch.cuda.CUDAGraph.replay
     save_span = VllmCustomForward.save_span
     records, active = {}, []
@@ -403,7 +403,7 @@ def main():
         return result
 
     def external(row):
-        return handle._llm.llm_engine.output_processor.request_states[row.identity.request_id].external_req_id
+        return handle.llm.llm_engine.output_processor.request_states[row.identity.request_id].external_req_id
 
     def cold(wave):
         provider = wave.position

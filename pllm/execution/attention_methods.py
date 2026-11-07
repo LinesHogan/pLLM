@@ -1,6 +1,6 @@
 """Declare attention methods and snapshot their facts for ordinary tensor-task readers.
 
-TensorBinding owns this program; a backend installs its reads and CPU checks replay
+TensorDeclaration owns this program; a backend installs its reads and CPU checks replay
 it on seeded paged KV. Fact snapshots use the normal task-result lifetime.
 """
 
@@ -24,7 +24,7 @@ from pllm.execution.tensor_program import TensorBatch
 
 if TYPE_CHECKING:
     from pllm.execution.compile_facts import BackendCompileFacts
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
 
 Fact = Literal["aux", "lse"]
 Argument = torch.Tensor | ModuleCall | int
@@ -139,7 +139,7 @@ class AttentionProgram:
                     )
             self.methods[layer] = method
 
-    def port(self, binding: TensorBinding, source: AttentionFact) -> TensorPort:
+    def port(self, binding: TensorDeclaration, source: AttentionFact) -> TensorPort:
         """Snapshot this layer's sampled facts once, before tensor-task consumers run."""
         from pllm.execution.declaration import When
         from pllm.execution.row_task_binding import declare_tensor
@@ -163,7 +163,7 @@ class AttentionProgram:
             return torch.empty((len(indices), *value.shape[1:]), dtype=value.dtype, device="meta")
         return value.index_select(0, self.sample_rows.index_select(0, indices.clamp_min(0)))
 
-    def plan(self, binding: TensorBinding, facts: BackendCompileFacts) -> None:
+    def plan(self, binding: TensorDeclaration, facts: BackendCompileFacts) -> None:
         """Trace methods in forward order to infer fact shapes and attention work."""
         for method in tuple(self.methods.values()):
             for _, source in method.inputs:
@@ -237,7 +237,7 @@ class AttentionProgram:
 
 
 def attention_example(
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     facts: BackendCompileFacts,
     program: AttentionProgram,
     layer: int,

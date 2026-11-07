@@ -27,13 +27,13 @@ def producer(feed, probe):
             feed.publish(value=tensor)
             with torch.cuda.stream(torch.cuda.Stream()):
                 tensor.zero_()
-            arena = feed._arena
-            pages.append(arena.root(feed._current).pages)
+            arena = feed.arena
+            pages.append(arena.root(feed.current_ref).pages)
         with pytest.raises(RuntimeError, match="before publishing"):
             pickle.dumps(feed)
         probe.send(("ready", pages))
         feed.publish(value=torch.full((2,), 4.0, device="cuda"))
-        probe.send(("fourth", arena.root(feed._current).pages))
+        probe.send(("fourth", arena.root(feed.current_ref).pages))
         feed.end()
     finally:
         feed.close()
@@ -71,10 +71,10 @@ def test_feed_selects_complete_versions_and_reclaims_only_after_completion(order
     context = mp.get_context("spawn")
     probe, child = context.Pipe()
     feed = receiver.take("source")
-    assert feed._arena is None
+    assert feed.arena is None
     process = context.Process(target=producer, args=(feed, child))
     process.start()
-    assert feed._moved and feed._arena is None
+    assert feed.moved and feed.arena is None
     child.close()
     try:
         assert probe.poll(30)
@@ -137,7 +137,7 @@ def retained_producer(feed, probe):
     try:
         tensor = torch.ones(2, device="cuda")
         feed.publish(value=tensor, extra=tensor)
-        arena = feed._arena
+        arena = feed.arena
         feed.end()
         probe.send("retained")
         assert arena.usage().pinned_versions > 0
@@ -193,7 +193,7 @@ def test_publish_rejects_invalid_user_fields_without_allocating_pages():
         ):
             with pytest.raises(ValueError):
                 feed.publish(**values)
-            assert feed._arena is None and not feed._failed
+            assert feed.arena is None and not feed.failed
         feed.end()
         assert isinstance(receiver(step_rows(0), torch.cuda.current_stream()), ReadonlyStepEnd)
         feed.close()
@@ -209,8 +209,8 @@ def bad_ack_producer(feed, probe):
         probe.send("ready")
         with pytest.raises(RuntimeError, match="completion proof"):
             feed.publish(value=torch.ones(2, device="cuda"))
-        assert feed._failed and feed._arena._releases
-        assert feed._arena.root(feed._current).ref == feed._current
+        assert feed.failed and feed.arena.pending_releases
+        assert feed.arena.root(feed.current_ref).ref == feed.current_ref
         with pytest.raises(RuntimeError, match="fail-stopped"):
             feed.publish(value=torch.ones(2, device="cuda"))
         probe.send("failed-with-owner")
@@ -230,7 +230,7 @@ def test_bad_ack_retains_failed_owner_and_cancels_queued_publications():
     try:
         assert probe.poll(30) and probe.recv() == "ready"
         incoming = receiver(step_rows(0), torch.cuda.current_stream())
-        incoming.roots[0].pages[0]._connection.send_bytes(b"wrong export")
+        incoming.roots[0].pages[0].connection.send_bytes(b"wrong export")
         assert probe.poll(30) and probe.recv() == "failed-with-owner"
         # The cancellation can race this test's probe; wait for its actual control record.
         from multiprocessing.connection import wait
@@ -248,10 +248,10 @@ def test_bad_ack_retains_failed_owner_and_cancels_queued_publications():
 def test_unused_feed_closes_without_starting_a_producer():
     execution, receiver = setup_feed(FeedWorkload())
     writer = receiver.writer
-    assert writer._arena is None
+    assert writer.arena is None
     receiver.close()
     receiver.close()
-    assert writer._closed and writer._arena is None
+    assert writer.closed and writer.arena is None
     execution.retire((), wait=True)
 
 
@@ -280,7 +280,7 @@ def test_control_eof_retains_owner_until_the_consumer_process_exits():
     assert probe.poll(30)
     feed = probe.recv()
     feed.publish(value=torch.ones(2, device="cuda"))
-    arena = feed._arena
+    arena = feed.arena
     assert probe.poll(30) and probe.recv() == "borrowed"
     probe.send("disconnect")
     assert probe.poll(30) and probe.recv() == "disconnected"
@@ -291,7 +291,7 @@ def test_control_eof_retains_owner_until_the_consumer_process_exits():
 
             with pytest.raises(TimeoutError):
                 closing.result(timeout=0.1)
-            assert feed._arena is arena and arena.usage().pinned_versions > 0
+            assert feed.arena is arena and arena.usage().pinned_versions > 0
         finally:
             probe.send("exit")
             process.join(30)
@@ -300,5 +300,5 @@ def test_control_eof_retains_owner_until_the_consumer_process_exits():
                 process.join()
         with pytest.raises(OSError):
             closing.result(timeout=30)
-    assert process.exitcode == 0 and feed._arena is None
+    assert process.exitcode == 0 and feed.arena is None
     probe.close()

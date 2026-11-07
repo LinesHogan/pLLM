@@ -25,7 +25,7 @@ def main() -> None:
         workload=ESampWorkload(ESampConfig(rank=2, intervention_beta=0.2)),
         config=ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 128, 0.25, seed=7, runner="mrv1"),
     )
-    native_rows, native_reweight = mrv1.encode_mrv1_rows, SamplerGuidance._reweight_finite_survivors
+    native_rows, native_reweight = mrv1.encode_mrv1_rows, SamplerGuidance.reweight_finite_survivors
     widths, phases, identities_seen = set(), set(), set()
     row_checks = sampler_checks = affected_checks = 0
 
@@ -70,7 +70,7 @@ def main() -> None:
         assert isinstance(handle.runner, mrv1.Mrv1Runner)
         with (
             patch.object(mrv1, "encode_mrv1_rows", inspect_rows),
-            patch.object(SamplerGuidance, "_reweight_finite_survivors", staticmethod(inspect_reweight)),
+            patch.object(SamplerGuidance, "reweight_finite_survivors", staticmethod(inspect_reweight)),
         ):
             batch = handle.generate_completions(
                 ["The sky is", "Explain why water freezes at", "The sea is"],

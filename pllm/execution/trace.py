@@ -219,13 +219,13 @@ class ExecutionTrace:
         self._on_export, self._export_dropped = on_export, 0
         self._closed = False
         self._failure: BaseException | None = None
-        self._thread = (
+        self.thread = (
             Thread(target=self._deliver, args=(on_export,), name="pllm-export", daemon=True)
             if on_export is not None
             else None
         )
-        if self._thread is not None:
-            self._thread.start()
+        if self.thread is not None:
+            self.thread.start()
             # A daemon delivery thread still alive at interpreter exit aborts the process.
             atexit.register(self.close)
 
@@ -553,8 +553,8 @@ class ExecutionTrace:
         try:
             self.drain()
         finally:
-            if self._thread is not None:
-                self._thread.join()
+            if self.thread is not None:
+                self.thread.join()
             with self._lock:
                 self._collect_timings()
                 self._events.clear()

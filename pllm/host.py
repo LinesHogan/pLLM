@@ -32,11 +32,11 @@ from pllm.contracts.host_batch import (
 )
 from pllm.execution.host_runtime import CompletionInput as CompletionInput, HostConfig as HostConfig
 from pllm.execution.step_input import StepInput as StepInput
-from pllm.execution.tensor_binding import StepResult as StepResult
+from pllm.execution.tensor_declaration import StepResult as StepResult
 
 if TYPE_CHECKING:
     from pllm.execution.state_execution import StateExecution
-    from pllm.execution.tensor_binding import TensorOutput
+    from pllm.execution.tensor_declaration import TensorOutput
     from pllm.execution.tensor_frame import TensorFrame
     from pllm.usage import Workload
 

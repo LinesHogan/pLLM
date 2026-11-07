@@ -42,7 +42,7 @@ class StateLayoutRequirement:
 
 @dataclass(frozen=True, slots=True)
 class StateRepresentationRequest:
-    memory_budget_bytes: int
+    state_page_budget_bytes: int
     states: tuple[StateLayoutRequirement, ...]
     candidates: tuple[StateProviderPlan, ...]
 

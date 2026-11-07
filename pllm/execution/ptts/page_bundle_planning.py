@@ -28,7 +28,7 @@ def compile_page_bundle_plan(
     timeline: SchedulerTimeline,
     providers: tuple["PageBundleProviderFacts", ...],
     max_admitted_lineages: int,
-    memory_budget_bytes: int,
+    state_page_budget_bytes: int,
     device: torch.device,
 ) -> PlanBundle:
     """Compile original declarations once; all choices remain Rust-owned."""
@@ -64,7 +64,7 @@ def compile_page_bundle_plan(
     if device.type == "cuda":
         required += ("state/fenced_reclaim@1",)
     request = StateRepresentationRequest(
-        memory_budget_bytes,
+        state_page_budget_bytes,
         tuple(
             StateLayoutRequirement(
                 binding.resource,

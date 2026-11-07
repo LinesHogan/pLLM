@@ -133,10 +133,10 @@ head = pllm.RequestState(
 - **步内多层**：不需要 memory——`@pllm.custom_forward` 直接声明
   （见 [Overlay 与重放](overlays-and-replay.md)）。
 
-## 状态会不会爆显存：state_memory_bytes 预算
+## 状态会不会爆显存：state_page_budget_bytes 预算
 
 所有状态页都住在 PageBundleArena 里，arena 的容量由
-`ExecutionOptions.state_memory_bytes` 设定。默认 `0`：取后端观测到的可用
+`ExecutionOptions.state_page_budget_bytes` 设定。默认 `0`：取后端观测到的可用
 容量。显式给值就是给 arena 划一个固定预算（基准就这么做，见
 [基准解读](benchmarking.md)）。
 
@@ -157,9 +157,9 @@ head = pllm.RequestState(
 路由用户特别注意：休眠 lineage 仍占准入容量（见上文路由键一节），所以
 「route 基数 × 每 lineage 字节」才是你的稳态占用，不是并发请求数。
 
-`ExecutionOptions.memory_budget_bytes` 约束任务与结果的峰值内存。框架在 meta/fake
+`ExecutionOptions.execution_peak_budget_bytes` 约束 pllm 的执行峰值：PTTS 状态页、任务工作区与存活结果、anchor 缓冲以及 CUDA Graph 池预留。模型权重与 KV 池不在内。框架在 meta/fake
 输入上执行实际张量步及前后向，按 512 字节追踪存储，不初始化 CUDA；负载不维护
-字节公式。捕获池另用 `capture_memory_bytes`。宿主有限训练声明 `max_input_rows`，
+字节公式。每个任务和模型的捕获池预算用 `cuda_graph_pool_budget_bytes`；它不是所有捕获池的合计上限。默认 `None` 按负载追踪任务预留，模型池默认 64 MiB；exact decode overlay 另按形状计入工作区。宿主有限训练声明 `max_input_rows`，
 并为奖励等宿主选择提供最大形状样例；详见[资源事实](../reference/authoring-contract.md#资源事实与内存预算)。
 
 ## 我想看状态到底占了多少：state_usage

@@ -42,10 +42,10 @@ def run(chunk):
             64,
             0.25,
             seed=7,
-            execution=pllm.ExecutionOptions(capture_memory_bytes=128 << 20),
+            execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=128 << 20),
         ),
     )
-    primitive = handle.runner.require_session()._custom_forward
+    primitive = handle.runner.require_session().custom_forward
     native, checked, errors = torch.cuda.CUDAGraph.replay, [], []
 
     def rms(value, norm):

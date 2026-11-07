@@ -249,10 +249,10 @@ loss/gradient outputs are copied out before a later replay can overwrite them.
 The first invocation warms up on a side stream and captures into a private graph pool.
 By default, each tensor task's capture reservation is derived at build from its maximum-shape
 allocation trace, including index tables and owned staging. It conservatively assumes no allocator
-reuse; actual graph residency is usually smaller. An explicit `capture_memory_bytes` sets a per-task
+reuse; actual graph residency is usually smaller. An explicit `cuda_graph_pool_budget_bytes` sets a per-task
 limit and fails at build if it cannot cover that reservation, naming the required value.
 Import-only store graphs allocate no tensors during replay and reserve their exact fixed storage.
-Model overlay and custom-forward graphs retain a 64 MiB default reservation when the option is unset.
+Model overlay and custom-forward graphs retain a 64 MiB default pool reservation when the option is unset; exact-decode overlays add shape-derived workspace allowances to the model pool.
 Overlay tiles keep a fixed per-task capture budget; a tile whose conservative reservation does not fit executes eagerly.
 Replacing hidden buffer storage starts a new
 cold capture. Subsequent invocations with fixed tap buffers perform no host-device wait.

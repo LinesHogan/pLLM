@@ -32,9 +32,9 @@ def measure(workload: pllm.Workload, options: BenchmarkOptions) -> float:
     config = replace(
         options.model_config(),
         execution=pllm.ExecutionOptions(
-            capture_memory_bytes=options.capture_memory_bytes,
-            state_memory_bytes=options.state_memory_bytes,
-            memory_budget_bytes=options.memory_budget_bytes,
+            cuda_graph_pool_budget_bytes=options.cuda_graph_pool_budget_bytes,
+            state_page_budget_bytes=options.state_page_budget_bytes,
+            execution_peak_budget_bytes=options.execution_peak_budget_bytes,
         ),
     )
     sampling = SamplingParams(

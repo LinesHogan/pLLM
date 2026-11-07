@@ -42,7 +42,7 @@ def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: t
     )
 
 
-_reweight = torch.compile(_reweight_unfused, dynamic=True, fullgraph=True)  # pyright: ignore[reportUnknownMemberType]
+reweight = torch.compile(_reweight_unfused, dynamic=True, fullgraph=True)  # pyright: ignore[reportUnknownMemberType]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +113,7 @@ class SamplerGuidance:
         self._active_guidance = None
 
     @staticmethod
-    def _reweight_finite_survivors(processed_logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
+    def reweight_finite_survivors(processed_logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
         assert (
             processed_logits.shape == (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
             and guidance.pred_dense_logits.device == processed_logits.device
@@ -132,7 +132,7 @@ class SamplerGuidance:
             if weights is None
             else guidance.guidance.beta * weights.to(survivors).unsqueeze(1)
         )
-        reweighted: torch.Tensor = _reweight(survivors, guidance.pred_dense_logits, beta)  # pyright: ignore[reportAssignmentType]
+        reweighted: torch.Tensor = reweight(survivors, guidance.pred_dense_logits, beta)  # pyright: ignore[reportAssignmentType]
         if rows is None:
             return reweighted
         output = processed_logits.clone()
@@ -216,7 +216,7 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
                 return sampled, survivors
             case SignedSamplerStages(guide=SignedSamplerGuidance() as guidance):
                 survivors = apply_top_k_top_p(processed_logits, top_k, top_p)
-                reweighted = self._reweight_finite_survivors(survivors, guidance)
+                reweighted = self.reweight_finite_survivors(survivors, guidance)
                 return super()._sample_random(reweighted, expanded_idx_mapping, idx_mapping_np, pos, None, None, False)
             case _:
                 return super()._sample_random(
@@ -279,7 +279,7 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
             logits = self.apply_temperature(logits, metadata.temperature, metadata.all_random)
             for processor in metadata.logitsprocs.argmax_invariant:
                 logits = processor.apply(logits)
-        logits = self._reweight_finite_survivors(apply_top_k_top_p(logits, metadata.top_k, metadata.top_p), guidance)
+        logits = self.reweight_finite_survivors(apply_top_k_top_p(logits, metadata.top_k, metadata.top_p), guidance)
         sampled = logits.argmax(dim=-1)
         if not metadata.all_greedy:
             assert metadata.temperature is not None

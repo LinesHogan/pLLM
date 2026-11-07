@@ -226,29 +226,29 @@ class PageBundleArena:
         plan: PlanBundle,
         *,
         device: torch.device | None = None,
-        _owned_resources: tuple[str, ...] | None = None,
+        owned_resources: tuple[str, ...] | None = None,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         self.plan = plan
         self.plan_digest = boundary_digest(plan)
         device = device or torch.device(plan.states.plans[0].device_kind.value)
         self.device = torch.device("cuda", torch.cuda.current_device()) if device == torch.device("cuda") else device
-        self._pools: dict[str, SlotPools] = {}
+        self.pools: dict[str, SlotPools] = {}
         layouts = {item.resource: item.layout for item in plan.tensor_layout_request.layouts}
-        self._owned_resources = tuple(layouts) if _owned_resources is None else _owned_resources
+        self._owned_resources = tuple(layouts) if owned_resources is None else owned_resources
         self._plans = {
             selected.resource: selected for selected in plan.states.plans if selected.resource in self._owned_resources
         }
         for resource, selected in self._plans.items():
-            self._pools[resource] = SlotPools(
+            self.pools[resource] = SlotPools(
                 layouts[resource],
                 selected.page_capacity,
                 self.device,
                 host=bool(selected.host_bytes),
                 map_host=map_host,
             )
-        self._resources = tuple(self._plans)
-        self._resource_ids = {resource: index for index, resource in enumerate(self._resources)}
+        self.resource_names = tuple(self._plans)
+        self._resource_ids = {resource: index for index, resource in enumerate(self.resource_names)}
         mutable = {
             effect.resource
             for task in plan.semantic_graph.tasks
@@ -262,11 +262,11 @@ class PageBundleArena:
             ],
             dtype=np.int64,
         ).reshape(-1, 3)
-        self._ledger = _core.PageLedger([pool.ledger for pool in self._pools.values()], specs)
+        self._ledger = _core.PageLedger([pool.ledger for pool in self.pools.values()], specs)
         self._events = PageEvents()
         self._remote_reads: dict[int, list[RemoteCompletion]] = {}
         # Remote readers retain their native pin until every ACK arrives.
-        self._releases: dict[PageRelease, None] = {}
+        self.pending_releases: dict[PageRelease, None] = {}
         self._storage_streams: dict[int, torch.cuda.Stream] = {}
         self._poisoned = False
         self._initialization = (
@@ -286,18 +286,18 @@ class PageBundleArena:
     @property
     def free_pages(self) -> int:
         self.collect_completed()
-        return sum(min(map(pools.free_count, range(len(pools.tensors)))) for pools in self._pools.values())
+        return sum(min(map(pools.free_count, range(len(pools.tensors)))) for pools in self.pools.values())
 
     @property
     def pending_pin_releases(self) -> int:
-        return len(self._releases)
+        return len(self.pending_releases)
 
     @property
     def allocation_ranges(self) -> tuple[tuple[str, int, int], ...]:
         """Allocation metadata, including spare COW pages and alignment padding."""
         return tuple(
             (str(tensor.device), tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
-            for pools in self._pools.values()
+            for pools in self.pools.values()
             for tensor in pools.tensors
         )
 
@@ -328,7 +328,7 @@ class PageBundleArena:
         retiring_pages = pages(retiring) - live_pages - private_pages
         sizes = {
             (resource, field.field_id): prod(field.shape) * field.dtype.itemsize
-            for resource, pool in self._pools.items()
+            for resource, pool in self.pools.items()
             for field in pool.layout.fields
         }
         reserved = sum(selected.reserved_bytes for selected in self._plans.values())
@@ -337,30 +337,30 @@ class PageBundleArena:
             sum(
                 sizes[root.resource, field.field_id]
                 for root in (*live, *retiring, *private)
-                for field in self._pools[root.resource].layout.fields
+                for field in self.pools[root.resource].layout.fields
             ),
             sum(sizes[resource, field] for resource, field, _ in live_pages | private_pages | retiring_pages),
             reserved
             - sum(
                 selected.page_capacity * sizes[resource, field.field_id]
                 for resource, selected in self._plans.items()
-                for field in self._pools[resource].layout.fields
+                for field in self.pools[resource].layout.fields
             ),
-            sum(pool.free_count(field) for pool in self._pools.values() for field in range(len(pool.tensors))),
+            sum(pool.free_count(field) for pool in self.pools.values() for field in range(len(pool.tensors))),
             len(live_pages),
             len(private_pages),
             len(retiring_pages),
             len(private),
             len(retiring),
             len(held),
-            len(self._releases),
+            len(self.pending_releases),
             self._ledger.admission_failures,
         )
 
     def _pages(self, groups: list[_core.PageSnapshot]) -> tuple[_Pages, ...]:
         return tuple(
             _Pages(
-                self._resources[resource],
+                self.resource_names[resource],
                 _refs(refs),
                 slots,
                 generations,
@@ -453,15 +453,16 @@ class PageBundleArena:
             self._events.order(waits, stream)
             self._events.retain(retained)
             with self._scope(stream), torch.no_grad():
-                self._fill_versions(copies)
+                self.fill_versions(copies)
         except Exception:
             self.abort(token)
             raise
         return token
 
-    def _fill_versions(self, copies: list[_core.PageCopy]) -> None:
+    def fill_versions(self, copies: list[_core.PageCopy]) -> None:
+        """Copy the planned state fields into their destination version slots."""
         for resource, field, source, destination in copies:
-            pools = self._pools[self._resources[resource]]
+            pools = self.pools[self.resource_names[resource]]
             if not len(source):
                 pools.tensors[field].index_fill_(0, upload(destination, self.device), 0)
             else:
@@ -470,13 +471,13 @@ class PageBundleArena:
 
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         (root,) = self._held_fields(token, token.after_refs.take((root_index,)), (field,))
-        return self._pools[root.resource].tensor(field, root.pages[field])
+        return self.pools[root.resource].tensor(field, root.pages[field])
 
     def writable_roots(self, token: PageWrite, *, initialize: bool = False) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Borrow writable fields, completing GPU work before handing storage to a CPU initializer."""
         self._issued_write(token)
         roots = tuple(
-            self._pools[root.resource].views(root.slots, root.generations, host=initialize)
+            self.pools[root.resource].views(root.slots, root.generations, host=initialize)
             for root, _ in self._held_roots((token,) * len(token.after_refs), token.after_refs)
         )
         if (
@@ -528,7 +529,7 @@ class PageBundleArena:
         owned exports use snapshot. The original pin owns completion and reclamation.
         """
         (root,) = self._held_fields(pin, StateRefs.of((ref,)), (field,))
-        return self._pools[root.resource].tensor(field, root.pages[field]).detach()
+        return self.pools[root.resource].tensor(field, root.pages[field]).detach()
 
     def _access_pages(self, access: PagePin | PageWrite) -> tuple[_Pages, ...]:
         if isinstance(access, PagePin):
@@ -557,11 +558,11 @@ class PageBundleArena:
 
     def ref_resource(self, refs: StateRefs) -> str:
         """Look up a homogeneous selection's resource by its arena-wide lineage identity."""
-        return self._resources[self._ledger.resource(int(refs.lineages[0]))]
+        return self.resource_names[self._ledger.resource(int(refs.lineages[0]))]
 
     def access_resource(self, access: PagePin | PageWrite) -> str:
         """Read the homogeneous resource of an issued access without inspecting state records."""
-        return self._resources[self._ledger.access_resource(_access_id(access), _stream_id(access.stream))]
+        return self.resource_names[self._ledger.access_resource(_access_id(access), _stream_id(access.stream))]
 
     def slot_matrix(self, access: PagePin | PageWrite, refs: StateRefs) -> tuple[str, Slots]:
         """Resolve a homogeneous array selection under its issued pin or private write."""
@@ -578,7 +579,7 @@ class PageBundleArena:
             owners,
             _ref_columns(refs),
         )
-        return self._resources[resource], slots
+        return self.resource_names[resource], slots
 
     def lazy_roots(self, access: tuple[PagePin | PageWrite, ...], owners: Slots, refs: StateRefs) -> LazyRoots:
         """Defer individual tensor views; batch slots stay in their exact pin/write matrix."""
@@ -586,7 +587,7 @@ class PageBundleArena:
 
     def _root_views(self, root: PageBundle, writable: frozenset[int] | None) -> tuple[torch.Tensor, ...]:
         self._require_live()
-        pools = self._pools[root.resource]
+        pools = self.pools[root.resource]
         assert writable is None or len(writable) == len(root.slots)
         if writable is None:
             return tuple(view.detach() for view in pools.views(root.slots, root.generations))
@@ -601,14 +602,14 @@ class PageBundleArena:
 
     def field_pool(self, resource: str, field: LayoutFieldId) -> torch.Tensor:
         """Bind stable graph storage; each invocation still supplies pin-authorized read slots."""
-        return self._pools[resource].tensors[field].detach()
+        return self.pools[resource].tensors[field].detach()
 
     def field_slots(
         self, access: tuple[PagePin | PageWrite, ...], refs: StateRefs, field: LayoutFieldId
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
         """The field pool and each selected exact-version slot."""
         resource, slots = self.slots(access, np.arange(len(access), dtype=np.int64), refs)
-        return self._pools[resource].tensors[field].detach(), tuple(slots[:, field].tolist())
+        return self.pools[resource].tensors[field].detach(), tuple(slots[:, field].tolist())
 
     def _held_fields(
         self, access: PagePin | PageWrite, refs: StateRefs, fields: tuple[LayoutFieldId, ...]
@@ -655,7 +656,7 @@ class PageBundleArena:
     def snapshot(self, pin: PagePin, ref: StateRef) -> tuple[torch.Tensor, ...]:
         """Clone a pinned version in its declared placement, ready on the caller's stream."""
         ((root, _),) = self._held_roots((pin,), StateRefs.of((ref,)))
-        pools = self._pools[root.resource]
+        pools = self.pools[root.resource]
         with self._scope(pin.stream):
             copies = tuple(value.detach().clone() for value in pools.views(root.slots, root.generations, host=True))
         if self.device.type == "cuda":
@@ -700,7 +701,7 @@ class PageBundleArena:
         receipt = PageRelease(release_id, pin, completion, remote)
         self._remote_reads.pop(pin.pin_id, None)
         if remote:
-            self._releases[receipt] = None
+            self.pending_releases[receipt] = None
         return receipt
 
     def wait_release(self, receipt: PageRelease) -> None:
@@ -714,7 +715,7 @@ class PageBundleArena:
     def release_complete(self, receipt: PageRelease) -> bool:
         self._require_live()
         self.collect_completed()
-        return receipt not in self._releases
+        return receipt not in self.pending_releases
 
     def retire(self, refs: StateRefs) -> None:
         self._require_live()
@@ -724,7 +725,7 @@ class PageBundleArena:
     def collect_completed(self, *, wait: bool = False) -> None:
         """Release pins whose remote readers have finished; local releases already happened behind their fence."""
         self._require_live()
-        for receipt in tuple(self._releases):
+        for receipt in tuple(self.pending_releases):
             if wait:
                 for read in receipt.remote_reads:
                     read.synchronize()
@@ -732,7 +733,7 @@ class PageBundleArena:
                 continue
             retained = self._ledger.complete_release(receipt.release_id, self._events.completed())
             self._events.retain(retained)
-            del self._releases[receipt]
+            del self.pending_releases[receipt]
 
     def _issued_write(self, token: PageWrite) -> None:
         self._require_live()
@@ -754,7 +755,7 @@ class PageBundleArena:
         if stream is not None and stream.cuda_stream not in self._storage_streams:
             # The arena may be destroyed after asynchronous cancellation. CUDA's
             # allocator must retain its backing on every declared reader/writer lane.
-            for pools in self._pools.values():
+            for pools in self.pools.values():
                 for tensor in pools.tensors:
                     tensor.record_stream(stream)
             self._storage_streams[stream.cuda_stream] = stream

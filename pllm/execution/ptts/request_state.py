@@ -262,12 +262,13 @@ class RequestStateDirectory:
         for state, keys, (columns, positions) in zip(self.states, self._keys, projected, strict=True):
             refs = self.arena.latest_batch(state.resource, columns)
             if history:
-                refs = self._rewind(refs, history)
+                refs = self.rewind_versions(refs, history)
             groups.append(ResourceSelection(state.resource, keys, refs, positions))
         return RequestStateSelection(rows if self.states else rows[:0], tuple(groups))
 
     @staticmethod
-    def _rewind(refs: StateRefs, history: tuple[StateRefs, ...]) -> StateRefs:
+    def rewind_versions(refs: StateRefs, history: tuple[StateRefs, ...]) -> StateRefs:
+        """Select the historical state versions visible at the requested publication lag."""
         versions = _core.rewind_versions(
             refs.lineages,
             refs.versions,

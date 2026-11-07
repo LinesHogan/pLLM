@@ -30,7 +30,7 @@ CONFIG = pllm.ModelConfig(
     max_num_batched_tokens=128,
     gpu_memory_utilization=0.3,
     cuda_graphs=True,
-    execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+    execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
 )
 
 
@@ -98,7 +98,7 @@ def test_native_lse_and_selected_oracle():
             tuple(torch.arange(length - query, length, device="cuda") for length, query in zip((95, 81), queries))
         )
         kv = PagedKV(keys, values, table, lengths, starts, len(q), TraceRead(128))
-        kv = replace(kv, _read=DenseAttention(kv, dim**-0.5))
+        kv = replace(kv, read_attention=DenseAttention(kv, dim**-0.5))
         for invalid in (q.repeat_interleave(2, dim=-1), q[:, :1], q[:1]):
             with pytest.raises(ValueError, match="keep packed rows and head_dim unchanged"):
                 kv.attend(invalid)
@@ -234,7 +234,7 @@ def test_layout_oracle_and_reclaimed_blocks(workload):
     with pllm.make_llm(config, workload=workload) as engine:
         runner = engine.runner
         model = runner.decoder.kv_writable("layout oracle")
-        program = runner.require_session()._deployment.execution.math.attention
+        program = runner.require_session().deployment.execution.math.attention
         # The native cache tensors alias exactly; the consumer's K/V write is skipped by vLLM.
         for layout in workload.backend_requirements().kv_layouts:
             if layout.keep == "none":
@@ -243,7 +243,7 @@ def test_layout_oracle_and_reclaimed_blocks(workload):
                     model.model.layers[layout.layer].self_attn.attn.kv_cache.data_ptr()
                     == model.model.layers[target].self_attn.attn.kv_cache.data_ptr()
                 )
-        manager = engine._require_open().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
+        manager = engine.require_llm().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
         allocated = manager.allocate_slots
         measurements = []
 

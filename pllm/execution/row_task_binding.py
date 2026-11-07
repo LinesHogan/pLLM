@@ -1,6 +1,6 @@
 """Row tasks: per-row training, gradients, sampler guidance and tensor exports.
 
-Module functions declare packed-row tasks on the TensorBinding supplied by workload authoring.
+Module functions declare packed-row tasks on the TensorDeclaration supplied by workload authoring.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ from pllm.execution.tensor_task import TensorExport, TensorTask
 from pllm.kernels.adamw import AdamWConfig
 
 if TYPE_CHECKING:
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +195,7 @@ def sampled_token_port() -> TensorPort:
 
 
 def declare_parameters(
-    b: TensorBinding,
+    b: TensorDeclaration,
     name: str,
     fields: tuple[LayoutField, ...],
     *,
@@ -233,7 +233,7 @@ def declare_parameters(
 
 
 def parameter_ports(
-    b: TensorBinding,
+    b: TensorDeclaration,
     state: State,
     shapes: Mapping[str, Shape],
     *,
@@ -294,7 +294,7 @@ def parameter_ports(
 
 
 def declare_weighted_train(
-    b: TensorBinding,
+    b: TensorDeclaration,
     name: str,
     state: State,
     *,
@@ -416,7 +416,7 @@ def state_metadata(state: State, *, version: bool) -> TensorPort:
 
 
 def declare_tensor(
-    b: TensorBinding,
+    b: TensorDeclaration,
     name: str,
     *,
     inputs: Mapping[str, TensorPort],
@@ -542,7 +542,7 @@ def declare_tensor(
     return decorate
 
 
-def validate_gradients(b: TensorBinding, trainers: tuple[Call, ...]) -> None:
+def validate_gradients(b: TensorDeclaration, trainers: tuple[Call, ...]) -> None:
     """Check that every differentiable path ends in a @pllm.train loss and each loss differentiates only its state."""
     tasks = {task.symbol: task for task in b.graph.tasks}
     retained = {
@@ -580,7 +580,7 @@ def validate_gradients(b: TensorBinding, trainers: tuple[Call, ...]) -> None:
         raise ValueError("every @pllm.differentiate result must feed a @pllm.train loss")
 
 
-def declare_logits(b: TensorBinding, prediction: Call, *, stage: SamplerStage) -> None:
+def declare_logits(b: TensorDeclaration, prediction: Call, *, stage: SamplerStage) -> None:
     """Send the prediction to the sampler: added to the logits before filtering, or guiding the draw after it."""
     if stage is SamplerStage.PACKED_PRE_FILTER_ADD and b.dimensions.vocab_size < 1:
         raise ValueError("@pllm.add_logits needs the model's vocabulary size; compile this workload with make_llm")

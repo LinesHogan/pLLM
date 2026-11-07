@@ -129,7 +129,7 @@ def _user_reference_workload() -> None:
     assert not torch.cuda.is_initialized()
     handle = pllm.make_llm(workload=HuberWorkload(2), config=engine())
     try:
-        child = handle._worker_state().process_id
+        child = handle.worker_state().process_id
         assert child != os.getpid()
         assert len(handle.generate(PROMPTS, greedy(4))) == 2
         finished = handle.diagnostics()
@@ -149,7 +149,7 @@ def _prefill_adapter_reconstruction() -> None:
         ) as handle:
             handle.select_trace(TraceSelection(max_events=4096))
             outputs = handle.generate(["The quick brown fox jumps over the lazy dog.", "Hello there."], greedy(2))
-            state = handle._worker_state()
+            state = handle.worker_state()
             assert state.process_id != os.getpid()
             assert state.diagnostics.update_count == 5 * sum(
                 (len(output.prompt_token_ids) + 2) // 3 for output in outputs
@@ -225,14 +225,14 @@ def _graph_overlay(*, exact: bool = False) -> None:
         GatedDeltaConfig(targets, chunk_size=4, visibility="exact" if exact else "forward_pinned")
     )
     options = ExecutionOptions(
-        capture_memory_bytes=512 << 20, memory_budget_bytes=2 << 30, allow_numerical_transforms=False
+        cuda_graph_pool_budget_bytes=512 << 20, execution_peak_budget_bytes=2 << 30, allow_numerical_transforms=False
     )
     with pllm.make_llm(workload=workload, config=engine(cuda_graphs=True, execution=options)) as handle:
         prompts = ["The sky is blue and the sea is calm.", "Water freezes when it is very cold."]
         first = handle.generate(prompts, greedy(3))
         second = handle.generate(prompts[::-1], greedy(3))
         assert [o.outputs[0].token_ids for o in first] == [o.outputs[0].token_ids for o in second][::-1]
-        state = handle._worker_state()
+        state = handle.worker_state()
         assert state.process_id != os.getpid() and state.diagnostics.update_count > 0
         assert_clean(state.diagnostics)
         assert not torch.cuda.is_initialized()
@@ -241,7 +241,7 @@ def _graph_overlay(*, exact: bool = False) -> None:
 
 def _captured_esamp(runner: RunnerName = "mrv2") -> None:
     assert not torch.cuda.is_initialized()
-    options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
+    options = ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2)
     handle = pllm.make_llm(
         workload=ESampWorkload(ESampConfig(rank=2)),
         config=engine(runner=runner, execution=options),
@@ -307,7 +307,7 @@ def _output_lora_shared_input() -> None:
     # This case asserts immediate next-draw visibility; exercise strict ordering.
     handle = pllm.make_llm(
         workload=workload,
-        config=engine(execution=ExecutionOptions(max_training_rows=2, publish_lag=0)),
+        config=engine(execution=ExecutionOptions(max_host_training_rows=2, publish_lag=0)),
     )
     try:
         sampling = greedy(3, logprobs=1)
@@ -470,7 +470,7 @@ def main() -> int:
     handle = pllm.make_llm(workload=workload, config=engine(memory=0.35))
     try:
         assert not torch.cuda.is_initialized(), "frontend allocated a second GPU execution"
-        child = handle._worker_state().process_id
+        child = handle.worker_state().process_id
         assert child != os.getpid()
         outputs = handle.generate(
             ["The sky is", "The sea is", "The grass is"],

@@ -20,8 +20,8 @@ from test.gpu.vllm_inplace_ttt_smoke import ImportedLowRank, open_llm
 def _assert_imported_factor_rows(handle, fields, indices):
     """Read the graph's actual page indices, independently of admission and publication order."""
     session = handle.runner.require_session()
-    (reader,) = session._overlay.readers
-    rows = session._step.rows.row_batch
+    (reader,) = session.parameter_overlay.readers
+    rows = session.step.rows.row_batch
     count = next(size for size in reader.programs if size >= rows.total_rows)
     slots, positions, owners = reader.ports(reader.table, count)
     for row in rows.request_rows:
@@ -48,8 +48,8 @@ def test_prompt_lora_batch_matches_individual_requests(workload, chunked):
         model_length=128,
         chunked=chunked,
         cuda_graphs=True,
-        capture_memory_bytes=512 << 20,
-        memory_budget_bytes=3 << 30,
+        cuda_graph_pool_budget_bytes=512 << 20,
+        execution_peak_budget_bytes=3 << 30,
     ) as handle:
         fields = None
         if isinstance(workload, ImportedLowRank):
@@ -85,18 +85,18 @@ def test_prompt_lora_batch_matches_individual_requests(workload, chunked):
                     ]
         diagnostics = handle.diagnostics()
         assert diagnostics.active_states == len(
-            handle.runner.require_session()._deployment.execution.directory.instance_states
+            handle.runner.require_session().deployment.execution.directory.instance_states
         )
         assert diagnostics.pending_state_releases == 0
 
 
 @pytest.mark.parametrize("workload", [PromptFactorsWorkload(), PromptMixtureWorkload(), DecodeFactorsWorkload()])
 def test_internal_projection_consumes_pinned_request_factors(workload, monkeypatch):
-    with open_llm(workload, seqs=3, chunked=True, memory_budget_bytes=1 << 30) as handle:
-        monkeypatch.setattr(handle._require_open(), "request_counter", iter(range(99, 0, -1)))
+    with open_llm(workload, seqs=3, chunked=True, execution_peak_budget_bytes=1 << 30) as handle:
+        monkeypatch.setattr(handle.require_llm(), "request_counter", iter(range(99, 0, -1)))
         session = handle.runner.require_session()
-        execution = session._deployment.execution
-        overlay = session._overlay
+        execution = session.deployment.execution
+        overlay = session.parameter_overlay
         captures = []
         capture_begin = torch.cuda.CUDAGraph.capture_begin
 
@@ -137,8 +137,8 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             def compare(hidden, desired, pools, table, output, captured, desired_capture):
                 base = output.clone()
                 emit(hidden, desired, pools, table, output, captured, desired_capture)
-                context = session._step.context
-                rows = session._step.rows.row_batch.rows
+                context = session.step.context
+                rows = session.step.rows.row_batch.rows
                 phases.add(frozenset(row.phase for row in rows))
                 for row in rows:
                     ref = context.current_owned_ref(context.selection.ref_for(row.identity, StateResource("factors")))
@@ -193,7 +193,7 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             raise AssertionError("tensor Python body ran after graph warmup")
 
         with monkeypatch.context() as replay:
-            replay.setattr(TensorExecutor, "_body", forbid_body)
+            replay.setattr(TensorExecutor, "execute_body", forbid_body)
             handle.generate(
                 ["Name a color.", "A short question about stars."],
                 SamplingParams(max_tokens=3, temperature=0, ignore_eos=True),
@@ -226,7 +226,7 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
     results = []
     for graphs in (False, True):
         with open_llm(
-            workload, cuda_graphs=graphs, capture_memory_bytes=256 << 20, memory_budget_bytes=1 << 30
+            workload, cuda_graphs=graphs, cuda_graph_pool_budget_bytes=256 << 20, execution_peak_budget_bytes=1 << 30
         ) as handle:
             if not graphs:
                 manager = handle.runner.cudagraph_manager
@@ -250,7 +250,7 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                     SamplingParams(max_tokens=5, temperature=0, ignore_eos=True, logprobs=1),
                 )
                 assert runs
-                checks.setattr(TensorExecutor, "_body", lambda *args: pytest.fail("producer body after warmup"))
+                checks.setattr(TensorExecutor, "execute_body", lambda *args: pytest.fail("producer body after warmup"))
                 outputs += handle.generate(
                     ["word " * 31, "Name a color."],
                     SamplingParams(max_tokens=5, temperature=0, ignore_eos=True, logprobs=1),
@@ -261,7 +261,7 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                 before_execute = session.before_execute
 
                 def preempt(scheduler_output):
-                    scheduler_output.preempted_req_ids = set(session._identities)
+                    scheduler_output.preempted_req_ids = set(session.request_identities)
                     return before_execute(scheduler_output)
 
                 with monkeypatch.context() as replay:
@@ -288,8 +288,8 @@ def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
             chunked=chunked,
             tokens=budget if chunked else 2176,
             model_length=2176,
-            memory_budget_bytes=4 << 30,
-            capture_memory_bytes=256 << 20,
+            execution_peak_budget_bytes=4 << 30,
+            cuda_graph_pool_budget_bytes=256 << 20,
         ) as handle:
             outputs = handle.generate(
                 prompts,

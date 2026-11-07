@@ -223,7 +223,7 @@ def validate_host_batch(
         ):
             raise ValueError(
                 f"{task.symbol}: host batch shapes {list(actual)} exceed the planned {list(limit.input_shapes)}; "
-                "raise ExecutionOptions(max_training_rows=N) for more training rows per state, or "
+                "raise ExecutionOptions(max_host_training_rows=N) for more training rows per state, or "
                 "HostConfig(max_input_rows=N) for a host workload"
             )
 

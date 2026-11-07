@@ -347,7 +347,7 @@ def main():
         max_num_seqs=args.batch,
         max_num_batched_tokens=512,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        execution=pllm.ExecutionOptions(capture_memory_bytes=512 << 20),
+        execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=512 << 20),
     )
     if args.rule == "contracts":
         replay_contracts(config)
@@ -396,7 +396,7 @@ def main():
         steady = [start.elapsed_time(end) / 100 for start, end in audit.steady]
         print(f"steady_replay_ms={steady} ratio={(steady[0] + steady[2]) / (steady[1] + steady[3]):.4f}")
         print(
-            f"graph_eager_bitwise_counts={sorted(audit.counts)} capture_bytes={audit.capture_bytes} budget_bytes={config.execution.capture_memory_bytes}"
+            f"graph_eager_bitwise_counts={sorted(audit.counts)} capture_bytes={audit.capture_bytes} budget_bytes={config.execution.cuda_graph_pool_budget_bytes}"
         )
         print(
             f"adaptive_depth model={args.model} batch={args.batch} rule={args.rule} checked={audit.checked} adaptive_ms={adaptive:.4f} baseline_ms={baseline:.4f} ratio={adaptive / baseline:.4f} blocking_syncs=0"

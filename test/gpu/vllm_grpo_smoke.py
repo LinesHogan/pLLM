@@ -35,7 +35,7 @@ def main() -> None:
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.35,
         seed=7,
-        execution=pllm.ExecutionOptions(max_training_rows=8, publish_lag=0),
+        execution=pllm.ExecutionOptions(max_host_training_rows=8, publish_lag=0),
     )
     workload = TokenRewardGRPO()
     report = pllm.explain(workload, config)
@@ -44,7 +44,7 @@ def main() -> None:
     assert any("sequence permutation" in name for name in result.passed)
     print(result)
     with pllm.make_llm(config, workload=workload) as handle:
-        execution = handle.runner.require_session()._deployment.execution
+        execution = handle.runner.require_session().deployment.execution
         (initial,) = execution.directory.select(PackedRows.from_rows(())).refs
         before = execution.snapshot(initial, torch.cuda.current_stream())[0].cpu()
         batches = workload.run(

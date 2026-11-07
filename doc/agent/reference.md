@@ -381,7 +381,7 @@ Tensors are in the model dtype. A method returning the plain update (`x + y`, `v
 bitwise. Costs: the method runs inside the model's CUDA graphs, where vLLM captures the model's own operators
 instead of inductor-fused ones, so compare a neutral run with eager vLLM (or use `check_on_gpu`, which builds a
 matching vanilla engine); `tensor_parallel_size=1`; prefix caching off. Stateful sublayers (`state=`) need a larger
-`ExecutionOptions(capture_memory_bytes=...)`; the error names the bytes required.
+`ExecutionOptions(cuda_graph_pool_budget_bytes=...)`; the error names the bytes required.
 
 ```python
 @dataclass(frozen=True)
@@ -409,7 +409,7 @@ pllm schedules a custom forward's layer slices itself and captures its own CUDA 
 whole-model graph is not used and `eager_reason` names `@pllm.custom_forward`. Methods reading `pllm.hidden` or
 `pllm.final_hidden` and `pllm.model.Adapter` are rejected; `pllm.residual` and `pllm.layer_logits` read each layer's
 last visited stream. Tensor parallelism needs vLLM 0.32.0 with `runner="mrv2"`. The slice graphs may need a larger
-`ExecutionOptions(capture_memory_bytes=...)` than the default; explain does not estimate it, and the error names the
+`ExecutionOptions(cuda_graph_pool_budget_bytes=...)` than the default; explain does not estimate it, and the error names the
 bytes required. Bounded Python `for` loops over workload settings are unrolled when traced.
 
 ```python
@@ -489,7 +489,7 @@ A training method that reads `pllm.batch(...)` fields trains on a batch you pass
 | `pllm.host.WeightedCEBatch(hidden, base_logits, labels, weights)` | Weighted cross-entropy rows; trains with `pllm.SGD`, `steps=` steps per state after the `reset=` method restores it. `WeightedCEBatch.for_prompts(..., prompt_indices)` keys one batch per prompt. |
 | `pllm.causal_model(adapter)` | A `pllm.model.CausalModel` with the named `pllm.model.Adapter` applied: `model(ids, attention_mask=...)` returns logits whose gradients reach the adapter's state; `model.base(...)` skips it. |
 | `pllm.host.make_host(config, workload)` | Compile a batch-training workload without a model. `admit(())`, then `step(StepInput.of_batch(batch))` per batch (returns a `StepResult`), then `retire(())`. |
-| `pllm.host.HostConfig(device, hidden_size=0, target_shape=(), seed=0, state_memory_bytes=..., max_input_rows=None, memory_budget_bytes=None)` | What `make_host` compiles against: device, hidden width of the batches and the shape of each row's target. |
+| `pllm.host.HostConfig(device, hidden_size=0, target_shape=(), seed=0, state_page_budget_bytes=..., max_input_rows=None, execution_peak_budget_bytes=None)` | What `make_host` compiles against: device, hidden width of the batches and the shape of each row's target. |
 | `pllm.host.StepInput` | One step's input; for host steps build it with `StepInput.of_batch(batch)`. |
 | `pllm.host.StepResult` | A host step's result: `value`, `loss`, `metrics`, and `parameters` (the updated fields by name). |
 | `pllm.host.CompletionInput` | What a feedback callable receives: `completions` (a `CompletionBatch`) and `hidden` (each completion's final hidden row). |
@@ -532,7 +532,7 @@ execution.retire(())
 | --- | --- |
 | `pllm.make_llm(config, *, workload=None)` | A vLLM engine running `workload`; use as a context manager. Methods: `generate(prompts, sampling_params, *, batch=None, sample_index=0, prompt_indices=None, routes=None)`, `generate_completions`, `generate_feedback`, `diagnostics()` (`eager_reason`, `update_count`, `trained_rows`, `loss_count`, ...), `trace_snapshot()`, `select_trace(...)`, `feed(name)`, `close()`. Without a workload it is plain vLLM. |
 | `pllm.ModelConfig(model, dtype="bfloat16", max_model_len=512, max_num_seqs=8, max_num_batched_tokens=512, gpu_memory_utilization=0.5, seed=0, ..., multiprocessing=False, execution=ExecutionOptions(), cuda_graphs="auto", kv_offload=None, tensor_parallel_size=1, ...)` | The model and engine. `cuda_graphs="auto"` uses CUDA graphs when the workload allows it (else eager, reason in `diagnostics().eager_reason`); `True` requires them. `multiprocessing=True` needs the workload class in an importable module. |
-| `pllm.ExecutionOptions(max_training_rows=1, capture_memory_bytes=None, state_memory_bytes=0, memory_budget_bytes=None, allow_numerical_transforms=True, tuning="heuristic", publish_lag=1)` | Framework policy. `publish_lag=0`: updates at step n are read at n + 1 and training no longer overlaps the next forward. Memory knobs bound what pllm reserves. |
+| `pllm.ExecutionOptions(max_host_training_rows=1, cuda_graph_pool_budget_bytes=None, state_page_budget_bytes=0, execution_peak_budget_bytes=None, allow_numerical_transforms=True, tuning="heuristic", publish_lag=1)` | Framework policy. `publish_lag=0`: updates at step n are read at n + 1 and training no longer overlaps the next forward. `state_page_budget_bytes` bounds PTTS device pages (0 uses observed free capacity); `execution_peak_budget_bytes` bounds the pllm execution peak including those pages, task workspace/live outputs and graph/anchor reservations (None is unlimited), excluding model weights/KV. `cuda_graph_pool_budget_bytes` budgets each task/model CUDA-graph pool (None traces tasks; model default 64 MiB before exact-decode overlay allowances). `max_host_training_rows` bounds host-fed training rows per state per step, default 1; decode request rows are separate. |
 | `pllm.KVOffload(connector="OffloadingConnector", cpu_bytes=536870912, prompt_only=False)` | Offload complete KV pages to CPU memory (`ModelConfig(kv_offload=...)`). |
 | `pllm.Workload` | The base class. Subclass it (a frozen dataclass when it has settings); put declarations and tensor math in it, nothing else. |
 
@@ -616,7 +616,7 @@ pllm.depth() -> 'Any'
 pllm.value(layer: 'int | Attr') -> 'Any'
     Inside a @pllm.custom_residual method, the value rows [rows, kv_heads, head_dim] layer `layer` computed for the same token in this forward (after its own value rewrite).
 pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, runner: Literal['mrv1', 'mrv2'] = 'mrv2', execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
-pllm.ExecutionOptions(max_training_rows: int = 1, capture_memory_bytes: int | None = None, state_memory_bytes: int = 0, memory_budget_bytes: int | None = None, allow_numerical_transforms: bool = True, tuning: Literal['heuristic', 'measured'] = 'heuristic', publish_lag: int = 1, guidance_capacity: int | None = 4096)
+pllm.ExecutionOptions(max_host_training_rows: int = 1, cuda_graph_pool_budget_bytes: int | None = None, state_page_budget_bytes: int = 0, execution_peak_budget_bytes: int | None = None, allow_numerical_transforms: bool = True, tuning: Literal['heuristic', 'measured'] = 'heuristic', publish_lag: int = 1, guidance_capacity: int | None = 4096)
     Framework execution policy; lag counts post-sampler steps hidden from readers.
 pllm.KVOffload(connector: Literal['OffloadingConnector', 'SimpleCPUOffloadConnector'] = 'OffloadingConnector', cpu_bytes: int = 536870912, prompt_only: bool = False)
     Batched same-engine CPU offload of complete allocation pages.
@@ -705,7 +705,7 @@ pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count:
     Public model slices and position state used inside custom_forward methods.
 pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
     One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
-pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', query_count: 'int', _read: 'AttentionRead', storage_window: 'int' = 0, prompt_lens: 'torch.Tensor | None' = None)
+pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', query_count: 'int', read_attention: 'AttentionRead', storage_window: 'int' = 0, prompt_lens: 'torch.Tensor | None' = None)
     Borrowed paged K/V, already including the current tokens; never changes cache storage.
 ```
 
@@ -714,7 +714,7 @@ pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block
 ```text
 pllm.host.make_host(config: 'HostConfig', workload: 'Workload') -> 'StateExecution[StepInput, TensorFrame, TensorOutput]'
     Compile `workload` without a model; each `step(StepInput.of_batch(batch))` trains on one host batch and returns a StepResult.
-pllm.host.HostConfig(device: 'torch.device', hidden_size: 'int' = 0, target_shape: 'tuple[int, ...]' = (), seed: 'int' = 0, state_memory_bytes: 'int' = 67108864, max_input_rows: 'int | None' = None, memory_budget_bytes: 'int | None' = None)
+pllm.host.HostConfig(device: 'torch.device', hidden_size: 'int' = 0, target_shape: 'tuple[int, ...]' = (), seed: 'int' = 0, state_page_budget_bytes: 'int' = 67108864, max_input_rows: 'int | None' = None, execution_peak_budget_bytes: 'int | None' = None)
     What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches and the shape of each row's target (() for one value per row), the seed of initial state values, and the state and per-step memory limits (max_input_rows bounds a batch).
 pllm.host.StepInput(rows: 'PackedPhaseRowBatch', sampler_rows: 'PackedSamplerRowBatch', hidden: 'HiddenRowBatch | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), batch: 'HostBatch[torch.Tensor] | None' = None, input_tokens: 'torch.Tensor | None' = None, hidden_readiness: 'CudaStreamReadiness | None' = None, batch_readiness: 'CudaStreamReadiness | None' = None, import_rows: 'Mapping[str, int]' = <factory>, overlay_updates: 'Mapping[tuple[RequestIdentity, Projection], UpdateOutput]' = <factory>)
 pllm.host.StepResult(value: 'torch.Tensor | None', invocation: 'InvocationOutput', entries: 'tuple[OverlayEntry, ...]' = (), input_gradients: 'Mapping[tuple[str, str], torch.Tensor]' = <factory>, parameter_gradient_fields: 'Mapping[StateRef, tuple[torch.Tensor, ...]]' = <factory>, metrics: 'Mapping[str, torch.Tensor]' = <factory>, parameters: 'Mapping[str, torch.Tensor]' = <factory>)

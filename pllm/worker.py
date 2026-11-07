@@ -47,7 +47,7 @@ class GPUWorker(compat.Worker):
         assert isinstance(runner, (WorkloadModelRunner, Mrv1Runner))
         return runner
 
-    def _install(self, workload: BackendWorkload[DataT, ResultT], install: BackendInstall) -> None:
+    def install_workload(self, workload: BackendWorkload[DataT, ResultT], install: BackendInstall) -> None:
         """Bind the driver's plan to the workload this process imported, refusing drifted sources."""
         runner = self.workload_runner
         plan = install.attachment.plan
@@ -86,7 +86,7 @@ class GPUWorker(compat.Worker):
                     return encode_boundary(probe_backend(probe.requirements, runner, publish_lag=probe.publish_lag))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
-                    self._install(decode_workload(install.definition), install)
+                    self.install_workload(decode_workload(install.definition), install)
                     return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)

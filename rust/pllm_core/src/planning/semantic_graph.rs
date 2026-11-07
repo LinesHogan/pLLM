@@ -194,7 +194,7 @@ pub(crate) struct Timeline {
     #[serde(default)]
     pub(crate) task_resources: Vec<TaskResourceFact>,
     #[serde(default)]
-    pub(crate) memory_budget_bytes: Option<u64>,
+    pub(crate) execution_peak_budget_bytes: Option<u64>,
     #[serde(default)]
     pub(crate) reserved_bytes: Vec<u64>,
     #[serde(default)]

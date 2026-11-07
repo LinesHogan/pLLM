@@ -15,7 +15,7 @@ from pllm.config import ModelConfig
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload
 
-BUDGET = pllm.ExecutionOptions(memory_budget_bytes=1 << 30)
+BUDGET = pllm.ExecutionOptions(execution_peak_budget_bytes=1 << 30)
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ def main() -> None:
         "Qwen/Qwen2.5-0.5B-Instruct", "bfloat16", 64, 2, 64, 0.25, seed=7, execution=BUDGET, cuda_graphs=False
     )
     handle = pllm.make_llm(workload=workload, config=config)
-    execution = handle.runner.require_session()._deployment.execution
+    execution = handle.runner.require_session().deployment.execution
     baseline = []
     observed = []
     hooks = []

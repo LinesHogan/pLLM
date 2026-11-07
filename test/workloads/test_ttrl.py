@@ -51,9 +51,9 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
         device,
         hidden_size=4,
         seed=11,
-        state_memory_bytes=65536,
+        state_page_budget_bytes=65536,
         max_input_rows=6,
-        memory_budget_bytes=1 << 20,
+        execution_peak_budget_bytes=1 << 20,
     )
     execution = make_host(facts, workload)
     plan = execution.arena.plan
@@ -65,8 +65,8 @@ def test_ttrl_matches_reward_update_retry_and_control_quorum(monkeypatch: pytest
     } == {WeightedRowBatch.schema}
     peak = plan.schedule.peak_memory_bytes
     with pytest.raises(ValueError):
-        make_host(replace(facts, memory_budget_bytes=peak - 1), workload)
-    execution = make_host(replace(facts, memory_budget_bytes=peak), workload)
+        make_host(replace(facts, execution_peak_budget_bytes=peak - 1), workload)
+    execution = make_host(replace(facts, execution_peak_budget_bytes=peak), workload)
     (initial,) = execution.admit((), stream)
     old_pin = execution.arena.pin_exact(StateRefs.of((initial,)), stream)
     original = execution.snapshot(initial, stream)

@@ -17,7 +17,7 @@ from pllm.execution.tensor_frame import TensorFrame, Tensors, UpdateOutput
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, autograd_loss
 
 if TYPE_CHECKING:
-    from pllm.execution.tensor_binding import TensorBinding
+    from pllm.execution.tensor_declaration import TensorDeclaration
 
 
 class CausalForward(Protocol):
@@ -63,7 +63,7 @@ _TRAINING_WINDOWS = (When.BEFORE_FORWARD, When.AFTER_SAMPLE, When.HOST_COMPUTE)
 
 
 def declare_batch_train(
-    b: TensorBinding,
+    b: TensorDeclaration,
     name: str,
     state: State,
     *,

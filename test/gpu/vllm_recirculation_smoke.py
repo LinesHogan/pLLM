@@ -108,7 +108,7 @@ def main():
         budget=7 if chunked else None,
         prefix="--prefix" in sys.argv,
     )
-    primitive = handle.runner.require_session()._custom_forward
+    primitive = handle.runner.require_session().custom_forward
     layer = primitive.model.layers[23]
     native_layer, native_capture, native_replay = ProgramWave.layer, ProgramWave.capture, torch.cuda.CUDAGraph.replay
     native_forward = VllmCustomForward.forward
@@ -265,7 +265,7 @@ def jacobi_evidence():
             batch=8,
             budget=2048,
         )
-        primitive = handle.runner.require_session()._custom_forward
+        primitive = handle.runner.require_session().custom_forward
         native, records = primitive.model.forward, []
 
         def forward(*args, **kwargs):

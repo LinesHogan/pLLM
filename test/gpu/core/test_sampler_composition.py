@@ -8,7 +8,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.backends.vllm import compat, sampler
-from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerStages, _reweight
+from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerStages, reweight
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload
 
 pytestmark = pytest.mark.gpu
@@ -32,7 +32,7 @@ class Stack(pllm.Workload):
 @pytest.mark.parametrize("runner,capacity", (("mrv1", 512), ("mrv2", None), ("mrv2", 512)))
 def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
     workload = Stack()
-    add, reweight = SignedSamplerStages.add_logits, SamplerGuidance._reweight_finite_survivors
+    add, reweight = SignedSamplerStages.add_logits, SamplerGuidance.reweight_finite_survivors
     checks = {"add": 0, "guide": 0, "trained": 0}
     fused = sampler.guided_sample
 
@@ -103,7 +103,7 @@ def test_additions_then_filtered_guidance(monkeypatch, runner, capacity):
     )
     with pllm.make_llm(config, workload=workload) as handle:
         monkeypatch.setattr(SignedSamplerStages, "add_logits", inspect_add)
-        monkeypatch.setattr(SamplerGuidance, "_reweight_finite_survivors", staticmethod(inspect_guide))
+        monkeypatch.setattr(SamplerGuidance, "reweight_finite_survivors", staticmethod(inspect_guide))
         monkeypatch.setattr(sampler, "guided_sample", inspect_fused)
         outputs = handle.generate(
             ["The sky is", "Water freezes because"],
@@ -123,5 +123,5 @@ def test_reweight_matches_unfused_arithmetic(prediction_dtype):
     prediction[:, ::7] = torch.nan
     beta = logits.new_tensor([0, 0.25, 1.5])[:, None]
     expected = torch.where(torch.isfinite(logits), (1 + beta) * logits - beta * prediction.float(), logits)
-    actual = _reweight(logits, prediction, beta)
+    actual = reweight(logits, prediction, beta)
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)

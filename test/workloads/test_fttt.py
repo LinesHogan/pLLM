@@ -30,7 +30,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         FTTTConfig(edit_scale=float("nan"))
     config = FTTTConfig(rank=2, learning_rate=0.05, feedback_feature_size=3, max_retries=2)
     service = FTTTFeedbackQueue(config, ArithmeticJudge())
-    host = HostConfig(torch.device("cpu"), hidden_size=4, seed=7, max_input_rows=1, memory_budget_bytes=1 << 20)
+    host = HostConfig(torch.device("cpu"), hidden_size=4, seed=7, max_input_rows=1, execution_peak_budget_bytes=1 << 20)
     workload = FTTTFeedback(service, host)
     identity = RequestIdentity("arithmetic", 0, 0)
     hidden = torch.tensor([[-1.0, -0.25, 0.5, 1.0]])
@@ -93,7 +93,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         """Scripted generation: prompt 7 answers correctly; with votes, two of three agree."""
 
         generate_feedback = VllmLlm.generate_feedback
-        _prompt_indices = VllmLlm._prompt_indices
+        resolve_prompt_indices = VllmLlm.resolve_prompt_indices
         _sample_limit = None
 
         def __init__(self, votes=False):

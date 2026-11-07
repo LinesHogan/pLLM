@@ -40,7 +40,7 @@ MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 MODEL_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
 DATA_REVISION = "3101c7d5072418e28b9008a6636bde82a006892c"
 DATA_SHA256 = "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
-OPTIONS = BenchmarkOptions(gpu_memory_utilization=0.7, capture_memory_bytes=8 << 30)
+OPTIONS = BenchmarkOptions(gpu_memory_utilization=0.7, cuda_graph_pool_budget_bytes=8 << 30)
 
 
 def config() -> pllm.ModelConfig:
@@ -49,7 +49,7 @@ def config() -> pllm.ModelConfig:
         OPTIONS.model_config(),
         revision=MODEL_REVISION,
         cuda_graphs="auto",
-        execution=pllm.ExecutionOptions(capture_memory_bytes=OPTIONS.capture_memory_bytes),
+        execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=OPTIONS.cuda_graph_pool_budget_bytes),
     )
 
 

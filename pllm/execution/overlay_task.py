@@ -509,7 +509,7 @@ class OverlayTransition:
     ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
         """Gather issued slots once per target/phase; writing results still belongs to the task."""
         if self.chunk is not None:
-            # TensorBinding installs the batched executor for every chunked overlay (configure_scans for routes).
+            # TensorDeclaration installs the batched executor for every chunked overlay (configure_scans for routes).
             assert self.executor is not None
             return self.executor.run(operands, target, indices, batch)
         return self.serial(operands, target, indices, batch)

@@ -38,9 +38,9 @@ class BenchmarkOptions:
     warmup: int = 1
     gpu_memory_utilization: float = 0.25
     profile: Path | None = None
-    capture_memory_bytes: int = 256 * 1024**2
-    state_memory_bytes: int = 256 * 1024**2
-    memory_budget_bytes: int | None = None
+    cuda_graph_pool_budget_bytes: int = 256 * 1024**2
+    state_page_budget_bytes: int = 256 * 1024**2
+    execution_peak_budget_bytes: int | None = None
     sampling_n: int = 16  # completions per prompt, as in the aligned throughput settings
     cuda_graphs: bool = True  # --eager switches every arm and its vanilla reference to eager execution
     guidance_capacity: int | None = ExecutionOptions().guidance_capacity
@@ -67,18 +67,21 @@ class BenchmarkOptions:
             "--profile", type=Path, help="directory for a separate replay of the measured rounds per arm"
         )
         parser.add_argument(
-            "--capture-memory-mib", type=int, default=256, help="explicit resident capacity for each captured task"
-        )
-        parser.add_argument(
-            "--state-memory-mib",
+            "--cuda-graph-pool-budget-mib",
             type=int,
             default=256,
-            help="fixed signed state capacity for timing and profile reconstruction",
+            help="CUDA-graph pool budget per tensor task and for model capture",
         )
         parser.add_argument(
-            "--execution-memory-mib",
+            "--state-page-budget-mib",
             type=int,
-            help="original AER declared-memory limit, excluding undeclared model/KV/library costs",
+            default=256,
+            help="PTTS device state-page budget for timing and profile reconstruction",
+        )
+        parser.add_argument(
+            "--execution-peak-budget-mib",
+            type=int,
+            help="planner execution peak: state pages, task workspace/outputs and graph/anchor reservations; excludes model/KV",
         )
         parser.add_argument(
             "--eager",
@@ -94,9 +97,9 @@ class BenchmarkOptions:
             args.warmup,
             args.gpu_memory_utilization,
             args.profile,
-            args.capture_memory_mib * 1024**2,
-            args.state_memory_mib * 1024**2,
-            None if args.execution_memory_mib is None else args.execution_memory_mib * 1024**2,
+            args.cuda_graph_pool_budget_mib * 1024**2,
+            args.state_page_budget_mib * 1024**2,
+            None if args.execution_peak_budget_mib is None else args.execution_peak_budget_mib * 1024**2,
             sampling_n=args.sampling_n,
             cuda_graphs=not args.eager,
             guidance_capacity=args.guidance_capacity,
@@ -111,8 +114,8 @@ class BenchmarkOptions:
                 self.rounds,
                 self.warmup,
                 self.sampling_n,
-                self.capture_memory_bytes,
-                self.state_memory_bytes,
+                self.cuda_graph_pool_budget_bytes,
+                self.state_page_budget_bytes,
             )
             < 1
         ):
@@ -188,7 +191,7 @@ class _Setup(Generic[D, R]):
     options: BenchmarkOptions
     requests: _Requests
     prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None
-    max_training_rows: int
+    max_host_training_rows: int
     require_training: bool
 
 
@@ -242,10 +245,10 @@ def _measure_arm(
     config = replace(
         options.model_config(),
         execution=ExecutionOptions(
-            setup.max_training_rows,
-            capture_memory_bytes=options.capture_memory_bytes,
-            state_memory_bytes=options.state_memory_bytes,
-            memory_budget_bytes=options.memory_budget_bytes,
+            setup.max_host_training_rows,
+            cuda_graph_pool_budget_bytes=options.cuda_graph_pool_budget_bytes,
+            state_page_budget_bytes=options.state_page_budget_bytes,
+            execution_peak_budget_bytes=options.execution_peak_budget_bytes,
             guidance_capacity=options.guidance_capacity,
         ),
     )
@@ -459,7 +462,7 @@ def compare(
     options: BenchmarkOptions,
     *,
     prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None = None,
-    max_training_rows: int = 1,
+    max_host_training_rows: int = 1,
     require_training: bool = False,
     prompt_indices: tuple[int, ...] | None = None,
     alternatives: tuple[tuple[str, BackendWorkload[D, R]], ...] = (),
@@ -498,7 +501,7 @@ def compare(
     if options.profile is not None:
         options.profile.mkdir(parents=True, exist_ok=True)
     requests = _Requests(prompts, sampling, indices)
-    setup = _Setup(options, requests, prepare, max_training_rows, require_training)
+    setup = _Setup(options, requests, prepare, max_host_training_rows, require_training)
     vanilla = _vanilla(options, requests)
     reports: list[BenchmarkResult] = []
     # CUPTI can affect later launches even after the profiling context exits, so profiles run last.

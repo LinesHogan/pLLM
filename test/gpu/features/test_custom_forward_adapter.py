@@ -11,7 +11,7 @@ from vllm.forward_context import override_forward_context
 import pllm
 from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
 from pllm.backends.vllm.custom_forward import VllmCustomForward
-from pllm.backends.vllm.parameter_overlay import _ProjectionReader
+from pllm.backends.vllm.parameter_overlay import ProjectionReader
 from pllm.contracts.semantic_graph import StateResource
 from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks
 from pllm.execution.ptts.state_refs import StateRefs
@@ -167,7 +167,7 @@ class PerCallReference:
         observation, results = wave.observation, wave.results
         with (
             override_forward_context(wave.attention.context),
-            patch.object(_ProjectionReader, "emit", lambda reader, *args: self.emit(reader, *args)),
+            patch.object(ProjectionReader, "emit", lambda reader, *args: self.emit(reader, *args)),
             patch.object(AdaptiveSlice, "__call__", lambda selection, *args: self.select(selection, *args)),
         ):
             reference = wave.body()
@@ -184,7 +184,7 @@ class PerCallReference:
         actual = owner.output.clone()
         self.packed = torch.tensor([row.packed_row_index for row in rows], device=actual.device)
         # Replaying the same positions overwrites only those KV cells, and preserves their causal history.
-        with patch.object(_ProjectionReader, "emit", lambda reader, *args: self.emit(reader, *args)):
+        with patch.object(ProjectionReader, "emit", lambda reader, *args: self.emit(reader, *args)):
             self.native_span(owner, rows, program)
         torch.testing.assert_close(actual[self.packed], owner.output[self.packed], rtol=0, atol=0)
         owner.output.copy_(actual)
@@ -197,12 +197,12 @@ def test_adapter_applies_to_each_custom_forward_projection_call():
         max_num_seqs=8,
         max_num_batched_tokens=128,
         gpu_memory_utilization=0.3,
-        execution=pllm.ExecutionOptions(capture_memory_bytes=256 << 20),
+        execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
     )
     report = pllm.explain(LoopedAdapter(), config)
     assert "every projection invocation" in str(report)
     handle = pllm.make_llm(workload=LoopedAdapter(), config=config)
-    owner = handle.runner.require_session()._custom_forward
+    owner = handle.runner.require_session().custom_forward
     audit = PerCallReference(owner)
     try:
         with (

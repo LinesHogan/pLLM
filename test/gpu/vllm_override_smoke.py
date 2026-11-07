@@ -39,11 +39,11 @@ def main() -> None:
             64,
             0.25,
             seed=7,
-            execution=pllm.ExecutionOptions(memory_budget_bytes=1 << 30),
+            execution=pllm.ExecutionOptions(execution_peak_budget_bytes=1 << 30),
             cuda_graphs=False,  # the checks below hook the model norm, which a captured graph does not call
         ),
     )
-    execution = handle.runner.require_session()._deployment.execution
+    execution = handle.runner.require_session().deployment.execution
     hidden = None
     base_logits = None
     observed = []
@@ -156,7 +156,7 @@ def main() -> None:
         edited = FTTTFeedback(FTTTFeedbackQueue(FTTTConfig(), FTTTDefaultJudge()), facts)(batch)
         assert edited is not None and edited.update_count == 1
         ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
-        reward = make_host(replace(facts, max_input_rows=3, memory_budget_bytes=1 << 20), TTRLWorkload(ttrl))
+        reward = make_host(replace(facts, max_input_rows=3, execution_peak_budget_bytes=1 << 20), TTRLWorkload(ttrl))
         reward.admit((), stream)
         trained = reward.step(ttrl_vote(batch, ttrl).step, stream)
         assert trained.loss is not None and reward.diagnostics().update_count == 1

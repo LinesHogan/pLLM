@@ -12,8 +12,8 @@ import pllm
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.contracts.codec import boundary_digest
 from pllm.execution.freeze import fingerprint
-from pllm.testing_contracts import _facts
-from test.workloads.kernel_workloads import Residual, _add
+from pllm.testing_contracts import contract_facts
+from test.workloads.kernel_workloads import Residual, add_kernel
 
 
 @pytest.mark.parametrize(
@@ -117,14 +117,14 @@ def test_dispatcher_lookup_needs_the_op_object(expression):
 def test_triton_source_changes_workload_and_cache_identity():
     config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct")
     workload = Residual()
-    _, facts = _facts(workload, config)
+    _, facts = contract_facts(workload, config)
     before = workload.build(facts).graph.execution_parameters_digest
     attachment = workload.compile_backend(facts).attachment
     cache = CachePolicy.for_attachment(attachment, "reuse").namespace
-    source = _add.src
+    source = add_kernel.src
     try:
-        _add._unsafe_update_src(source.replace("value + branch", "value - branch"))
+        add_kernel._unsafe_update_src(source.replace("value + branch", "value - branch"))
         assert workload.build(facts).graph.execution_parameters_digest != before
         assert CachePolicy.for_attachment(workload.compile_backend(facts).attachment, "reuse").namespace != cache
     finally:
-        _add._unsafe_update_src(source)
+        add_kernel._unsafe_update_src(source)

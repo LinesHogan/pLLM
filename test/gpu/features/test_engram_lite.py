@@ -17,8 +17,8 @@ from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.torch_private import HostGather
 from pllm.testing import check_on_gpu
-from pllm.testing_gpu import _release_models
-from test.gpu.features.test_custom_residual import CONFIG, Observe, _deviation, _generate, _oracle_logprobs
+from pllm.testing_gpu import release_models
+from test.gpu.features.test_custom_residual import CONFIG, Observe, generate_tokens, logprob_deviation, oracle_logprobs
 from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 from test.workloads.test_pretrained import LogitLookup
 
@@ -33,7 +33,7 @@ class UntraceableLookup(pllm.Workload):
 
 
 def test_lookup_compile_failure_at_startup():
-    _release_models()
+    release_models()
     message = r"(?s)lookup method `[^`]*lookup` cannot compile as one full graph:.*memoryview.*allow_numerical_transforms=False"
     with pytest.raises(ValueError, match=message):
         with pllm.make_llm(CONFIG, workload=UntraceableLookup()):
@@ -74,13 +74,13 @@ def test_host_row_gathers_replay_device_indices():
 
 def generation(workload, config):
     """Drain closed compiled models before vLLM takes its startup memory snapshot."""
-    _release_models()
-    return _generate(workload, config)
+    release_models()
+    return generate_tokens(workload, config)
 
 
 def _lookup_logprobs(tokens, table):
     """The FP32 model plus the lookup's pretrained bonus, before normalization."""
-    logprobs = _oracle_logprobs(tokens)
+    logprobs = oracle_logprobs(tokens)
     ids = torch.tensor(tokens, device=logprobs.device)
     previous = torch.cat((ids.new_full((1,), -1), ids[:-1]))
     bonus = table.to(logprobs)[(ids + previous).remainder(len(table))]
@@ -91,8 +91,8 @@ def _assert_lookup_generation(actual, expected, table):
     """Concurrent model kernels may round differently; host lookup must retain FP32 accuracy."""
     assert [tokens for tokens, _ in actual] == [tokens for tokens, _ in expected]
     oracle = partial(_lookup_logprobs, table=table)
-    expected_error, _ = _deviation(expected, oracle)
-    actual_error, _ = _deviation(actual, oracle)
+    expected_error, _ = logprob_deviation(expected, oracle)
+    actual_error, _ = logprob_deviation(actual, oracle)
     assert actual_error <= expected_error + torch.finfo(torch.bfloat16).eps
 
 
@@ -109,12 +109,12 @@ def test_engram_placements_and_capture(tmp_path, logits):
         host = LogitLookup(path)
     config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=32, enable_chunked_prefill=True)
     expected = generation(replace(host, placement="device"), config)
-    execute = StateExecution._execute_task
-    fill_versions = PageBundleArena._fill_versions
+    execute = StateExecution.execute_task
+    fill_versions = PageBundleArena.fill_versions
 
     def delay_admission(arena, copies):
         if any(
-            not len(source) and arena._pools[arena._resources[resource]].host_tensors
+            not len(source) and arena.pools[arena.resource_names[resource]].host_tensors
             for resource, _, source, _ in copies
         ):
             torch.cuda._sleep(100_000_000)
@@ -124,7 +124,7 @@ def test_engram_placements_and_capture(tmp_path, logits):
 
     def complete_forward(session):
         # A late request.prepare would serialize host reads after the transformer.
-        assert session._step is not None and session._step.context is not None
+        assert session.step is not None and session.step.context is not None
         complete(session)
 
     def delayed(execution, context, task):
@@ -135,8 +135,8 @@ def test_engram_placements_and_capture(tmp_path, logits):
 
     # The main model reaches the consumer before the side copy unless its graph waits on the event.
     with (
-        patch.object(StateExecution, "_execute_task", delayed),
-        patch.object(PageBundleArena, "_fill_versions", delay_admission),
+        patch.object(StateExecution, "execute_task", delayed),
+        patch.object(PageBundleArena, "fill_versions", delay_admission),
         patch.object(VllmSession, "complete_forward", complete_forward),
     ):
         actual = generation(host, config)
@@ -174,7 +174,7 @@ def test_three_gib_host_table_with_one_gib_device_budget(tmp_path):
     save_file({"table": table, "wk": weights, "wv": weights.clone()}, path)
     del table
     workload = EngramLite(path, buckets=buckets, placement="host")
-    config = replace(CONFIG, cuda_graphs=True, execution=replace(CONFIG.execution, memory_budget_bytes=1 << 30))
+    config = replace(CONFIG, cuda_graphs=True, execution=replace(CONFIG.execution, execution_peak_budget_bytes=1 << 30))
     report = pllm.explain(workload, config)
     assert report.peak_memory_bytes < 1 << 30
     assert next(state for state in report.states if state.name == "memory").host_bytes >= 3 * 1024**3

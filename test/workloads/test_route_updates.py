@@ -29,7 +29,7 @@ ROUTE_FACTS = replace(
     probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ProjectionShape(TARGET, 4, 4),)),
     timeline=model_timeline(torch.device("cpu"), CAPABILITIES),
     providers=(PageBundleProviderFacts("test.route@1", 16, StateDeviceKind.CPU),),
-    state_memory_budget_bytes=1 << 20,
+    state_page_budget_bytes=1 << 20,
 )
 
 

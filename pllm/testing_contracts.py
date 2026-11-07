@@ -48,7 +48,7 @@ from pllm.execution.preemption import preemption_policy
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_binding import TensorBinding, TensorOutput
+from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
 from pllm.execution.tensor_executor import reads_rows
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
@@ -297,7 +297,7 @@ def scheduled_step(
     return StepInput(rows, sampler, HiddenRowBatch(rows, tuple(taps)) if taps else None, operands=operands)
 
 
-def _step(
+def contract_step_input(
     shape: ModelShape,
     facts: BackendCompileFacts,
     counts: tuple[tuple[int, int, int], ...],
@@ -306,6 +306,7 @@ def _step(
     identities: tuple[RequestIdentity, ...],
     history: int = -1,
 ) -> StepInput:
+    """Build deterministic model inputs for one step of a contract-check schedule."""
     dtype = facts.probe.tensor_dtype.torch
     hidden = {
         resource: _hidden_values(shape, facts, resource, counts, channel, perturbed).to(
@@ -385,7 +386,7 @@ def _feedback(value: StepInput, shape: ModelShape, perturbed: int | None) -> Sam
     return SamplerFeedback(value.sampler_rows, logits, logits.argmax(-1))
 
 
-def _field_name(declaration: TensorBinding, resource: str, index: int) -> str:
+def _field_name(declaration: TensorDeclaration, resource: str, index: int) -> str:
     names = tuple(
         name for (state, name), view in declaration.field_views.items() if state == resource and view.field == index
     )
@@ -393,7 +394,7 @@ def _field_name(declaration: TensorBinding, resource: str, index: int) -> str:
 
 
 def _state_values(
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput], row: PackedPhaseRow, declaration: TensorBinding
+    execution: StateExecution[StepInput, TensorFrame, TensorOutput], row: PackedPhaseRow, declaration: TensorDeclaration
 ) -> dict[str, torch.Tensor]:
     selection = execution.directory.select(PackedRows.from_rows((row,)))
     immutable = {state.resource for state in declaration.graph.states if state.immutable}
@@ -406,7 +407,7 @@ def _state_values(
     }
 
 
-def _shared_resources(declaration: TensorBinding) -> frozenset[str]:
+def _shared_resources(declaration: TensorDeclaration) -> frozenset[str]:
     return frozenset(
         str(state.resource)
         for state in declaration.graph.states
@@ -504,7 +505,7 @@ def _execute_step(
 
 
 def _imported_batch(
-    declaration: TensorBinding, identities: tuple[RequestIdentity, ...], perturbed: int | None
+    declaration: TensorDeclaration, identities: tuple[RequestIdentity, ...], perturbed: int | None
 ) -> StateImport[torch.Tensor] | None:
     """Seed distinct per-request rows, independent of admission and packed order."""
     if not declaration.imports:
@@ -538,7 +539,7 @@ def _embeddings(value: StepInput, width: int, dtype: torch.dtype, perturbed: int
 
 
 def _site_step(
-    binding: TensorBinding,
+    binding: TensorDeclaration,
     facts: BackendCompileFacts,
     value: StepInput,
     tokens: torch.Tensor,
@@ -564,7 +565,7 @@ def _site_step(
 def _run(
     workload: Workload,
     facts: BackendCompileFacts,
-    declaration: TensorBinding,
+    declaration: TensorDeclaration,
     shape: ModelShape,
     order: tuple[int, ...],
     *,
@@ -624,7 +625,9 @@ def _run(
                 execution.retire((script[1],), wait=True)
                 execution.admit((script[1],))
             value = replace(
-                _step(shape, facts, counts, step * stride, perturbed, script, declaration.graph.input_token_history),
+                contract_step_input(
+                    shape, facts, counts, step * stride, perturbed, script, declaration.graph.input_token_history
+                ),
                 batch=imports,
                 import_rows=import_rows,
             )
@@ -755,7 +758,8 @@ def _compare(
     return failures
 
 
-def _facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape, BackendCompileFacts]:
+def contract_facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape, BackendCompileFacts]:
+    """Build CPU contract-check facts and model dimensions without loading model weights."""
     requirements = workload.backend_requirements()
     shape = ModelShape.of_config(config, requirements.parameter_targets)
     facts = compile_facts(
@@ -785,7 +789,7 @@ def _facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape, Backend
 def _variants(
     workload: Workload,
     facts: BackendCompileFacts,
-    declaration: TensorBinding,
+    declaration: TensorDeclaration,
     shape: ModelShape,
     exports: frozenset[str],
     skipped: list[CheckSkip],
@@ -840,12 +844,12 @@ def _variants(
 def _component_independence(workload: Workload, config: ModelConfig) -> list[str]:
     """Compare each field's state, methods and sampler stages with its standalone execution."""
     failures: list[str] = []
-    shape, facts = _facts(workload, config)
+    shape, facts = contract_facts(workload, config)
     facts, declaration = workload.specialize(facts, config.execution)
     composite = _run(workload, facts, declaration, shape, (0, 1, 2))
     outputs = composite.outputs()
     for path, component in component_workloads(workload)[1:]:
-        shape, facts = _facts(component, config)
+        shape, facts = contract_facts(component, config)
         facts, declaration = component.specialize(facts, config.execution)
         alone = _run(component, facts, declaration, shape, (0, 1, 2))
         for (request, token, output), expected in alone.outputs().items():
@@ -871,7 +875,7 @@ def _component_independence(workload: Workload, config: ModelConfig) -> list[str
 
 def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
     failures: list[str] = []
-    neutral_shape, neutral_facts = _facts(neutral, config)
+    neutral_shape, neutral_facts = contract_facts(neutral, config)
     neutral_facts, neutral_declaration = neutral.specialize(neutral_facts, config.execution)
     sampler = neutral.plan_backend(neutral_facts, neutral_declaration).spec.sampler
     if any(stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in sampler):
@@ -893,7 +897,7 @@ def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
 
 
 def _initial_parameters(
-    declaration: TensorBinding, programs: tuple[TokenProgram, ...], seed: int
+    declaration: TensorDeclaration, programs: tuple[TokenProgram, ...], seed: int
 ) -> dict[StateInput, torch.Tensor]:
     """Give the adaptive oracle the same declared initial fields as the state executor."""
     sources = tuple(dict.fromkeys(source for program in programs for _, source in program.parameters))
@@ -907,7 +911,7 @@ def _initial_parameters(
     return {source: source.view.read(roots[source.resource][source.view.field]) for source in sources}
 
 
-def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool = False) -> CheckResult:
+def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalence: bool = False) -> CheckResult:
     """Check request schedules, replay and state visibility on CPU, without loading a model.
 
     Uses fixed per-token inputs, real planner/executor paths and the runners' row labeller.
@@ -925,7 +929,7 @@ def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool 
         reason = "requires a causal model" if requirements.causal_training else "requires a host feed"
         return CheckResult(tuple(passed), (*skipped, CheckSkip("CPU schedules", reason)))
     try:
-        shape, facts = _facts(workload, config)
+        shape, facts = contract_facts(workload, config)
         facts, declaration = workload.specialize(facts, config.execution)
         attachment = workload.plan_backend(facts, declaration)
     except (ValueError, RuntimeError, TypeError) as error:
@@ -1112,7 +1116,7 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
     failures: list[str] = []
     result = CheckResult((), ())
     try:
-        result = _check(workload, config)
+        result = check_contracts(workload, config)
         if len(component_workloads(workload)) > 1 and not any(
             skip.property in ("CPU schedules", "model-site execution", "adaptive decoder") for skip in result.skipped
         ):

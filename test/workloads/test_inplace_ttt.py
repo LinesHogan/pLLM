@@ -30,7 +30,8 @@ from test.backend_facts import assert_finite_resources
 from test.dense_update import DenseUpdate, DenseUpdateConfig
 
 
-def _input(operands: tuple[ProjectionOperands, ...]) -> StepInput:
+def projection_input(operands: tuple[ProjectionOperands, ...]) -> StepInput:
+    """Build step rows for the requests and phases named by projection operands."""
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
     identities, phases = zip(*selected, strict=True) if selected else ((), ())
     return testing.step_input(identities, tokens=phases, sampler_order=(), operands=operands)
@@ -88,7 +89,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
             )
             for index, target in enumerate(targets)
         )
-        (result,) = execution.step(_input(step)).entries
+        (result,) = execution.step(projection_input(step)).entries
         assert result.before_ref == latest
         latest = result.after_ref
         assert latest.version_id == row + 1 and result.changed == (row == 1)
@@ -99,7 +100,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     # The independent outer-product oracle must be visible only to the trained request.
     deltas = 0.3 * desired.transpose(1, 2) @ hidden
     for request_index, identity in enumerate(identities):
-        value = _input(
+        value = projection_input(
             tuple(
                 ProjectionOperands(
                     identity,
@@ -173,7 +174,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     requests = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 0))
     initial = low_rank.admit(requests)
     result = low_rank.step(
-        _input(
+        projection_input(
             (
                 ProjectionOperands(
                     requests[0],
@@ -198,7 +199,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     for request_index, identity in enumerate(requests):
         ref = updated.after_ref if request_index == 0 else initial[1]
         before = low_rank.snapshot(ref)
-        value = _input(
+        value = projection_input(
             (
                 ProjectionOperands(
                     identity,
@@ -356,7 +357,7 @@ def _check_exact_projection_lifecycle():
             for i, identity in enumerate(requests)
             for target in targets
         )
-        value = _input(operands)
+        value = projection_input(operands)
         invocation = execution.begin(value.rows.request_rows)
         execution.execute_anchor(invocation, AnchorId(0))
         task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
@@ -447,7 +448,7 @@ def _check_causality_witness(workload, facts, requests, targets):
         )
         for target in targets
     )
-    value = _input(operands)
+    value = projection_input(operands)
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(
@@ -497,7 +498,7 @@ def _check_exact_additive_projection():
         )
         for index, target in enumerate(targets)
     )
-    value = _input(operands)
+    value = projection_input(operands)
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(
@@ -529,7 +530,7 @@ def _check_exact_additive_projection():
         replace(operand, phase=HiddenPhase.DECODE, hidden=hidden[:1], desired=operand.desired[:1])
         for operand in operands
     )
-    value = _input(decode)
+    value = projection_input(decode)
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(
@@ -605,7 +606,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
             for identity, phase in zip(ids, (HiddenPhase.PREFILL, HiddenPhase.DECODE), strict=True)
             for target in TARGETS
         )
-        value = _input(operands)
+        value = projection_input(operands)
         invocation = execution.begin(value.rows.request_rows)
         execution.execute_anchor(invocation, AnchorId(0))
         task = ProjectionTask(
@@ -842,7 +843,7 @@ def test_paper_ttt_matches_fake_decoder_oracle(tmp_path, track, scale):
     expected = tuple(paper_oracle(body, x, convs, projs, track, 3.0) for x in prompts)
     decoder = SimpleNamespace(model=SimpleNamespace(model=body), projection=body.projection)
     overlay = ExactParameterOverlay(decoder, deployed.attachment.spec.overlay_bindings, torch.device("cpu"), 16)
-    overlay._staging = CpuOperandStaging()
+    overlay.operand_staging = CpuOperandStaging()
     try:
         # A partial prefill chunk completes in decode; the completing token reads old state.
         with (

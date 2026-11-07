@@ -13,7 +13,8 @@ from pllm.model import Layers
 
 
 @triton.jit
-def _add(x, y, output, count: tl.constexpr, BLOCK: tl.constexpr):
+def add_kernel(x, y, output, count: tl.constexpr, BLOCK: tl.constexpr):
+    """Add two tensors with the Triton kernel used by custom-kernel workload tests."""
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(x + index, index < count, 0).to(tl.float32)
     branch = tl.load(y + index, index < count, 0).to(tl.float32)
@@ -24,7 +25,7 @@ def _add(x, y, output, count: tl.constexpr, BLOCK: tl.constexpr):
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """A Triton residual add with the same arithmetic as its Torch CPU reference."""
     output = torch.empty_like(x)
-    _add[(triton.cdiv(x.numel(), 256),)](x, y, output, x.numel(), BLOCK=256)
+    add_kernel[(triton.cdiv(x.numel(), 256),)](x, y, output, x.numel(), BLOCK=256)
     return output
 
 
@@ -34,7 +35,8 @@ def _fake(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @add.register_kernel("cpu")
-def _cpu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def add_cpu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Reference the custom addition in FP32 before rounding to the input dtype."""
     return (x.float() + y.float()).to(x.dtype)
 
 

@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 import pllm
 from pllm.execution.state_execution import StateExecution
-from pllm.execution.tensor_binding import TensorOutput
+from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.host import (
     BarrierState,

@@ -101,7 +101,7 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
     assert json.loads(json.dumps(asdict(report)))["model"]["hidden_size"] == 8
     assert report.peak_memory_bytes >= sum(state.reserved_bytes for state in report.states)
     assert report.members and not report.budget_errors
-    assert "[exact]" in str(report)
+    assert "[exact; state_page_budget_bytes]" in str(report)
     if isinstance(workload, (WindowAttention, SinkAttention, SharedAttention)):
         assert len(report.kv_capacity) == 10 and "KV bytes/request" in str(report)
         full = report.kv_capacity[2].bytes
@@ -140,15 +140,19 @@ def test_esamp_attribution_and_budget_fallback(model_config):
         replace(
             model_config,
             execution=pllm.ExecutionOptions(
-                memory_budget_bytes=report.inline_peak_memory_bytes,
+                execution_peak_budget_bytes=report.inline_peak_memory_bytes,
             ),
         ),
     )
     assert not inline.budget_errors and all(task.lane == "main" for member in inline.members for task in member.tasks)
-    failed = pllm.explain(workload, replace(model_config, execution=pllm.ExecutionOptions(memory_budget_bytes=1)))
+    failed = pllm.explain(
+        workload, replace(model_config, execution=pllm.ExecutionOptions(execution_peak_budget_bytes=1))
+    )
     assert failed.budget_errors and "max_num_batched_tokens" in str(failed)
     assert failed.peak_memory_bytes == report.peak_memory_bytes
-    state_failed = pllm.explain(workload, replace(model_config, execution=pllm.ExecutionOptions(state_memory_bytes=1)))
+    state_failed = pllm.explain(
+        workload, replace(model_config, execution=pllm.ExecutionOptions(state_page_budget_bytes=1))
+    )
     assert state_failed.budget_errors
 
 

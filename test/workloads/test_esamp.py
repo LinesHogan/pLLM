@@ -108,7 +108,7 @@ def _request_lifecycle(monkeypatch):
     )
     for lag, expected in enumerate(([9, 5, 0], [6, 5, 0], [3, 5, 0])):
         np.testing.assert_array_equal(
-            RequestStateDirectory._rewind(refs, history[-lag:] if lag else ()).versions, expected
+            RequestStateDirectory.rewind_versions(refs, history[-lag:] if lag else ()).versions, expected
         )
     with pytest.raises(ValueError):
         ExecutionOptions(publish_lag=-1)
@@ -198,7 +198,7 @@ def _esamp_native_oracle(device, normalized):
     )
     workload = ESampWorkload(config)
     facts = facts_for(device, 8, 8, lineages=3, memory_bytes=100000)
-    facts, declaration = workload.specialize(facts, ExecutionOptions(capture_memory_bytes=16 * 1024**2))
+    facts, declaration = workload.specialize(facts, ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2))
     deployment = workload.bind_backend(facts, workload.plan_backend(facts, declaration), declaration)
     execution = deployment.execution
     plan = execution.arena.plan
@@ -288,7 +288,7 @@ def _ordinary_request_distillation(device_name) -> None:
     device = torch.device(device_name)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     workload = Distillation()
-    options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
+    options = ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2)
     execution = workload.compile_backend(facts_for(device, 4, 9, lineages=3), options)
     execution = execution.execution
     # Same request id, different samples: the keys keep three separate lineages.
@@ -416,7 +416,7 @@ def _module_request_distillation(device_name) -> None:
     """Module state matches one torch copy of the module per request, trained by torch AdamW."""
     device = torch.device(device_name)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    options = ExecutionOptions(capture_memory_bytes=16 * 1024**2)
+    options = ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2)
     facts = facts_for(device, 4, 9, lineages=2)
     execution = ModuleDistillation().compile_backend(facts, options).execution
     identities = tuple(RequestIdentity(f"r{index}", 0, 0) for index in range(2))
@@ -473,7 +473,7 @@ def test_multirow_state_reduction_matches_adamw(reduction, request_state, device
     device = torch.device(device_name)
     stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
     facts = replace(facts_for(device, 4, 12, lineages=4, memory_bytes=1 << 20), vocab_size=4)
-    execution = RowTrainer().compile_backend(facts, ExecutionOptions(capture_memory_bytes=16 << 20)).execution
+    execution = RowTrainer().compile_backend(facts, ExecutionOptions(cuda_graph_pool_budget_bytes=16 << 20)).execution
     identities = tuple(RequestIdentity(str(i), group, i) for i, group in enumerate((0, 1, 0, 0)))
     execution.admit((), stream)
     initial = execution.admit(identities, stream)

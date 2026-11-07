@@ -15,7 +15,7 @@ from pllm.contracts.host_batch import validate_host_batch
 from pllm.execution.post_sample import PostSampleOverlap
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.workloads import (
     DecodeFactorsWorkload,
@@ -445,7 +445,7 @@ class ImportedTrainer(ImportedRows):
 @pytest.mark.parametrize("workload", (ImportedRows(), ImportedTrainer()))
 def test_check_detects_imports_routed_by_sorted_request_id(workload, model_config):
     assert "imported rows / request isolation" in testing.check(workload, model_config).passed
-    prepare = TensorBinding.prepare_import
+    prepare = TensorDeclaration.prepare_import
 
     def sorted_requests(self, update, batch, data):
         # 499e3a26 class: request-id order is not packed-row order.
@@ -453,7 +453,7 @@ def test_check_detects_imports_routed_by_sorted_request_id(workload, model_confi
         data.step = replace(data.step, import_rows=rows)
         prepare(self, update, batch, data)
 
-    with patch.object(TensorBinding, "prepare_import", sorted_requests):
+    with patch.object(TensorDeclaration, "prepare_import", sorted_requests):
         with pytest.raises(testing.ContractError, match="misrouted rows"):
             testing.check(workload, model_config)
 
@@ -513,7 +513,7 @@ def test_import_shape_boundary_and_first_export(per_request):
 def test_check_detects_chunk_local_token_history(model_config):
     from pllm import testing_contracts
 
-    step = testing_contracts._step
+    step = testing_contracts.contract_step_input
 
     def shifted(*args, **kwargs):
         value = step(*args, **kwargs)
@@ -523,7 +523,10 @@ def test_check_detects_chunk_local_token_history(model_config):
             value.input_tokens[:, 1:] = value.input_tokens[:, :-1].clone()
         return value
 
-    with patch.object(testing_contracts, "_step", shifted), pytest.raises(testing.ContractError, match="mixed"):
+    with (
+        patch.object(testing_contracts, "contract_step_input", shifted),
+        pytest.raises(testing.ContractError, match="mixed"),
+    ):
         testing.check(TokenHistory(), model_config)
 
 

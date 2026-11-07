@@ -68,9 +68,9 @@ predict  guide_sampling  model.execute / main / captured  distiller (boundary, 1
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
 tap      model.layers.0[0], decode: 460800 bytes shared by loss, predict
 tap      model.layers.23[0], decode: 460800 bytes shared by loss
-state  scope  roots  bytes/root  reserved bytes [exact]
+state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
 distiller  request  514  114704  58957916
-memory   peak 964907104 bytes funded by pllm [tensor reservations; excludes GPU-dependent BLAS workspace]
+memory   peak 964907104 bytes funded by pllm [tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
          below 964907104 bytes tasks run inline; below 919026784 bytes planning fails
 preempt  state keep; replay rejection: not applicable to kept state
 host     0 syncs in traced workload math; exports: none
@@ -93,7 +93,7 @@ note     Timing settings equal to defaults are labelled default; explicit use of
   - `state reads (origin, distance)`：读哪份状态、读到的版本离最新差几步。`loss` 读最新的（距离 0），`predict` 读的版本落后 1（这就是教程 03 里说的“第 N 步的更新在第 N+2 步被读到”带来的重叠）。所以对 `MiniESamp` 来说，`loss` 训练在旁路 stream、进 graph；`predict` 在主 stream、进 graph。
 - **`tap`**：从模型里取出的 hidden（第 0 层、第 23 层）和预留的缓冲大小（各 460800 字节）；第 0 层的那份由 `loss` 和 `predict` 共用。
 - **`state`**：`distiller` 是请求级状态，预留 514 份（`roots`），每份 114704 字节，共 58957916 字节（约 56 MiB）；`[exact]` 表示这是精确值。514 是为 128 个并发请求和在途的版本预留的份数——比并发数多，因为训练中的新版本和正在被读的旧版本要同时存在。
-- **`memory`**：pllm 为负载的张量计算预留的峰值 964907104 字节（约 920 MiB）。第二行说明：预算低于 964907104 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 919026784 字节时规划失败。
+- **`memory`**：由 `execution_peak_budget_bytes` 约束的 pllm 执行峰值（含 PTTS 页、任务工作区与结果、图池和 anchor 预留），为 964907104 字节（约 920 MiB）。第二行说明：预算低于 964907104 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 919026784 字节时规划失败。
 - **`host`**：负载的张量数学里没有 GPU 到 CPU 的同步（`0 syncs`）。
 - **`timing`**：时机设置及其后果；`(default)` 表示你没改过默认值。
 - **`note`**：这份报告不知道的事（见下文的限制说明）。
@@ -119,9 +119,9 @@ forward  eager: activation patches run outside CUDA graphs
 member  effect  anchor / lane / graph  state reads (origin, distance)
 patch  ActivationPatch  model site or inactive method
   forward eager because patch: activation patches run outside CUDA graphs
-state  scope  roots  bytes/root  reserved bytes [exact]
+state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
 steer  instance  514  3584  1842188
-memory   peak 60644372 bytes funded by pllm [tensor reservations; excludes GPU-dependent BLAS workspace]
+memory   peak 60644372 bytes funded by pllm [tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
 preempt  state reset; replay rejection: use request-owned keys containing request_id and remove mutable instance state
 host     unverified syncs in traced workload math; exports: none
 ```
@@ -148,14 +148,14 @@ host     unverified syncs in traced workload math; exports: none
 ```python
 small = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_model_len=512, max_num_seqs=128,
                          max_num_batched_tokens=8192,
-                         execution=pllm.ExecutionOptions(memory_budget_bytes=64 << 20))
+                         execution=pllm.ExecutionOptions(execution_peak_budget_bytes=64 << 20))
 print(pllm.explain(MiniESamp(beta=0.5), small).budget_errors)
 ```
 
 输出如下：
 
 ```text
-('workload tasks need 919026784 bytes at their peak but only 67108864 fit; lower max_num_batched_tokens or raise ExecutionOptions.memory_budget_bytes; lower max_num_seqs or max_num_batched_tokens, or raise the named execution budget',)
+('pllm execution needs 919026784 bytes at its peak but only 67108864 fit; lower max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; lower max_num_seqs or max_num_batched_tokens, or raise the named execution budget',)
 ```
 
 `budget_errors` 为空表示声明的预算装得下；不为空时，报告仍会给出不带这个限制的计划，并附上和 `make_llm` 相同的报错信息。如果是其他准入错误（例如不支持的组合），`pllm.explain` 会直接抛出异常，报错信息与创建引擎时相同。
