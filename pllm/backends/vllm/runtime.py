@@ -65,7 +65,12 @@ from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
-from pllm.execution.torch_private import blas_workspace_bytes, clear_blas_workspaces
+from pllm.execution.torch_private import (
+    blas_workspace_bytes,
+    bytecode_hooks,
+    clear_blas_workspaces,
+    remove_bytecode_hooks,
+)
 from pllm.execution.trace import TraceSelection, TraceSnapshot
 
 if TYPE_CHECKING:
@@ -158,6 +163,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     _closed: bool = False
     next_prompt_index: int = 0
     _pending_input: ExitStack | None = None
+    compile_hooks: tuple[int, ...] = ()  # Dynamo bytecode hooks the in-process engine registered; see vllm_engine
 
     def require_llm(self) -> LLM:
         """Return the live vLLM engine; a closed handle cannot execute operations."""
@@ -275,9 +281,15 @@ class VllmLlm(Generic[DataT, ResultT]):
         if self._pending_input is not None:
             self._pending_input.close()
             self._pending_input = None
-        # vLLM's shutdown runs its collection while this handle still owns the
-        # runner. Collect model/session cycles only after dropping those owners.
-        gc.collect()
+        # Process-wide torch.compile state retains a closed engine: the bytecode hooks hold its weights and the
+        # cached backends its CUDA graph pools. Closing an in-process engine already ends any other in-process
+        # engine (vLLM tears down the shared parallel groups), so resetting the shared compile caches costs no one.
+        remove_bytecode_hooks(self.compile_hooks)
+        torch.compiler.reset()
+        # vLLM's shutdown runs its collection while this handle still owns the runner. Collect model/session
+        # cycles only after dropping those owners; finalizers free further cycles, so collect until none are left.
+        while gc.collect():
+            pass
         if torch.cuda.is_initialized():
             clear_blas_workspaces()
             torch.cuda.empty_cache()
@@ -621,8 +633,12 @@ def _per_prompt(outputs: list[RequestOutput], n: int) -> list[RequestOutput]:
 
 def vllm_engine(
     config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str], *, cuda_graphs: bool
-) -> LLM:
-    """Build the vLLM engine; a workload adds its worker, scheduler and graph options."""
+) -> tuple[LLM, tuple[int, ...]]:
+    """Build the vLLM engine; a workload adds its worker, scheduler and graph options.
+
+    Also returns the Dynamo bytecode hooks an in-process model registered while loading (Qwen3 registers two);
+    vLLM never removes them, so the handle's close() does.
+    """
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
         _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
@@ -639,8 +655,9 @@ def vllm_engine(
             f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose matching runner/multiprocessing settings"
         )
     os.environ.update(environment)
+    hooks = bytecode_hooks()
     try:
-        return LLM(
+        llm = LLM(
             model=config.model,
             revision=config.revision,
             dtype=config.dtype,
@@ -666,6 +683,7 @@ def vllm_engine(
                 os.environ.pop(name)
             else:
                 os.environ[name] = value
+    return llm, tuple(bytecode_hooks() - hooks)
 
 
 def create_vllm_llm(
@@ -695,7 +713,7 @@ def create_vllm_llm(
     # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
     forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV]).encode()).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
-    llm = vllm_engine(
+    llm, hooks = vllm_engine(
         config,
         {
             **options,
@@ -711,7 +729,8 @@ def create_vllm_llm(
     )
 
     with ExitStack() as construction:
-        construction.callback(llm.llm_engine.engine_core.shutdown)
+        # Until the workload handle exists, a plain handle owns the engine and releases it on failure.
+        construction.callback(VllmLlm[None, None](llm, compile_hooks=hooks).close)
         if config.multiprocessing or config.tensor_parallel_size > 1:
             replies = llm.collective_rpc(
                 "workload_command",
@@ -731,7 +750,7 @@ def create_vllm_llm(
             attachment = workload.plan_backend(facts, declaration)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
             handle = VllmLlm[DataT, ResultT](
-                llm, None, attachment, facts, policy, requirements.sample_limit, eager_reason
+                llm, None, attachment, facts, policy, requirements.sample_limit, eager_reason, compile_hooks=hooks
             )
             install = encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
             llm.collective_rpc("workload_command", timeout=30.0, args=(BackendCommand.INSTALL.value, install))
@@ -751,7 +770,14 @@ def create_vllm_llm(
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
             handle = VllmLlm[DataT, ResultT](
-                llm, runner, deployment.attachment, facts, policy, requirements.sample_limit, eager_reason
+                llm,
+                runner,
+                deployment.attachment,
+                facts,
+                policy,
+                requirements.sample_limit,
+                eager_reason,
+                compile_hooks=hooks,
             )
         construction.pop_all()
         return handle

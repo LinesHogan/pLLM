@@ -19,7 +19,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler as Mrv2Sampler
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ModelConfig
-from pllm.testing_gpu import CHECK_PROMPTS, plain_model, release_models
+from pllm.testing_gpu import CHECK_PROMPTS, plain_model
 from pllm.usage import Workload
 
 _Sample = ParamSpec("_Sample")
@@ -324,19 +324,14 @@ def check_distribution(
         if value is not None and (not isfinite(value) or value < 0):
             raise ValueError(f"{name} must be finite and >= 0")
     start = perf_counter()
-    release_models()
-    try:
-        references, plain_seconds = _plain_continuations(workload, config, texts, tokens, temperature)
-        release_models()
-        values, workload_seconds = _workload_distances(workload, config, references)
-        positions = [
-            (index, reference.prompt_length + token)
-            for index, reference in enumerate(references)
-            for token in range(tokens)
-        ]
-        summaries = distance_summaries(values, positions, worst)
-    finally:
-        release_models()
+    references, plain_seconds = _plain_continuations(workload, config, texts, tokens, temperature)
+    values, workload_seconds = _workload_distances(workload, config, references)
+    positions = [
+        (index, reference.prompt_length + token)
+        for index, reference in enumerate(references)
+        for token in range(tokens)
+    ]
+    summaries = distance_summaries(values, positions, worst)
     forward, reverse, tv = summaries
     return DistributionResult(
         forward,

@@ -88,9 +88,8 @@ def make_llm(
         from pllm.backends.vllm.runtime import VllmLlm, vllm_engine
 
         admit_parallel(config)
-        return VllmLlm[None, None](
-            vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
-        )
+        llm, hooks = vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
+        return VllmLlm[None, None](llm, compile_hooks=hooks)
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None

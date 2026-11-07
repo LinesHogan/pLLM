@@ -145,23 +145,20 @@ def accuracy(workload: pllm.Workload) -> tuple[float, list[str]]:
 
 
 def throughput(workload: pllm.Workload, eager: bool, log: Path) -> dict[str, Any]:
-    """Reuse benchmark.compare's aligned measurements, retaining all three round rates."""
+    """Reuse benchmark.compare's aligned measurements against CUDA-graph vanilla, retaining all round rates."""
     # The revision is pinned even though BenchmarkOptions has no revision field.
     options = replace(OPTIONS, model=checkpoint_directory(MODEL, MODEL_REVISION), cuda_graphs=not eager)
     with log.open("w") as stream, contextlib.redirect_stdout(stream):
-        compare(workload, options)
+        (candidate,) = compare(workload, options)
+        reference = candidate
         if eager:
-            compare(
+            (reference,) = compare(
                 load_submission(Path(__file__).with_name("candidate.py")).WORKLOAD, replace(options, cuda_graphs=True)
             )
-    rows = [json.loads(line) for line in log.read_text().splitlines() if line.startswith("{")]
-    candidate = next(row for row in rows if row.get("implementation") == "tensor")
-    vanilla = next(row for row in rows if row.get("implementation") == "vanilla_graph")
     return {
-        "throughput": candidate["output_tokens_per_second"],
-        "round_rates": candidate["round_rates"],
-        "vanilla_round_rates": vanilla["round_rates"],
-        "throughput_ratio": candidate["output_tokens_per_second"] / vanilla["output_tokens_per_second"],
+        "throughput": candidate.tokens_per_second,
+        "round_rates": candidate.round_rates,
+        "throughput_ratio": candidate.tokens_per_second / reference.vanilla_tokens_per_second,
     }
 
 

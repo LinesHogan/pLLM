@@ -1,4 +1,8 @@
-"""Equal-work measurements through the public workload execution path."""
+"""Throughput measurements through the public workload execution path.
+
+`throughput` times any engine for tutorials and scripts; `compare` runs the aligned equal-work comparison of workload
+arms against plain vLLM that tools/benchmark_*.py and the algorithm-search scorer use.
+"""
 
 from __future__ import annotations
 
@@ -149,6 +153,18 @@ class BenchmarkResult:
     planned_peak_memory_bytes: int
     round_process_cpu_seconds: tuple[float, ...]
     state_usage: PageBundleUsage
+    vanilla_tokens_per_second: float  # plain vLLM, same prompts and sampling, in the arm's CUDA-graph mode
+
+    @property
+    def round_rates(self) -> tuple[float, ...]:
+        """Output tokens per second of each measured round; every round generates the same tokens (ignore_eos)."""
+        round_tokens = self.output_tokens / len(self.round_seconds)
+        return tuple(round_tokens / seconds for seconds in self.round_seconds)
+
+    @property
+    def tokens_per_second(self) -> float:
+        """The headline rate: the median round rate."""
+        return median(self.round_rates)
 
     @property
     def effective_work(self) -> tuple[int, int, int, int]:
@@ -170,12 +186,7 @@ class _Requests:
 
     prompts: list[str]
     sampling: SamplingParams
-    indices: tuple[int, ...]
-
-    def rates(self, round_seconds: tuple[float, ...]) -> tuple[float, ...]:
-        """Output tokens per second of each round; every round generates all tokens (ignore_eos)."""
-        tokens = len(self.prompts) * self.sampling.n * (self.sampling.max_tokens or 0)
-        return tuple(tokens / seconds for seconds in round_seconds)
+    indices: tuple[int, ...] | None  # None lets the engine number prompts; plain vLLM engines accept only None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,37 +204,40 @@ class _Setup(Generic[D, R]):
     prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None
     max_host_training_rows: int
     require_training: bool
+    vanilla_tokens_per_second: float
+
+
+def throughput(
+    llm: VllmLlm[D, R], prompts: list[str], sampling: SamplingParams, *, warmup: int = 1, rounds: int = 3
+) -> float:
+    """Median output tokens per second over `rounds` generate calls after `warmup` untimed ones.
+
+    Each round times one whole `llm.generate`, prefill included, and counts the tokens it actually generated.
+    """
+    requests = _Requests(prompts, sampling, None)
+    for _ in range(warmup):
+        llm.generate(prompts, sampling)
+    torch.cuda.synchronize()
+    seconds, _, tokens = _generate_rounds(llm, requests, None, rounds)
+    return median(count / elapsed for count, elapsed in zip(tokens, seconds, strict=True))
 
 
 def _vanilla(options: BenchmarkOptions, requests: _Requests) -> float:
     """Plain vLLM's median round rate for the same prompts and sampling, in the arms' CUDA-graph mode."""
-    round_seconds: list[float] = []
     with make_llm(options.model_config()) as llm:
-        for _ in range(options.warmup):
-            llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
-        torch.cuda.synchronize()
-        for _ in range(options.rounds):
-            started = perf_counter()
-            llm.generate(requests.prompts, requests.sampling, use_tqdm=False)
-            torch.cuda.synchronize()
-            round_seconds.append(perf_counter() - started)
-    rates = requests.rates(tuple(round_seconds))
+        rate = throughput(llm, requests.prompts, requests.sampling, warmup=options.warmup, rounds=options.rounds)
     mode = "graph" if options.cuda_graphs else "eager"
-    print(
-        json.dumps(
-            {"implementation": f"vanilla_{mode}", "output_tokens_per_second": median(rates), "round_rates": rates}
-        )
-    )
-    return median(rates)
+    print(json.dumps({"implementation": f"vanilla_{mode}", "output_tokens_per_second": rate}))
+    return rate
 
 
 def _generate_rounds(
     handle: VllmLlm[D, R], requests: _Requests, host_batch: HostBatch[torch.Tensor] | None, rounds: int
-) -> tuple[tuple[float, ...], tuple[float, ...], int]:
-    """Wall and process CPU seconds of each round, and the tokens generated over all rounds."""
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[int, ...]]:
+    """Wall and process CPU seconds, and generated tokens, of each round."""
     elapsed: list[float] = []
     cpu_elapsed: list[float] = []
-    tokens = 0
+    tokens: list[int] = []
     for _ in range(rounds):
         cpu_started = process_time()
         started = perf_counter()
@@ -233,8 +247,8 @@ def _generate_rounds(
         torch.cuda.synchronize()
         elapsed.append(perf_counter() - started)
         cpu_elapsed.append(process_time() - cpu_started)
-        tokens += sum(len(completion.token_ids) for output in outputs for completion in output.outputs)
-    return tuple(elapsed), tuple(cpu_elapsed), tokens
+        tokens.append(sum(len(completion.token_ids) for output in outputs for completion in output.outputs))
+    return tuple(elapsed), tuple(cpu_elapsed), tuple(tokens)
 
 
 def _measure_arm(
@@ -278,7 +292,7 @@ def _measure_arm(
             arm.name,
             cold,
             elapsed,
-            tokens,
+            sum(tokens),
             after.loss_count - before.loss_count,
             after.update_count - before.update_count,
             after.trained_rows - before.trained_rows,
@@ -292,6 +306,7 @@ def _measure_arm(
             plan.schedule.peak_memory_bytes,
             cpu_elapsed,
             after.state_usage,
+            setup.vanilla_tokens_per_second,
         )
         assert (
             report.output_tokens == options.batch * options.sampling_n * options.tokens * options.rounds
@@ -307,17 +322,15 @@ def _measure_arm(
     return report, footprint
 
 
-def _print_arm(report: BenchmarkResult, requests: _Requests, vanilla: float) -> None:
+def _print_arm(report: BenchmarkResult) -> None:
     """Print a measured arm as one JSON line; the headline rate is the median round rate."""
-    rates = requests.rates(report.round_seconds)
-    rate = median(rates)
     print(
         json.dumps(
             {
                 **asdict(report),
-                "output_tokens_per_second": rate,
-                "round_rates": rates,
-                "vs_vanilla": rate / vanilla,
+                "output_tokens_per_second": report.tokens_per_second,
+                "round_rates": report.round_rates,
+                "vs_vanilla": report.tokens_per_second / report.vanilla_tokens_per_second,
                 "peak_extra_allocated_bytes": report.peak_allocated_bytes - report.baseline_allocated_bytes,
             }
         )
@@ -467,7 +480,10 @@ def compare(
     prompt_indices: tuple[int, ...] | None = None,
     alternatives: tuple[tuple[str, BackendWorkload[D, R]], ...] = (),
 ) -> tuple[BenchmarkResult, ...]:
-    """Measure ordinary model workloads; optimized arms and nonzero training are opt-in."""
+    """Measure ordinary model workloads against plain vLLM; optimized arms and nonzero training are opt-in.
+
+    Each result carries the plain-vLLM rate it was compared against.
+    """
     indices = tuple(range(options.batch)) if prompt_indices is None else prompt_indices
     # Each prompt's sampling_n completions are independent samples with their own sample index (and request state).
     prompts = [f"Explain the mathematical idea numbered {index}:" for index in indices]
@@ -501,8 +517,7 @@ def compare(
     if options.profile is not None:
         options.profile.mkdir(parents=True, exist_ok=True)
     requests = _Requests(prompts, sampling, indices)
-    setup = _Setup(options, requests, prepare, max_host_training_rows, require_training)
-    vanilla = _vanilla(options, requests)
+    setup = _Setup(options, requests, prepare, max_host_training_rows, require_training, _vanilla(options, requests))
     reports: list[BenchmarkResult] = []
     # CUPTI can affect later launches even after the profiling context exits, so profiles run last.
     for directory in (None,) if options.profile is None else (None, options.profile):
@@ -510,7 +525,7 @@ def compare(
             report, footprint = _measure_arm(setup, arm, directory)
             if directory is None:
                 reports.append(report)
-                _print_arm(report, requests, vanilla)
+                _print_arm(report)
             else:
                 _print_profile(options, reports, directory, report, footprint)
             gc.collect()

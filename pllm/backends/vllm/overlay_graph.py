@@ -35,12 +35,7 @@ from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttach
 from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.execution.cuda_graph import conditional_graph_pool
-from pllm.execution.torch_private import (
-    bytecode_hooks,
-    compilation_cleanups,
-    cuda_graph_pool_bytes,
-    release_compilation,
-)
+from pllm.execution.torch_private import compilation_cleanups, cuda_graph_pool_bytes, release_compilation
 
 _BUDGET = "pllm_pinned_projection_v2_bytes"
 _OVERLAY_GRAPHS = CUDAGraphMode.FULL_AND_PIECEWISE
@@ -146,27 +141,19 @@ class OverlayGraphRunner(compat.ModelRunner):
         super().__init__(vllm_config, device)
         self.projection_model: DecoderBody | None = None
         self.overlay_graph_bytes = _graph_budget(vllm_config)
-        self._compile_hooks: tuple[int, ...] = ()
         self._compile_cleanups: tuple[int, ...] = ()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        hooks = bytecode_hooks()
-        try:
-            super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
-        finally:
-            # Qwen3 inherits two compile decorators: vLLM's cleanup() sees only the
-            # last handle, leaving the first bound hook (and its model) globally live.
-            self._compile_hooks = tuple(bytecode_hooks() - hooks)
+        super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
         self.decoder = bind_model(self.model)
         if graph_mode(self.overlay_graph_bytes) is AttachmentGraphMode.CUDA_GRAPH:
             self.projection_model = self.decoder.model.model
             self.projection_model.do_not_compile = True
 
     def shutdown(self) -> None:
-        """Remove vLLM's global Dynamo hook before dropping its bound decoder."""
+        """Release the captured bodies' compiled-code globals before dropping the bound decoder."""
         super().shutdown()
-        release_compilation(self._compile_hooks, self._compile_cleanups)
-        self._compile_hooks = ()
+        release_compilation(self._compile_cleanups)
         self._compile_cleanups = ()
         self.projection_model = None
 

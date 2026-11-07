@@ -17,7 +17,6 @@ from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.torch_private import HostGather
 from pllm.testing import check_on_gpu
-from pllm.testing_gpu import release_models
 from test.gpu.features.test_custom_residual import CONFIG, Observe, generate_tokens, logprob_deviation, oracle_logprobs
 from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 from test.workloads.test_pretrained import LogitLookup
@@ -33,7 +32,6 @@ class UntraceableLookup(pllm.Workload):
 
 
 def test_lookup_compile_failure_at_startup():
-    release_models()
     message = r"(?s)lookup method `[^`]*lookup` cannot compile as one full graph:.*memoryview.*allow_numerical_transforms=False"
     with pytest.raises(ValueError, match=message):
         with pllm.make_llm(CONFIG, workload=UntraceableLookup()):
@@ -72,12 +70,6 @@ def test_host_row_gathers_replay_device_indices():
                 torch.testing.assert_close(actual.cpu(), wanted, rtol=0, atol=0)
 
 
-def generation(workload, config):
-    """Drain closed compiled models before vLLM takes its startup memory snapshot."""
-    release_models()
-    return generate_tokens(workload, config)
-
-
 def _lookup_logprobs(tokens, table):
     """The FP32 model plus the lookup's pretrained bonus, before normalization."""
     logprobs = oracle_logprobs(tokens)
@@ -108,7 +100,7 @@ def test_engram_placements_and_capture(tmp_path, logits):
         save_file({"table": table}, path)
         host = LogitLookup(path)
     config = replace(CONFIG, cuda_graphs=True, max_num_batched_tokens=32, enable_chunked_prefill=True)
-    expected = generation(replace(host, placement="device"), config)
+    expected = generate_tokens(replace(host, placement="device"), config)
     execute = StateExecution.execute_task
     fill_versions = PageBundleArena.fill_versions
 
@@ -139,16 +131,18 @@ def test_engram_placements_and_capture(tmp_path, logits):
         patch.object(PageBundleArena, "fill_versions", delay_admission),
         patch.object(VllmSession, "complete_forward", complete_forward),
     ):
-        actual = generation(host, config)
+        actual = generate_tokens(host, config)
     if logits:
         _assert_lookup_generation(actual, expected, table.float() * host.gate)
     else:
         assert actual == expected
     if not logits:
-        assert generation(host, replace(config, cuda_graphs=False)) == expected
+        assert generate_tokens(host, replace(config, cuda_graphs=False)) == expected
     # Residual hooks capture vLLM source operators; use that arithmetic for the logprob oracle.
-    baseline = generation(None, config) if logits else generation(Observe(), replace(config, cuda_graphs=False))
-    neutral = generation(replace(host, gate=0), config)
+    baseline = (
+        generate_tokens(None, config) if logits else generate_tokens(Observe(), replace(config, cuda_graphs=False))
+    )
+    neutral = generate_tokens(replace(host, gate=0), config)
     if logits:
         _assert_lookup_generation(neutral, baseline, torch.zeros_like(table, dtype=torch.float32))
     else:
@@ -178,4 +172,4 @@ def test_three_gib_host_table_with_one_gib_device_budget(tmp_path):
     report = pllm.explain(workload, config)
     assert report.peak_memory_bytes < 1 << 30
     assert next(state for state in report.states if state.name == "memory").host_bytes >= 3 * 1024**3
-    assert generation(workload, config) == generation(Observe(), replace(config, cuda_graphs=False))
+    assert generate_tokens(workload, config) == generate_tokens(Observe(), replace(config, cuda_graphs=False))

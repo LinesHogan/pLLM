@@ -75,7 +75,7 @@ def compiling_method(kind: str, name: str) -> Generator[None]:
 
 
 def bytecode_hooks() -> set[int]:
-    """Snapshot Dynamo hook handles so a backend can own every decorator's registration."""
+    """Snapshot Dynamo hook handles so an engine handle can own every hook its model registers."""
     return set(_bytecode_hooks)
 
 
@@ -84,10 +84,14 @@ def compilation_cleanups() -> set[int]:
     return set(CleanupManager.instance.values)
 
 
-def release_compilation(hooks: tuple[int, ...], cleanups: tuple[int, ...]) -> None:
-    """Release one engine's hooks and module globals using Torch's cleanup records."""
+def remove_bytecode_hooks(hooks: tuple[int, ...]) -> None:
+    """Remove one engine's Dynamo bytecode hooks; vLLM never removes them, and each holds its compiled model."""
     for key in hooks:
         _bytecode_hooks.pop(key, None)
+
+
+def release_compilation(cleanups: tuple[int, ...]) -> None:
+    """Release one engine's compiled-code module globals using Torch's cleanup records."""
     for key in cleanups:
         if key in CleanupManager.instance.values:
             CleanupManager.instance._remove_id(key)  # pyright: ignore[reportPrivateUsage]

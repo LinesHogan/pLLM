@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 import torch
 from vllm import SamplingParams
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request
 
@@ -359,16 +358,6 @@ def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generati
     return result
 
 
-def release_models() -> None:
-    """Drain finished diagnostic engines before vLLM samples free memory for the next one."""
-    if torch.cuda.is_initialized():
-        torch.cuda.synchronize()
-        # Compiled graph caches can retain a closed engine's model tensors.
-        torch.compiler.reset()
-        cleanup_dist_env_and_memory()
-        torch.cuda.synchronize()
-
-
 def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tuple[int, ...], ...], ...]:
     with pllm.make_llm(config, workload=workload) as handle:
         return (_tokens(handle), _tokens(handle, 0.8))
@@ -380,20 +369,18 @@ def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[No
     report = explain(workload, config)
     requirements = workload.backend_requirements()
     options: GraphOptions = {} if report.eager_reason else graph_options(config, requirements)
-    with VllmLlm[None, None](
-        vllm_engine(
-            replace(config, execution=ExecutionOptions()),
-            {**options, "worker_cls": "auto", **load_options(requirements.checkpoint_names)},
-            {},
-            cuda_graphs=not bool(report.eager_reason),
-        )
-    ) as vanilla:
+    llm, hooks = vllm_engine(
+        replace(config, execution=ExecutionOptions()),
+        {**options, "worker_cls": "auto", **load_options(requirements.checkpoint_names)},
+        {},
+        cuda_graphs=not bool(report.eager_reason),
+    )
+    with VllmLlm[None, None](llm, compile_hooks=hooks) as vanilla:
         yield vanilla
 
 
 def _neutral(workload: Workload, config: ModelConfig) -> None:
     observed = _neutral_tokens(workload, config)
-    release_models()
     with plain_model(workload, config) as vanilla:
         expected = tuple(
             tuple(
@@ -442,7 +429,6 @@ def _sequence_permutation(workload: Workload, config: ModelConfig) -> None:
     labels = torch.tensor([[-100, -100, 3, 4], [-100, 3, 2, -100]])
     batch = CausalTrainBatch(ids, labels, torch.ones_like(ids), torch.tensor([-0.5, 1.5]))
     expected = _sequence_trial(workload, config, batch)
-    release_models()
     permuted = map_host_batch(batch, lambda tensor: tensor.flip(0))
     assert isinstance(permuted, CausalTrainBatch)
     actual = _sequence_trial(workload, config, permuted)
@@ -514,7 +500,6 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
         and not report.eager_reason
         and baseline is not None
     ):
-        release_models()
         try:
             with pllm.make_llm(replace(config, cuda_graphs=False), workload=workload) as eager:
                 baseline.compare_states(_state_tokens(eager, baseline), "exact decode")
@@ -563,15 +548,12 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
                 passed.append("device equivalence: CPU check script method outputs replayed on CUDA")
         except (AssertionError, RuntimeError, ValueError, TypeError) as error:
             failures.append(f"[device equivalence] {error}")
-    release_models()
     try:
         result = _workload_checks(workload, config)
         passed.extend(result.passed)
         skipped.extend(result.skipped)
     except ContractError as error:
         failures.extend(error.failures)
-    finally:
-        release_models()
     if any(member.host_batch for member in explain(workload, config).members):
         if config.execution.max_host_training_rows < 2:
             skipped.append(CheckSkip("sequence permutation", "set max_host_training_rows >= 2"))
@@ -581,8 +563,6 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
                 passed.append("sequence permutation: aligned sequences and weights preserve the AdamW update")
             except ContractError as error:
                 failures.extend(error.failures)
-            finally:
-                release_models()
     if neutral is None:
         skipped.append(CheckSkip("neutral", "pass neutral= with the author's disabled settings"))
     else:
@@ -591,8 +571,6 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
             passed.append("neutral: greedy and seeded sampling bitwise")
         except ContractError as error:
             failures.extend(error.failures)
-        finally:
-            release_models()
     if failures:
         raise ContractError(tuple(failures))
     return CheckResult(tuple(passed), tuple(skipped))
