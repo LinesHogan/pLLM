@@ -96,3 +96,35 @@ def test_projection_math_budget_and_allocator_peak(operator):
                 output = pools[1][slot] @ output
         expected.append(output if row < 15 else torch.zeros_like(output))
     torch.testing.assert_close(actual, torch.stack(expected))
+
+
+def test_row_weight_operand_bypasses_overlay():
+    """An identity dequantization borrows base weights and restores the installed projection hook."""
+    from vllm.model_executor.layers.linear import LinearMethodBase, RowParallelLinear
+
+    from pllm.backends.vllm.parameter_overlay import _ProjectionHook, base_weight
+
+    class IdentityMethod(LinearMethodBase):
+        def create_weights(self, *args, **kwargs):
+            pass
+
+        def apply(self, layer, x, bias=None):
+            return x @ layer.weight.T
+
+    module = RowParallelLinear.__new__(RowParallelLinear)
+    torch.nn.Module.__init__(module)
+    module.weight = torch.nn.Parameter(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    module.params_dtype = torch.float32
+    module.input_size_per_partition = module.output_size_per_partition = module.tp_size = 2
+    module.quant_method = IdentityMethod()
+    hook = _ProjectionHook(module)
+
+    def overlay(hidden):
+        return hidden @ module.weight.T + 1, None
+
+    hook.install(overlay)
+    try:
+        torch.testing.assert_close(base_weight(module, True, torch.device("cpu")), module.weight)
+        torch.testing.assert_close(module.quant_method.apply(module, torch.eye(2)), module.weight.T + 1)
+    finally:
+        hook.close()

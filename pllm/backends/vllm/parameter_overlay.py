@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 import torch
@@ -67,6 +68,11 @@ def inspect_parameter_targets(
     return tuple(specs)
 
 
+def _row_parallel(module: LinearBase) -> bool:
+    """Whether the projection computes a rank-local partial output."""
+    return isinstance(module, RowParallelLinear) and module.tp_size > 1
+
+
 class _ProjectionHook:
     """Put a down delta inside vLLM's GEMM, before its own row all-reduce.
 
@@ -77,7 +83,7 @@ class _ProjectionHook:
     def __init__(self, module: LinearBase) -> None:
         self.module = module
         self.forward = module.forward
-        self.apply = module.quant_method.apply if isinstance(module, RowParallelLinear) and module.tp_size > 1 else None
+        self.apply = module.quant_method.apply if _row_parallel(module) else None
         self.callback: Callable[[torch.Tensor], LinearOutput] = self.forward
         self.bias: torch.Tensor | None = None
 
@@ -119,7 +125,16 @@ Slice = tuple[ParameterOverlayFieldBinding, int, int]
 def base_weight(module: LinearBase, reading: bool, device: torch.device) -> torch.Tensor:
     """Borrow or dequantize operand("weight") for this read, only when its function uses it."""
     if reading:
-        return frozen_weight(module).detach()
+        if not _row_parallel(module):
+            return frozen_weight(module).detach()
+        method = module.quant_method
+        apply = method.apply
+        # vLLM's identity dequantizer calls apply; it must borrow the base, without overlay hooks.
+        method.apply = partial(type(method).apply, method)
+        try:
+            return frozen_weight(module).detach()
+        finally:
+            method.apply = apply
     return torch.empty((0, module.input_size_per_partition), dtype=module.params_dtype, device=device)
 
 
