@@ -97,6 +97,7 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
                 if requirements.stateful_residual or requirements.exact_phases
                 else _OVERLAY_GRAPHS
             ),
+            cudagraph_num_of_warmups=1 if requirements.custom_residual else 0,
             cudagraph_capture_sizes=list(sizes),
             max_cudagraph_capture_size=capacity,
         ),

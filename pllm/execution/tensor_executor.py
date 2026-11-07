@@ -35,7 +35,7 @@ from pllm.execution.tensor_frame import (
 )
 from pllm.execution.tensor_program import ADAM, PageUpdate, TaskOutput, TensorBatch
 from pllm.execution.tensor_task import FieldWriter, TensorTask
-from pllm.execution.torch_private import MemoryTrace, disable_current_modes, measure
+from pllm.execution.torch_private import MemoryTrace, compiling_method, disable_current_modes, measure
 from pllm.kernels.page_copy import copy_pages, gather_rows
 
 Table = TypeVar("Table", torch.Tensor, npt.NDArray[np.int64])
@@ -54,7 +54,7 @@ def _warm_lookup(
     **inputs: torch.Tensor,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Compile on device samples while keeping the planning invocation shape-only."""
-    try:
+    with compiling_method("lookup", str(task.symbol)):
         with disable_current_modes():
             samples: dict[str, torch.Tensor] = {}
             host_samples: list[torch.Tensor] = []
@@ -71,12 +71,6 @@ def _warm_lookup(
                 samples[name] = sample
             function(**task.arguments(samples))
             torch.cuda.current_stream(device).synchronize()
-    except Exception as error:
-        raise ValueError(
-            f"lookup method `{task.symbol}` cannot compile as one full graph: {error}\n"
-            "Use traceable tensor operations (and fake/meta implementations for custom ops), "
-            "or set ExecutionOptions(allow_numerical_transforms=False) to opt out of lookup fusion."
-        ) from error
     return task.function(**task.arguments(inputs))
 
 

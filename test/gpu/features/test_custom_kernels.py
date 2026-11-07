@@ -3,7 +3,8 @@
 import os
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from tempfile import TemporaryDirectory
 
 import pytest
 import torch
@@ -27,14 +28,20 @@ CONFIG = pllm.ModelConfig(
 WORKLOADS = (Residual(), Forward(), Forward(constant=True))
 
 
-@pytest.mark.parametrize("index", range(len(WORKLOADS)), ids=("residual", "forward", "constant"))
+@pytest.mark.parametrize("index", range(len(WORKLOADS) + 1), ids=("residual", "forward", "constant", "main"))
 def test_custom_kernels(index):
     # Keep native batch-invariant GEMMs out of the parent process's FP32 oracle tests.
-    subprocess.run(
-        [sys.executable, __file__, str(index)],
-        env={**os.environ, "VLLM_BATCH_INVARIANT": "1"},
-        check=True,
-    )
+    with TemporaryDirectory() as cache:
+        subprocess.run(
+            [sys.executable, __file__, str(index)],
+            env={
+                **os.environ,
+                "VLLM_BATCH_INVARIANT": "1",
+                "VLLM_CACHE_ROOT": cache,
+                "VLLM_DISABLE_COMPILE_CACHE": "0",
+            },
+            check=True,
+        )
 
 
 def _kernel_contract(workload):
@@ -71,4 +78,23 @@ def test_wrong_reference_fails_device_equivalence():
 
 
 if __name__ == "__main__":
-    _kernel_contract(WORKLOADS[int(sys.argv[1])])
+    if sys.argv[1] == str(len(WORKLOADS)):
+
+        @torch.library.custom_op("kernel_test::main_add", mutates_args=())
+        def main_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            """An executable-defined operator using the ordinary tested kernel."""
+            return add(x, y)
+
+        @main_add.register_fake
+        def main_add_meta(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        @dataclass(frozen=True)
+        class MainResidual(pllm.Workload):
+            @pllm.custom_residual(site="attention", layers=(0,))
+            def residual(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                return scale(main_add(x, y))
+
+        _kernel_contract(MainResidual())
+    else:
+        _kernel_contract(WORKLOADS[int(sys.argv[1])])

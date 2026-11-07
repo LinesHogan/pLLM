@@ -22,6 +22,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
 from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.torch_private import compile_math, compiling_method
 from pllm.kernels.page_copy import copy_pages
 
 _FIELDS = ("carry", "_pending_rows_x", "_pending_rows_y", "_pending_length")
@@ -45,6 +46,8 @@ class SiteMemorySchedule:
         memory = rewrite.memory
         assert memory is not None
         self.memory = memory
+        self.name = rewrite.name
+        self.numerics = arena.plan.timeline.tensor_policy.allow_numerical_transforms
         self.update = memory.update(rewrite, rewrite.places[0])
         self.views = (memory.carry.view, *memory.pending)
         self.pools = tuple(
@@ -144,26 +147,20 @@ class SiteMemorySchedule:
     ) -> tuple[dict[str, Tensor], Tensor]:
         """Fuse the mapped chunk math with explicit tensor inputs before model capture."""
         mapped = torch.vmap(self.one, in_dims=(0, 0, 0, 0, None))
-        if not x.is_cuda:
+        if not x.is_cuda or not self.numerics:
             return mapped(fields, x, y, count, invariants)
         key = len(x), x.shape[1]
         if key not in self._buckets:
-            body = make_fx(
-                lambda *args: mapped(*args),
-                tracing_mode="fake",
-                _allow_non_fake_inputs=True,
-            )(fields, x, y, count, invariants)
-            self._buckets[key] = torch.compile(  # pyright: ignore[reportUnknownMemberType]
-                body,
-                fullgraph=True,
-                dynamic=False,
-                options={
-                    "triton.cudagraphs": False,
-                    "emulate_precision_casts": True,
-                    "epilogue_fusion": False,
-                    "max_autotune_gemm_backends": "ATEN",
-                },
-            )
+            with compiling_method("model-site", self.name):
+                body = make_fx(
+                    lambda *args: mapped(*args),
+                    tracing_mode="fake",
+                    _allow_non_fake_inputs=True,
+                )(fields, x, y, count, invariants)
+                function = compile_math(body)
+                result = function(fields, x, y, count, invariants)
+                self._buckets[key] = function
+                return result
         return self._buckets[key](fields, x, y, count, invariants)
 
     def bucket(

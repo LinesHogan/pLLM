@@ -227,6 +227,25 @@ def test_identity_rewrites_reproduce_the_model_bitwise(workload: pllm.Workload, 
     assert _generate(workload, config) == _vanilla()
 
 
+def test_site_compile_failure_names_method_and_allows_opt_out() -> None:
+    """Fullgraph failures happen during engine binding; the numerical opt-out runs the authored body."""
+
+    @dataclass(frozen=True)
+    class Untraceable(pllm.Workload):
+        @pllm.custom_residual(site="final")
+        def collapse(self, x: torch.Tensor) -> torch.Tensor:
+            memoryview(b"\0")[0]
+            return x
+
+    with pytest.raises(
+        ValueError, match=r"(?s)model-site method `collapse`.*full graph.*memoryview.*allow_numerical_transforms=False"
+    ):
+        with pllm.make_llm(CONFIG, workload=Untraceable()):
+            pass
+    eager = replace(CONFIG, execution=replace(CONFIG.execution, allow_numerical_transforms=False))
+    assert _generate(Untraceable(), eager) == _vanilla()
+
+
 @cache
 def _reference() -> torch.nn.Module:
     return AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).cuda().eval()

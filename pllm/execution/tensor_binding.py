@@ -64,7 +64,7 @@ from pllm.execution.tensor_program import (
     native_body,
 )
 from pllm.execution.tensor_task import TensorTask
-from pllm.execution.torch_private import HostGather
+from pllm.execution.torch_private import HostGather, compile_math
 
 if TYPE_CHECKING:
     from pllm.execution.checkpoint import PretrainedFile
@@ -161,9 +161,7 @@ def _lookup_math(task: TensorTask, facts: BackendCompileFacts | None) -> TensorM
         )
     ):
         return None
-    return torch.compile(  # pyright: ignore[reportUnknownMemberType]
-        partial(_tensor_math, task.function), fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
-    )
+    return compile_math(partial(_tensor_math, task.function))
 
 
 class TensorBinding(Builder[TensorFrame]):

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from inspect import getclosurevars, unwrap
 from pathlib import Path
 from types import FunctionType
-from typing import TypedDict
+from typing import ParamSpec, TypedDict, TypeVar
 from uuid import UUID
 
 import torch
@@ -36,6 +36,40 @@ fx_graph_cse: Callable[[torch.fx.Graph], torch.fx.Graph] = compile_utils.fx_grap
 
 CudaPoolHandle = torch.cuda._POOL_HANDLE  # pyright: ignore[reportPrivateUsage]
 disable_current_modes = _python_dispatch._disable_current_modes  # pyright: ignore[reportPrivateUsage]
+
+
+_Parameters = ParamSpec("_Parameters")
+_Result = TypeVar("_Result")
+
+
+def compile_math(function: Callable[_Parameters, _Result], *, dynamic: bool = False) -> Callable[_Parameters, _Result]:
+    """Compile a tensor body for capture by its caller, with a separate method recompilation budget."""
+    # Torch's overloads omit isolate_recompiles, which its runtime signature supports.
+    return torch.compile(  # pyright: ignore[reportCallIssue, reportUnknownVariableType, reportUnknownMemberType]
+        function,
+        fullgraph=True,
+        isolate_recompiles=True,
+        dynamic=dynamic,
+        options={
+            "triton.cudagraphs": False,
+            "emulate_precision_casts": True,
+            "epilogue_fusion": False,
+            "max_autotune_gemm_backends": "ATEN",
+        },
+    )
+
+
+@contextmanager
+def compiling_method(kind: str, name: str) -> Generator[None]:
+    """Surface fullgraph failures at warmup with the author's method and opt-out."""
+    try:
+        yield
+    except Exception as error:
+        raise ValueError(
+            f"{kind} method `{name}` cannot compile as one full graph: {error}\n"
+            "Use traceable tensor operations (and fake/meta implementations for custom ops), "
+            "or set ExecutionOptions(allow_numerical_transforms=False) to opt out of fusion."
+        ) from error
 
 
 def bytecode_hooks() -> set[int]:
