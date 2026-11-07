@@ -473,10 +473,11 @@ class DecodeOverlay:
             for index in indices:
                 self.complete_row(index, results[index].changed, hidden, desired, embedding, base)
 
+    @torch.inference_mode(False)
     def counted(
         self, index: int, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
     ) -> UpdateOutput:
-        """Keep opaque readouts and non-chunk updates on their ordinary tensor path."""
+        """Gather ordinary tensors before autograd enables gradient recording inside the projection."""
         values, count = self.values(index), self.table[-1, index]
         chunk = self.math.chunk
         if chunk is not None:
