@@ -698,8 +698,8 @@ pllm.model.ActivationPatch(state: 'str', layers: 'tuple[int, ...]', first_tokens
     Edit the hidden state at `layers` from a state, whoever writes it (ReFT-style): the first and last prompt tokens, and with decode=True every decode token.
 pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, str]' = ('a', 'b'), scale: 'float' = 1.0)
     Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
-pllm.model.CausalModel(forward: 'CausalForward | None', factors: 'tuple[torch.Tensor, ...]')
-    The method's callable model argument and its overlay-free base forward.
+pllm.model.CausalModel(forward: 'CausalForward | None', factors: 'tuple[torch.Tensor, ...] | None')
+    The method's callable model argument; `base` is the same model without the declared overlay.
 pllm.model.LayerOutputs(values: tuple[torch.Tensor, ...], start: int, layer_count: int)
     Post-layer residual streams indexed by absolute layer, negative from the model end.
 pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count: int, generated: torch.Tensor, entries: dict[str, torch.Tensor], over: Literal['token', 'span'] = 'token', namespace: str = '')

@@ -15,17 +15,38 @@ from pllm.contracts.semantic_graph import MathContract, SemanticInputSource, Sta
 from pllm.execution.declaration import Call, State, When, native
 from pllm.execution.tensor_frame import TensorFrame, Tensors, UpdateOutput
 from pllm.execution.tensor_program import TaskOutput, TensorBatch, autograd_loss
+from pllm.kernels.label_logprobs import head_logits, label_logprobs
 
 if TYPE_CHECKING:
     from pllm.execution.tensor_declaration import TensorDeclaration
 
 
-class CausalForward(Protocol):
-    """A bound decoder forward; factors are borrowed from the current invocation."""
+@dataclass(frozen=True)
+class LMHead:
+    """The decoder's frozen output projection: logits = (hidden @ weight.T)[..., :vocab_size] * scale."""
 
-    def __call__(
+    weight: torch.Tensor
+    vocab_size: int
+    scale: float
+
+    def __call__(self, hidden: torch.Tensor) -> torch.Tensor:
+        return head_logits(hidden, self.weight, self.vocab_size, self.scale)
+
+    def label_logprobs(self, hidden: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
+        """[rows] log-probabilities of each row's label, without materializing all rows' logits at once."""
+        return label_logprobs(hidden, self.weight, labels, self.vocab_size, self.scale, ignore_index)
+
+
+class CausalForward(Protocol):
+    """A bound decoder forward split before its LM head; factors are borrowed from the current invocation."""
+
+    head: LMHead
+
+    def hidden(
         self, ids: torch.Tensor, attention_mask: torch.Tensor | None, factors: tuple[torch.Tensor, ...] | None
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """The final normalized hidden states, [batch, tokens, hidden]."""
+        ...
 
 
 CausalBinder = Callable[[tuple[ParameterOverlayFieldBinding, ...]], CausalForward]
@@ -33,19 +54,39 @@ CausalBinder = Callable[[tuple[ParameterOverlayFieldBinding, ...]], CausalForwar
 
 @dataclass(frozen=True)
 class CausalModel:
-    """The method's callable model argument and its overlay-free base forward."""
+    """The method's callable model argument; `base` is the same model without the declared overlay."""
 
     forward: CausalForward | None
-    factors: tuple[torch.Tensor, ...]
+    factors: tuple[torch.Tensor, ...] | None
 
     def __call__(self, ids: torch.Tensor, *, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Logits [batch, tokens, vocab] in the model dtype."""
         assert self.forward is not None, "bind the causal port in the model-owning worker"
-        return self.forward(ids, attention_mask, self.factors)
+        return self.forward.head(self.forward.hidden(ids, attention_mask, self.factors))
 
-    def base(self, ids: torch.Tensor, *, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Evaluate the frozen base without the declared overlay."""
-        assert self.forward is not None
-        return self.forward(ids, attention_mask, None)
+    @property
+    def base(self) -> CausalModel:
+        """The frozen base model, without the declared overlay."""
+        return CausalModel(self.forward, None)
+
+    def token_logprobs(
+        self,
+        ids: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        """Log-probabilities [batch, tokens - 1], in at least FP32, of labels[:, 1:] after each prefix.
+
+        Positions labelled ignore_index read 0. Logits never exist for the whole batch at once, so memory does not
+        grow with batch * tokens * vocab as it does when the caller applies log_softmax to model(ids).
+        """
+        assert self.forward is not None, "bind the causal port in the model-owning worker"
+        hidden = self.forward.hidden(ids, attention_mask, self.factors)[:, :-1]
+        targets = labels[:, 1:]
+        rows = hidden.reshape(-1, hidden.shape[-1])
+        return self.forward.head.label_logprobs(rows, targets.reshape(-1), ignore_index).view_as(targets)
 
 
 TrainingBatch = CausalTrainBatch[torch.Tensor] | WeightedRowBatch[torch.Tensor]

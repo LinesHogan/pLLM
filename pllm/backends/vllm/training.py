@@ -19,6 +19,7 @@ from vllm.model_executor.models.qwen3 import Qwen3Attention
 
 from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer, frozen_weight
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
+from pllm.execution.causal_batch import LMHead
 from pllm.execution.parameter_projection import parameter_correction
 
 Project = Callable[[LinearBase, torch.Tensor], torch.Tensor]
@@ -150,6 +151,7 @@ class CausalTraining:
             self.projections.setdefault(projection, []).append((offset, size, binding, slice(start, end)))
             start = end
         self.qk_norms = tuple(bind_qk_norms(layer) for layer in self.model.model.layers)
+        self.head = LMHead(model.lm_head.weight, model.config.vocab_size, model.logits_processor.scale)
 
     def project(
         self, projection: LinearBase, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
@@ -164,7 +166,7 @@ class CausalTraining:
                 output = output.slice_scatter(corrected, dim=-1, start=offset, end=offset + size)
         return output
 
-    def __call__(
+    def hidden(
         self, ids: torch.Tensor, attention_mask: torch.Tensor | None, factors: tuple[torch.Tensor, ...] | None
     ) -> torch.Tensor:
         """Full sequence-local causal attention with vLLM component precision and PTTS factors."""
@@ -196,5 +198,4 @@ class CausalTraining:
             hidden = mlp_forward(layer, hidden, project)
         assert residual is not None
         hidden, _ = add_norm(self.model.model.norm, hidden, residual)
-        logits = F.linear(hidden, self.model.lm_head.weight)[:, :, : self.model.config.vocab_size]
-        return logits * self.model.logits_processor.scale
+        return hidden

@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
-from torch.nn import functional as F
 from vllm import RequestOutput, SamplingParams
 
 import pllm
@@ -65,8 +64,8 @@ class TTRL(pllm.Workload):
         model: pllm.model.CausalModel = pllm.causal_model("adapter"),
     ) -> torch.Tensor:
         """Fit answer tokens selected by the majority vote."""
-        logits = model(input_ids, attention_mask=attention_mask)[:, :-1].float()
-        return F.cross_entropy(logits.transpose(1, 2), labels[:, 1:], ignore_index=-100)
+        logprobs = model.token_logprobs(input_ids, labels, attention_mask=attention_mask)
+        return -logprobs.sum() / labels[:, 1:].ne(-100).sum()
 
     def advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         """Select majority answers for supervised TTRL."""
@@ -146,9 +145,6 @@ class GRPO(TTRL):
         weights: torch.Tensor = pllm.batch("weights"),
     ) -> torch.Tensor:
         """Weight each sequence's mean answer-token negative log probability by its advantage."""
-        logits = model(input_ids, attention_mask=attention_mask)[:, :-1].float()
-        targets = labels[:, 1:]
-        losses = F.cross_entropy(logits.transpose(1, 2), targets, ignore_index=-100, reduction="none")
-        mask = targets != -100
-        per_sequence = (losses * mask).sum(-1) / mask.sum(-1).clamp_min(1)
+        logprobs = model.token_logprobs(input_ids, labels, attention_mask=attention_mask)
+        per_sequence = -logprobs.sum(-1) / labels[:, 1:].ne(-100).sum(-1).clamp_min(1)
         return (weights * per_sequence).mean()

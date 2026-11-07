@@ -7,22 +7,19 @@ from enum import StrEnum
 from math import isfinite
 
 import torch
-from torch.nn import functional as F
 
 import pllm
 
 
-def _sentence_cross_entropy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
-    shifted = labels[..., 1:].contiguous()
-    valid = shifted.ne(ignore_index)
-    logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
-    losses = F.cross_entropy(
-        logits[..., :-1, :].contiguous().view(-1, logits.shape[-1]),
-        shifted.view(-1),
-        reduction="none",
-        ignore_index=ignore_index,
-    ).view_as(shifted)
-    return (losses * valid).sum(-1) / valid.sum(-1).clamp_min(1)
+def _sentence_cross_entropy(
+    model: pllm.model.CausalModel,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    ignore_index: int,
+) -> torch.Tensor:
+    logprobs = model.token_logprobs(input_ids, labels, attention_mask=attention_mask, ignore_index=ignore_index)
+    return -logprobs.sum(-1) / labels[:, 1:].ne(ignore_index).sum(-1).clamp_min(1)
 
 
 class TLMMode(StrEnum):
@@ -109,10 +106,8 @@ class TLMWorkload(pllm.Workload):
         selection = None
         if config.mode is TLMMode.OFFLINE:
             with torch.no_grad():
-                selection = _sentence_cross_entropy(
-                    model.base(input_ids, attention_mask=attention_mask), labels, config.ignore_index
-                )
-        sentence = _sentence_cross_entropy(model(input_ids, attention_mask=attention_mask), labels, config.ignore_index)
+                selection = _sentence_cross_entropy(model.base, input_ids, labels, attention_mask, config.ignore_index)
+        sentence = _sentence_cross_entropy(model, input_ids, labels, attention_mask, config.ignore_index)
         selection = sentence.detach() if selection is None else selection
         selected = selection > config.threshold
         weighted = sentence * (config.lamb * torch.exp(selection - config.threshold)) * selected.to(sentence.dtype)

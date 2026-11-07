@@ -22,6 +22,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
+from pllm.execution.causal_batch import LMHead
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
@@ -40,7 +41,7 @@ class TinyCausalPort:
         generator = torch.Generator().manual_seed(23)
         self.embedding = torch.randn(5, 3, generator=generator, dtype=torch.float64)
         self.base = torch.randn(2, 3, 3, generator=generator, dtype=torch.float64)
-        self.head = torch.randn(3, 5, generator=generator, dtype=torch.float64)
+        self.head = LMHead(torch.randn(3, 5, generator=generator, dtype=torch.float64).T, 5, 1.0)
 
     def __deepcopy__(self, memo):
         raise AssertionError("binding must retain the original frozen causal model")
@@ -50,7 +51,7 @@ class TinyCausalPort:
     def bind(self, bindings):
         return self
 
-    def __call__(self, ids, attention_mask, factors) -> torch.Tensor:
+    def hidden(self, ids, attention_mask, factors) -> torch.Tensor:
         hidden = self.embedding[ids]
         weights = (
             self.base
@@ -59,7 +60,7 @@ class TinyCausalPort:
                 tuple(self.base[index] + factors[2 * index + 1] @ factors[2 * index] for index in range(2))
             )
         )
-        return torch.tanh((hidden @ weights[0].T) + (hidden @ weights[1].T)) @ self.head
+        return torch.tanh((hidden @ weights[0].T) + (hidden @ weights[1].T))
 
 
 def causal_facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
@@ -95,9 +96,9 @@ def _reference(model, parameters, batch, config):
     hidden = model.embedding[batch.input_ids]
     q = model.base[0] + parameters[1] @ parameters[0]
     v = model.base[1] + parameters[3] @ parameters[2]
-    logits = torch.tanh(F.linear(hidden, q) + F.linear(hidden, v)) @ model.head
+    logits = model.head(torch.tanh(F.linear(hidden, q) + F.linear(hidden, v)))
     selector = (
-        torch.tanh(F.linear(hidden, model.base[0]) + F.linear(hidden, model.base[1])) @ model.head
+        model.head(torch.tanh(F.linear(hidden, model.base[0]) + F.linear(hidden, model.base[1])))
         if config.mode is TLMMode.OFFLINE
         else logits.detach()
     )

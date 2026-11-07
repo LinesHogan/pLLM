@@ -58,7 +58,7 @@ def test_weighted_causal_loss_and_adamw_match_torch() -> None:
         # No cross_entropy or workload helper: gather target log probabilities and average answer tokens by row.
         hidden = model.embedding[batch.input_ids]
         q, v = (model.base[index] + parameters[2 * index + 1] @ parameters[2 * index] for index in range(2))
-        logits = (torch.tanh(hidden @ q.T + hidden @ v.T) @ model.head).float()
+        logits = model.head(torch.tanh(hidden @ q.T + hidden @ v.T))
         targets = batch.labels[:, 1:]
         mask = targets != -100
         logp = logits[:, :-1].log_softmax(-1).gather(-1, targets.clamp_min(0).unsqueeze(-1)).squeeze(-1)
