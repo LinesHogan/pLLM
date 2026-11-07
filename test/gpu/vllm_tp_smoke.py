@@ -569,7 +569,7 @@ def m4_reference():
 
 
 @pytest.mark.parametrize("kind", ["dense", "low_rank", "dense_train", "low_rank_train"])
-@pytest.mark.parametrize("targets", [("down_proj",), ("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")])
+@pytest.mark.parametrize("targets", [("down_proj",), ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")])
 def test_tp_projection(kind, targets, monkeypatch, m4_reference):
     from time import perf_counter
 
