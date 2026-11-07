@@ -885,6 +885,17 @@ class InstanceState:
                 else LayoutField(key, value, context.field_dtype(name, key, self.dtype), self.alignment)
                 for key, value in self.fields.items()
             )
+        if (
+            consumer.operator is ParameterOverlayOperator.LOW_RANK_ADD
+            and self.optimizer is not None
+            and self.initialize is None
+            and not self.pretrained
+            and not self.imported
+        ):
+            raise ValueError(
+                f"{name}: add initialize= (e.g. random A, zero B); with both low_rank factors at zero "
+                "every gradient is zero and the adapter never learns"
+            )
         context.binding.overlay_targets = consumer.targets
         return overlay_fields(
             _fields(self),
