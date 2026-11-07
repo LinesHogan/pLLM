@@ -1,4 +1,16 @@
-"""Signed pre/post-filter interventions over the original vLLM sampler state."""
+"""Workload sampler epilogue over vLLM's LM-head output and sampling kernels.
+
+The sampler epilogue folds workload logit operations into work inference already
+needs: guide_sampling shares the LM-head GEMM (or projects bounded survivors and
+reweights inside the seeded draw), and add_logits folds declared-order additions
+into MRv2's FP32 sampler-input copy when vLLM processes logits; steps without
+processing keep the LM-head dtype. Each addition rounds in the LM-head logit's
+dtype before the next stage, including row subsets. All upstream processors,
+filters, raw/processed logprobs and guidance see that same distribution. MRv1
+uses the same ordered-add copy before its upstream processors; it has no separate
+FP32 copy to remove when its LM head already returns FP32. No step reads device
+values on the host.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from vllm.config.model import LogprobsMode
+from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.v1.outputs import SamplerOutput as Mrv1SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
@@ -14,22 +26,13 @@ from vllm.v1.sample.sampler import Sampler as UpstreamMrv1Sampler
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.guided_sampling import guided_sample
+from pllm.backends.vllm.sampler_epilogue import copy_additions
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback, SamplerStage
 from pllm.execution.cuda_stream import upload
-
-
-def add_logits(logits: torch.Tensor, guidance: SignedSamplerGuidance) -> torch.Tensor:
-    """Add one declared contribution at its packed sampler rows."""
-    assert logits.shape == (guidance.guidance.total_rows, guidance.pred_dense_logits.shape[1])
-    if guidance.guidance.affected_row_ids == tuple(range(logits.shape[0])):
-        return logits + guidance.pred_dense_logits.to(logits)
-    rows = upload(guidance.guidance.affected_row_ids, logits.device)
-    output = logits.clone()
-    output.index_add_(0, rows, guidance.pred_dense_logits.to(logits))
-    return output
 
 
 def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -76,12 +79,28 @@ class SignedSamplerStages:
             (stage for stage in self.stages if stage.guidance.stage is SamplerStage.PACKED_POST_FILTER_EXACT), None
         )
 
-    def add_logits(self, logits: torch.Tensor) -> torch.Tensor:
+    def add_logits(self, logits: torch.Tensor, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """Sum additions in their declared order before vLLM applies its filters."""
-        for stage in self.stages:
-            if isinstance(stage, SignedSamplerGuidance) and stage.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD:
-                logits = add_logits(logits, stage)
-        return logits
+        additions = self.additions
+        return (
+            copy_additions(
+                logits,
+                tuple(stage.pred_dense_logits for stage in additions),
+                tuple(stage.guidance.affected_row_ids for stage in additions),
+                dtype=dtype,
+            )
+            if additions
+            else logits
+        )
+
+    @property
+    def additions(self) -> tuple[SignedSamplerGuidance, ...]:
+        """Dense contributions in declaration order, excluding the post-filter guide."""
+        return tuple(
+            stage
+            for stage in self.stages
+            if isinstance(stage, SignedSamplerGuidance) and stage.guidance.stage is SamplerStage.PACKED_PRE_FILTER_ADD
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +185,12 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
             case SignedSamplerStages() as stages:
                 with torch.inference_mode(False):
                     base_logits = logits.detach().clone() if stages.capture_feedback else None
-                output = super().__call__(stages.add_logits(logits), input_batch)
+                dtype = (
+                    torch.float32
+                    if stages.additions and self._requires_logits_processing(input_batch.idx_mapping_np)
+                    else logits.dtype
+                )
+                output = super().__call__(stages.add_logits(logits, dtype=dtype), input_batch)
                 with torch.inference_mode(False):
                     feedback = (
                         SamplerFeedback(
@@ -181,6 +205,18 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
                 return output
             case _SampledGuidance():
                 assert False
+
+    def _copy_logits(self, logits: torch.Tensor, idx_mapping_np: np.ndarray) -> torch.Tensor:
+        stages = self._active_guidance
+        if isinstance(stages, SignedSamplerStages) and stages.additions:
+            raw_logprobs = self.logprobs_mode not in PROCESSED_LOGPROBS_MODES and (
+                self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
+                or self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) > 0
+            )
+            if not raw_logprobs:
+                # The epilogue owns this FP32 tensor; raw-logprob callers retain a separate copy.
+                return logits
+        return super()._copy_logits(logits, idx_mapping_np)
 
     def _sample_random(
         self,

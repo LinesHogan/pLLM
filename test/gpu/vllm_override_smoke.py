@@ -51,7 +51,7 @@ def main() -> None:
     hook = None
     reader_ref = None
     native_guidance = StateExecution.sampler_guidance
-    native_add, native_complete = sampler.add_logits, StateExecution.complete_sampler
+    native_add, native_complete = sampler.SignedSamplerStages.add_logits, StateExecution.complete_sampler
     try:
 
         def capture(module, args, output):
@@ -66,8 +66,9 @@ def main() -> None:
             (reader_ref,) = invocation.pin.refs
             return native_guidance(owner, invocation, stream)
 
-        def inspect_add(logits, guidance):
+        def inspect_add(stages, logits, *, dtype=torch.float32):
             nonlocal base_logits
+            (guidance,) = stages.additions
             base_logits = logits.detach().clone()
             assert hidden is not None
             # Lagged guidance uses the invocation's exact read pin, while training
@@ -88,8 +89,8 @@ def main() -> None:
                         @ up[identity.sample_index - 1].T
                     )
             torch.testing.assert_close(guidance.pred_dense_logits, expected, rtol=2e-4, atol=2e-5)
-            result = native_add(logits, guidance)
-            torch.testing.assert_close(result, logits + expected.to(logits))
+            result = native_add(stages, logits, dtype=dtype)
+            torch.testing.assert_close(result, (logits + expected.to(logits)).to(dtype))
             torch.testing.assert_close(logits, base_logits, rtol=0, atol=0)
             observed.append(int(torch.count_nonzero(expected)))
             return result
@@ -102,7 +103,7 @@ def main() -> None:
                 drawn.setdefault((identity.prompt_index, identity.sample_index), []).append(token)
 
         with (
-            patch.object(sampler, "add_logits", inspect_add),
+            patch.object(sampler.SignedSamplerStages, "add_logits", inspect_add),
             patch.object(StateExecution, "sampler_guidance", inspect_guidance),
             patch.object(StateExecution, "complete_sampler", inspect_feedback),
         ):

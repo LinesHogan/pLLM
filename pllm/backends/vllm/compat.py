@@ -1,11 +1,13 @@
 """Every difference between the supported vLLM releases, 0.27.1 and 0.32.0, behind 0.32.0's interfaces.
 
 The worker, runner, graph and sampler modules subclass the four classes below and are written against 0.32.0. On
-0.32.0 the names are vLLM's own classes; on 0.27.1 they are thin subclasses that accept 0.32.0's arguments and
-provide its seams. Dropping 0.27.1 deletes the `if VLLM_027` branch. Pyright checks each branch against its own
+0.32.0 the runner names are vLLM's own classes; on 0.27.1 thin subclasses accept 0.32.0's arguments and
+provide its seams. The sampler also exposes the FP32 copy seam on both releases. Dropping 0.27.1 deletes the `if VLLM_027` branch. Pyright checks each branch against its own
 release: pyrightconfig.json defines VLLM_027 true for .venv, pyrightconfig.vllm032.json false for .venv-vllm032.
 """
 
+import numpy as np
+import torch
 from vllm import __version__
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -51,8 +53,6 @@ if VLLM_027:
     from contextlib import AbstractContextManager
     from typing import Any
 
-    import numpy as np
-    import torch
     from vllm.config.model import PROCESSED_LOGPROBS_MODES
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -116,8 +116,82 @@ if VLLM_027:
         ) -> BatchExecutionDescriptor:
             return super().dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)
 
-    class Sampler(VllmSampler):
-        """0.27.1's MRv2 sampler split as in 0.32.0: sample() applies the sampling parameters, _sample_random() draws."""
+else:
+    from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
+
+    Worker = VllmWorker
+    ModelRunner = GPUModelRunner
+    CudaGraphManager = ModelCudaGraphManager
+
+
+class Sampler(VllmSampler):
+    """Upstream parameter pipelines with a sampler-input copy seam for workload additions.
+
+    Neither release exposes that seam; the bodies below retain its processor order
+    and delegate all processing/filtering kernels to vLLM. On 0.27 sample() also
+    exposes 0.32's draw seam for post-filter guidance.
+    """
+
+    def _requires_logits_processing(self, idx_mapping_np: np.ndarray) -> bool:
+        if VLLM_027:
+            return super()._requires_logits_processing(idx_mapping_np)
+        return bool(np.any(self.needs_logits_processing[idx_mapping_np]))
+
+    def _copy_logits(self, logits: torch.Tensor, idx_mapping_np: np.ndarray) -> torch.Tensor:
+        return torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+
+    def _apply_sampling_filters(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        skip_top_k_top_p: bool,
+    ) -> torch.Tensor:
+        self.sampling_states.apply_temperature(logits, expanded_idx_mapping, idx_mapping_np)
+        self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+        return (
+            logits
+            if skip_top_k_top_p
+            else self.sampling_states.apply_top_k_top_p(logits, expanded_idx_mapping, idx_mapping_np)
+        )
+
+    if VLLM_027:
+
+        def apply_sampling_params(
+            self,
+            logits: torch.Tensor,
+            expanded_idx_mapping: torch.Tensor,
+            idx_mapping_np: np.ndarray,
+            pos: torch.Tensor,
+            input_ids: torch.Tensor,
+            expanded_local_pos: torch.Tensor,
+            skip_top_k_top_p: bool = False,
+        ) -> torch.Tensor:
+            if not self._requires_logits_processing(idx_mapping_np):
+                return logits
+
+            # Guidance can fold additions into this copy before any processors run.
+            logits = self._copy_logits(logits, idx_mapping_np)
+
+            self.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+
+            self.penalties_state.apply_penalties(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                input_ids,
+                expanded_local_pos,
+            )
+
+            self.bad_words_state.apply_bad_words(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                input_ids,
+                expanded_local_pos,
+            )
+
+            return self._apply_sampling_filters(logits, expanded_idx_mapping, idx_mapping_np, skip_top_k_top_p)
 
         def sample(
             self,
@@ -167,8 +241,41 @@ if VLLM_027:
             )
             return sampled, processed_logits
 
-else:
-    Worker = VllmWorker
-    ModelRunner = GPUModelRunner
-    CudaGraphManager = ModelCudaGraphManager
-    Sampler = VllmSampler
+    else:
+
+        def apply_sampling_params(
+            self,
+            logits: torch.Tensor,
+            expanded_idx_mapping: torch.Tensor,
+            idx_mapping: torch.Tensor,
+            idx_mapping_np: np.ndarray,
+            pos: torch.Tensor,
+            input_ids: torch.Tensor,
+            expanded_local_pos: torch.Tensor,
+            seq_lens_upper_bound_np: np.ndarray,
+            skip_top_k_top_p: bool = False,
+        ) -> torch.Tensor:
+            if not self._requires_logits_processing(idx_mapping_np):
+                return logits
+
+            # Guidance can fold additions into this copy before any processors run.
+            logits = self._copy_logits(logits, idx_mapping_np)
+
+            ctx = LogitsContext(
+                expanded_idx_mapping=expanded_idx_mapping,
+                idx_mapping=idx_mapping,
+                idx_mapping_np=idx_mapping_np,
+                expanded_local_pos=expanded_local_pos,
+                input_ids=input_ids,
+                pos=pos,
+                seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+            )
+
+            for processor in self.logits_processors:
+                logits = processor.apply(logits, ctx)
+
+            # Forcing runs last so no stage can overwrite the forced end marker
+            # or weaken it by scaling.
+            self.thinking_budget_state.apply(logits, ctx)
+
+            return self._apply_sampling_filters(logits, expanded_idx_mapping, idx_mapping_np, skip_top_k_top_p)

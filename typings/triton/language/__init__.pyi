@@ -21,6 +21,7 @@ uint32: dtype
 uint64: dtype
 
 class tensor:
+    dtype: dtype
     shape: tuple[int, ...]
     def reshape(self, shape: tuple[int, ...]) -> tensor: ...
     def to(self, dtype: dtype, bitcast: bool = False) -> tensor: ...

@@ -41,6 +41,21 @@ from test.workloads.attention_workloads import SharedAttention, SinkAttention, W
 from test.workloads.kernel_workloads import Forward, Residual
 
 
+@dataclass(frozen=True)
+class _PrefillBias(pllm.Workload):
+    """A prefill-only addition before a separate decoder contribution."""
+
+    @pllm.add_logits()
+    def bias(self, h: torch.Tensor = pllm.hidden(0, tokens="prefill")) -> torch.Tensor:
+        return h[:, :1].float().expand(-1, 32)
+
+
+@dataclass(frozen=True)
+class _MixedAdditions(pllm.Workload):
+    prefill: _PrefillBias = _PrefillBias()
+    decode: DoLaWorkload = DoLaWorkload(layers=(0, 2))
+
+
 @pytest.fixture
 def model_config(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(
@@ -193,7 +208,14 @@ def test_declared_flop_estimates(model_config):
     dola = pllm.explain(DoLaWorkload(layers=(0, 2)), model_config)
     contrast = next(task for member in dola.members for task in member.tasks if task.name == "contrast")
     assert contrast.estimate.projection_flops_estimate == rows * 3 * 2 * hidden * padded_vocab
-    assert contrast.estimate.sampler_bytes_estimate == rows * vocab * 12
+    assert contrast.estimate.sampler_bytes_estimate == rows * vocab * 10
+    mixed = pllm.explain(_MixedAdditions(), model_config)
+    additions = {task.name: task.estimate for member in mixed.members for task in member.tasks}
+    assert (
+        additions["prefill.bias"].sampler_bytes_estimate == additions["prefill.bias"].eager_kernel_count_estimate == 0
+    )
+    assert additions["decode.contrast"].sampler_bytes_estimate == contrast.estimate.sampler_bytes_estimate
+    assert additions["decode.contrast"].eager_kernel_count_estimate == contrast.estimate.eager_kernel_count_estimate
     lora = pllm.explain(OutputLoRAWorkload(), model_config)
     assert any(
         task.estimate is not None and task.estimate.optimizer_bytes_estimate > 0

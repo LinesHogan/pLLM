@@ -379,6 +379,12 @@ class SelectiveBias(pllm.Workload):
 
 偏置向量在调用时传入：`llm.generate(..., batch=pllm.io.StateImport((vector,)))`。
 
+#### Sampler epilogue：把词表操作放进已有遍历
+
+框架把工作负载的 logits 操作并入 LM Head 和采样阶段，统一称为 **sampler epilogue**。`@pllm.add_logits` 的多个贡献按声明顺序加入，每次仍按输入 logits 的 dtype 舍入；`rows=` 只影响选中行，再照常执行 vLLM 的惩罚、掩码、温度和过滤。MRv2 在需要处理 logits 的步骤中，把这些加法与已有的 FP32 采样输入拷贝合成一次遍历；跳过处理的步骤保留 LM Head 的 dtype，省去每个贡献的 dtype 转换、独立加法和行子集的全量拷贝；随后可继续组合 `@pllm.guide_sampling`。逐步路径不读取设备值到主机。请求 raw logprobs 时仍保留独立原始分布；MRv1 使用同一有序加法内核，但输入已经是 FP32 时没有可省的上游转换遍历。
+
+`explain` 将这次共享拷贝的输入读取、FP32 写回和一个内核归到第一个解码加法，后续加法只计各自贡献的读取字节；行选择按最大全批大小估计。这是逻辑流量估计，不是延迟预测。
+
 #### 默认有界融合引导：容量为什么是 4096？
 
 `ExecutionOptions.guidance_capacity` 默认是 **4096**。在支持的 MRv2、TP=1、未量化且未缩放或变换的 LM Head 上，框架在 vLLM 完成过滤后只投影保留下来的 token，并把引导与抽样融合；不支持的 runner 或 LM Head 会自动选择精确的 dense 路径。`guidance_capacity=None` 可显式选择精确 dense，`pllm.explain` 会报告实际路径、回退原因以及相应的 FLOP/字节估计。

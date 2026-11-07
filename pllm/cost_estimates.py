@@ -136,11 +136,12 @@ def _estimate_ops(
 
 @dataclass(frozen=True, slots=True)
 class CostEstimate:
-    """Logical work at the declared decode batch size, ignoring fusion and cache reuse.
+    """Logical work at the declared decode batch size, ignoring task-body fusion and cache reuse.
 
     Matmul counts include autograd where declared. Read traffic follows declared fields; transitions count whole roots;
     optimizer traffic is a subset of state traffic, not an additional allocation or DRAM measurement.
-    Projection counts cover extra LM-head rows. Shared layer projections are charged once.
+    Projection counts cover extra LM-head rows. Shared layer projections and the
+    ordered-add sampler copy are charged once; each addition reads its contribution.
     Kernel counts are source operators in the task body; eager counts cover state
     copies and sampler work outside that body. Prefill-only bodies count zero at decode.
     """
@@ -154,7 +155,9 @@ class CostEstimate:
     sampler_bytes_estimate: int = 0
     kernel_count_estimate: int = 0
     eager_kernel_count_estimate: int = 0
-    label: str = "estimate: matmuls, logical bytes and source kernels per decode step; ignores cache reuse and fusion"
+    label: str = (
+        "estimate: matmuls, logical bytes and source kernels per decode step; ignores cache reuse and task-body fusion"
+    )
 
 
 def _traffic(binding: TensorDeclaration, facts: BackendCompileFacts, symbol: TaskSymbol) -> tuple[int, int]:
@@ -214,9 +217,10 @@ def _sampler_kernels(
     batch: TensorBatch,
     projected_layers: int,
     padded_vocab_size: int,
+    copies_logits: bool,
 ) -> int:
     from pllm.backends.vllm.guided_sampling import guided_sample
-    from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerGuidance, add_logits
+    from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerGuidance, SignedSamplerStages
     from pllm.contracts.sampler import PackedSamplerGuidanceBatch
 
     task = binding.tensor_tasks.get(symbol)
@@ -230,7 +234,11 @@ def _sampler_kernels(
     weights = torch.empty((padded_vocab_size, hidden), dtype=dtype, device="meta")
     assert batch.feedback is not None
     guidance = PackedSamplerGuidanceBatch(
-        batch.feedback.sampler_rows, prediction, tuple(range(rows)), task.sampler_beta
+        batch.feedback.sampler_rows,
+        prediction,
+        tuple(range(rows)),
+        task.sampler_beta,
+        stage=task.sampler_stage or SamplerStage.PACKED_POST_FILTER_EXACT,
     )
     with (
         FakeTensorMode(allow_non_fake_inputs=True),
@@ -258,8 +266,8 @@ def _sampler_kernels(
             else:
                 dense = torch.mm(prediction.to(dtype), weights.T)[:, : facts.vocab_size]
                 SamplerGuidance.reweight_finite_survivors(logits, SignedSamplerGuidance(guidance, dense))
-        elif task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
-            add_logits(logits, SignedSamplerGuidance(guidance, prediction))
+        elif copies_logits:
+            SignedSamplerStages((SignedSamplerGuidance(guidance, prediction),)).add_logits(logits)
     return counter.count
 
 
@@ -275,9 +283,19 @@ def estimate_tasks(
     estimates: dict[str, CostEstimate] = {}
     calls: OpCalls = {}
     projected: set[int] = set()
+    first_addition = min(
+        (
+            task
+            for task in binding.tensor_tasks.values()
+            if task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD and task.phase is not HiddenPhase.PREFILL
+        ),
+        key=lambda task: task.sampler_order,
+        default=None,
+    )
     for symbol in producers_first(binding.graph, tuple(operations)):
         operation = operations[symbol]
         task = binding.tensor_tasks.get(symbol)
+        copies_logits = task is not None and task is first_addition
         if (
             binding.graph.trains_on_batch
             and data.step.batch is None
@@ -307,11 +325,15 @@ def estimate_tasks(
                     + facts.probe.hidden_size * width
                     + 16
                 )
-            elif task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+            elif task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD and task.phase is not HiddenPhase.PREFILL:
                 width = facts.probe.tensor_dtype.itemsize
                 delta = batch.results[symbol, task.outputs[0]]
-                conversion = 0 if delta.dtype == facts.probe.tensor_dtype.torch else delta.element_size() + width
-                sampler = facts.max_admitted_lineages * facts.vocab_size * (3 * width + conversion)
+                # One shared sampler-input copy; later declarations only read their contribution.
+                sampler = (
+                    facts.max_admitted_lineages
+                    * facts.vocab_size
+                    * (delta.element_size() + (width + 4 if copies_logits else 0))
+                )
             if any(
                 isinstance(source, HiddenInputSource) and source.site is HiddenSite.LAYER_LOGITS
                 for source in task.sources.values()
@@ -341,7 +363,7 @@ def estimate_tasks(
             if task is not None and task.phase is HiddenPhase.PREFILL
             else (
                 (0 if symbol not in executables else _copy_kernels(executables[symbol], batch))
-                + _sampler_kernels(binding, facts, symbol, batch, projected_layers, padded_vocab_size)
+                + _sampler_kernels(binding, facts, symbol, batch, projected_layers, padded_vocab_size, copies_logits)
             ),
         )
     ops, model_kernels = _estimate_ops(binding, facts, calls)
