@@ -16,7 +16,7 @@ from torch.fx.proxy import TraceError
 
 from pllm.execution.model_sites import PatchInput, Place, ResidualRewrite, SiteValues, activation_write
 from pllm.execution.module_graph import ModuleCall
-from pllm.execution.torch_private import compile_math, compiling_method, tensor_node_metadata
+from pllm.execution.torch_private import compile_math, compiling_method, set_tuple_output, tensor_node_metadata
 
 _Argument = Tensor | ModuleCall | int | Callable[[Tensor], Tensor]
 
@@ -180,7 +180,7 @@ class SiteBody:
         terminal: fx.Node,
         operands: tuple[fx.Node, ...],
     ) -> None:
-        output.args = (operands,)
+        set_tuple_output(body, output, operands)
         body.graph.erase_node(terminal)
         body.recompile()
         self._bodies[key] = body, True

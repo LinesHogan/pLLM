@@ -933,7 +933,7 @@ def _check(workload: Workload, config: ModelConfig, *, device_equivalence: bool 
     passed.append("compile")
     from pllm.cost_estimates import estimate_tasks
 
-    _, ops = estimate_tasks(declaration, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
+    _, ops, _ = estimate_tasks(declaration, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
     missing = tuple(op.name for op in ops if not op.cpu_reference)
     if missing:
         return CheckResult(

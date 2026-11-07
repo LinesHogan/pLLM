@@ -18,14 +18,16 @@ from torch import _decomp
 from torch._dynamo.convert_frame import _bytecode_hooks  # pyright: ignore[reportPrivateUsage]
 from torch._dynamo.utils import CleanupManager
 from torch._functorch import compile_utils
+from torch._higher_order_ops.triton_kernel_wrap import triton_kernel_wrapper_mutation
 from torch._library.custom_ops import CustomOpDef as CustomOpDef, _maybe_get_opdef  # pyright: ignore[reportPrivateUsage]
 from torch._ops import OpOverload, OpOverloadPacket, _OpNamespace, _Ops  # pyright: ignore[reportPrivateUsage]
 from torch._subclasses.fake_tensor import DynamicOutputShapeException, FakeTensor, FakeTensorMode as FakeTensorMode
+from torch.fx.graph import _PyTreeCodeGen  # pyright: ignore[reportPrivateUsage]
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.overrides import TorchFunctionMode
 from torch.utils import _python_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_leaves, tree_structure
 from torch.utils.flop_counter import flop_registry
 
 from pllm.kernels.page_copy import host_rows
@@ -160,6 +162,14 @@ def custom_op_definition(target: object) -> CustomOpDef | None:
     return _maybe_get_opdef(target.name()) if isinstance(target, OpOverload) else None
 
 
+def set_tuple_output(body: torch.fx.GraphModule, output: torch.fx.Node, operands: tuple[torch.fx.Node, ...]) -> None:
+    """Keep make_fx's pytree contract consistent when a rewrite changes output arity."""
+    codegen = body.graph._codegen  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(codegen, _PyTreeCodeGen)
+    codegen.pytree_info = codegen.pytree_info._replace(out_spec=tree_structure(operands))
+    output.args = (operands,)
+
+
 def dispatcher_namespace(value: object) -> str | None:
     """Distinguish Torch dispatcher handles from ordinary imported modules and callables."""
     if isinstance(value, _Ops):
@@ -213,6 +223,69 @@ class CustomOpTrace(TorchDispatchMode):
                 if isinstance(value, torch.Tensor)
             )
             self.calls.append((definition, flops, size))
+        return result
+
+
+class KernelCountMode(TorchDispatchMode):
+    """Count shape-traced device operators that can do work, before compiler fusion.
+
+    Views and uninitialized allocations launch no kernels. Opaque operators count
+    once; libraries may implement one operator with several kernels. This is a
+    source-operation estimate, not a CUDA launch measurement.
+    """
+
+    supports_higher_order_operators = True
+
+    def __init__(self) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType]
+        self.count = 0
+
+    def __torch_dispatch__(
+        self,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        keywords = kwargs or {}
+        result = func(*args, **keywords)
+        if func is triton_kernel_wrapper_mutation:
+            self.count += 1
+            return result
+        if not isinstance(func, OpOverload):
+            return result
+        if func.namespace == "aten" and func.name().removeprefix("aten::").removeprefix("new_").startswith("empty"):
+            return result
+        if torch.Tag.inplace_view in func.tags:
+            return result
+        inputs = tuple(value for value in tree_leaves((args, keywords)) if isinstance(value, torch.Tensor))
+        if (func.overloadpacket is torch.ops.aten._to_copy and inputs[0].device.type == "cpu") or (
+            func.overloadpacket is torch.ops.aten.copy_ and inputs[1].device.type == "cpu"
+        ):
+            return result  # Host uploads are transfers, not device kernels.
+        outputs = tuple(value for value in tree_leaves(result) if isinstance(value, torch.Tensor))
+        writes = tuple(
+            value
+            for index, argument in enumerate(func._schema.arguments)  # pyright: ignore[reportPrivateUsage]
+            if argument.alias_info is not None and argument.alias_info.is_write
+            for value in tree_leaves(args[index] if index < len(args) else keywords.get(argument.name))
+            if isinstance(value, torch.Tensor)
+        )
+        fresh = tuple(
+            value for value in outputs if all(value.untyped_storage() != source.untyped_storage() for source in inputs)
+        )
+        # copy_(self) and copying an identical view are no-ops, including norm
+        # kernels returning the input buffers they have already updated.
+        if func.overloadpacket is torch.ops.aten.copy_ and len(inputs) >= 2:
+            left, right = inputs[:2]
+            if (
+                left.untyped_storage() == right.untyped_storage()
+                and left.storage_offset() == right.storage_offset()
+                and left.shape == right.shape
+                and left.stride() == right.stride()
+            ):
+                return result
+        self.count += any(value.device.type != "cpu" and value.numel() for value in (*fresh, *writes))
         return result
 
 

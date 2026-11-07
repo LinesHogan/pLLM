@@ -197,34 +197,7 @@ class ModelSites:
                 ),
                 (None, None) if taps is None else (taps.taps.get((path, 0)), taps.taps.get((path, 1))),
             )
-            if boundary.owner is not None and boundary.owner.memory is None:
-                assert before is not None
-                sample = weight.new_empty((1, self.streams, self.hidden) if self.streams > 1 else (1, self.hidden))
-                branch = weight.new_empty((1, self.hidden))
-                boundary.write = SiteBody(
-                    boundary.owner, before, self, (sample, branch), compiled=methods.get((boundary.owner.name, False))
-                )
-                if boundary.write.identity:
-                    boundary.owner = None
-            sample = weight.new_empty((1, self.streams, self.hidden) if self.streams > 1 else (1, self.hidden))
-            if boundary.reader is not None:
-                assert after is not None
-                boundary.read = SiteBody(
-                    boundary.reader,
-                    after,
-                    self,
-                    (sample,),
-                    compiled=methods.get((boundary.reader.name, True)),
-                    read=True,
-                )
-            if boundary.final is not None:
-                boundary.collapse = SiteBody(
-                    boundary.final,
-                    boundary.final.places[0],
-                    self,
-                    (sample,),
-                    compiled=methods.get((boundary.final.name, False)),
-                )
+            boundary.bind(weight, methods)
             if before is not None and before[0] == "mlp":
                 self._ends[before[1]] = boundary
             if (
@@ -250,13 +223,7 @@ class ModelSites:
                 width,
                 head_dim,
             )
-            if hook.owner is not None:
-                sample = weight.new_empty((1, width // head_dim, head_dim))
-                hook.write = SiteBody(
-                    hook.owner, ("value", layer), self, (sample,), compiled=methods.get((hook.owner.name, False))
-                )
-                if hook.write.identity:
-                    hook.owner = None
+            hook.bind(weight, methods)
             if hook.owner is None and hook.keeps is None:
                 continue
             hook.index = len(self.hooks)
@@ -414,6 +381,41 @@ class _Boundary:
     read: SiteBody | None = None
     collapse: SiteBody | None = None
 
+    def bind(self, weight: Tensor, methods: dict[tuple[str, bool], Callable[..., None]]) -> None:
+        """Bind the same authored bodies for execution and shape-only cost tracing."""
+        if self.owner is not None and self.owner.memory is None:
+            assert self.before is not None
+            sample = weight.new_empty(
+                (1, self.sites.streams, self.sites.hidden) if self.sites.streams > 1 else (1, self.sites.hidden)
+            )
+            branch = weight.new_empty((1, self.sites.hidden))
+            self.write = SiteBody(
+                self.owner, self.before, self.sites, (sample, branch), compiled=methods.get((self.owner.name, False))
+            )
+            if self.write.identity:
+                self.owner = None
+        sample = weight.new_empty(
+            (1, self.sites.streams, self.sites.hidden) if self.sites.streams > 1 else (1, self.sites.hidden)
+        )
+        if self.reader is not None:
+            assert self.after is not None
+            self.read = SiteBody(
+                self.reader,
+                self.after,
+                self.sites,
+                (sample,),
+                compiled=methods.get((self.reader.name, True)),
+                read=True,
+            )
+        if self.final is not None:
+            self.collapse = SiteBody(
+                self.final,
+                self.final.places[0],
+                self.sites,
+                (sample,),
+                compiled=methods.get((self.final.name, False)),
+            )
+
     def graph_forward(self, branch: Tensor, stream: Tensor | None = None) -> Tensor | tuple[Tensor, Tensor]:
         """Expose fresh outputs with the shapes vLLM's compiled model carries between boundaries."""
         normed = torch.empty_like(branch)
@@ -562,6 +564,20 @@ class _Value:
     head_dim: int
     index: int = 0
     write: SiteBody | None = None
+
+    def bind(self, weight: Tensor, methods: dict[tuple[str, bool], Callable[..., None]]) -> None:
+        """Bind a value rewrite, omitting shape-independent identity methods."""
+        if self.owner is not None:
+            sample = weight.new_empty((1, self.width // self.head_dim, self.head_dim))
+            self.write = SiteBody(
+                self.owner,
+                ("value", self.layer),
+                self.sites,
+                (sample,),
+                compiled=methods.get((self.owner.name, False)),
+            )
+            if self.write.identity:
+                self.owner = None
 
     def __call__(self, hidden: Tensor) -> LinearOutput:
         output = self.native(hidden)

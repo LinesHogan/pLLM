@@ -115,6 +115,9 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
         add, scale = report.custom_ops
         assert add.flops_per_row == 8 and scale.flops_per_row is None
         assert add.cpu_reference and "unknown [no flop formula, counted 0]" in str(report)
+    if isinstance(workload, Forward):
+        assert report.members[0].tasks[0].estimate is None
+        assert report.members[0].kernels.total > 0
     if isinstance(workload, (StepLoopWorkload, PrefillAdaptersWorkload)):
         tokens = tuple(item for item in report.escape_hatches if item.setting == "tokens")
         assert tokens and all(item.is_default for item in tokens)
@@ -194,6 +197,33 @@ def test_declared_flop_estimates(model_config):
         for task in member.tasks
     )
     assert "estimate / step" in str(report)
+    assert report.kernels.captured > 0 and report.kernels.eager > 0
+    assert report.kernels.total == sum(member.kernels.total for member in report.members) + sum(
+        task.estimate.kernel_count_estimate + task.estimate.eager_kernel_count_estimate
+        for task in report.framework_tasks
+        if task.estimate is not None
+    )
+    assert str(report).count("kernels  ") == len(report.members) + 1
+
+
+def test_kernel_estimate_excludes_metadata_and_counts_mutations():
+    from pllm.execution.torch_private import KernelCountMode
+    from pllm.kernels.page_copy import copy_pages
+
+    x = torch.empty((3, 8), device="meta")
+    indices = torch.empty(3, device="meta", dtype=torch.long)
+    with KernelCountMode() as counter:
+        view = x.view(3, 2, 4).transpose(1, 2)
+        torch.empty_like(view)
+        x.new_empty(x.shape)
+        x.copy_(x.view_as(x))
+        x.copy_(torch.empty(x.shape))
+    assert counter.count == 0
+    with KernelCountMode() as counter:
+        result = x + 1
+        result.zero_()
+        copy_pages(result, x, indices, indices)
+    assert counter.count == 3
 
 
 @pytest.mark.parametrize("workload", (StepLoopWorkload(), RecirculationWorkload()))

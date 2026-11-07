@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from pllm.backends.vllm.kv_layout import layout_capacity
 from pllm.config import ExecutionOptions, ModelConfig
-from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, BackendAttachment
+from pllm.contracts.backend_attachment import TOKEN_CAPTURE_CAPABILITY, AttachmentGraphMode, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch
@@ -50,6 +50,23 @@ class TaskCost:
 
 
 @dataclass(frozen=True, slots=True)
+class KernelEstimate:
+    """Added source operators per decode step, separated by their launch context."""
+
+    captured: int = 0
+    eager: int = 0
+
+    @property
+    def total(self) -> int:
+        """Operators within graphs plus individually launched eager operators."""
+        return self.captured + self.eager
+
+    def __str__(self) -> str:
+        context = "graph + eager" if self.captured and self.eager else "graph" if self.captured else "eager"
+        return f"~{self.total} ({context})" if self.total else "0"
+
+
+@dataclass(frozen=True, slots=True)
 class MemberCost:
     """An authored method or model value and all tasks emitted on its behalf."""
 
@@ -59,6 +76,7 @@ class MemberCost:
     eager_reason: str
     host_batch: str
     training: str
+    kernels: KernelEstimate
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +155,7 @@ class ExplainResult:
     custom_ops: tuple[OpCost, ...]
     attention: tuple[AttentionCost, ...]
     kv_capacity: tuple[KVCapacity, ...]
+    kernels: KernelEstimate
 
     def __str__(self) -> str:
         forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
@@ -149,6 +168,7 @@ class ExplainResult:
             "member  effect  anchor / lane / graph  state reads (origin, distance)",
         ]
         for member in self.members:
+            lines.append(f"kernels  {member.name}: {member.kernels} / step")
             for task in member.tasks:
                 lines.append(
                     f"{member.name}  {member.effect}  {task.anchor} / {task.lane} / "
@@ -170,7 +190,7 @@ class ExplainResult:
                     )
                 else:
                     lines.append(
-                        "  estimate / step: unavailable; profile this model-site or host-batch body with a loaded model"
+                        "  matmul/byte estimate / step: unavailable; profile this model-site or host-batch body with a loaded model"
                     )
             if not member.tasks:
                 lines.append(f"{member.name}  {member.effect}  model site or inactive method")
@@ -178,6 +198,7 @@ class ExplainResult:
                 lines.append(f"  {member.host_batch}")
             if member.eager_reason:
                 lines.append(f"  forward eager because {member.name}: {member.eager_reason}")
+        lines.append(f"kernels  total: {self.kernels} / step [estimate: source operators; excludes base model]")
         lines.extend(
             f"tap      {tap.module}[{tap.output}], {','.join(tap.phases)}: "
             f"{tap.resident_bytes} bytes shared by {', '.join(tap.members)}"
@@ -277,7 +298,11 @@ def _task_costs(plan: PlanBundle, estimates: dict[str, CostEstimate]) -> dict[st
 
 
 def _members(
-    binding: TensorBinding, costs: dict[str, TaskCost], reasons: dict[str, str], max_training_rows: int
+    binding: TensorBinding,
+    costs: dict[str, TaskCost],
+    reasons: dict[str, str],
+    max_training_rows: int,
+    sites: dict[str, KernelEstimate],
 ) -> tuple[MemberCost, ...]:
     result: list[MemberCost] = []
     for name, member in binding.members.items():
@@ -304,8 +329,23 @@ def _members(
             )
             else ""
         )
-        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch, training))
+        kernels = _kernel_sum(tasks, (sites.get(name, KernelEstimate()),))
+        result.append(
+            MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch, training, kernels)
+        )
     return tuple(result)
+
+
+def _kernel_sum(tasks: tuple[TaskCost, ...], sites: tuple[KernelEstimate, ...]) -> KernelEstimate:
+    graph = sum(site.captured for site in sites)
+    eager = sum(site.eager for site in sites)
+    for task in tasks:
+        if task.estimate is None:
+            continue
+        count = task.estimate.kernel_count_estimate
+        graph += count if task.captured else 0
+        eager += task.estimate.eager_kernel_count_estimate + (0 if task.captured else count)
+    return KernelEstimate(graph, eager)
 
 
 def _taps(
@@ -593,6 +633,7 @@ def explain_facts(
     BLAS scratch is excluded from this CPU-comparable report; make_llm funds it separately.
     """
     from pllm.backends.vllm.admission import admit_workload, eager_reasons
+    from pllm.backends.vllm.site_estimates import estimate_sites
 
     requirements = workload.backend_requirements()
     reason = admit_workload(config, requirements)
@@ -600,15 +641,32 @@ def explain_facts(
     facts, binding, specialization_errors = _specialize(workload, facts, config)
     attachment, threshold, inline_peak, errors = _plans(workload, facts, binding, config)
     plan = attachment.plan
-    estimates, ops = estimate_tasks(binding, facts, config.execution, padded_vocab_size=shape.padded_vocab_size)
+    estimates, ops, model_kernels = estimate_tasks(
+        binding, facts, config.execution, padded_vocab_size=shape.padded_vocab_size
+    )
     costs = _task_costs(plan, estimates)
+    forward_task = binding.graph.custom_forward_task
+    model_captured = facts.probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH or (
+        forward_task is not None and costs[forward_task.symbol].captured
+    )
+    sites = {
+        name: KernelEstimate(graph, eager) if model_captured else KernelEstimate(0, graph + eager)
+        for name, (graph, eager) in estimate_sites(binding, facts).items()
+    }
+    for name, count in model_kernels.items():
+        site = sites.get(name, KernelEstimate())
+        sites[name] = (
+            KernelEstimate(site.captured + count, site.eager)
+            if model_captured
+            else KernelEstimate(site.captured, site.eager + count)
+        )
     return ExplainResult(
         shape,
         config.dtype,
         config.runner,
         config.tensor_parallel_size,
         reason,
-        _members(binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_training_rows),
+        _members(binding, costs, dict(eager_reasons(config, requirements)), config.execution.max_training_rows, sites),
         tuple(cost for symbol, cost in costs.items() if symbol not in binding.task_members),
         _states(plan, binding, config.max_num_seqs),
         tuple(
@@ -633,10 +691,12 @@ def explain_facts(
             "GPU fit is decided at make_llm after vLLM allocates; weights, KV cache, vLLM activations and fragmentation are excluded.",
             "Projection and scan BLAS workspace depends on the GPU; affected peaks and overlap thresholds are lower bounds until make_llm.",
             "FLOP and byte estimates use max_num_seqs decode rows, declared-field reads and full-root transitions including optimizer fields, no cache reuse; prompt/model-site costs can differ.",
+            "Kernel estimates count non-view device dispatches before fusion at max_num_seqs decode rows; opaque ops count once, libraries may launch several kernels. Graph counts are nodes inside replay, not host launches; state copies and sampler stages are eager. Publications only change ownership metadata. Untraced host-batch and native custom-forward model math are excluded; profile for actual counts.",
             "Host sync count covers shape-traced workload math; model-site math and framework syncs need GPU verification.",
             "Timing settings equal to defaults are labelled default; explicit use of the same value is indistinguishable.",
         ),
         ops,
         binding.attention.costs,
         layout_capacity(shape, config, workload.backend_requirements().kv_layouts) if binding.attention.methods else (),
+        _kernel_sum(tuple(costs.values()), tuple(sites.values())),
     )

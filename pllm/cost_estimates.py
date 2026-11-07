@@ -9,7 +9,7 @@ import torch
 from torch.utils.flop_counter import FlopCounterMode
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -22,8 +22,18 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.freeze import fingerprint
 from pllm.execution.task_memory import example, producers_first, site_arguments, task_example
 from pllm.execution.tensor_binding import TensorBinding
+from pllm.execution.tensor_frame import TensorFrame
+from pllm.execution.tensor_program import TensorBatch, TensorOperation
 from pllm.execution.token_program import Cell
-from pllm.execution.torch_private import CustomOpDef, CustomOpTrace, FakeTensorMode, custom_op, tensor_node_metadata
+from pllm.execution.torch_private import (
+    CustomOpDef,
+    CustomOpTrace,
+    FakeTensorMode,
+    KernelCountMode,
+    custom_op,
+    tensor_node_metadata,
+)
+from pllm.kernels.page_copy import copy_pages
 
 
 @dataclass(frozen=True)
@@ -65,7 +75,9 @@ def _op_cost(name: str, entries: list[tuple[str, float | None, float, CustomOpDe
     )
 
 
-def _estimate_ops(binding: TensorBinding, facts: BackendCompileFacts, calls: OpCalls) -> tuple[OpCost, ...]:
+def _estimate_ops(
+    binding: TensorBinding, facts: BackendCompileFacts, calls: OpCalls
+) -> tuple[tuple[OpCost, ...], dict[str, int]]:
     """Add model-site math that task tracing leaves to the native model driver."""
     kwargs = site_arguments(binding, facts)
     for rewrite in binding.sites.rewrites:
@@ -82,13 +94,16 @@ def _estimate_ops(binding: TensorBinding, facts: BackendCompileFacts, calls: OpC
                 _append_calls(calls, trace, name, rows)
     from pllm.execution.attention_methods import TraceRead, attention_example
 
+    model_kernels: dict[str, int] = {}
     for layer, method in binding.attention.methods.items():
         probe = facts.probe
         rows = facts.max_admitted_lineages
         context = probe.causal_domain.positions if probe.causal_domain is not None else 1
         q, kv, arguments = attention_example(binding, facts, binding.attention, layer, rows, TraceRead(context))
-        with CustomOpTrace() as trace:
+        with CustomOpTrace() as trace, KernelCountMode() as kernels:
             method.function(q, kv, **arguments)
+        if method.name != "native":
+            model_kernels[method.name] = model_kernels.get(method.name, 0) + kernels.count
         _append_calls(calls, trace, f"{method.name} [attention layer {layer}]", rows)
     task = binding.graph.custom_forward_task
     for role, program in (binding.custom_forward_programs or {}).items():
@@ -101,7 +116,11 @@ def _estimate_ops(binding: TensorBinding, facts: BackendCompileFacts, calls: OpC
                     for value in (tensor_node_metadata(node),)
                     if value is not None
                 )
-                cell.graph(*args)
+                with KernelCountMode() as kernels:
+                    cell.graph(*args)
+            if role == "decode" and task is not None:
+                owner = binding.task_members[task.symbol][0]
+                model_kernels[owner] = model_kernels.get(owner, 0) + kernels.count
             invariants = {name for name, _ in program.parameters}
             rows = next(
                 (
@@ -112,7 +131,7 @@ def _estimate_ops(binding: TensorBinding, facts: BackendCompileFacts, calls: OpC
                 1,
             )
             _append_calls(calls, trace, f"{task.symbol if task else 'forward'} [{role}]", rows)
-    return tuple(_op_cost(name, entries) for name, entries in sorted(calls.items()))
+    return tuple(_op_cost(name, entries) for name, entries in sorted(calls.items())), model_kernels
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +141,8 @@ class CostEstimate:
     Matmul counts include autograd where declared. Read traffic follows declared fields; transitions count whole roots;
     optimizer traffic is a subset of state traffic, not an additional allocation or DRAM measurement.
     Projection counts cover extra LM-head rows. Shared layer projections are charged once.
+    Kernel counts are source operators in the task body; eager counts cover state
+    copies and sampler work outside that body. Prefill-only bodies count zero at decode.
     """
 
     rows: int
@@ -131,7 +152,9 @@ class CostEstimate:
     state_write_bytes_estimate: int = 0
     optimizer_bytes_estimate: int = 0
     sampler_bytes_estimate: int = 0
-    label: str = "estimate: matmuls and logical bytes per decode step; ignores cache reuse and fusion"
+    kernel_count_estimate: int = 0
+    eager_kernel_count_estimate: int = 0
+    label: str = "estimate: matmuls, logical bytes and source kernels per decode step; ignores cache reuse and fusion"
 
 
 def _traffic(binding: TensorBinding, facts: BackendCompileFacts, symbol: TaskSymbol) -> tuple[int, int]:
@@ -170,9 +193,79 @@ def _traffic(binding: TensorBinding, facts: BackendCompileFacts, symbol: TaskSym
     return reads, writes
 
 
+def _copy_kernels(operation: TensorOperation[TensorFrame], batch: TensorBatch) -> int:
+    if operation.mode == "read" or operation.copy_fields == ():
+        return 0
+    batch = operation.scoped(batch)
+    with KernelCountMode() as counter:
+        for field in range(len(batch.roots[0]) if batch.roots else 0):
+            if operation.copy_fields is not None and field not in operation.copy_fields:
+                continue
+            pool, slots = batch.field_slots(field)
+            indices = torch.empty(len(slots), dtype=torch.long, device="meta")
+            copy_pages(pool, pool, indices, indices)
+    return counter.count
+
+
+def _sampler_kernels(
+    binding: TensorBinding,
+    facts: BackendCompileFacts,
+    symbol: TaskSymbol,
+    batch: TensorBatch,
+    projected_layers: int,
+    padded_vocab_size: int,
+) -> int:
+    from pllm.backends.vllm.guided_sampling import guided_sample
+    from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerGuidance, add_logits
+    from pllm.contracts.sampler import PackedSamplerGuidanceBatch
+
+    task = binding.tensor_tasks.get(symbol)
+    if task is None or (task.sampler_stage is None and not projected_layers):
+        return 0
+    rows, hidden = facts.max_admitted_lineages, facts.probe.hidden_size
+    dtype = facts.probe.tensor_dtype.torch
+    logits = torch.empty((rows, facts.vocab_size), dtype=dtype, device="meta")
+    prediction = batch.results[symbol, task.outputs[0]] if task.sampler_stage is not None else logits
+    ids = torch.empty(rows, dtype=torch.long, device="meta")
+    weights = torch.empty((padded_vocab_size, hidden), dtype=dtype, device="meta")
+    assert batch.feedback is not None
+    guidance = PackedSamplerGuidanceBatch(
+        batch.feedback.sampler_rows, prediction, tuple(range(rows)), task.sampler_beta
+    )
+    with (
+        FakeTensorMode(allow_non_fake_inputs=True),
+        KernelCountMode() as counter,
+        torch.compiler.set_stance("force_eager"),
+    ):
+        for _ in range(projected_layers):
+            torch.mm(torch.empty((rows, hidden), dtype=dtype, device="meta"), weights.T)
+        if task.sampler_beta:
+            if facts.guidance_capacity is not None:
+                guided_sample(
+                    logits,
+                    prediction,
+                    weights,
+                    ids,
+                    None,
+                    task.sampler_beta,
+                    facts.guidance_capacity,
+                    ids,
+                    logits[:, 0],
+                    ids,
+                    ids,
+                    fp64=False,
+                )
+            else:
+                dense = torch.mm(prediction.to(dtype), weights.T)[:, : facts.vocab_size]
+                SamplerGuidance._reweight_finite_survivors(logits, SignedSamplerGuidance(guidance, dense))  # pyright: ignore[reportPrivateUsage]
+        elif task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+            add_logits(logits, SignedSamplerGuidance(guidance, prediction))
+    return counter.count
+
+
 def estimate_tasks(
     binding: TensorBinding, facts: BackendCompileFacts, options: ExecutionOptions, *, padded_vocab_size: int
-) -> tuple[dict[str, CostEstimate], tuple[OpCost, ...]]:
+) -> tuple[dict[str, CostEstimate], tuple[OpCost, ...], dict[str, int]]:
     """Trace the production shape-only operation, including training backward and optimizer work."""
     # Decode has one row per request even for stateless layer-logit readers.
     facts = replace(facts, probe=replace(facts.probe, max_packed_rows=facts.max_admitted_lineages))
@@ -193,11 +286,11 @@ def estimate_tasks(
         ):
             continue  # A missing host batch bypasses its body; zero would misreport untraced model math.
         data = task_example(data, None if task is None else task.phase)
-        with FlopCounterMode(display=False) as counter, CustomOpTrace() as trace:
+        with FlopCounterMode(display=False) as counter, CustomOpTrace() as trace, KernelCountMode() as kernels:
             operation.memory(data, batch)
         _append_calls(calls, trace, str(symbol), facts.max_admitted_lineages)
         reads, writes = _traffic(binding, facts, symbol)
-        projection = sampler = 0
+        projection = sampler = projected_layers = 0
         if task is not None:
             if task.sampler_beta:
                 capacity = facts.guidance_capacity
@@ -224,6 +317,7 @@ def estimate_tasks(
                 for source in task.sources.values()
             ):
                 layers = set(facts.probe.layer_logits) - projected
+                projected_layers = len(layers)
                 projection += (
                     len(layers) * 2 * facts.max_admitted_lineages * facts.probe.hidden_size * padded_vocab_size
                 )
@@ -242,5 +336,13 @@ def estimate_tasks(
             or any(binding.members[name].effect == "train" for name in binding.task_members.get(symbol, ()))
             else 0,
             sampler,
+            0 if task is not None and task.phase is HiddenPhase.PREFILL else kernels.count,
+            0
+            if task is not None and task.phase is HiddenPhase.PREFILL
+            else (
+                (0 if symbol not in executables else _copy_kernels(executables[symbol], batch))
+                + _sampler_kernels(binding, facts, symbol, batch, projected_layers, padded_vocab_size)
+            ),
         )
-    return estimates, _estimate_ops(binding, facts, calls)
+    ops, model_kernels = _estimate_ops(binding, facts, calls)
+    return estimates, ops, model_kernels
