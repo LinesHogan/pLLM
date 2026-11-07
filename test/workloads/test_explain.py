@@ -359,7 +359,7 @@ def test_tp_down_shard_costs(model_config, kind):
     assert all(torch.equal(a, b) for a, b in zip(*initialized))
 
 
-def test_tp_down_rejects_cross_shard_loss(model_config):
+def test_tp_down_admission(model_config):
     from pllm.backends.vllm import compat
 
     if compat.VLLM_027:
@@ -373,3 +373,10 @@ def test_tp_down_rejects_cross_shard_loss(model_config):
         )
     with pytest.raises(ValueError, match="not shard-local.*gradient needs other ranks"):
         pllm.explain(PrefillAdaptersWorkload(rank=2, chunk_size=4), replace(model_config, tensor_parallel_size=2))
+
+    from test.tp_overlays import ExportB, ExportDown, ReadDown
+
+    for workload in (ExportDown(), ReadDown()):
+        with pytest.raises(ValueError, match="input shards are projection-local.*tensor_parallel_size=1"):
+            pllm.explain(workload, replace(model_config, tensor_parallel_size=2))
+    pllm.explain(ExportB(), replace(model_config, tensor_parallel_size=2))

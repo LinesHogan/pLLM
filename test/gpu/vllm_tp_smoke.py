@@ -480,6 +480,45 @@ def _m4_fields(worker):
     return _M4_FIELDS
 
 
+def _m4_rounding_unit(values):
+    scale = values.abs().max().bfloat16()
+    return (torch.nextafter(scale, torch.full_like(scale, float("inf"))).float() - scale.float()).item()
+
+
+def _m4_projection_reference(kind, fields):
+    from pllm.contracts.parameter_overlay import ParameterOverlayOperator
+    from pllm.execution.parameter_projection import parameter_correction
+
+    operator = (
+        ParameterOverlayOperator.LOW_RANK_ADD if kind.startswith("low_rank") else ParameterOverlayOperator.DENSE_ADD
+    )
+    inputs, outputs = fields[0].shape[-1], fields[-1].shape[0]
+    generator = torch.Generator().manual_seed(7)
+    hidden = torch.randn(8, inputs, generator=generator).bfloat16().cuda()
+    weight = (0.02 * torch.randn(outputs, inputs, generator=generator)).bfloat16().cuda()
+    fields = tuple(value.cuda() for value in fields)
+    base_truth = hidden.double() @ weight.double().T
+    truth = base_truth + parameter_correction(hidden.double(), tuple(value.double() for value in fields), operator)
+    dtype = torch.float32 if kind.endswith("train") else torch.bfloat16
+    partials, bases = [], []
+    for x, w, a in zip(hidden.chunk(2, -1), weight.chunk(2, -1), fields[0].chunk(2, -1)):
+        x, w, a = x.contiguous(), w.contiguous(), a.contiguous()
+        base = x @ w.T
+        weights = tuple(
+            value.to(dtype).unsqueeze(0).expand(len(x), *value.shape).contiguous() for value in (a, *fields[1:])
+        )
+        delta = parameter_correction(x.to(dtype)[:, None], weights, operator, batched=True)[:, 0]
+        bases.append(base.float())
+        partials.append(base.float() + delta.float())
+    native_error = sum(bases).bfloat16().double() - base_truth
+    error = sum(partials).bfloat16().double() - truth
+    native_rms = native_error.square().mean().sqrt().item()
+    rms = error.square().mean().sqrt().item()
+    assert rms <= 1.05 * native_rms
+    assert error.abs().max() <= native_error.abs().max() + _m4_rounding_unit(truth)
+    print(f"M4 {kind} FP64 projection: native RMS={native_rms:.6g}, adapter RMS={rms:.6g}", flush=True)
+
+
 def _m4_scores(output):
     return torch.tensor(
         [
@@ -505,8 +544,8 @@ def m4_reference():
             plain.enqueue(PROMPTS, _m4_params(), use_tqdm=False)
             plain.wake_up(tags=["scheduling"])
             scores.append(_m4_scores(plain.wait_for_completion(RequestOutput, use_tqdm=False)))
-    error = (scores[1] - scores[0]).abs().max().item()
-    print(f"M4 plain vLLM TP logprob max_abs={error:.6g}", flush=True)
+    error = (scores[1] - scores[0]).abs()
+    print(f"M4 plain vLLM TP logprob max_abs={error.max():.6g}, RMS={error.square().mean().sqrt():.6g}", flush=True)
     return error
 
 
@@ -543,7 +582,10 @@ def test_m4_down(kind, monkeypatch, m4_reference):
             started = perf_counter()
             handle.generate(PROMPTS, SamplingParams(max_tokens=64, temperature=0, ignore_eos=True))
             rates.append(8 * 64 / (perf_counter() - started))
-            assert handle.diagnostics().active_states == 0
+            diagnostics = handle.diagnostics()
+            assert diagnostics.active_states == 0
+            if kind.endswith("train"):
+                assert diagnostics.update_count > 0
         roots = []
         for row in range(1):
             values = []
@@ -559,11 +601,15 @@ def test_m4_down(kind, monkeypatch, m4_reference):
             roots.append(values)
         observed.append((tokens(output), roots, _m4_scores(output)))
     assert observed[0][0] == observed[1][0]
-    torch.testing.assert_close(observed[1][2], observed[0][2], rtol=0, atol=1.2 * m4_reference + 0.01)
+    # Use native TP drift plus one model-precision ULP; the FP64 oracle checks the projection arithmetic.
+    torch.testing.assert_close(
+        observed[1][2], observed[0][2], rtol=0, atol=m4_reference.max().item() + _m4_rounding_unit(observed[0][2])
+    )
+    _m4_projection_reference(kind, observed[0][1][0])
     for whole, sharded in zip(observed[0][1], observed[1][1]):
-        for value, reference in zip(sharded, whole):
+        for index, (value, reference) in enumerate(zip(sharded, whole)):
             torch.testing.assert_close(
-                value, reference, rtol=0.02 if kind.endswith("train") else 0, atol=2e-5 if kind.endswith("train") else 0
+                value, reference, rtol=0, atol=1e-6 if kind.endswith("train") and index == 0 else 0
             )
     print(
         f"M4 {kind}: TP1={rates[0]:.1f} TP2={rates[1]:.1f} tok/s; "

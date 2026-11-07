@@ -983,6 +983,7 @@ class Adapter:
     vLLM sums each rank's corrected partial output in its existing all-reduce. Updates must be shard-local;
     reconstruction losses and updates to B that need the full projected input require TP=1. per_head and q/v
     overlays remain deferred, as do imported/checkpoint adapters and side-lane adapter training at TP>1.
+    Input-shard fields are read only in projection transitions; replicated factors remain available to other methods.
     """
 
     state: str
@@ -2732,6 +2733,10 @@ class _Reflection:
         if (state, field) not in self.parameters:
             declared = ", ".join(f"{resource}.{key}" for resource, key in self.parameters)
             raise ValueError(f"pllm.parameter({state!r}, {field!r}) names no declared field; declared: {declared}")
+        if self.binding.field_views[state, field].field in self.binding.field_shards.get(state, {}):
+            raise ValueError(
+                f"{state}.{field}: TP down input shards are projection-local; other readers need tensor_parallel_size=1"
+            )
         return self.parameters[state, field]
 
     def declare_values(self) -> None:

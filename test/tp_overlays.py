@@ -32,7 +32,7 @@ class DownState(pllm.Workload):
     def initialize(self, fields, generator):
         """Consume the same global random stream in TP1 and TP2."""
         for value in fields.values():
-            value.normal_(std=0.002, generator=generator)
+            value.normal_(std=0.02 if self.operator == "low_rank" else 0.002, generator=generator)
 
 
 @dataclass(frozen=True)
@@ -99,3 +99,32 @@ class SharedDownAdapter(DownAdapter):
         """Share the same declared delta across requests."""
         state = super().weights
         return pllm.InstanceState(state.fields, dtype=state.dtype, initialize=state.initialize)
+
+
+@dataclass(frozen=True)
+class ExportDown(DownAdapter):
+    """A global-looking export must not silently publish rank zero's input slice."""
+
+    @pllm.export(max_rows=3, max_cols=1)
+    def observe(self, value=pllm.parameter("weights", "value_0", per_row=True)):
+        return value.mean(dim=(-2, -1)).reshape(-1, 1)
+
+
+@dataclass(frozen=True)
+class ReadDown(SharedDownAdapter):
+    """A forward cannot derive replicated control or outputs from local input shards."""
+
+    @pllm.custom_forward(tokens="all")
+    def run(self, layers, value=pllm.parameter("weights", "value_0")):
+        return layers()[-1] + value.sum()
+
+
+@dataclass(frozen=True)
+class ExportB(DownAdapter):
+    """Replicated B remains readable through the ordinary state ports."""
+
+    operator: Literal["dense", "low_rank"] = "low_rank"
+
+    @pllm.export(max_rows=3, max_cols=1)
+    def observe(self, value=pllm.parameter("weights", "b_0", per_row=True)):
+        return value.mean(dim=(-2, -1)).reshape(-1, 1)
