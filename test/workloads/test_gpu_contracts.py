@@ -103,3 +103,45 @@ def test_inplace_neutral_contract(tmp_path):
     assert "exact decode: eager terminal request state on fixed per-token inputs" in result.passed
     assert "neutral: greedy and seeded sampling bitwise" in result.passed
     print(result)
+
+
+@pytest.mark.parametrize("runner", ("mrv1", "mrv2"))
+def test_distribution_contract(monkeypatch, runner):
+    from pllm.testing import check_distribution
+    from pllm.testing_distribution import _Observation
+
+    record = _Observation.record
+
+    def without_sync(self, sampled, logits):
+        mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            return record(self, sampled, logits)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+    monkeypatch.setattr(_Observation, "record", without_sync)
+    config = pllm.ModelConfig(
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        max_model_len=64,
+        max_num_seqs=2,
+        max_num_batched_tokens=64,
+        gpu_memory_utilization=0.25,
+        runner=runner,
+    )
+    near = check_distribution(
+        ESampWorkload(ESampConfig(rank=2, intervention_beta=1e-4)),
+        config,
+        temperature=0.8,
+        max_mean_kl=0.01,
+        max_p99_kl=0.01,
+    )
+    strong = check_distribution(DoLaWorkload(layers=(0, 2)), config, max_mean_kl=0.01, max_p99_kl=0.01)
+    assert near.passed and not strong.passed
+    assert near.token_count == strong.token_count == 32
+    assert near.tv.mean < strong.tv.mean
+    assert strong.kl_workload_to_plain.p99 > 0.01
+    assert strong.tv.worst[0].value == strong.tv.max
+    assert all(0 <= item.prompt_index < 2 and item.token_offset >= 1 for item in strong.tv.worst)
+    print("near-neutral", near, near.run_seconds, near.elapsed_seconds)
+    print("strong", strong, strong.run_seconds, strong.elapsed_seconds)

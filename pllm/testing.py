@@ -62,6 +62,12 @@ from pllm.testing_contracts import (
     check as check,
     scheduled_step as scheduled_step,
 )
+from pllm.testing_distribution import (
+    DistanceSummary as DistanceSummary,
+    DistributionResult as DistributionResult,
+    TokenDistance as TokenDistance,
+    check_distribution as check_distribution,
+)
 from pllm.testing_gpu import check_on_gpu as check_on_gpu
 
 if TYPE_CHECKING:
@@ -218,6 +224,10 @@ def run_guided_step(
 
 __all__ = [
     "CheckResult",
+    "DistanceSummary",
+    "DistributionResult",
+    "TokenDistance",
+    "check_distribution",
     "ContractError",
     "check",
     "check_on_gpu",

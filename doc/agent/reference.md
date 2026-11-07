@@ -543,6 +543,10 @@ execution.retire(())
 | `pllm.explain(workload, config)` | Plan on CPU from `config.json` without weights or CUDA: per method its timing anchor, CUDA stream lane and graph capture; why the forward is eager; state bytes; peak memory pllm reserves; host syncs in your math; timing settings. `str()` prints a table; `dataclasses.asdict()` gives JSON-ready data (`eager_reason`, `members`, `states`, `peak_memory_bytes`, `budget_errors`, ...). |
 | `pllm.testing.check(workload, config, *, neutral=None)` | Run fixed three-request schedules on CPU through the real planner and executor: row permutation, request isolation, mixed prefill/decode, chunked prompts, preemption replay, publish_lag versions, and with `neutral=` that the disabled workload adds exactly zero. Returns a `CheckResult`; raises `ContractError`. |
 | `pllm.testing.check_on_gpu(workload, config, *, neutral=None)` | Load real engines: planning, eight steady decode steps, forced KV eviction and recompute, and with `neutral=` greedy and seeded sampling bitwise equal to the plain model. Run it in its own process with `multiprocessing=False`, `max_num_seqs >= 2`, `max_model_len >= 32`. |
+| `pllm.testing.check_distribution(workload, config, *, prompts=None, tokens=16, temperature=0, max_mean_kl=None, max_p99_kl=None, worst=5)` | Teacher-force the plain model's continuation through the workload with matching graph/compile settings. Full-vocabulary FP32 KL in both directions and TV; thresholds bound both KL directions. Returns numbers and pass/fail; no thresholds measures only. |
+| `pllm.testing.DistributionResult` | `kl_plain_to_workload`, `kl_workload_to_plain`, `tv`, `token_count`, `run_seconds`, `elapsed_seconds`, `passed`, `failures`. |
+| `pllm.testing.DistanceSummary` | `mean`, nearest-rank `p99`, `max`, and `worst` positions. KL uses nats; TV is half the L1 probability distance. |
+| `pllm.testing.TokenDistance` | `prompt_index`, predicted `token_offset` in prompt + continuation (both zero-based), and `value`. |
 | `pllm.testing.CheckResult` | `passed` (names of verified properties) and `skipped` (each with `property` and `reason`); `str()` prints a table. |
 | `pllm.testing.ContractError` | An `AssertionError` whose `failures` lists every discrepancy, naming the method that mixed rows or the framework routing that differs. |
 
@@ -753,6 +757,14 @@ pllm.io.load_tensor_fields(path: 'Path', fields: 'tuple[str, ...]') -> 'tuple[to
 ```text
 pllm.testing.CheckResult(passed: 'tuple[str, ...]', skipped: 'tuple[CheckSkip, ...]')
     Verified properties and explicit skips; dataclasses.asdict produces JSON-ready data.
+pllm.testing.DistanceSummary(mean: 'float', p99: 'float', max: 'float', worst: 'tuple[TokenDistance, ...]')
+    Token-weighted mean, nearest-rank P99, maximum, and largest distances with their positions.
+pllm.testing.DistributionResult(kl_plain_to_workload: 'DistanceSummary', kl_workload_to_plain: 'DistanceSummary', tv: 'DistanceSummary', token_count: 'int', run_seconds: 'float', elapsed_seconds: 'float', failures: 'tuple[str, ...]')
+    Exact diagnostic values and threshold failures; dataclasses.asdict is JSON-ready.
+pllm.testing.TokenDistance(prompt_index: 'int', token_offset: 'int', value: 'float')
+    A distance at a zero-based prompt index and predicted token offset in its full sequence.
+pllm.testing.check_distribution(workload: 'Workload', config: 'ModelConfig', *, prompts: 'Sequence[str] | None' = None, tokens: 'int' = 16, temperature: 'float' = 0, max_mean_kl: 'float | None' = None, max_p99_kl: 'float | None' = None, worst: 'int' = 5) -> 'DistributionResult'
+    Measure how far a workload moves the plain model's output distribution on CUDA.
 pllm.testing.ContractError(failures: 'tuple[str, ...]')
     All observed contract failures, with the responsible method or framework routing named.
 pllm.testing.check(workload: 'Workload', config: 'ModelConfig', *, neutral: 'Workload | None' = None) -> 'CheckResult'

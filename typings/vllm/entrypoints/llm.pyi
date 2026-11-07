@@ -4,6 +4,7 @@ from typing import Literal
 
 from vllm import RequestOutput, SamplingParams
 from vllm.config import CompilationConfig
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine.llm_engine import LLMEngine
 
 class LLM:
@@ -35,6 +36,7 @@ class LLM:
         compilation_config: CompilationConfig | None = None,
         kv_transfer_config: dict[str, str | dict[str, int | bool]] | None = None,
     ) -> None: ...
+    def get_tokenizer(self) -> TokenizerLike: ...
     def generate(
         self,
         prompts: str | list[str],

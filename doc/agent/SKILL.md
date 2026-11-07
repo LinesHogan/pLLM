@@ -192,6 +192,14 @@ print(testing.check_on_gpu(Distill(), pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instru
 It loads real engines: eight steady decode steps, forced KV eviction and recompute, and with `neutral=`
 greedy and seeded sampling must equal the plain model bitwise. Run it in a fresh process.
 
+Use `testing.check_distribution(workload, config, max_mean_kl=0.01, max_p99_kl=0.1)` to bound
+how far a workload moves the plain model's full-vocabulary distribution under teacher forcing.
+It returns both KL directions and TV (mean, P99, max, worst token positions), `passed`, `failures`
+and timings. Omit thresholds for measurement. P99 catches rare broken positions that a mean can
+hide; this measures distribution movement, not task quality. Prompts are prefills; scores cover
+the plain model's continuation (default two prompts × 16 tokens). See its docstring for sampling,
+graph settings and memory cost.
+
 When you report, say which checks ran on CPU and which on GPU, and in which Python environment. A CPU pass
 is not a GPU pass.
 

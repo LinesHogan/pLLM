@@ -375,10 +375,10 @@ def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tupl
         return (_tokens(handle), _tokens(handle, 0.8))
 
 
-def _neutral(workload: Workload, config: ModelConfig) -> None:
+@contextmanager
+def _plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[None, None]]:
+    """Load vanilla vLLM with the workload's checkpoint and graph/compile options."""
     report = explain(workload, config)
-    observed = _neutral_tokens(workload, config)
-    _release_models()
     requirements = workload.backend_requirements()
     options: GraphOptions = {} if report.eager_reason else graph_options(config, requirements)
     with VllmLlm[None, None](
@@ -389,6 +389,13 @@ def _neutral(workload: Workload, config: ModelConfig) -> None:
             cuda_graphs=not bool(report.eager_reason),
         )
     ) as vanilla:
+        yield vanilla
+
+
+def _neutral(workload: Workload, config: ModelConfig) -> None:
+    observed = _neutral_tokens(workload, config)
+    _release_models()
+    with _plain_model(workload, config) as vanilla:
         expected = tuple(
             tuple(
                 tuple(output.outputs[0].token_ids)
