@@ -348,6 +348,7 @@ print(pllm.explain(Steering(), CONFIG).eager_reason)
 | `imported=True` | On `RequestState` / `InstanceState`: the values come from `StateImport`, not from the workload. |
 | `checkpoint={field: tensor_name}` | On an `InstanceState` without optimizer: load the fields from the model checkpoint's tensors (with `layers=(...)` the names may contain `{layer}`). |
 | `pllm.io.load_tensor_fields(path, fields)` | Load named tensors from a weights-only checkpoint file, in the order of `fields`. |
+| `pllm.io.checkpoint_directory(model, revision=None)`, `pllm.io.checkpoint_tensors(checkpoint, names)` | Read base-model tensors (e.g. `model.embed_tokens.weight`) on CPU: resolve the downloaded model snapshot, then load the named tensors from it or from one safetensors file. |
 | `pllm.io.Feed` | `llm.feed(state)` returns it for an `InstanceState(feed="ordered" or "latest")` filled by a producer process: `publish(**fields)`, `missing()`, `end()`, `close()`. See `examples/video_session.py`. |
 
 ```python gpu
@@ -748,6 +749,10 @@ pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind',
 pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
     Explicit observations only; empty filters match all, disabled flags retain nothing.
 pllm.io.TraceSnapshot(execution_id: 'str', process_id: 'int', events: 'tuple[TraceEvent, ...]', dropped: 'int', capacity: 'int', pending_device_timings: 'int' = 0, export_dropped: 'int' = 0, schema_version: 'int' = 10)
+pllm.io.checkpoint_directory(model: str, revision: str | None = None) -> str
+    Resolve the local snapshot that the model loader has already downloaded.
+pllm.io.checkpoint_tensors(checkpoint: str, names: tuple[str, ...], *, state: str = '') -> dict[str, torch.Tensor]
+    Read named tensors from one safetensors file or a sharded model snapshot.
 pllm.io.load_tensor_fields(path: 'Path', fields: 'tuple[str, ...]') -> 'tuple[torch.Tensor, ...]'
     Decode a weights-only checkpoint into the caller's explicit tensor field order.
 ```

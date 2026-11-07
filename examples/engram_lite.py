@@ -15,7 +15,6 @@ from safetensors.torch import save_file  # pyright: ignore[reportUnknownVariable
 from vllm.tokenizers import TokenizerLike, get_tokenizer  # pyright: ignore[reportUnknownVariableType]
 
 import pllm
-from pllm.execution.checkpoint import checkpoint_directory, checkpoint_tensors
 
 
 def ngram_keys(ids: torch.Tensor, buckets: int) -> torch.Tensor:
@@ -80,7 +79,7 @@ class EngramLite(pllm.Workload):
 def fit(corpus: str, path: str, *, buckets: int = 65536, width: int = 32) -> None:
     """Fit bucket means on a local corpus with a seeded projection of frozen next-token embeddings."""
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    checkpoint = checkpoint_directory(model_name)
+    checkpoint = pllm.io.checkpoint_directory(model_name)
     tokenizer: TokenizerLike = get_tokenizer(checkpoint)
     tokens = torch.tensor(tokenizer.encode(Path(corpus).read_text()), dtype=torch.long)
     if len(tokens) < 4:
@@ -88,7 +87,7 @@ def fit(corpus: str, path: str, *, buckets: int = 65536, width: int = 32) -> Non
     positions = torch.arange(len(tokens) - 1)[:, None] - torch.arange(3)
     ids = tokens[positions.clamp_min(0)].masked_fill(positions < 0, -1)
     keys = ngram_keys(ids, buckets)
-    embedding = checkpoint_tensors(checkpoint, ("model.embed_tokens.weight",))["model.embed_tokens.weight"][
+    embedding = pllm.io.checkpoint_tensors(checkpoint, ("model.embed_tokens.weight",))["model.embed_tokens.weight"][
         tokens[1:]
     ].float()
     projection = torch.randn(embedding.shape[1], width, generator=torch.Generator().manual_seed(7))

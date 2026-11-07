@@ -29,7 +29,6 @@ from vllm import SamplingParams  # noqa: E402
 
 import pllm  # noqa: E402
 from pllm.benchmark import BenchmarkOptions, compare  # noqa: E402
-from pllm.execution.checkpoint import checkpoint_directory  # noqa: E402
 from pllm.testing import check, check_on_gpu  # noqa: E402
 from tools.ai_eval.score import load_submission  # noqa: E402
 
@@ -121,7 +120,7 @@ def accuracy(workload: pllm.Workload) -> tuple[float, list[str]]:
 def throughput(workload: pllm.Workload, eager: bool, log: Path) -> dict[str, Any]:
     """Reuse benchmark.compare's aligned measurements against CUDA-graph vanilla, retaining all round rates."""
     # The revision is pinned even though BenchmarkOptions has no revision field.
-    options = replace(OPTIONS, model=checkpoint_directory(MODEL, MODEL_REVISION), cuda_graphs=not eager)
+    options = replace(OPTIONS, model=pllm.io.checkpoint_directory(MODEL, MODEL_REVISION), cuda_graphs=not eager)
     with log.open("w") as stream, contextlib.redirect_stdout(stream):
         (candidate,) = compare(workload, options)
         reference = candidate
