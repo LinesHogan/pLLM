@@ -11,7 +11,7 @@ import torch
 
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.parameter_overlay import FieldView, ProjectionShape
+from pllm.contracts.parameter_overlay import FieldView, Projection, ProjectionShape
 from pllm.contracts.semantic_graph import (
     ImplementationId,
     SemanticEffect,
@@ -39,19 +39,25 @@ OperationMode = Literal["read", "transition", "update", "gradient"]
 
 @dataclass(frozen=True, slots=True)
 class Dimensions:
-    """Model geometry used by workload declarations; target_shapes exposes global projection widths."""
+    """Global model widths for workload declarations, with input/output partitions for each target."""
 
     hidden_size: int
     vocab_size: int
-    projections: tuple[ProjectionShape, ...] = ()
+    target_shapes: tuple[tuple[int, int], ...] = ()
     dtype: TensorDType = TensorDType.FLOAT32
     layer_count: int = 0
     tensor_parallel_size: int = 1
+    target_partitions: tuple[tuple[int, int], ...] = ()
 
-    @property
-    def target_shapes(self) -> tuple[tuple[int, int], ...]:
-        """Global projection widths supplied to workload field and module declarations."""
-        return tuple(projection.global_shape for projection in self.projections)
+    def projections(self, targets: tuple[Projection, ...]) -> tuple[ProjectionShape, ...]:
+        """Resolve rank-local widths; declarations without partitions describe replicated projections."""
+        partitions = self.target_partitions or ((1, 1),) * len(self.target_shapes)
+        return tuple(
+            ProjectionShape(target, inputs // input_parts, outputs // output_parts, input_parts, output_parts)
+            for target, (inputs, outputs), (input_parts, output_parts) in zip(
+                targets, self.target_shapes, partitions, strict=True
+            )
+        )
 
 
 Shape = tuple[int, ...] | Callable[[Dimensions], tuple[int, ...]]

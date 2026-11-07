@@ -146,7 +146,7 @@ def declare_parameter_overlay(
     )
     math = OverlayTransition(
         tuple(fields),
-        b.dimensions.projections,
+        b.dimensions.projections(targets),
         phases,
         apply,
         function,

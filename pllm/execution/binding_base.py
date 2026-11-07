@@ -68,20 +68,20 @@ def overlay_fields(
         or not isfinite(effect.scale)
     ):
         raise ValueError("an adapter needs sorted unique targets, the fields its operator applies and a finite scale")
-    for index, (target, (inputs, outputs)) in enumerate(zip(effect.targets, dimensions.target_shapes, strict=True)):
+    projections = dimensions.projections(effect.targets)
+    for index, projection in enumerate(projections):
         _check_target_fields(
             effect,
             fields,
-            f"{target.name} of layer {target.layer}",
-            inputs,
-            outputs,
+            f"{projection.target.name} of layer {projection.target.layer}",
+            *projection.global_shape,
             dimensions.dtype,
             {key: dtype(f"{key}_{index}", value) for key, value in fields.items()},
         )
     if dimensions.tensor_parallel_size > 1:
         if effect.operator is ParameterOverlayOperator.HEAD_ADD:
             raise ValueError("per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP")
-        for projection in dimensions.projections:
+        for projection in projections:
             _check_target_fields(
                 effect,
                 fields,
@@ -95,7 +95,7 @@ def overlay_fields(
         overlay_field(
             f"{key}_{index}", field, projection, dimensions.tensor_parallel_size, dtype(f"{key}_{index}", field)
         )
-        for index, projection in enumerate(dimensions.projections)
+        for index, projection in enumerate(projections)
         for key, field in fields.items()
     )
 

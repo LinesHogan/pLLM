@@ -160,7 +160,7 @@ def admit_update(
     if dimensions.tensor_parallel_size == 1:
         return
     update = _Update(function, arguments, tuple(fields), effect.applied_fields, gradient, chunked)
-    for index, projection in enumerate(dimensions.projections):
+    for index, projection in enumerate(dimensions.projections(effect.targets)):
         samples: list[tuple[torch.Tensor, ...]] = []
         for inputs, outputs in (projection.global_shape, (projection.input_size, projection.output_size)):
             widths = {

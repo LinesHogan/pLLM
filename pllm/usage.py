@@ -3121,10 +3121,11 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         dimensions = Dimensions(
             facts.probe.hidden_size,
             facts.vocab_size,
-            facts.probe.targets,
+            tuple(target.global_shape for target in facts.probe.targets),
             facts.probe.tensor_dtype,
             facts.layer_count,
             facts.probe.tensor_parallel_size,
+            tuple((target.input_partitions, target.output_partitions) for target in facts.probe.targets),
         )
         b = TensorDeclaration(
             type(self).__qualname__, boundary_digest(dimensions, facts.initialization_seed), dimensions
