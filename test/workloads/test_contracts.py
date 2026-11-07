@@ -35,10 +35,10 @@ from pllm.workloads import (
     RecirculationWorkload,
     ReFTConfig,
     ReFTWorkload,
+    RewardHeadWorkload,
     StepLoopWorkload,
     TLMConfig,
     TLMWorkload,
-    TTRLWorkload,
 )
 from pllm.workloads.dola import DoLaWorkload
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
@@ -237,7 +237,7 @@ class PromptMask(pllm.Workload):
             JacobiRecirculationWorkload(),
             StepLoopWorkload(),
             FTTTWorkload(),
-            TTRLWorkload(),
+            RewardHeadWorkload(),
             TLMWorkload(TLMConfig()),
             VideoWorkload(),
         )

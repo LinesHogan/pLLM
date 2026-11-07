@@ -68,7 +68,7 @@ CONSUMER_NAMES = (
     "esamp",
     "dummy",
     "recirculation",
-    "ttrl",
+    "reward_head",
     "fttt",
     "gtta",
     "override",

@@ -17,6 +17,13 @@ from pllm.workloads.recirculation import (
     RecirculationWorkload as RecirculationWorkload,
 )
 from pllm.workloads.reft import ReFTConfig as ReFTConfig, ReFTWorkload as ReFTWorkload
+from pllm.workloads.reward_head import (
+    MajorityVote as MajorityVote,
+    RewardHeadConfig as RewardHeadConfig,
+    RewardHeadFeedback as RewardHeadFeedback,
+    RewardHeadWorkload as RewardHeadWorkload,
+    majority_vote as majority_vote,
+)
 from pllm.workloads.state_producers import (
     DecodeFactorsWorkload as DecodeFactorsWorkload,
     PromptFactorsWorkload as PromptFactorsWorkload,
@@ -24,10 +31,3 @@ from pllm.workloads.state_producers import (
 )
 from pllm.workloads.step_loop import StepLoopWorkload as StepLoopWorkload
 from pllm.workloads.tlm import TLMConfig as TLMConfig, TLMWorkload as TLMWorkload
-from pllm.workloads.ttrl import (
-    TTRLConfig as TTRLConfig,
-    TTRLFeedback as TTRLFeedback,
-    TTRLResult as TTRLResult,
-    TTRLWorkload as TTRLWorkload,
-    ttrl_vote as ttrl_vote,
-)

@@ -1,7 +1,7 @@
 """FTTT edit training against an independent Adam oracle, plus the judge-driven retry loop.
 
 The retry loop is the vLLM handle's ``generate_feedback`` driven by a scripted
-generator, so retry, stop, update barriers and TTRL vote quorums run without a model.
+generator, so retry, stop, update barriers and reward-head vote quorums run without a model.
 """
 
 import re
@@ -38,7 +38,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
     # A failed step (two failed rows exceed max_input_rows=1) publishes no edit and drops the queue.
     extra = replace(wrong, identity=RequestIdentity("excess", 1, 0))
     with pytest.raises(ValueError):
-        workload(CompletionInput.copy_of(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
+        workload(CompletionInput(CompletionBatch((wrong, extra)), hidden.expand(2, -1)))
     assert workload.edit.diagnostics().update_count == 0 and service.queued_feedback == 0
 
     # Spell out the feature projection and use PyTorch Adam, not production helpers.
@@ -65,7 +65,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         loss.backward()
         optimizer.step()
         retry_batch = CompletionBatch((replace(wrong, identity=RequestIdentity(f"attempt-{version}", 0, version)),))
-        result = workload(CompletionInput.copy_of(retry_batch, hidden))
+        result = workload(CompletionInput(retry_batch, hidden))
         assert result.update_count == 1
         torch.testing.assert_close(result.losses[0], loss.detach())
         torch.testing.assert_close(result.edit_delta, (inputs @ down.T @ up.T).detach())
@@ -74,7 +74,7 @@ def test_fttt_matches_edit_oracle_and_settles_judge_retry() -> None:
         state = service.lifecycle("round", 0)
         assert state.retries == state.adapter_version == version
     accepted = Completion(identity, 0, "round", (4,), "4", FinishReason.STOP)
-    assert not service.enqueue(CompletionInput.copy_of(CompletionBatch((accepted,)), hidden))
+    assert not service.enqueue(CompletionInput(CompletionBatch((accepted,)), hidden))
     result = workload.step()
     assert result.update_count == 0 and result.losses == () and result.state_version == 2
     assert result.retry_controls[0].action is RetryAction.ACCEPT
@@ -87,7 +87,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     from vllm import SamplingParams
 
     from pllm.backends.vllm.runtime import VllmLlm
-    from pllm.workloads.ttrl import TTRLConfig, TTRLFeedback, TTRLWorkload
+    from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadFeedback, RewardHeadWorkload
 
     class Generation:
         """Scripted generation: prompt 7 answers correctly; with votes, two of three agree."""
@@ -126,7 +126,7 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
                 )
                 for row, index in enumerate(prompt_indices)
             )
-            return CompletionInput.copy_of(CompletionBatch(entries), torch.ones(len(entries), 4))
+            return CompletionInput(CompletionBatch(entries), torch.ones(len(entries), 4))
 
     service = FTTTFeedbackQueue(FTTTConfig(rank=2, max_retries=2), ArithmeticJudge())
     processor = FTTTFeedback(service, HostConfig(torch.device("cpu"), hidden_size=4))
@@ -181,9 +181,8 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
     )
     assert list(feedback) == [] and len(idle.calls) == 1
 
-    ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)
-    reward = make_host(HostConfig(torch.device("cpu"), hidden_size=4), TTRLWorkload(ttrl))
-    reward.admit(())
+    config = RewardHeadConfig(rank=2, votes_per_prompt=3, samples_per_prompt=3)
+    head = make_host(HostConfig(torch.device("cpu"), hidden_size=4), RewardHeadWorkload(config))
 
     votes = Generation(votes=True)
     # A vote group retries as a whole after its quorum update.
@@ -191,12 +190,12 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
         votes.generate_feedback(
             ["vote"] * 3,
             SamplingParams(max_tokens=1),
-            feedback=TTRLFeedback(reward, ttrl),
+            feedback=RewardHeadFeedback(head, config),
             group_id="votes",
             max_rounds=2,
             prompt_indices=(11, 11, 11),
         )
     )
     assert votes.calls == [(11, 11, 11), (11, 11, 11)]
-    assert len(rounds) == 2 and reward.diagnostics().update_count == 2
-    reward.retire(())
+    assert len(rounds) == 2 and head.diagnostics().update_count == 2
+    head.close()

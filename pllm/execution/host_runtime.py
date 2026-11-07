@@ -6,13 +6,12 @@ pllm.host.make_host compiles a pllm.Workload with this config; the vLLM session 
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import TypeVar
 
 import torch
 
-from pllm.contracts.feedback import Completion, CompletionBatch, FinishReason
+from pllm.contracts.feedback import CompletionBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
@@ -65,41 +64,11 @@ def bind_host(
 
 @dataclass(frozen=True, slots=True)
 class CompletionInput:
-    """One owned completion/hidden boundary, shared by host consumers."""
+    """The completions of one generate call and each one's final hidden row (float32, one row per completion),
+    shared by host consumers; generate has finished writing `hidden` when it returns."""
 
     completions: CompletionBatch
     hidden: torch.Tensor
-    readiness: CudaStreamReadiness | None = None
-
-    @classmethod
-    def example(cls, config: HostConfig, device: torch.device = torch.device("meta")) -> CompletionInput:
-        """A shape-only input with domain-neutral completion metadata."""
-        if config.max_input_rows is None:
-            raise ValueError("finite completion costs require max_input_rows")
-        entries = tuple(
-            Completion(RequestIdentity(str(i), i, 0), i, str(i), (), "", FinishReason.LENGTH)
-            for i in range(config.max_input_rows)
-        )
-        return cls(
-            CompletionBatch(entries),
-            torch.empty((len(entries), config.hidden_size), dtype=torch.float32, device=device),
-        )
-
-    @classmethod
-    def copy_of(
-        cls, completions: CompletionBatch, hidden: torch.Tensor, stream: torch.cuda.Stream | None = None
-    ) -> CompletionInput:
-        if (
-            (hidden.device.type == "cuda") != (stream is not None)
-            or (stream is not None and stream.device != hidden.device)
-            or hidden.ndim != 2
-            or hidden.shape[0] != len(completions.entries)
-            or hidden.device.type not in ("cpu", "cuda")
-        ):
-            raise ValueError("completion input requires rows aligned to completions on its producer stream")
-        with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
-            owned = hidden.detach().to(dtype=torch.float32, copy=True)
-            return cls(completions, owned, CudaStreamReadiness(stream) if stream is not None else None)
 
 
 class CompletionRows:
@@ -132,11 +101,6 @@ class CompletionRows:
     def synchronize(self) -> None:
         if self._readiness is not None:
             self._readiness.synchronize()
-
-    def finish(self, completions: CompletionBatch) -> CompletionInput:
-        self.require_complete()
-        assert tuple(entry.identity for entry in completions.entries) == self.identities
-        return CompletionInput(completions, self.hidden, self._readiness)
 
 
 @dataclass(frozen=True, slots=True)

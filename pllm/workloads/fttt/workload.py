@@ -2,14 +2,13 @@
 applies.
 
 FTTTWorkload is the edit as an ordinary pllm.Workload state trained by AdamW. FTTTFeedback compiles it with
-pllm.host.make_host and steps it: pass `FTTTFeedback` as generate_feedback's `feedback=` and
+pllm.host.make_host and trains it: pass `FTTTFeedback` as generate_feedback's `feedback=` and
 `FTTTResult.state_update` as its `edit=`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -17,8 +16,6 @@ from torch.nn import functional as F
 
 import pllm
 from pllm.execution.cuda_stream import upload
-from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_declaration import StepResult
 from pllm.host import CompletionInput, HostConfig, WeightedRowBatch, make_host
 from pllm.workloads.fttt.feedback_queue import FTTTFeedbackQueue
 from pllm.workloads.fttt.math import feedback_rows
@@ -72,19 +69,13 @@ class FTTTWorkload(pllm.Workload):
         return F.mse_loss(edit_rows(hidden, feedback, down, up), target)
 
 
-def current_stream(device: torch.device) -> torch.cuda.Stream | None:
-    return torch.cuda.current_stream(device) if device.type == "cuda" else None
-
-
 class FTTTFeedback:
-    """The `generate_feedback` callable: a queue of judged feedback and the edit it trains, compiled and admitted
-    on `host` (whose target_shape FTTT sets to its feedback width); steps run on the caller's current CUDA stream.
-    `edit` is the ordinary execution handle."""
+    """The `generate_feedback` callable: a queue of judged feedback and the edit it trains on `host` (whose
+    target_shape FTTT sets to its feedback width); steps run on the caller's current CUDA stream."""
 
     def __init__(self, queue: FTTTFeedbackQueue, host: HostConfig) -> None:
         self.queue = queue
         self.edit = make_host(replace(host, target_shape=(queue.config.feedback_width,)), FTTTWorkload(queue.config))
-        self.edit.admit((), current_stream(host.device))
 
     def __call__(self, batch: CompletionInput) -> FTTTResult | None:
         """Judge `batch`, queue its feedback, and run one edit step on the oldest queued feedback."""
@@ -99,11 +90,11 @@ class FTTTFeedback:
             return None
         try:
             if queued.selected_rows:
-                delta, losses, version = self._train(queued)
+                delta, losses = self._train(queued)
             else:
-                (latest,) = self.edit.latest(())
                 delta = queued.batch.hidden.new_empty((0, queued.batch.hidden.shape[1]))
-                losses, version = (), latest.version_id
+                losses = ()
+            version = self.edit.version
             self.queue.commit(queued, version)
         except BaseException:
             self.queue.abort()
@@ -119,25 +110,17 @@ class FTTTFeedback:
             version,
         )
 
-    def _train(self, queued: FTTTQueuedFeedback) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], int]:
+    def _train(self, queued: FTTTQueuedFeedback) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Step the edit on the failed rows, then apply the updated edit to the same rows."""
-        hidden, readiness = queued.batch.hidden, queued.batch.readiness
-        device = hidden.device
-        stream = current_stream(device)
-        with nullcontext() if stream is None else torch.cuda.stream(stream):
-            if readiness is not None and stream is not None:
-                readiness.order_on(stream)
-            rows = hidden.index_select(0, upload(queued.selected_rows, device))
-            records = queued.feedback_records
-            feedback = upload(
-                feedback_rows(records, feature_size=self.queue.config.feedback_feature_size), device, torch.float32
-            )
-            weights = torch.ones(len(records), device=device)
-            result = self.edit.step(StepInput.of_batch(WeightedRowBatch(rows, feedback, weights)), stream)
-            assert isinstance(result, StepResult) and result.publication is not None and result.loss is not None
-            delta = edit_rows(rows, feedback, result.parameters["down"], result.parameters["up"])
-        (published,) = result.publication.after_refs
-        return delta, (result.loss,), published.version_id
+        hidden = queued.batch.hidden
+        rows = hidden.index_select(0, upload(queued.selected_rows, hidden.device))
+        records = queued.feedback_records
+        feedback = upload(
+            feedback_rows(records, feature_size=self.queue.config.feedback_feature_size), hidden.device, torch.float32
+        )
+        step = self.edit.train(WeightedRowBatch(rows, feedback, torch.ones(len(records), device=hidden.device)))
+        assert step.loss is not None  # FTTTWorkload.update always returns a loss
+        return edit_rows(rows, feedback, step.parameters["down"], step.parameters["up"]), (step.loss,)
 
 
 __all__ = ["FTTTFeedback", "FTTTWorkload", "edit_rows", "edit_targets"]

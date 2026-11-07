@@ -4,16 +4,15 @@ import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from vllm import RequestOutput, SamplingParams
 
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
-from pllm.execution.tensor_declaration import TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
 from pllm.host import CausalTrainBatch
-from pllm.workloads.ttrl import boxed_label
+from pllm.workloads.reward_head import boxed_label
 
 
 @dataclass(frozen=True)
@@ -108,7 +107,7 @@ class TTRL(pllm.Workload):
 
     def run(
         self,
-        handle: VllmLlm[TensorFrame, TensorOutput],
+        handle: VllmLlm[Any, Any],
         prompts: list[str],
         sampling: SamplingParams,
         *,

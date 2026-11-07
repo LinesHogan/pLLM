@@ -19,8 +19,8 @@ from pllm.execution.ptts.state_refs import StateRefs
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
+from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadWorkload, majority_vote
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_vote
 from pllm.workloads.video import VideoWorkload
 
 pytestmark = pytest.mark.skipif(torch.cuda.device_count() < 2 or compat.VLLM_027, reason="needs two GPUs and vLLM 0.32")
@@ -165,7 +165,7 @@ def test_j1_admission():
         pllm.make_llm(replace(config(), runner="mrv1"), workload=DummyWorkload())
 
 
-def test_j1_ttrl(monkeypatch):
+def test_j1_reward_head(monkeypatch):
     from pllm.authoring import WeightedRowBatch
 
     # Only the test digest callback crosses EngineCore via pickle; production commands remain JSON.
@@ -173,10 +173,10 @@ def test_j1_ttrl(monkeypatch):
     settings = replace(
         config(), multiprocessing=True, execution=ExecutionOptions(max_host_training_rows=8, publish_lag=0)
     )
-    with pllm.make_llm(settings, workload=TTRLWorkload(TTRLConfig(rank=4))) as handle:
+    with pllm.make_llm(settings, workload=RewardHeadWorkload(RewardHeadConfig(rank=4))) as handle:
 
         def feedback(completed):
-            reward = ttrl_vote(completed, TTRLConfig(rank=4))
+            reward = majority_vote(completed, RewardHeadConfig(rank=4))
             # Known targets ensure the transport/training check does not depend on boxed-answer quality.
             batch = WeightedRowBatch(completed.hidden, torch.ones(8), torch.ones(8))
             handle.generate(PROMPTS, SamplingParams(max_tokens=2, temperature=0), batch=batch)
@@ -202,7 +202,7 @@ def test_j1_ttrl(monkeypatch):
         assert handle.diagnostics().update_count == 2
         digests = handle.require_llm().collective_rpc(_head)
         assert digests[0] == digests[1]
-        print(f"J1 TTRL: two feedback rounds, two updates, equal head fields {digests[0]}", flush=True)
+        print(f"J1 reward head: two feedback rounds, two updates, equal head fields {digests[0]}", flush=True)
 
 
 @pytest.mark.parametrize("lag", [0, 1])

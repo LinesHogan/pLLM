@@ -30,10 +30,10 @@ from pllm.workloads import (
     RecirculationWorkload,
     ReFTConfig,
     ReFTWorkload,
+    RewardHeadWorkload,
     StepLoopWorkload,
     TLMConfig,
     TLMWorkload,
-    TTRLWorkload,
 )
 from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
 from pllm.workloads.video import VideoWorkload
@@ -105,7 +105,7 @@ def model_config(tmp_path, monkeypatch):
         JacobiRecirculationWorkload(),
         StepLoopWorkload(),
         FTTTWorkload(),
-        TTRLWorkload(),
+        RewardHeadWorkload(),
         TLMWorkload(TLMConfig()),
         VideoWorkload(),
     ),

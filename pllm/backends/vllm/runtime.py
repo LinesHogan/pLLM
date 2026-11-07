@@ -60,7 +60,6 @@ from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
@@ -438,11 +437,7 @@ class VllmLlm(Generic[DataT, ResultT]):
                 FinishReason(completion.finish_reason),
             )
         return CompletionInput(
-            CompletionBatch(tuple(completions[identity] for identity in run.identities)),
-            run.destination,
-            CudaStreamReadiness(torch.cuda.current_stream(run.destination.device))
-            if run.destination.device.type == "cuda"
-            else None,
+            CompletionBatch(tuple(completions[identity] for identity in run.identities)), run.destination
         )
 
     def _generate(

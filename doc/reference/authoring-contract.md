@@ -32,7 +32,7 @@
 [Dummy](../../pllm/workloads/dummy.py)、
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
-使用普通的 `Recurrence` 声明；[TTRL](../../pllm/workloads/ttrl.py) 使用普通 `Workload`
+使用普通的 `Recurrence` 声明；[reward head](../../pllm/workloads/reward_head.py) 使用普通 `Workload`
 的宿主路径（奖励投票是宿主函数 `ttrl_vote`），FTTT 的编辑也是（`FTTTFeedback` 作反馈回调）；
 GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；

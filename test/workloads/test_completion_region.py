@@ -8,7 +8,7 @@ import torch
 
 import pllm
 from pllm.authoring import StepInput, WeightedRowBatch
-from pllm.host import HostConfig, make_host
+from pllm.host import HostConfig
 
 
 @dataclass(frozen=True)
@@ -52,10 +52,10 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
         max_input_rows=4,
     )
     workload = TwoGroups()
-    execution = make_host(facts, workload)
+    execution = workload.compile_host(facts)
     peak = execution.arena.plan.schedule.peak_memory_bytes
     with pytest.raises(ValueError):
-        make_host(replace(facts, execution_peak_budget_bytes=peak - 1), workload)
+        workload.compile_host(replace(facts, execution_peak_budget_bytes=peak - 1))
     (initial,) = execution.admit((), stream)
     original = execution.snapshot(initial, stream)
     if stream is not None:

@@ -17,13 +17,13 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.host import HostConfig, make_host
+from pllm.host import HostConfig
 from pllm.worker import GPUWorker
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
 from pllm.workloads.override import OverRIDEWorkload
 from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload
+from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadWorkload
 from test.boundary.test_backend_attachment import overlay_facts
 
 
@@ -65,7 +65,7 @@ def test_workload_transport_round_trips_workloads_and_rejects_what_the_worker_ca
 
 def _plan() -> PlanBundle:
     config = HostConfig(torch.device("cpu"), hidden_size=4)
-    return make_host(config, TTRLWorkload(TTRLConfig(rank=2))).arena.plan
+    return RewardHeadWorkload(RewardHeadConfig(rank=2)).compile_host(config).arena.plan
 
 
 def test_plan_bundle_codec_round_trips_and_rejects_injected_fields() -> None:

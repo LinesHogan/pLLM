@@ -480,7 +480,7 @@ print(testing.check(PromptAdapters(), CONFIG).passed)
 ## Train on host batches or run a host feedback loop
 
 A training method that reads `pllm.batch(...)` fields trains on a batch you pass to
-`llm.generate(..., batch=...)` (or to a `make_host` execution) instead of on request rows.
+`llm.generate(..., batch=...)` (or to `HostTrainer.train` for state only host code reads) instead of on request rows.
 
 | Name | Meaning |
 | --- | --- |
@@ -489,10 +489,9 @@ A training method that reads `pllm.batch(...)` fields trains on a batch you pass
 | `pllm.host.CausalTrainBatch(input_ids, labels, attention_mask=None)` | int64 `[sequences, tokens]` ids and labels for causal LM training through `pllm.causal_model`; one AdamW step per batch. |
 | `pllm.host.WeightedCEBatch(hidden, base_logits, labels, weights)` | Weighted cross-entropy rows; trains with `pllm.SGD`, `steps=` steps per state after the `reset=` method restores it. `WeightedCEBatch.for_prompts(..., prompt_indices)` keys one batch per prompt. |
 | `pllm.causal_model(adapter)` | A `pllm.model.CausalModel` with the named `pllm.model.Adapter` applied: `model(ids, attention_mask=...)` returns logits whose gradients reach the adapter's state; `model.base(...)` skips it. |
-| `pllm.host.make_host(config, workload)` | Compile a batch-training workload without a model. `admit(())`, then `step(StepInput.of_batch(batch))` per batch (returns a `StepResult`), then `retire(())`. |
+| `pllm.host.make_host(config, workload)` | Compile a batch-training workload without a model and return its `pllm.host.HostTrainer`: `train(batch)` per batch, `version`, `diagnostics()`, `close()` (or use it in `with`). |
 | `pllm.host.HostConfig(device, hidden_size=0, target_shape=(), seed=0, state_page_budget_bytes=..., max_input_rows=None, execution_peak_budget_bytes=None)` | What `make_host` compiles against: device, hidden width of the batches and the shape of each row's target. |
-| `pllm.host.StepInput` | One step's input; for host steps build it with `StepInput.of_batch(batch)`. |
-| `pllm.host.StepResult` | A host step's result: `value`, `loss`, `metrics`, and `parameters` (the updated fields by name). |
+| `pllm.host.TrainStep` | What `train` returns: `loss` and `parameters` (the updated fields by name). |
 | `pllm.host.CompletionInput` | What a feedback callable receives: `completions` (a `CompletionBatch`) and `hidden` (each completion's final hidden row). |
 | `pllm.host.Completion`, `pllm.host.CompletionBatch` | One sampled completion (`identity`, `output_index`, `group_id`, `token_ids`, `text`, `finish_reason`), and a batch of them (`entries`). |
 | `pllm.host.FinishReason` | `STOP`, `LENGTH` or `ERROR`. |
@@ -504,7 +503,7 @@ A training method that reads `pllm.batch(...)` fields trains on a batch you pass
 `feedback(completion_input)`, and retries the prompts whose completions the result marks `RETRY`, for at
 most `max_rounds` rounds; it yields `(completion_input, result)` per round. The result is any object with
 `retry_controls`, `update_barriers` and `update_count`; returning `None` ends the loop. See
-`pllm/workloads/ttrl.py` and tutorial 05.
+`pllm/workloads/reward_head.py` and tutorial 05.
 
 ```python
 @dataclass(frozen=True)
@@ -519,12 +518,10 @@ class RewardHead(pllm.Workload):
         return (weights * error).sum() / weights.sum().clamp_min(1)
 
 
-execution = pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=896), RewardHead())
-execution.admit(())
-batch = pllm.host.WeightedRowBatch(torch.randn(4, 896), torch.ones(4), torch.ones(4))
-result = execution.step(pllm.host.StepInput.of_batch(batch))
-print(result.loss is not None, tuple(result.parameters["w"].shape))
-execution.retire(())
+with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=896), RewardHead()) as head:
+    batch = pllm.host.WeightedRowBatch(torch.randn(4, 896), torch.ones(4), torch.ones(4))
+    step = head.train(batch)
+    print(step.loss is not None, tuple(step.parameters["w"].shape), head.version)
 ```
 
 ## Configure the engine and execution
@@ -714,14 +711,16 @@ pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block
 ### pllm.host
 
 ```text
-pllm.host.make_host(config: 'HostConfig', workload: 'Workload') -> 'StateExecution[StepInput, TensorFrame, TensorOutput]'
-    Compile `workload` without a model; each `step(StepInput.of_batch(batch))` trains on one host batch and returns a StepResult.
+pllm.host.make_host(config: 'HostConfig', workload: 'Workload') -> 'HostTrainer'
+    Compile `workload` without a model and admit its instance state; `train(batch)` steps it on one host batch.
 pllm.host.HostConfig(device: 'torch.device', hidden_size: 'int' = 0, target_shape: 'tuple[int, ...]' = (), seed: 'int' = 0, state_page_budget_bytes: 'int' = 67108864, max_input_rows: 'int | None' = None, execution_peak_budget_bytes: 'int | None' = None)
     What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches and the shape of each row's target (() for one value per row), the seed of initial state values, and the state and per-step memory limits (max_input_rows bounds a batch).
-pllm.host.StepInput(rows: 'PackedPhaseRowBatch', sampler_rows: 'PackedSamplerRowBatch', hidden: 'HiddenRowBatch | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), batch: 'HostBatch[torch.Tensor] | None' = None, input_tokens: 'torch.Tensor | None' = None, hidden_readiness: 'CudaStreamReadiness | None' = None, batch_readiness: 'CudaStreamReadiness | None' = None, import_rows: 'Mapping[str, int]' = <factory>, overlay_updates: 'Mapping[tuple[RequestIdentity, Projection], UpdateOutput]' = <factory>)
-pllm.host.StepResult(value: 'torch.Tensor | None', invocation: 'InvocationOutput', entries: 'tuple[OverlayEntry, ...]' = (), input_gradients: 'Mapping[tuple[str, str], torch.Tensor]' = <factory>, parameter_gradient_fields: 'Mapping[StateRef, tuple[torch.Tensor, ...]]' = <factory>, metrics: 'Mapping[str, torch.Tensor]' = <factory>, parameters: 'Mapping[str, torch.Tensor]' = <factory>)
-pllm.host.CompletionInput(completions: 'CompletionBatch', hidden: 'torch.Tensor', readiness: 'CudaStreamReadiness | None' = None)
-    One owned completion/hidden boundary, shared by host consumers.
+pllm.host.HostTrainer(execution: 'StateExecution[StepInput, TensorFrame, TensorOutput]')
+    A workload's instance state, trained on host batches without a model.
+pllm.host.TrainStep(loss: 'torch.Tensor | None', parameters: 'Mapping[str, torch.Tensor]')
+    One host training step: its loss (None when the train method skipped the update) and the trained state's fields after the step, by name, as owned copies ready on the caller's current stream.
+pllm.host.CompletionInput(completions: 'CompletionBatch', hidden: 'torch.Tensor')
+    The completions of one generate call and each one's final hidden row (float32, one row per completion), shared by host consumers; generate has finished writing `hidden` when it returns.
 pllm.host.WeightedCEBatch(hidden: ~T, base_logits: ~T, labels: ~T, weights: ~T, keys: tuple[pllm.contracts.request_state.RequestStateKey, ...] = ())
     Shared [rows, ...] or independently keyed [adapters, rows, ...] weighted CE.
 pllm.host.WeightedRowBatch(hidden: ~T, targets: ~T, weights: ~T)

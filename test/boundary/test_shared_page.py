@@ -51,6 +51,5 @@ def test_completion_capture_orders_rows_and_requires_all_identities() -> None:
         capture.require_complete()
     capture.write((IDENTITIES[2], IDENTITIES[0]), torch.tensor([[2.0, 2.0], [0.0, 0.0]]))
     capture.write((IDENTITIES[1], IDENTITIES[0]), torch.tensor([[1.0, 1.0], [3.0, 3.0]]))
-    completed = capture.finish(BATCH)
-    assert completed.hidden is hidden and completed.completions is BATCH
+    capture.require_complete()
     torch.testing.assert_close(hidden, torch.tensor([[3.0, 3.0], [1.0, 1.0], [2.0, 2.0]]))

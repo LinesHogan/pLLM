@@ -22,7 +22,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TraceEventKind, TraceSelection, TraceSnapshot
-from pllm.host import HostConfig, make_host
+from pllm.host import HostConfig
 from pllm.testing import backend_facts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources
@@ -47,7 +47,7 @@ def exported(execution, value):
 
 def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
     workload = DummyWorkload(DummyConfig(export_every_n_steps=2, export_max_rows=2, export_max_cols=3))
-    execution = make_host(CPU, workload)
+    execution = workload.compile_host(CPU)
     if device_name != "cpu":
         _trace_selection_and_bounds(execution.plan, device_name)
         return
@@ -64,9 +64,9 @@ def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
     hidden.fill_(-1)
     torch.testing.assert_close(result, expected)
     hidden.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5))
-    variant = make_host(CPU, centered_hidden(workload.config))
+    variant = centered_hidden(workload.config).compile_host(CPU)
     torch.testing.assert_close(exported(variant, value(2)), expected - hidden[1:3].mean(dim=-1, keepdim=True))
-    disabled = make_host(CPU, DummyWorkload(replace(workload.config, enabled=False)))
+    disabled = DummyWorkload(replace(workload.config, enabled=False)).compile_host(CPU)
     with patch.object(TensorTask, "read", autospec=True, side_effect=TensorTask.read) as reads:
         assert disabled.step(value(2)) is None
         reads.assert_not_called()
@@ -104,7 +104,7 @@ def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
 
     chained = Chained()
     for execution in (
-        make_host(CPU, chained),
+        chained.compile_host(CPU),
         assert_finite_resources(chained, facts).execution,
     ):
         torch.testing.assert_close(exported(execution, value(2)), (expected + 1) * 2)
@@ -112,10 +112,10 @@ def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
     # A transform's closure values are frozen when the workload compiles.
     scale = [2.0]
     custom = replace(workload, transform=lambda rows: rows * scale[0])
-    frozen = make_host(CPU, custom)
+    frozen = custom.compile_host(CPU)
     scale[0] = 3.0
     torch.testing.assert_close(exported(frozen, value(2)), expected * 2)
-    torch.testing.assert_close(exported(make_host(CPU, custom), value(2)), expected * 3)
+    torch.testing.assert_close(exported(custom.compile_host(CPU), value(2)), expected * 3)
 
     class Unsourced(DummyWorkload):
         @pllm.export()
@@ -240,7 +240,7 @@ def test_export_queue_delivery_and_lifecycle(device, overflow) -> None:
         assert release.wait(10)
         delivered.append(event)
 
-    execution = make_host(CPU, DummyWorkload())
+    execution = DummyWorkload().compile_host(CPU)
     trace = ExecutionTrace(execution.plan, capacity=1, on_export=consume)
     value = torch.ones((2, 3), device=device)
     record = lambda policy: trace.record(
@@ -292,7 +292,7 @@ def test_export_failure_and_meta() -> None:
         def on_export(self):
             pass
 
-    execution = make_host(CPU, InvalidConsumer())
+    execution = InvalidConsumer().compile_host(CPU)
     trace = execution.trace
     record = lambda device: trace.record(
         TraceEventKind.TENSOR,

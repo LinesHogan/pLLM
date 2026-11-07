@@ -1,6 +1,6 @@
 """Workloads in a real vLLM EngineCore child process, with the frontend never touching CUDA.
 
-Covers ESamp (eager and captured), shared completions feeding FTTT/TTRL, ReFT and
+Covers ESamp (eager and captured), shared completions feeding FTTT/the reward head, ReFT and
 Output LoRA inputs, automatic feedback retries, TLM, Dummy exports, a user workload
 loaded by reference and CUDA inputs shared over IPC. Run with a flag from MODES to
 execute one scenario.
@@ -42,8 +42,8 @@ from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 from pllm.workloads.prefill_adapters import PrefillAdaptersWorkload
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload
+from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadWorkload, majority_vote
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_vote
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ["The sky is", "Water freezes at"]
@@ -108,8 +108,7 @@ def _gpu_shared_input() -> None:
             group_id="gpu",
             completion_device=device,
         )
-        assert changed.hidden.device == device and changed.readiness is not None
-        changed.readiness.order_on(torch.cuda.current_stream(device))
+        assert changed.hidden.device == device
         assert torch.isfinite(changed.hidden).all() and not torch.allclose(baseline.hidden, changed.hidden.cpu())
         diagnostics = handle.diagnostics()
         assert diagnostics.update_count == 1
@@ -504,19 +503,17 @@ def main() -> int:
             (100, 3),
             (100, 4),
         ]
-        assert batch.hidden.device.type == "cpu" and batch.readiness is None
+        assert batch.hidden.device.type == "cpu"
         assert batch.hidden.shape == (3, handle.attachment.probe.hidden_size)
         assert torch.isfinite(batch.hidden).all() and torch.count_nonzero(batch.hidden) > 0
         facts = HostConfig(torch.device("cpu"), hidden_size=batch.hidden.shape[1])
         feedback = FTTTFeedbackQueue(FTTTConfig(), FTTTDefaultJudge())
         edited = FTTTFeedback(feedback, facts)(batch)
         assert edited is not None and edited.update_count == 1
-        ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
-        reward = make_host(facts, TTRLWorkload(ttrl))
-        reward.admit(())
-        trained = reward.step(ttrl_vote(batch, ttrl).step)
-        assert trained.loss is not None and reward.diagnostics().update_count == 1
-        reward.retire(())
+        config = RewardHeadConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
+        with make_host(facts, RewardHeadWorkload(config)) as head:
+            assert head.train(majority_vote(batch, config).batch).loss is not None
+            assert head.diagnostics().update_count == 1
         assert not torch.cuda.is_initialized()
         print(f"enginecore child={child} loss={final.loss_count} update={final.update_count}")
     finally:
@@ -545,7 +542,7 @@ def main() -> int:
     finally:
         reft.close()
     assert torch.isfinite(batch.hidden).all() and torch.isfinite(changed.hidden).all()
-    print("shared completion -> FTTT/TTRL updates=1/1; shared ReFT input publications=1; parent CUDA=off")
+    print("shared completion -> FTTT/reward head updates=1/1; shared ReFT input publications=1; parent CUDA=off")
     _tlm_shared_input()
     _output_lora_shared_input()
     _independent_lora_input()

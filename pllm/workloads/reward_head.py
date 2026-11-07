@@ -1,4 +1,6 @@
-"""TTRL: majority-vote rewards computed on the host, and a reward head trained on them as an ordinary workload."""
+"""A reward head fit to majority-vote rewards: the host votes on each prompt's boxed answers (majority_vote), and
+RewardHeadWorkload, an ordinary workload trained on the host (pllm.host.make_host), learns the 0/1 rewards from the
+completions' hidden rows. RewardHeadFeedback does both as a generate_feedback callable."""
 
 import re
 from collections import Counter
@@ -10,17 +12,14 @@ import torch
 from torch.nn import functional as F
 
 import pllm
-from pllm.execution.state_execution import StateExecution
-from pllm.execution.tensor_declaration import TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
 from pllm.host import (
     BarrierState,
     CompletionInput,
     ControlReason,
+    HostTrainer,
     RetryAction,
     RetryControl,
     RewardOutcome,
-    StepInput,
     UpdateBarrier,
     WeightedRowBatch,
 )
@@ -44,7 +43,7 @@ def boxed_label(text: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class TTRLConfig:
+class RewardHeadConfig:
     rank: int = 16
     learning_rate: float = 1e-3
     votes_per_prompt: int = 0
@@ -61,17 +60,19 @@ class TTRLConfig:
                 or 0 < self.samples_per_prompt <= self.votes_per_prompt
             )
         ):
-            raise ValueError("TTRL requires positive rank/rate and paired vote/sample counts")
+            raise ValueError(
+                "RewardHeadConfig needs a positive rank and learning rate, and 0 < samples_per_prompt <= votes_per_prompt or both 0"
+            )
 
 
 @dataclass(frozen=True, slots=True)
-class TTRLResult:
-    """Host feedback for one completion batch, and the training step that learns from it."""
+class MajorityVote:
+    """Host feedback for one completion batch, and the batch the reward head learns from."""
 
     reward_outcomes: tuple[RewardOutcome, ...]
     retry_controls: tuple[RetryControl, ...]
     update_barriers: tuple[UpdateBarrier, ...]
-    step: StepInput
+    batch: WeightedRowBatch[torch.Tensor]
 
     @property
     def update_count(self) -> int:
@@ -79,7 +80,7 @@ class TTRLResult:
         return int(any(barrier.ready_count for barrier in self.update_barriers))
 
 
-def ttrl_vote(value: CompletionInput, config: TTRLConfig) -> TTRLResult:
+def majority_vote(value: CompletionInput, config: RewardHeadConfig) -> MajorityVote:
     """Vote each prompt's boxed answers; rows matching the majority train the head toward reward 1."""
     entries = value.completions.entries
     groups: dict[int, list[int]] = {}
@@ -96,7 +97,7 @@ def ttrl_vote(value: CompletionInput, config: TTRLConfig) -> TTRLResult:
             or config.votes_per_prompt
             and len(indices) != config.votes_per_prompt
         ):
-            raise ValueError("TTRL requires one complete declared vote group per prompt")
+            raise ValueError("majority_vote needs one complete vote group (votes_per_prompt completions) per prompt")
         counts = Counter(labels[i] for i in indices if labels[i])
         majority[prompt] = max(counts, key=lambda label: counts[label]) if counts else ""
         eligible = indices[: config.samples_per_prompt] if config.samples_per_prompt else indices
@@ -104,7 +105,7 @@ def ttrl_vote(value: CompletionInput, config: TTRLConfig) -> TTRLResult:
         selected.extend(trainable)
         barriers.append(
             UpdateBarrier(
-                f"ttrl:{group_id}:{prompt}",
+                f"majority:{group_id}:{prompt}",
                 group_id,
                 BarrierState.READY if trainable else BarrierState.BLOCKED,
                 tuple(entries[i].identity.request_id for i in indices),
@@ -122,7 +123,7 @@ def ttrl_vote(value: CompletionInput, config: TTRLConfig) -> TTRLResult:
                 float(correct) if correct is not None else None,
                 correct,
                 "",
-                "ttrl_majority:boxed_normalized_exact",
+                "majority:boxed_normalized_exact",
                 label,
                 "" if label else ControlReason.MISSING_ANSWER.value,
             )
@@ -146,30 +147,28 @@ def ttrl_vote(value: CompletionInput, config: TTRLConfig) -> TTRLResult:
         hidden.new_tensor([reward.reward or 0.0 for reward in rewards]),
         hidden.new_tensor([float(index in chosen) for index in range(len(entries))]),
     )
-    step = StepInput.of_batch(batch, value.readiness)
-    return TTRLResult(tuple(rewards), tuple(controls), tuple(barriers), step)
+    return MajorityVote(tuple(rewards), tuple(controls), tuple(barriers), batch)
 
 
 @dataclass(frozen=True)
-class TTRLFeedback:
-    """The `generate_feedback` callable: vote, step the reward head (`execution`, a TTRLWorkload compiled with
-    pllm.host.make_host) on the votes, and return the result."""
+class RewardHeadFeedback:
+    """The `generate_feedback` callable: vote, train the reward head (a RewardHeadWorkload from
+    pllm.host.make_host) on the votes, and return the vote."""
 
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput]
-    config: TTRLConfig
-    stream: torch.cuda.Stream | None = None
+    head: HostTrainer
+    config: RewardHeadConfig
 
-    def __call__(self, value: CompletionInput) -> TTRLResult:
-        result = ttrl_vote(value, self.config)
-        self.execution.step(result.step, self.stream)
-        return result
+    def __call__(self, value: CompletionInput) -> MajorityVote:
+        vote = majority_vote(value, self.config)
+        self.head.train(vote.batch)
+        return vote
 
 
 @dataclass(frozen=True)
-class TTRLWorkload(pllm.Workload):
-    """A rank-r reward head, fit by AdamW to the 0/1 majority rewards of `ttrl_vote` steps."""
+class RewardHeadWorkload(pllm.Workload):
+    """A rank-r reward head, fit by AdamW to the 0/1 rewards of `majority_vote`."""
 
-    config: TTRLConfig = TTRLConfig()
+    config: RewardHeadConfig = RewardHeadConfig()
 
     @property
     def head(self) -> pllm.InstanceState:

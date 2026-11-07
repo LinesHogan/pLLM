@@ -84,12 +84,12 @@ decision = _core.intern_tensor_layouts(request)
 assert json.loads(decision)['bindings'][0]['layout_id'] == 0
 assert callable(pllm.make_llm)
 for workload in ('dummy', 'esamp', 'fttt', 'gtta', 'inplace_ttt', 'tlm',
-                 'reft', 'recirculation', 'override', 'ttrl', 'lora'):
+                 'reft', 'recirculation', 'override', 'reward_head', 'lora'):
     module = importlib.import_module('pllm.workloads.' + workload)
     assert Path(module.__file__).resolve().is_relative_to(installed)
 from pllm.host import HostConfig, make_host
 from pllm.workloads.dummy import DummyWorkload
-execution = make_host(HostConfig(torch.device('cpu')), DummyWorkload())
+make_host(HostConfig(torch.device('cpu')), DummyWorkload()).close()
 assert not torch.cuda.is_initialized()
 print('isolated wheel: Rust layout codec executed')
 """,

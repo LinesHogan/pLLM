@@ -288,46 +288,23 @@ def ttrl(submission: ModuleType, device: str) -> None:
         return  # Host readiness/stream protocols are outside the optional tensor-only CUDA oracle.
     hidden = torch.randn(8, 8)
     config = pllm.host.HostConfig(torch.device("cpu"), hidden_size=8, max_input_rows=8, state_page_budget_bytes=1 << 20)
-    execution = pllm.host.make_host(config, submission.Workload())
-    refs = execution.admit(())
     weight = torch.nn.Parameter(torch.zeros(8))
     optimizer = torch.optim.AdamW([weight], lr=0.01, weight_decay=0)
     targets = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0])
     weights = torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0])
-    actual = execution.snapshot(refs[0])
-    try:
+    with pllm.host.make_host(config, submission.Workload()) as head:
         for _ in range(2):
             optimizer.zero_grad()
             loss = (weights * (hidden @ weight - targets).square()).sum() / weights.sum()
             loss.backward()  # pyright: ignore[reportUnknownMemberType]
             optimizer.step()  # pyright: ignore[reportUnknownMemberType]
-            assert weight.grad is not None
-            result = submission.feedback(execution, hidden, answers, groups)
-            close(result.loss, loss.detach())
-            assert result.publication is not None
-            actual = execution.snapshot(result.publication.after_refs[0])
-            for value, expected in zip(
-                actual,
-                (
-                    weight,
-                    weight.grad,
-                    optimizer.state[weight]["step"],
-                    optimizer.state[weight]["exp_avg"],
-                    optimizer.state[weight]["exp_avg_sq"],
-                ),
-                strict=True,
-            ):
-                close(value, expected)
-        before = [value.clone() for value in actual]
-        result = submission.feedback(execution, hidden, [""] * 8, groups)
-        assert result.publication is not None
-        for value, expected in zip(execution.snapshot(result.publication.after_refs[0]), before, strict=True):
-            close(value, expected)
-        assert execution.diagnostics().update_count == 2
-        assert execution.diagnostics().loss_count == 3, "feedback must step exactly once, including empty selection"
-    finally:
-        execution.retire((), wait=True)
-    assert refs and execution.diagnostics().active_states == 0
+            step = submission.feedback(head, hidden, answers, groups)
+            close(step.loss, loss.detach())
+            close(step.parameters["w"], weight)
+        step = submission.feedback(head, hidden, [""] * 8, groups)
+        close(step.parameters["w"], weight)
+        assert head.diagnostics().update_count == 2
+        assert head.diagnostics().loss_count == 3, "feedback must train exactly once, including empty selection"
 
 
 def check_math(task: str, submission: ModuleType, device: str = "cpu") -> None:

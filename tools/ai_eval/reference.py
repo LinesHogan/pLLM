@@ -6,9 +6,6 @@ from dataclasses import dataclass
 import torch
 
 import pllm
-from pllm.execution.state_execution import StateExecution
-from pllm.execution.tensor_declaration import TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
 
 
 def direction(positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
@@ -193,15 +190,11 @@ def vote(answers: list[str], groups: list[int]) -> tuple[list[float], list[float
 
 
 def feedback(
-    execution: StateExecution[pllm.host.StepInput, TensorFrame, TensorOutput],
-    hidden: torch.Tensor,
-    answers: list[str],
-    groups: list[int],
-) -> TensorOutput:
-    """Feed one completion batch to an admitted host execution."""
+    head: pllm.host.HostTrainer, hidden: torch.Tensor, answers: list[str], groups: list[int]
+) -> pllm.host.TrainStep:
+    """Train the reward head once on one completion batch's votes."""
     targets, weights = vote(answers, groups)
-    batch = pllm.host.WeightedRowBatch(hidden, hidden.new_tensor(targets), hidden.new_tensor(weights))
-    return execution.step(pllm.host.StepInput.of_batch(batch))
+    return head.train(pllm.host.WeightedRowBatch(hidden, hidden.new_tensor(targets), hidden.new_tensor(weights)))
 
 
 WORKLOADS = {

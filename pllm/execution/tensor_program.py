@@ -286,7 +286,6 @@ class FunctionMath(Generic[I, D, R]):
             nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
             torch.inference_mode(False),
         ):
-            value.order_host_batch()
             data = self.prepare_data(value, read_batch(context))
             return data if context.value is None or self.resume_data is None else self.resume_data(context.value, data)
 

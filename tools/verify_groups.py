@@ -19,7 +19,7 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("pllm/workloads/esamp*", ("esamp", "enginecore")),
     ("pllm/workloads/override*", ("feedback", "enginecore")),
     ("pllm/workloads/fttt/*", ("feedback", "enginecore")),
-    ("pllm/workloads/ttrl*", ("feedback", "enginecore", "tp")),
+    ("pllm/workloads/reward_head*", ("feedback", "enginecore", "tp")),
     ("pllm/workloads/reft*", ("reft", "enginecore")),
     ("pllm/workloads/tlm/*", ("tlm", "enginecore", "tp")),
     ("pllm/workloads/lora*", ("enginecore",)),

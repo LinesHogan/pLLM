@@ -91,7 +91,7 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
 | 激活修改／外部字段发布 | [Activation checkpoints](../reference/authoring-contract.md#激活检查点) | [ReFT](../../pllm/workloads/reft.py) |
 | 逐 token prefill replay | [层路由](overlays-and-replay.md#层路由让更新当步生效) | [Recirculation](../../pllm/workloads/recirculation.py) |
 | 完整因果模型训练适配 | [因果批训练](../reference/authoring-contract.md#因果批训练) | [TLM](../../pllm/workloads/tlm/workload.py) |
-| completion／reward 驱动训练 | [Completion learning](../reference/authoring-contract.md#completion-学习) | [TTRL](../../pllm/workloads/ttrl.py) |
+| completion／reward 驱动训练 | [Completion learning](../reference/authoring-contract.md#completion-学习) | [reward head](../../pllm/workloads/reward_head.py) |
 | judge、环境查询与队列 | [Write mathematics：宿主循环](../reference/authoring-contract.md#编写原生数学) | [FTTT](../../pllm/workloads/fttt/workload.py)、[GTTA](../../pllm/workloads/gtta/workload.py) |
 | 显式分页／反向／capture 优化 | [原语与资源契约](../reference/authoring-contract.md#原语与资源契约) | ESamp、Output LoRA 中的显式绑定 |
 

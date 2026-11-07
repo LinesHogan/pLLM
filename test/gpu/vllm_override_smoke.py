@@ -2,7 +2,7 @@
 
 Guidance added before filtering must equal the independent head oracle at the exact
 read version, feedback must carry the untouched base logits and the drawn tokens,
-and a captured completion batch feeds FTTT and TTRL on the GPU.
+and a captured completion batch feeds FTTT and the reward head on the GPU.
 """
 
 import sys
@@ -24,7 +24,7 @@ from pllm.execution.state_execution import StateExecution
 from pllm.host import HostConfig, make_host
 from pllm.workloads.fttt import FTTTConfig, FTTTDefaultJudge, FTTTFeedback, FTTTFeedbackQueue
 from pllm.workloads.override import OverRIDEConfig, OverRIDEWorkload
-from pllm.workloads.ttrl import TTRLConfig, TTRLWorkload, ttrl_vote
+from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadWorkload, majority_vote
 
 
 def main() -> None:
@@ -147,8 +147,6 @@ def main() -> None:
                 group_id="vote",
                 prompt_indices=(100, 100, 100),
             )
-        stream = torch.cuda.current_stream(execution.device)
-        batch.readiness.order_on(stream)
         assert len(batch.completions.entries) == 3
         for completion, row in zip(batch.completions.entries, batch.hidden, strict=True):
             assert completion.identity.prompt_index == 100
@@ -156,13 +154,14 @@ def main() -> None:
         facts = HostConfig(execution.device, hidden_size=batch.hidden.shape[1])
         edited = FTTTFeedback(FTTTFeedbackQueue(FTTTConfig(), FTTTDefaultJudge()), facts)(batch)
         assert edited is not None and edited.update_count == 1
-        ttrl = TTRLConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
-        reward = make_host(replace(facts, max_input_rows=3, execution_peak_budget_bytes=1 << 20), TTRLWorkload(ttrl))
-        reward.admit((), stream)
-        trained = reward.step(ttrl_vote(batch, ttrl).step, stream)
-        assert trained.loss is not None and reward.diagnostics().update_count == 1
-        reward.retire(())
-        print(f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/TTRL updates=1/1")
+        config = RewardHeadConfig(rank=2, votes_per_prompt=3, samples_per_prompt=2)
+        bounded = replace(facts, max_input_rows=3, execution_peak_budget_bytes=1 << 20)
+        with make_host(bounded, RewardHeadWorkload(config)) as head:
+            assert head.train(majority_vote(batch, config).batch).loss is not None
+            assert head.diagnostics().update_count == 1
+        print(
+            f"OverRIDE: updates={diagnostics.update_count} sampler_checks={len(observed)}; FTTT/reward head updates=1/1"
+        )
     finally:
         if hook is not None:
             hook.remove()
