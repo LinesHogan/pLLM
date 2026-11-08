@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import overload
 
 import numpy as np
@@ -16,12 +17,22 @@ from pllm.contracts.request_identity import RequestIdentity
 Slots = npt.NDArray[np.int64]
 
 
-def tap_selection(phases: Collection[HiddenPhase]) -> int:
-    """Which of PackedPhaseRowBatch.tap_selected holds the rows a tap reading `phases` keeps: latest decode rows,
-    completed prompt endings, both, or every fresh token (a superset of the others)."""
+class TapRows(IntEnum):
+    """Which of PackedPhaseRowBatch.tap_selected a tap keeps, in the native labeler's order."""
+
+    LATEST_DECODE = 0
+    PROMPT_ENDINGS = 1
+    DECODE_AND_PROMPT_ENDINGS = 2
+    FRESH = 3  # every token computed fresh this step, a superset of the others
+
+
+def tap_selection(phases: Collection[HiddenPhase]) -> TapRows:
+    """The rows a tap reading `phases` keeps."""
     if HiddenPhase.ALL in phases:
-        return 3
-    return 2 if len(phases) == 2 else int(HiddenPhase.PREFILL in phases)
+        return TapRows.FRESH
+    if len(phases) == 2:
+        return TapRows.DECODE_AND_PROMPT_ENDINGS
+    return TapRows.PROMPT_ENDINGS if HiddenPhase.PREFILL in phases else TapRows.LATEST_DECODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,26 +91,28 @@ class PackedRows(Sequence[PackedPhaseRow]):
             else self.batch.inspect_row(int(self.indices[index]))
         )
 
+    def __iter__(self) -> Iterator[PackedPhaseRow]:
+        return iter(self.batch.inspect(self.indices))
+
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, PackedRows):
-            if self.batch is other.batch:
-                return np.array_equal(self.indices, other.indices)
-            return (
-                np.array_equal(self.columns[[0, 1, 2, 3, 5, 6]], other.columns[[0, 1, 2, 3, 5, 6]])
-                and self.identities == other.identities
-            )
+        if isinstance(other, PackedRows) and self.batch is other.batch:
+            return np.array_equal(self.indices, other.indices)
         return tuple(self) == other
 
     @property
-    def columns(self) -> Slots:
-        """Borrow selected numeric labels in invocation order."""
-        return self.batch.columns[:, self.indices]
+    def identity_indices(self) -> Slots:
+        """Each row's index into batch.request_identities."""
+        return self.batch.identity_indices[self.indices]
+
+    @property
+    def token_offsets(self) -> Slots:
+        return self.batch.token_offsets[self.indices]
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
         """Borrow admitted identities in row order without constructing row records."""
         identities = np.asarray(self.batch.request_identities, dtype=np.object_)
-        return tuple(identities[self.batch.columns[4, self.indices]])
+        return tuple(identities[self.identity_indices])
 
     def producer(self, phase: HiddenPhase | None) -> PackedRows:
         """Select a producer phase without inspecting records."""
@@ -113,9 +126,9 @@ class PackedRows(Sequence[PackedPhaseRow]):
 class PackedPhaseRowBatch:
     """Numeric labels inspected by task execution and diagnostics.
 
-    Columns are packed index, request ordinal, token offset, phase (decode=0/prefill=1),
-    identity-table index, prompt length and retained-replay flag. Tap selections are ordered as in
-    tap_selection; tap maps index the allocated slot vector, and index zero fills unselected rows.
+    The rows of `columns` are named by the properties below (the native labeler writes the same order);
+    `columns[0]` is the packed index. Tap selections are ordered as in TapRows; tap maps index the
+    allocated slot vector, and index zero fills unselected rows.
     """
 
     step_id: int
@@ -161,9 +174,10 @@ class PackedPhaseRowBatch:
         last = {r.identity: index for index, r in enumerate(rows)}
         requests = np.fromiter(last.values(), dtype=np.int64)
         ordinal_last = np.fromiter({r.request_ordinal: index for index, r in enumerate(rows)}.values(), dtype=np.int64)
-        fresh = columns[6] == 0
-        prefill = np.flatnonzero((columns[3] == 1) & (columns[2] == columns[5] - 1) & fresh)
-        decode = np.sort(ordinal_last[(columns[3, ordinal_last] == 0) & fresh[ordinal_last]])
+        _, _, offsets, phases, _, prompt_lengths, recomputed = columns
+        fresh = recomputed == 0
+        prefill = np.flatnonzero((phases == 1) & (offsets == prompt_lengths - 1) & fresh)
+        decode = np.sort(ordinal_last[(phases[ordinal_last] == 0) & fresh[ordinal_last]])
         selected = (decode, prefill, np.concatenate((decode, prefill)), np.flatnonzero(fresh))
         ranks = tuple(np.zeros(total_rows, dtype=np.int64) for _ in selected)
         for indices, mapping in zip(selected, ranks, strict=True):
@@ -184,6 +198,34 @@ class PackedPhaseRowBatch:
     @property
     def total_rows(self) -> int:
         return self.columns.shape[1]
+
+    @property
+    def request_ordinals(self) -> Slots:
+        """Each row's request position in this step's scheduling order."""
+        return self.columns[1]
+
+    @property
+    def token_offsets(self) -> Slots:
+        return self.columns[2]
+
+    @property
+    def phases(self) -> Slots:
+        """1 for prompt (prefill) rows, 0 for decode rows, -1 for rows without a phase."""
+        return self.columns[3]
+
+    @property
+    def identity_indices(self) -> Slots:
+        """Each row's index into request_identities."""
+        return self.columns[4]
+
+    @property
+    def prompt_lengths(self) -> Slots:
+        return self.columns[5]
+
+    @property
+    def recomputed(self) -> Slots:
+        """1 where retained state already consumed the token (retained replay), else 0."""
+        return self.columns[6]
 
     def inspect(self, indices: Slots) -> tuple[PackedPhaseRow, ...]:
         """Materialize exact row records for an explicit consumer."""
@@ -206,7 +248,7 @@ class PackedPhaseRowBatch:
 
     def identity(self, index: int) -> RequestIdentity:
         """Borrow one row's admitted identity without constructing a row record."""
-        return self.request_identities[int(self.columns[4, int(index)])]
+        return self.request_identities[int(self.identity_indices[int(index)])]
 
     @property
     def rows(self) -> PackedRows:
@@ -214,7 +256,7 @@ class PackedPhaseRowBatch:
 
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
-        return tuple(self.request_identities[int(index)] for index in self.columns[4])
+        return tuple(self.request_identities[int(index)] for index in self.identity_indices)
 
     @property
     def request_rows(self) -> PackedRows:
@@ -224,21 +266,13 @@ class PackedPhaseRowBatch:
     def producer_rows(self, phase: HiddenPhase | None) -> PackedRows:
         """Fresh prompt endings, latest decode rows or every fresh token; None: each request's fresh final row."""
         if phase is None:
-            return PackedRows(self, self.request_indices[self.columns[6, self.request_indices] == 0])
+            return PackedRows(self, self.request_indices[self.recomputed[self.request_indices] == 0])
         return PackedRows(self, self.tap_selected[tap_selection((phase,))])
-
-    @property
-    def prefill_rows(self) -> PackedRows:
-        return PackedRows(self, np.flatnonzero(self.columns[3] == 1))
-
-    @property
-    def decode_rows(self) -> PackedRows:
-        return PackedRows(self, np.flatnonzero(self.columns[3] == 0))
 
     @property
     def latest_decode_rows(self) -> PackedRows:
         """Each request's final fresh decode row."""
-        return PackedRows(self, self.tap_selected[0])
+        return PackedRows(self, self.tap_selected[TapRows.LATEST_DECODE])
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,7 +320,8 @@ class PackedSamplerRowBatch:
     @property
     def identities(self) -> tuple[RequestIdentity, ...]:
         return tuple(
-            self.row_batch.request_identities[int(index)] for index in self.row_batch.columns[4, self.packed_indices]
+            self.row_batch.request_identities[int(index)]
+            for index in self.row_batch.identity_indices[self.packed_indices]
         )
 
 
@@ -363,6 +398,7 @@ def label_rows(
 __all__ = [
     "label_rows",
     "tap_selection",
+    "TapRows",
     "RowLabeler",
     "PackedRows",
     "PackedPhaseRow",

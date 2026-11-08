@@ -89,9 +89,9 @@ class FieldWriter:
         if group.instance:
             return tuple(selection.refs.positions(group.refs).tolist())
         indices = _core.select_states(
-            selection.rows.batch.columns[4, selection.rows.indices],
+            selection.rows.identity_indices,
             group.state_indices,
-            rows.batch.columns[4, rows.indices],
+            rows.identity_indices,
         )
         return tuple(indices.tolist())
 
@@ -127,7 +127,7 @@ class TensorExport:
     def output(self, value: torch.Tensor, data: TensorFrame, source_rows: int) -> TaskOutput:
         """Publish the bounded result with each row's request and token position, in events of whole rows."""
         value = value[: self.max_rows, : self.max_cols]
-        identities, positions = data.rows.identities, tuple(data.rows.columns[2].tolist())
+        identities, positions = data.rows.identities, tuple(data.rows.token_offsets.tolist())
         rows = MAX_SNAPSHOT_BYTES // value[0].nbytes
         return TaskOutput(
             observations=tuple(

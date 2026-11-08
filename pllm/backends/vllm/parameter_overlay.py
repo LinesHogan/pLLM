@@ -744,7 +744,7 @@ class PinnedParameterOverlay:
             self.prepare_decode(rows, transition)
             return
         assert transition is None
-        ordinals = rows.columns[1]
+        ordinals = rows.request_ordinals
         self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
         self.sources = rows.inspect(self.starts)
         self.total_rows = rows.total_rows
@@ -867,8 +867,8 @@ class HybridParameterOverlay:
     ) -> None:
         """Select the same eligibility used by dispatch from the labelled row facts."""
         training = not uniform_decode(
-            bool((rows.columns[3] == 1).any()),
-            tuple(np.unique(rows.columns[4], return_counts=True)[1].tolist()),
+            bool((rows.phases == 1).any()),
+            tuple(np.unique(rows.identity_indices, return_counts=True)[1].tolist()),
         )
         for reader in self.pinned.readers:
             reader.enabled = not training

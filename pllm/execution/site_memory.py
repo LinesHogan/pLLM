@@ -31,7 +31,7 @@ _FIELDS = ("carry", "_pending_rows_x", "_pending_rows_y", "_pending_length")
 def _request_spans(rows: PackedPhaseRowBatch) -> tuple[tuple[int, int], ...]:
     if not rows.total_rows:
         return ()
-    identities = rows.columns[4]
+    identities = rows.identity_indices
     starts = np.append(0, np.flatnonzero(identities[1:] != identities[:-1]) + 1)
     stops = np.append(starts[1:], rows.total_rows)
     first: list[int] = starts.tolist()

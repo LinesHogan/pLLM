@@ -7,7 +7,16 @@ use numpy::{
 };
 use pyo3::prelude::*;
 
-use crate::packed_rows::column;
+use crate::packed_rows::{
+    column, IDENTITY, PACKED, PROMPT_INDEX_WORD, REQUEST_LENGTH_WORD, REQUEST_WORDS,
+    SAMPLE_INDEX_WORD,
+};
+
+// Request-key fields a resource projects, as bits; RequestStateDirectory sends their sum.
+const REQUEST_ID: i64 = 1;
+const PROMPT_INDEX: i64 = 2;
+const SAMPLE_INDEX: i64 = 4;
+const ROUTE: i64 = 8;
 
 type Array<'py> = Bound<'py, PyArray1<i64>>;
 type Matrix<'py> = Bound<'py, PyArray2<i64>>;
@@ -217,17 +226,24 @@ fn project_key(words: &[i64], fields: i64) -> Vec<i64> {
     if fields == 0 {
         return Vec::new();
     }
-    let request_length = words[2] as usize;
+    let route = REQUEST_WORDS + words[REQUEST_LENGTH_WORD] as usize;
+    let word = |field: i64, index: usize, absent: i64| {
+        if fields & field != 0 {
+            words[index]
+        } else {
+            absent
+        }
+    };
     let mut key = vec![
-        if fields & 2 != 0 { words[0] } else { -1 },
-        if fields & 4 != 0 { words[1] } else { -1 },
-        if fields & 1 != 0 { words[2] } else { 0 },
+        word(PROMPT_INDEX, PROMPT_INDEX_WORD, -1),
+        word(SAMPLE_INDEX, SAMPLE_INDEX_WORD, -1),
+        word(REQUEST_ID, REQUEST_LENGTH_WORD, 0),
     ];
-    if fields & 1 != 0 {
-        key.extend_from_slice(&words[3..3 + request_length]);
+    if fields & REQUEST_ID != 0 {
+        key.extend_from_slice(&words[REQUEST_WORDS..route]);
     }
-    if fields & 8 != 0 {
-        key.extend_from_slice(&words[3 + request_length..]);
+    if fields & ROUTE != 0 {
+        key.extend_from_slice(&words[route..]);
     }
     key
 }
@@ -335,22 +351,22 @@ fn row_plan<'py>(
         let mut last = std::collections::BTreeMap::new();
         for (position, &p) in packed.iter().enumerate() {
             let p = p as usize;
-            let request = rows[[4, p]];
+            let request = rows[[IDENTITY, p]];
             let state = if instance || versions.is_empty() {
                 0
             } else {
                 selection[&request]
             };
             for (c, v) in [
-                *sampler.get(&rows[[0, p]]).unwrap_or(&-1),
-                words[offsets[request as usize] as usize + 1],
+                *sampler.get(&rows[[PACKED, p]]).unwrap_or(&-1),
+                words[offsets[request as usize] as usize + SAMPLE_INDEX_WORD],
                 state,
                 if versions.is_empty() {
                     state
                 } else {
                     versions[state as usize]
                 },
-                rows[[0, p]],
+                rows[[PACKED, p]],
             ]
             .into_iter()
             .enumerate()

@@ -255,9 +255,7 @@ class RequestStateDirectory:
     def select(self, rows: PackedRows, history: tuple[StateRefs, ...] = ()) -> RequestStateSelection:
         """Project numeric rows and select exact versions, rewinding inputs for declared lag."""
         batch = rows.batch
-        projected = self._projection.project(
-            batch.identity_data, batch.identity_offsets, np.ascontiguousarray(batch.columns[4, rows.indices])
-        )
+        projected = self._projection.project(batch.identity_data, batch.identity_offsets, rows.identity_indices)
         groups: list[ResourceSelection] = []
         for state, keys, (columns, positions) in zip(self.states, self._keys, projected, strict=True):
             refs = self.arena.latest_batch(state.resource, columns)

@@ -103,7 +103,7 @@ class VllmActivationPatch:
                     indices = np.flatnonzero(selected & (windows[2] == phase))
                     if not len(indices):
                         continue
-                    ids, inverse = np.unique(rows.columns[4, indices], return_inverse=True)
+                    ids, inverse = np.unique(rows.identity_indices[indices], return_inverse=True)
                     identities = tuple(rows.request_identities[int(i)] for i in ids)
                     refresh = phase == 0 and binding.decode_refresh is DecodeRefresh.STEP
                     held_versions = tuple(
@@ -118,12 +118,12 @@ class VllmActivationPatch:
     def _row_windows(rows: PackedPhaseRowBatch) -> np.ndarray[tuple[int, int], np.dtype[np.int64]]:
         windows = np.zeros((3, rows.total_rows), dtype=np.int64)
         for phase in (1, 0):
-            indices = np.flatnonzero(rows.columns[3] == phase)
+            indices = np.flatnonzero(rows.phases == phase)
             if not len(indices):
                 continue
-            order = np.argsort(rows.columns[4, indices], kind="stable")
+            order = np.argsort(rows.identity_indices[indices], kind="stable")
             indices = indices[order]
-            identities = rows.columns[4, indices]
+            identities = rows.identity_indices[indices]
             starts = np.r_[0, np.flatnonzero(identities[1:] != identities[:-1]) + 1]
             lengths = np.diff(np.r_[starts, len(indices)])
             windows[0, indices] = np.arange(len(indices)) - np.repeat(starts, lengths)

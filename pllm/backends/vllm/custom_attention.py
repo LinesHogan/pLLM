@@ -114,7 +114,7 @@ class CustomAttention:
         if self.program.prompt_lens.numel():
             self.program.prompt_lens[: len(rows.request_indices)].copy_(
                 upload(
-                    rows.columns[5, rows.request_indices],
+                    rows.prompt_lengths[rows.request_indices],
                     self.program.prompt_lens.device,
                 )
             )

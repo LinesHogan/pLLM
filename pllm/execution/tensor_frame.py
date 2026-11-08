@@ -172,7 +172,7 @@ class RowPlan:
             data.step.sampler_rows.packed_indices,
             rows.batch.identity_data,
             rows.batch.identity_offsets,
-            selection.rows.batch.columns[4, selection.rows.indices],
+            selection.rows.identity_indices,
             selection.state_indices,
             selection.refs.versions,
             selection.instance if selection.groups else False,

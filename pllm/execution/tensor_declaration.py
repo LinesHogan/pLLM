@@ -657,10 +657,11 @@ class TensorDeclaration:
 
         def prepare(value: StepInput, batch: TensorBatch) -> TensorFrame:
             if sampled:
-                packed = value.sampler_rows.packed_indices
-                columns = value.rows.columns[:, packed]
-                eligible = (columns[6] == 0) & ((columns[3] == 0) | (columns[2] == columns[5] - 1))
-                rows = PackedRows(value.rows, packed[eligible])
+                labels, packed = value.rows, value.sampler_rows.packed_indices
+                ends = (labels.phases[packed] == 0) | (
+                    labels.token_offsets[packed] == labels.prompt_lengths[packed] - 1
+                )
+                rows = PackedRows(labels, packed[ends & (labels.recomputed[packed] == 0)])
             else:
                 rows = read(value.rows)
             data = TensorFrame(value, rows)

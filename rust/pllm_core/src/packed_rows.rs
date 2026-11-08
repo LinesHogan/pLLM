@@ -9,6 +9,23 @@ use numpy::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+// Rows of the label matrix; PackedPhaseRowBatch names them in Python.
+pub(crate) const PACKED: usize = 0;
+const ORDINAL: usize = 1;
+const OFFSET: usize = 2;
+const PHASE: usize = 3;
+pub(crate) const IDENTITY: usize = 4;
+const PROMPT_LENGTH: usize = 5;
+const RECOMPUTED: usize = 6;
+const COLUMNS: usize = 7;
+
+// Identity words (packed_rows.py identity_words): prompt index, sample index, request-ID length,
+// then the request-ID bytes and the route bytes.
+pub(crate) const PROMPT_INDEX_WORD: usize = 0;
+pub(crate) const SAMPLE_INDEX_WORD: usize = 1;
+pub(crate) const REQUEST_LENGTH_WORD: usize = 2;
+pub(crate) const REQUEST_WORDS: usize = 3;
+
 /// Request generations and retained-state frontiers, owned by one runner session.
 #[pyclass]
 #[derive(Default)]
@@ -79,9 +96,12 @@ impl RowLabeler {
         self.validate(scheduled, prompt, computed, ids)?;
         // numpy's readonly borrows stay alive until preparation finishes; no tensor or CUDA access.
         let labels = py.allow_threads(|| self.label(scheduled, prompt, computed, ids, keep));
-        let rows = numpy::ndarray::Array2::from_shape_vec((7, labels.rows.len() / 7), labels.rows)
-            .expect("label columns have equal lengths")
-            .into_pyarray(py);
+        let rows = numpy::ndarray::Array2::from_shape_vec(
+            (COLUMNS, labels.rows.len() / COLUMNS),
+            labels.rows,
+        )
+        .expect("label columns have equal lengths")
+        .into_pyarray(py);
         let mut words = Vec::new();
         let mut offsets = vec![0];
         for &id in ids {
@@ -148,7 +168,7 @@ impl RowLabeler {
         keep: bool,
     ) -> Labels {
         let total: usize = scheduled.iter().map(|&n| n as usize).sum();
-        let mut rows = vec![0; 7 * total];
+        let mut rows = vec![0; COLUMNS * total];
         let mut links = Vec::with_capacity(ids.len());
         let (mut prefill, mut decode, mut fresh) = (Vec::new(), Vec::new(), Vec::new());
         let mut start = 0;
@@ -165,17 +185,14 @@ impl RowLabeler {
                 let offset = i64::from(done) + i64::from(token);
                 let replay = keep && offset < frontier;
                 for (column, value) in [
-                    packed as i64,
-                    request as i64,
-                    offset,
-                    i64::from(offset < i64::from(length)),
-                    request as i64,
-                    i64::from(length),
-                    i64::from(replay),
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                    (PACKED, packed as i64),
+                    (ORDINAL, request as i64),
+                    (OFFSET, offset),
+                    (PHASE, i64::from(offset < i64::from(length))),
+                    (IDENTITY, request as i64),
+                    (PROMPT_LENGTH, i64::from(length)),
+                    (RECOMPUTED, i64::from(replay)),
+                ] {
                     rows[column * total + packed] = value;
                 }
                 if !replay {
