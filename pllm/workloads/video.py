@@ -37,7 +37,7 @@ class VideoWorkload(pllm.Workload):
         return pllm.InstanceState(
             {name: (self.grid_size, self.grid_size) for name in FEATURES},
             dtype=torch.float32,
-            feed="ordered",
+            init=pllm.Fed("ordered"),
         )
 
     @property

@@ -60,9 +60,18 @@ from pllm.execution.method_inputs import (
     Value,
 )
 from pllm.execution.model_sites import Site
-from pllm.execution.module_state import ModuleFactory, parameter_count
 from pllm.execution.position_state import PositionState as PositionState
-from pllm.execution.tensor_frame import Tensors, UpdateOutput as UpdateOutput
+from pllm.execution.state_init import (
+    Computed as Computed,
+    Fed as Fed,
+    FromModule as FromModule,
+    Imported as Imported,
+    ModelCheckpoint as ModelCheckpoint,
+    Pretrained as Pretrained,
+    StateInit,
+    Zeros as Zeros,
+)
+from pllm.execution.tensor_frame import UpdateOutput as UpdateOutput
 from pllm.execution.token_program import Over, Tokens
 from pllm.kernels.adamw import AdamWConfig
 
@@ -161,7 +170,8 @@ def parameter(state: str, field: str, *, per_row: bool = False) -> Any:
 
 
 def module(state: str) -> Any:
-    """A state declared with `module=`, called like the module; request state uses each row's own parameters."""
+    """A state declared with init=pllm.FromModule(...), called like the module; request state uses each row's own
+    parameters."""
     return ModuleInput(state)
 
 
@@ -260,89 +270,35 @@ def value(layer: int | Callable[[Any], int]) -> Any:
 
 @dataclass(frozen=True)
 class InstanceState:
-    """State shared by requests; pretrained= supplies safetensors starting values instead of initialize=.
-
-    Plain states load tensor names matching their fields. Module states load a strict state_dict on meta,
-    skipping random initialization. Values convert to the declared storage dtype, including trainable states.
-    placement="host" explicitly keeps read-only pretrained gathered fields in pinned host memory;
-    placement="device" (default) never falls back to host. Budgets count device residency separately.
+    """State shared by requests. `init` says where its starting values come from (default pllm.Zeros()):
+    pllm.Computed(function), pllm.Pretrained(path), pllm.ModelCheckpoint(names), pllm.FromModule(factory),
+    pllm.Fed(order) or pllm.Imported(). Values convert to the declared storage dtype, including trainable states.
     """
 
     fields: Mapping[str, Shape | Field] = field(default_factory=lambda: dict[str, Shape | Field]())
+    shape: Shape | None = None
+    dtype: torch.dtype | Literal["auto"] = "auto"
+    init: StateInit = field(default=Zeros(), kw_only=True)
     # How @pllm.train or @pllm.train_in_forward updates the state. Training on request rows or on WeightedRowBatch
     # and CausalTrainBatch fields takes pllm.AdamW; WeightedCEBatch training and @pllm.train_in_forward take pllm.SGD.
     optimizer: AdamWConfig | SGD | None = field(default=None, kw_only=True)
-    # Run once per resource when binding; every admission copies the same seeded initial tensors.
-    initialize: Callable[[Tensors, torch.Generator], None] | None = None
-    shape: Shape | None = None
-    dtype: torch.dtype | Literal["auto"] = "auto"
     alignment: int = field(default=16, kw_only=True)
-    # A fed state is filled by a producer process (VllmLlm.feed): "ordered" consumes every publication in order,
-    # "latest" only the newest.
-    feed: Literal["ordered", "latest"] | None = field(default=None, kw_only=True)
     # Plain per-request tensors carried across steps (written by pllm.carry); never optimizer-managed.
     carry: Mapping[str, Shape] = field(default_factory=lambda: dict[str, Shape](), kw_only=True)
-    # An `nn.Module` built from the model's dimensions; its parameters become the state, initialized as the
-    # module initializes them (every request starts from the same values).
-    module: ModuleFactory | None = field(default=None, kw_only=True)
-    imported: bool = field(default=False, kw_only=True)
-    pretrained: str = field(default="", kw_only=True)
-    placement: Literal["device", "host"] = field(default="device", kw_only=True)
-    checkpoint: Mapping[str, str] = field(default_factory=lambda: dict[str, str](), kw_only=True)
+    # One copy of each field per listed layer, named `{field}_{layer}` (e.g. per-layer checkpoint tensors).
     layers: tuple[int, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
-        if self.placement not in ("device", "host"):
-            raise ValueError('placement needs "device" or "host"')
-        if self.placement == "host" and (
-            self.scope is not StateScope.INSTANCE
-            or not self.pretrained
-            or self.optimizer is not None
-            or self.module is not None
-            or self.carry
-        ):
-            raise ValueError(
-                'placement="host" needs a read-only pretrained InstanceState of gathered fields; '
-                'use placement="device" for modules or mutable state'
-            )
-        if self.pretrained and (self.initialize is not None or self.checkpoint or self.feed or self.imported):
-            raise ValueError(
-                "pretrained= supplies starting values; drop initialize=, checkpoint=, feed= and imported=True"
-            )
-        if self.checkpoint and (
-            self.scope is not StateScope.INSTANCE
-            or self.optimizer is not None
-            or self.initialize is not None
-            or self.module is not None
-            or self.feed
-            or self.imported
-            or set(self.checkpoint) != set(self.fields)
-        ):
-            raise ValueError("checkpoint state needs an immutable InstanceState with a tensor name for every field")
         if self.layers and (
             self.scope is not StateScope.INSTANCE
             or tuple(sorted(set(self.layers))) != self.layers
             or self.layers[0] < 0
         ):
             raise ValueError("layers needs sorted unique nonnegative indices on an InstanceState")
-        if self.feed not in (None, "ordered", "latest"):
-            raise ValueError(f'feed={self.feed!r}: use "ordered", "latest" or None')
-        if self.module is not None:
-            if self.fields or self.shape is not None or self.initialize is not None or self.feed:
-                raise ValueError(
-                    "a module state takes its fields and initial values from the module; drop fields/shape/initialize"
-                )
-            object.__setattr__(self, "fields", {"parameters": parameter_count(self.module)})
-        if self.feed is not None and (
-            self.scope is not StateScope.INSTANCE
-            or self.optimizer is not None
-            or self.initialize is not None
-            or self.carry
-            or self.imported
-        ):
-            raise ValueError("fed state needs InstanceState without an optimizer, initializer or carry fields")
         if self.shape is not None:
             object.__setattr__(self, "fields", {"value": self.shape})
+        object.__setattr__(self, "fields", self.init.fields(self.fields))
+        self.init.check(self)
         if self.carry and self.optimizer is None:
             raise ValueError("carry fields ride on the training transition; give the state an optimizer")
         if set(self.carry) & set(self.fields):
@@ -369,36 +325,6 @@ class InstanceState:
     @property
     def request_keys(self) -> tuple[RequestKeyField, ...]:
         return ()
-
-    def source(self) -> str:
-        """Describe where this state's version-zero values come from."""
-        if self.imported:
-            return (
-                "imported: "
-                + ("one row per prompt" if self.scope is StateScope.REQUEST else "field tensors")
-                + " via generate(batch=pllm.io.StateImport(...)), applied before the request's first forward"
-            )
-        if self.feed:
-            return "fed"
-        if self.checkpoint:
-            return "base checkpoint"
-        if self.module is not None:
-            return "module init"
-        return "initialize" if self.initialize is not None else "zeros"
-
-    def checkpoint_names(self) -> tuple[str, ...]:
-        """Exact checkpoint tensor names, in the same order as the allocated fields."""
-        if not self.checkpoint:
-            return ()
-        return (
-            tuple(
-                pattern.format(layer=layer)
-                for layer in self.layers
-                for pattern in (self.checkpoint[key] for key in self.fields)
-            )
-            if self.layers
-            else tuple(self.checkpoint[key] for key in self.fields)
-        )
 
 
 @dataclass(frozen=True)
@@ -846,6 +772,13 @@ __all__ = [
     "batch",
     "InstanceState",
     "RequestState",
+    "Zeros",
+    "Computed",
+    "Pretrained",
+    "ModelCheckpoint",
+    "FromModule",
+    "Fed",
+    "Imported",
     "train_in_forward",
     "custom_residual",
     "depth",

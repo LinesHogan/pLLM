@@ -130,7 +130,7 @@ def test_feed_selects_complete_versions_and_reclaims_only_after_completion(order
 class TwoFieldFeed(FeedWorkload):
     @property
     def source(self) -> pllm.InstanceState:
-        return pllm.InstanceState({"value": (2,), "extra": (2,)}, feed=self.order)
+        return pllm.InstanceState({"value": (2,), "extra": (2,)}, init=pllm.Fed(self.order))
 
 
 def retained_producer(feed, probe):

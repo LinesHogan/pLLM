@@ -25,6 +25,7 @@ from pllm.execution.model_sites import DepthInput, EarlierInput, ResultInput, Si
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.module_state import skeleton
 from pllm.execution.row_task_binding import parameter_rows, sampled_token_port, state_metadata
+from pllm.execution.state_init import FromModule
 from pllm.execution.tensor_frame import (
     TensorPort,
     Tensors,
@@ -249,9 +250,9 @@ class ModuleInput(Parameter):
 
     def skeleton(self, context: WorkloadContext) -> torch.nn.Module:
         definition = context.state_definition(self.state, f"{self.state}: pllm.module needs a declared module state")
-        if definition.module is None:
-            raise TypeError(f"{self.state}: pllm.module needs a state declared with module=")
-        return skeleton(definition.module, context.binding.dimensions)
+        if not isinstance(definition.init, FromModule):
+            raise TypeError(f"{self.state}: pllm.module needs a state declared with init=pllm.FromModule(...)")
+        return skeleton(definition.init.factory, context.binding.dimensions)
 
     def request(self, context: WorkloadContext) -> bool:
         return context.state_definition(self.state, "pllm.module needs a declared state").scope is StateScope.REQUEST

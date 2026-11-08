@@ -289,7 +289,7 @@ custom forward 单元里需要 `register_vmap`。`register_kernel("cpu")` 可选
 送入 `custom_residual`、且只依赖 token id 与不变状态的结果，在 forward 开始前于旁路 stream 上执行。读取 token 历史的结果送入 `custom_residual`
 时需要 `tensor_parallel_size=1`。
 
-`InstanceState(..., pretrained=path)` 从 safetensors 读初值（字段同名张量；文件哈希计入负载身份）。`placement="host"`
+`InstanceState(..., init=pllm.Pretrained(path))` 从 safetensors 读初值（字段同名张量；文件哈希计入负载身份）。`placement="host"`
 把只被按行 gather 的只读预训练字段放在锁页主机内存里；默认 `placement="device"` 放不下也不会回退到主机。显存预算与
 主机内存分开计算；`pllm.explain` 给出主机字节数与每行传输字节数。主机表支持按行读取：`table[idx]`、`torch.index_select`、
 `torch.nn.functional.embedding`、`torch.vmap` 里的按行读，以及先取视图（如 `table[:, ::2]`）再按行读；对主机表做其他运算会在
@@ -346,7 +346,7 @@ traced while_loop，并提示使用 bounded for-loop。
 ## 外部 Overlay
 
 `pllm.model.Adapter` 消费状态，不指定生产者。普通 `@pllm.train`、tuple-valued
-`@pllm.write(state=..., fields=(...))`、初始化及 `imported=True` 均可独立生产字段。
+`@pllm.write(state=..., fields=(...))`、`init=` 初值及 `init=pllm.Imported()` 均可独立生产字段。
 `hidden(layer, tokens="prefill")` 读取完整 prompt 的最后一行，默认 tokens 为 decode。
 写入默认 BEFORE_FORWARD；当前 forward 的 hidden 只能用于 AFTER_FORWARD/AFTER_SAMPLE。
 详见[生产者与消费者](../guides/overlays-and-replay.md#独立声明状态生产者与模型消费者)。
@@ -373,7 +373,7 @@ class ShineStyleLoRA(pllm.Workload):
         return pllm.RequestState({
             "a": pllm.Field(lambda in_features, out_features: (2, in_features)),
             "b": pllm.Field(lambda in_features, out_features: (out_features, 2)),
-        }, imported=True)
+        }, init=pllm.Imported())
 
     @property
     def adapter(self) -> pllm.model.Adapter:

@@ -18,7 +18,7 @@ class TwoGroups(pllm.Workload):
         return pllm.InstanceState(
             {"matrix": (2, 3), "bias": (3,)},
             optimizer=pllm.AdamW(lr=0.017, betas=(0.83, 0.96), eps=1e-5, weight_decay=0.09),
-            initialize=self.initialize,
+            init=pllm.Computed(self.initialize),
         )
 
     def initialize(self, parameters, generator):

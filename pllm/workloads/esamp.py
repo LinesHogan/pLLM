@@ -55,7 +55,7 @@ class ESampWorkload(pllm.Workload):
     def distiller(self) -> pllm.RequestState:
         config = self.config
         return pllm.RequestState(
-            module=lambda m: Distiller(m.hidden_size, config.rank, config.output_layernorm),
+            init=pllm.FromModule(lambda m: Distiller(m.hidden_size, config.rank, config.output_layernorm)),
             optimizer=pllm.AdamW(config.learning_rate, config.betas, config.eps, config.weight_decay),
         )
 

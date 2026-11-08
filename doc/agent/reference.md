@@ -136,21 +136,32 @@ print(rows.shape)  # torch.Size([6, 896])
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.RequestState(fields=..., initialize=None, shape=None, dtype="auto", key_fields=("request_id",), *, optimizer=None, module=None, imported=False, carry=..., ...)` | Tensors that every request owns a private copy of, admitted with the request and freed when it finishes. Read as row-aligned tensors: a field of shape `S` reads as `[rows, *S]`. |
+| `pllm.RequestState(fields=..., shape=None, dtype="auto", key_fields=("request_id",), *, init=pllm.Zeros(), optimizer=None, carry=..., ...)` | Tensors that every request owns a private copy of, admitted with the request and freed when it finishes. Read as row-aligned tensors: a field of shape `S` reads as `[rows, *S]`. |
 | `pllm.InstanceState(...)` | Tensors shared by all requests of the engine; same arguments minus `key_fields`. A field reads with its declared shape, without a row axis. |
 | `pllm.Field(shape, dtype="auto")` | A field whose shape is `lambda in_features, out_features: (...)`: the widths of each target projection when a `pllm.model.Adapter` reads the state, otherwise `(hidden_size, hidden_size)`. Also gives one field an explicit `dtype`. |
 | `pllm.Dimensions` | What a plain shape callable receives: `hidden_size`, `vocab_size`, `layer_count`, `target_shapes`, `dtype`. Write `{"bias": lambda m: (m.vocab_size,)}`. |
 | `pllm.parameter(state, field, *, per_row=False)` | Read one field. `per_row=True` gives an instance field a broadcast row axis for row-wise math. |
-| `pllm.module(state)` | Read a state declared with `module=lambda m: nn.Module(...)` as a callable module; for request state each row runs with its own parameters. |
+| `pllm.module(state)` | Read a state declared with `init=pllm.FromModule(lambda m: nn.Module(...))` as a callable module; for request state each row runs with its own parameters. |
 | `pllm.version(state)` | int64 `[rows]`: how many updates each row's state has received (0 before the first). |
 | `pllm.index(state)` | int64 `[rows]`: each row's slot in the state pool. |
 | `pllm.PositionState(initial=0.0)` | One hidden-width vector per KV cache block, read and written only by `layers.load` / `layers.save` inside `@pllm.custom_forward`. |
 
 Declaring fields: `shape=(n,)` declares one field named `"value"`; `fields={"w": shape, ...}` declares named
-fields, each shape a tuple, a `pllm.Dimensions` callable or a `pllm.Field`; `module=` takes the fields from
-the module's parameters. Initial values: `initialize(fields, generator)` fills the fields in place once
-(every request then starts from the same values), `module=` uses the module's own initialization, otherwise
-fields start at zero. Storage dtype `"auto"`: float32 when the state has an optimizer or a method rewrites a
+fields, each shape a tuple, a `pllm.Dimensions` callable or a `pllm.Field`; `init=pllm.FromModule(...)` takes
+the fields from the module's parameters. Initial values come from the one `init=` source (every request starts
+from the same values):
+
+| `init=` | Starting values |
+| --- | --- |
+| `pllm.Zeros()` | Every field at zero (the default). |
+| `pllm.Computed(function)` | `function(fields, generator)` fills the named field tensors in place, once, with a seeded generator. |
+| `pllm.Pretrained(path, placement="device")` | Tensors named like the fields from a safetensors file; the file's hash joins the workload's identity. `placement="host"` keeps a read-only table that methods only gather rows from in pinned host memory; `"device"` never falls back to host. |
+| `pllm.ModelCheckpoint({field: tensor_name})` | The served model's checkpoint tensors (with `layers=(...)` the names may contain `{layer}`); `InstanceState` without optimizer, read-only. |
+| `pllm.FromModule(factory, pretrained="")` | The parameters of `factory(dimensions)`, an `nn.Module`, as the state's one field, initialized as the module does or from a state_dict file. |
+| `pllm.Fed("ordered" or "latest")` | Published by a producer process through `llm.feed(state)`; one per workload. |
+| `pllm.Imported()` | Passed to `generate(batch=pllm.io.StateImport(...))`. |
+
+ Storage dtype `"auto"`: float32 when the state has an optimizer or a method rewrites a
 field from its old value, the model dtype otherwise. Declare state as a class attribute, or as a property
 annotated `-> pllm.RequestState` / `-> pllm.InstanceState` when its shape depends on workload fields.
 
@@ -165,7 +176,7 @@ class Probe(pllm.Workload):
 
     @property
     def head(self) -> pllm.RequestState:
-        return pllm.RequestState(module=lambda m: nn.Linear(m.hidden_size, self.rank))
+        return pllm.RequestState(init=pllm.FromModule(lambda m: nn.Linear(m.hidden_size, self.rank)))
 
     @pllm.export(name="probe", max_rows=8, max_cols=4)
     def score(self, h: torch.Tensor = pllm.final_hidden(), head: nn.Module = pllm.module("head")) -> torch.Tensor:
@@ -227,7 +238,9 @@ class ShallowDistiller(pllm.Workload):
     @property
     def distiller(self) -> pllm.RequestState:
         return pllm.RequestState(
-            module=lambda m: nn.Sequential(nn.Linear(m.hidden_size, self.rank), nn.Linear(self.rank, m.hidden_size)),
+            init=pllm.FromModule(
+                lambda m: nn.Sequential(nn.Linear(m.hidden_size, self.rank), nn.Linear(self.rank, m.hidden_size))
+            ),
             optimizer=pllm.AdamW(1e-3),
         )
 
@@ -277,7 +290,7 @@ a strength setting whose value 0 makes the method return exactly zero.
 @dataclass(frozen=True)
 class LogitBias(pllm.Workload):
     strength: float = 1.0
-    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, imported=True)
+    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, init=pllm.Imported())
 
     @pllm.add_logits()
     def add(self, sample: torch.Tensor = pllm.sample_index(),
@@ -315,7 +328,7 @@ forward.
 | Name | Meaning |
 | --- | --- |
 | `pllm.model.ActivationPatch(state, layers, first_tokens=0, last_tokens=2, operator="low_rank_affine", *, decode=False, refresh="admission", on_missing="stop")` | Edit the output of `layers` (the residual stream after them) from a state, whoever writes it. `operator="add"` adds one vector field per layer; `"low_rank_affine"` reads three fields per layer (ReFT). Applies to the first `first_tokens` and last `last_tokens` prompt tokens, and with `decode=True` to every decode token. `refresh="step"` reads the newest version every decode step. Runs inside the model's CUDA graphs. |
-| `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0)` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `"dense"` and `"per_head"` read the field `weight`. A trainable `"low_rank"` state needs `initialize=` (e.g. random A, zero B), `pretrained=` or `imported=True`: with both factors at zero every gradient is zero, so it is rejected. An Adapter on an `InstanceState` makes the model forward eager; on a `RequestState` it stays in CUDA graphs. Inside `@pllm.custom_forward` the delta applies at every projection call, including repeated layers. |
+| `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0)` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `"dense"` and `"per_head"` read the field `weight`. A trainable `"low_rank"` state needs a non-zero `init=` (e.g. `pllm.Computed` with random A, zero B): with both factors at zero every gradient is zero, so it is rejected. An Adapter on an `InstanceState` makes the model forward eager; on a `RequestState` it stays in CUDA graphs. Inside `@pllm.custom_forward` the delta applies at every projection call, including repeated layers. |
 | `pllm.model.Projection(name, layer=None)` | A linear projection by its Hugging Face module name: `"q_proj"`, `"k_proj"`, `"v_proj"`, `"gate_proj"`, `"up_proj"` or `"down_proj"`; `layer=None` means every layer. |
 
 Declare both as class attributes or typed properties. A `pllm.Field` shape callable of a state an `Adapter`
@@ -324,14 +337,14 @@ target, named `a_0`, `b_0`, `a_1`, ... in target order.
 
 With `tensor_parallel_size > 1` (vLLM 0.32 MRv2), `"dense"` and `"low_rank"` deltas follow each projection's
 shards: q/k/v and gate/up partition dense weights and B by output rows, down partitions dense weights and A by
-input columns; the other factor is replicated. The state starts from `initialize=` and only
+input columns; the other factor is replicated. The state starts from `pllm.Zeros` or `pllm.Computed` and only
 `@pllm.train_in_forward` may update it, using the local shard (training replicated A from column-sharded outputs,
-or B from row-sharded inputs, is rejected). `"per_head"` deltas and adapter states with an optimizer, `imported=`,
-`checkpoint=`, `pretrained=` or `module=` need `tensor_parallel_size=1`.
+or B from row-sharded inputs, is rejected). `"per_head"` deltas and adapter states with an optimizer or another
+`init=` source need `tensor_parallel_size=1`.
 
 ```python
 class Steering(pllm.Workload):
-    steer = pllm.InstanceState({"vector": pllm.Field(lambda width, _: (width,))}, imported=True)
+    steer = pllm.InstanceState({"vector": pllm.Field(lambda width, _: (width,))}, init=pllm.Imported())
     patch = pllm.model.ActivationPatch("steer", layers=(12,), operator="add", decode=True)
 
 
@@ -341,8 +354,13 @@ class PromptLoRA(pllm.Workload):
 
     @property
     def lora(self) -> pllm.RequestState:
-        return pllm.RequestState({"a": pllm.Field(lambda inputs, outputs: (self.rank, inputs)),
-                                  "b": pllm.Field(lambda inputs, outputs: (outputs, self.rank))}, imported=True)
+        return pllm.RequestState(
+            {
+                "a": pllm.Field(lambda inputs, outputs: (self.rank, inputs)),
+                "b": pllm.Field(lambda inputs, outputs: (outputs, self.rank)),
+            },
+            init=pllm.Imported(),
+        )
 
     @property
     def apply(self) -> pllm.model.Adapter:
@@ -357,12 +375,10 @@ print(pllm.explain(Steering(), CONFIG).eager_reason)
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.io.StateImport(values, keys=())` | Tensors for an `imported=True` state, in field order, passed as `llm.generate(..., batch=StateImport(...))`. An instance state gets a new version that this call's requests read; later calls without `batch=` keep it. For request state the values carry a leading prompt axis and are written once, before each request's first forward. |
-| `imported=True` | On `RequestState` / `InstanceState`: the values come from `StateImport`, not from the workload. |
-| `checkpoint={field: tensor_name}` | On an `InstanceState` without optimizer: load the fields from the model checkpoint's tensors (with `layers=(...)` the names may contain `{layer}`). |
+| `pllm.io.StateImport(values, keys=())` | Tensors for an `init=pllm.Imported()` state, in field order, passed as `llm.generate(..., batch=StateImport(...))`. An instance state gets a new version that this call's requests read; later calls without `batch=` keep it. For request state the values carry a leading prompt axis and are written once, before each request's first forward. |
 | `pllm.io.load_tensor_fields(path, fields)` | Load named tensors from a weights-only checkpoint file, in the order of `fields`. |
 | `pllm.io.checkpoint_directory(model, revision=None)`, `pllm.io.checkpoint_tensors(checkpoint, names)` | Read base-model tensors (e.g. `model.embed_tokens.weight`) on CPU: resolve the downloaded model snapshot, then load the named tensors from it or from one safetensors file. |
-| `pllm.io.Feed` | `llm.feed(state)` returns it for an `InstanceState(feed="ordered" or "latest")` filled by a producer process: `publish(**fields)`, `missing()`, `end()`, `close()`. See `examples/video_session.py`. |
+| `pllm.io.Feed` | `llm.feed(state)` returns it for an `InstanceState(init=pllm.Fed("ordered" or "latest"))` filled by a producer process: `publish(**fields)`, `missing()`, `end()`, `close()`. See `examples/video_session.py`. |
 
 ```python gpu
 del seen  # the StreamNorm example above is done
@@ -477,7 +493,7 @@ class PromptAdapters(pllm.Workload):
     def adapters(self) -> pllm.RequestState:
         return pllm.RequestState({"a": pllm.Field(lambda inputs, outputs: (self.rank, inputs)),
                                   "b": pllm.Field(lambda inputs, outputs: (outputs, self.rank))},
-                                 initialize=start_small, optimizer=pllm.SGD(1e-3))
+                                 init=pllm.Computed(start_small), optimizer=pllm.SGD(1e-3))
 
     @pllm.train_in_forward(state="adapters", targets=TARGETS, operator="low_rank", chunk=16, flush="prompt_end")
     def learn(self, x: torch.Tensor = pllm.operand("input"), target: torch.Tensor = pllm.operand("target"),
@@ -686,7 +702,7 @@ pllm.final_hidden(*, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -
 pllm.parameter(state: 'str', field: 'str', *, per_row: 'bool' = False) -> 'Any'
     One tensor field of a declared state, aligned to the operation's rows for request state.
 pllm.module(state: 'str') -> 'Any'
-    A state declared with `module=`, called like the module; request state uses each row's own parameters.
+    A state declared with init=pllm.FromModule(...), called like the module; request state uses each row's own parameters.
 pllm.version(state: 'str') -> 'Any'
     How many updates each row's state has received (0 before the first update).
 pllm.index(state: 'str') -> 'Any'
@@ -709,10 +725,24 @@ pllm.causal_model(adapter: 'str') -> 'Any'
     The causal LM with the named pllm.model.Adapter applied, as a pllm.model.CausalModel; .base skips it.
 pllm.batch(field: "Literal['hidden', 'base_logits', 'labels', 'weights', 'targets', 'input_ids', 'attention_mask']") -> 'Any'
     One field of the host batch passed to generate.
-pllm.InstanceState(fields: 'Mapping[str, Shape | Field]' = <factory>, initialize: 'Callable[[Tensors, torch.Generator], None] | None' = None, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto']" = 'auto', *, optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, feed: "Literal['ordered', 'latest'] | None" = None, carry: 'Mapping[str, Shape]' = <factory>, module: 'ModuleFactory | None' = None, imported: 'bool' = False, pretrained: 'str' = '', placement: "Literal['device', 'host']" = 'device', checkpoint: 'Mapping[str, str]' = <factory>, layers: 'tuple[int, ...]' = ())
-    State shared by requests; pretrained= supplies safetensors starting values instead of initialize=.
-pllm.RequestState(fields: 'Mapping[str, Shape | Field]' = <factory>, initialize: 'Callable[[Tensors, torch.Generator], None] | None' = None, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto']" = 'auto', key_fields: 'tuple[KeyField, ...]' = ('request_id',), *, optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, feed: "Literal['ordered', 'latest'] | None" = None, carry: 'Mapping[str, Shape]' = <factory>, module: 'ModuleFactory | None' = None, imported: 'bool' = False, pretrained: 'str' = '', placement: "Literal['device', 'host']" = 'device', checkpoint: 'Mapping[str, str]' = <factory>, layers: 'tuple[int, ...]' = ())
+pllm.InstanceState(fields: 'Mapping[str, Shape | Field]' = <factory>, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto']" = 'auto', *, init: 'StateInit' = Zeros(), optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, carry: 'Mapping[str, Shape]' = <factory>, layers: 'tuple[int, ...]' = ())
+    State shared by requests. `init` says where its starting values come from (default pllm.Zeros()): pllm.Computed(function), pllm.Pretrained(path), pllm.ModelCheckpoint(names), pllm.FromModule(factory), pllm.Fed(order) or pllm.Imported(). Values convert to the declared storage dtype, including trainable states.
+pllm.RequestState(fields: 'Mapping[str, Shape | Field]' = <factory>, shape: 'Shape | None' = None, dtype: "torch.dtype | Literal['auto']" = 'auto', key_fields: 'tuple[KeyField, ...]' = ('request_id',), *, init: 'StateInit' = Zeros(), optimizer: 'AdamWConfig | SGD | None' = None, alignment: 'int' = 16, carry: 'Mapping[str, Shape]' = <factory>, layers: 'tuple[int, ...]' = ())
     Per-request parameters, read as tensors aligned to the current operation's rows.
+pllm.Zeros()
+    Every field starts at zero (the default).
+pllm.Computed(function: 'Initializer')
+    `function(fields, generator)` fills the named field tensors in place, once per build with a seeded generator; every admission copies the result.
+pllm.Pretrained(path: 'str', placement: "Literal['device', 'host']" = 'device')
+    Tensors from a safetensors file: a plain state loads the tensors named like its fields, a module state (pllm.FromModule(..., pretrained=path)) a strict state_dict. Values convert to the declared storage dtype.
+pllm.ModelCheckpoint(names: 'Mapping[str, str]')
+    Tensors of the served model's own checkpoint, one name per field (with `layers=`, a pattern formatted with each `{layer}`); vLLM skips them when it loads the model. The state is read-only.
+pllm.FromModule(factory: 'ModuleFactory', pretrained: 'str' = '')
+    The parameters of an `nn.Module` built from the model's dimensions become the state's one field, initialized as the module initializes them, or from a safetensors state_dict at `pretrained`. pllm.module(state) calls it.
+pllm.Fed(order: "Literal['ordered', 'latest']")
+    Filled by a producer process (VllmLlm.feed): "ordered" consumes every publication in order, "latest" only the newest. A workload declares at most one fed state.
+pllm.Imported()
+    Supplied by generate(batch=pllm.io.StateImport(...)) and applied before the request's first forward: one row per prompt for a RequestState, the field tensors for an InstanceState.
 pllm.PositionState(initial: float = 0.0)
     One model-hidden vector per KV allocation block, initialized at token zero.
 pllm.AdamW(lr: 'float', betas: 'tuple[float, float]' = (0.9, 0.999), eps: 'float' = 1e-08, weight_decay: 'float' = 0.0)

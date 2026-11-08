@@ -70,9 +70,9 @@ class Distill(pllm.Workload):
     beta: float = 0.5
 
     distiller = pllm.RequestState(
-        module=lambda m: nn.Sequential(
+        init=pllm.FromModule(lambda m: nn.Sequential(
             nn.Linear(m.hidden_size, 4), nn.Linear(4, m.hidden_size)
-        ),
+        )),
         optimizer=pllm.AdamW(1e-3),
     )
 
@@ -157,7 +157,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 @dataclass(frozen=True)
 class BadBias(pllm.Workload):
     strength: float = 1.0
-    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, imported=True)
+    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, init=pllm.Imported())
 
     # ❌ 错误写法：按张量的值走 Python 分支，需要 GPU -> CPU 同步
     @pllm.add_logits()
@@ -174,7 +174,7 @@ class BadBias(pllm.Workload):
 @dataclass(frozen=True)
 class GoodBias(pllm.Workload):
     strength: float = 1.0
-    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, imported=True)
+    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, init=pllm.Imported())
 
     # ✅ 正确写法：用张量掩码和 torch.where 在 GPU 上逐行完成分支
     @pllm.add_logits()
@@ -305,7 +305,7 @@ class Probe(pllm.Workload):
                 "w": pllm.Field(lambda width, _: (width,), dtype=torch.float32),  # 显式 FP32
                 "v": pllm.Field(lambda width, _: (width,)),  # 只读，自动跟随模型精度
             },
-            imported=True,
+            init=pllm.Imported(),
         )
 
     @pllm.export(name="score", max_rows=8, max_cols=2)
@@ -356,7 +356,7 @@ config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=exec_opts)
 
 ### 5.1 在线训练与引导采样
 
-**它是什么、什么时候用**：每个请求拥有自己的小网络（如 `RequestState(module=..., optimizer=pllm.AdamW(...))`），每步用 `@pllm.train` 在旁路更新权重，并用 `@pllm.guide_sampling` 或 `@pllm.add_logits` 调整下一步的采样分布（典型算法：`ESamp`、`OverRIDE`，见[教程 03](../tutorials/03_decode_training.ipynb)）。读多层词表分布的 `DoLa` 一类方法也在这里一并讨论。
+**它是什么、什么时候用**：每个请求拥有自己的小网络（如 `RequestState(init=pllm.FromModule(...), optimizer=pllm.AdamW(...))`），每步用 `@pllm.train` 在旁路更新权重，并用 `@pllm.guide_sampling` 或 `@pllm.add_logits` 调整下一步的采样分布（典型算法：`ESamp`、`OverRIDE`，见[教程 03](../tutorials/03_decode_training.ipynb)）。读多层词表分布的 `DoLa` 一类方法也在这里一并讨论。
 
 #### 代码示例
 
@@ -366,7 +366,7 @@ config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=exec_opts)
 @dataclass(frozen=True)
 class SelectiveBias(pllm.Workload):
     strength: float = 1.0
-    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, imported=True)
+    bias = pllm.InstanceState({"b": lambda m: (m.vocab_size,)}, init=pllm.Imported())
 
     def later_samples(self, sample: torch.Tensor = pllm.sample_index()) -> torch.Tensor:
         return sample > 0  # 每个 prompt 的第 0 个样本保持原样，留作对照
@@ -441,8 +441,7 @@ class LookupPrior(pllm.Workload):
     def table(self) -> pllm.InstanceState:
         return pllm.InstanceState(
             {"bonus": lambda m: (self.buckets, m.vocab_size)},
-            pretrained=self.path,
-            placement=self.placement,
+            init=pllm.Pretrained(self.path, placement=self.placement),
         )
 
     # 不带效果装饰器的查表方法：只读 token 历史和只读表
@@ -483,7 +482,7 @@ class LookupPrior(pllm.Workload):
 > **实用建议与限制**
 > * **怎么让主机查表成功藏进前向里？** 把查表写成**不带效果装饰器的独立方法**，只读取 `pllm.input_tokens` 和不可变状态，再让 `@pllm.add_logits` 或 `@pllm.custom_residual` 通过 `pllm.result("lookup")` 读它的结果。这样规划器才能把它排到 `request.prepare / side`。如果把查表直接写在 `@pllm.add_logits` 方法体里，它会落在 `model.execute / main`；如果查表方法还读了 `pllm.hidden` 或 `pllm.final_hidden`，它要等前向结束（`state.publish / main`）。两种情况传输都无法与前向重叠。
 > * **怎么估算 PCIe 传输能不能藏住？** 看 `pllm.explain` 输出的 `logical transfer bytes/row`（或 `decode bytes/step`），用 $\frac{\text{并发数} \times \text{bytes/row}}{22\text{ GB/s}}$ 估算 PCIe 耗时。只要它明显短于一次模型前向（如 0.5B 的 $3.3\text{ ms}$），绝大部分传输都能被藏住。
-> * **`placement="host"` 支持的操作**：仅支持只读 `pretrained` 表的按行读取，包括直接索引 `table[idx]`（含切片视图如 `table[:, ::2][idx]`）、`torch.index_select`、`torch.nn.functional.embedding` 和 `torch.vmap`，其他操作在规划时被拒绝。模型层内的方法（如 `@pllm.custom_residual`）不能直接读主机表，要通过 `pllm.result` 读取独立查表方法的结果。原因是：模型层内的方法在模型图里、主 stream 上某一层的中间执行，在那里读主机内存，PCIe 搬运会直接卡住这一层之后的前向，藏不掉；拆成只依赖 token 和只读表的独立方法后，规划器才能把它提前到步首的旁路 stream，用少量 SM 读、与前向重叠（见上一条）。同一个查表结果也可以同时交给多个效果方法，而只搬一次。`pllm` 不会为了装下预算自动把表挪到主机内存，这个取舍由你显式声明。
+> * **`placement="host"` 支持的操作**：仅支持只读 `pllm.Pretrained` 表的按行读取，包括直接索引 `table[idx]`（含切片视图如 `table[:, ::2][idx]`）、`torch.index_select`、`torch.nn.functional.embedding` 和 `torch.vmap`，其他操作在规划时被拒绝。模型层内的方法（如 `@pllm.custom_residual`）不能直接读主机表，要通过 `pllm.result` 读取独立查表方法的结果。原因是：模型层内的方法在模型图里、主 stream 上某一层的中间执行，在那里读主机内存，PCIe 搬运会直接卡住这一层之后的前向，藏不掉；拆成只依赖 token 和只读表的独立方法后，规划器才能把它提前到步首的旁路 stream，用少量 SM 读、与前向重叠（见上一条）。同一个查表结果也可以同时交给多个效果方法，而只搬一次。`pllm` 不会为了装下预算自动把表挪到主机内存，这个取舍由你显式声明。
 
 ---
 
@@ -685,7 +684,7 @@ class SkipMiddle(pllm.Workload):
 
 > **实用建议与限制**
 > * **TP 不会减少单卡上 `pllm` 状态的显存占用**：因为状态是按 rank 复制而非分片的（`pllm.explain` 会在输出中提示 `reservations are per rank`）。TP 省下的是底座模型权重在单卡上的占用。
-> * **TP > 1 不支持的特性**：以下能力在 `tensor_parallel_size > 1` 时会被直接拒绝：`@pllm.custom_residual`、`@pllm.custom_attention`、除按分片的 dense / low-rank 改写（只由 `@pllm.train_in_forward` 在本卡分片上更新）之外的权重改写、经 `pllm.causal_model` 的整模型训练、状态投喂（`feed`），以及 `pllm.testing.check_on_gpu`（请先在 `tensor_parallel_size=1` 下跑通 `check_on_gpu`）。
+> * **TP > 1 不支持的特性**：以下能力在 `tensor_parallel_size > 1` 时会被直接拒绝：`@pllm.custom_residual`、`@pllm.custom_attention`、除按分片的 dense / low-rank 改写（只由 `@pllm.train_in_forward` 在本卡分片上更新）之外的权重改写、经 `pllm.causal_model` 的整模型训练、状态投喂（`pllm.Fed`），以及 `pllm.testing.check_on_gpu`（请先在 `tensor_parallel_size=1` 下跑通 `check_on_gpu`）。
 
 ---
 

@@ -38,7 +38,7 @@ class PrefillAdaptersWorkload(pllm.Workload):
                 "a": pllm.Field(lambda in_features, out_features: (self.rank, in_features), dtype=self.dtype),
                 "b": pllm.Field(lambda in_features, out_features: (out_features, self.rank), dtype=self.dtype),
             },
-            initialize=initialize,
+            init=pllm.Computed(initialize),
             # Apply the mean reconstruction gradient once per prompt chunk.
             optimizer=pllm.SGD(self.learning_rate),
         )

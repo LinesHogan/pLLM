@@ -43,6 +43,7 @@ from pllm.execution.method_inputs import (
 )
 from pllm.execution.position_state import PositionState
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.state_init import Computed
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
@@ -132,7 +133,6 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 with operation.context.declaring(operation.name):
                     inputs.update((name, tuple(arguments.values())) for name, arguments in operation.sources().items())
         declared = BackendRequirements(
-            checkpoint_names=tuple(name for state in definitions.values() for name in state.checkpoint_names()),
             parameter_targets=tuple(target for delta in context.adapters.values() for target in delta.targets),
             activation_layers=tuple(layer for patch in context.activations.values() for layer in patch.layers),
             position_states=context.position_states(),
@@ -142,11 +142,11 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 for delta in context.adapters.values()
                 if delta.state in definitions
             ),
-            feeds=any(state.feed is not None for state in definitions.values()),
         )
         return BackendRequirements.combine(
             (
                 declared,
+                *(state.init.requirements(state) for state in definitions.values()),
                 *(operation.effect.requirements() for operation in context.operations),
                 *(source.requirements() for name in sorted(inputs) for source in inputs[name]),
             )
@@ -258,9 +258,11 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
         if (getter := _property(member)) is not None:
             seeds.append(getter)
     for value in values.values():
-        if (state := _typed(value, InstanceState)) is not None and state.initialize is not None:
-            method = _typed(state.initialize, MethodType)
-            if (function := _typed(state.initialize if method is None else method.__func__, FunctionType)) is not None:
+        if (state := _typed(value, InstanceState)) is not None and isinstance(state.init, Computed):
+            method = _typed(state.init.function, MethodType)
+            if (
+                function := _typed(state.init.function if method is None else method.__func__, FunctionType)
+            ) is not None:
                 seeds.append(function)
     _declare_result_helpers(context, candidates, seeds)
     _freeze_helpers(context, candidates, seeds)

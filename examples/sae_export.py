@@ -18,7 +18,7 @@ import pllm
 class SAE(pllm.Workload):
     """A frozen linear feature encoder shared by three observation taps."""
 
-    encoder = pllm.InstanceState(module=lambda m: torch.nn.Linear(m.hidden_size, 16, bias=False))
+    encoder = pllm.InstanceState(init=pllm.FromModule(lambda m: torch.nn.Linear(m.hidden_size, 16, bias=False)))
 
     def on_export(self, event: pllm.io.TraceEvent) -> None:
         """Print and persist the same sequence, layers, request identities, token positions and CPU value."""

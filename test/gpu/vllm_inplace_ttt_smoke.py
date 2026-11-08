@@ -98,7 +98,7 @@ class ImportedLowRank(pllm.Workload):
 
     @property
     def factors(self) -> pllm.RequestState:
-        return replace(low_rank_factors(), imported=True)
+        return replace(low_rank_factors(), init=pllm.Imported())
 
     @property
     def adapter(self) -> pllm.model.Adapter:

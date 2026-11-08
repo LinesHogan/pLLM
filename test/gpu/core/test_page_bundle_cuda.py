@@ -284,7 +284,8 @@ class HealthState(pllm.Workload):
     """Publish controlled values so diagnostics can be checked without a model."""
 
     values = pllm.InstanceState(
-        {"finite": (4,), "mixed": (4,), "empty": (0,), "large": (HEALTH_ELEMENTS,)}, initialize=_initialize_health
+        {"finite": (4,), "mixed": (4,), "empty": (0,), "large": (HEALTH_ELEMENTS,)},
+        init=pllm.Computed(_initialize_health),
     )
 
     @pllm.custom_residual(site="mlp", layers=(0,))

@@ -284,7 +284,7 @@ class PrecisionRoles(pllm.Workload):
 
     @property
     def imported(self) -> pllm.InstanceState:
-        return pllm.InstanceState({"w": (8,)}, imported=True, dtype=self.dtype)
+        return pllm.InstanceState({"w": (8,)}, init=pllm.Imported(), dtype=self.dtype)
 
     @property
     def trained(self) -> pllm.RequestState:

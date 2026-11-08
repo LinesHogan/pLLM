@@ -29,7 +29,9 @@ class ProjectionState(pllm.Workload):
                 "b": pllm.Field(lambda inputs, outputs: (outputs, 4)),
             }
         )
-        return pllm.RequestState(fields, dtype=torch.float32, initialize=self.initialize, optimizer=self.optimizer)
+        return pllm.RequestState(
+            fields, dtype=torch.float32, init=pllm.Computed(self.initialize), optimizer=self.optimizer
+        )
 
     def initialize(self, fields, generator):
         """Consume the same global random stream in TP1 and TP2."""
@@ -153,7 +155,7 @@ class SharedProjectionAdapter(ProjectionAdapter):
     def weights(self) -> pllm.InstanceState:
         """Share the same declared delta across requests."""
         state = super().weights
-        return pllm.InstanceState(state.fields, dtype=state.dtype, initialize=state.initialize)
+        return pllm.InstanceState(state.fields, dtype=state.dtype, init=state.init)
 
 
 @dataclass(frozen=True)

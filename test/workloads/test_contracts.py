@@ -384,7 +384,9 @@ class MoR(pllm.Workload):
 
     @property
     def router(self) -> pllm.InstanceState:
-        return pllm.InstanceState(module=lambda m: torch.nn.Linear(m.hidden_size, 1), dtype=torch.float32)
+        return pllm.InstanceState(
+            init=pllm.FromModule(lambda m: torch.nn.Linear(m.hidden_size, 1)), dtype=torch.float32
+        )
 
     @pllm.custom_forward(tokens="prefill")
     def prompt(self, layers, router=pllm.module("router")):
@@ -434,7 +436,11 @@ class ImportedRows(pllm.Workload):
     @property
     def steer(self) -> pllm.InstanceState:
         fields = {"vector": pllm.Field(lambda width, _: (width,))}
-        return pllm.RequestState(fields, imported=True) if self.request else pllm.InstanceState(fields, imported=True)
+        return (
+            pllm.RequestState(fields, init=pllm.Imported())
+            if self.request
+            else pllm.InstanceState(fields, init=pllm.Imported())
+        )
 
     @pllm.export(name="imported", every=1, max_rows=3, max_cols=8)
     def observe(self, hidden=pllm.hidden(0), vector=pllm.parameter("steer", "vector", per_row=True)):

@@ -58,5 +58,3 @@ def test_explicit_placement_and_engram_contracts(tmp_path):
     assert all(state.placement == "device" and state.transfer_bytes_per_step == 0 for state in device.states)
     with pytest.raises(ValueError, match="row gathers only"):
         pllm.explain(WholeTable(str(path), buckets=1024, width=2, placement="host", layers=(0,)), config)
-    with pytest.raises(ValueError, match="read-only pretrained"):
-        pllm.InstanceState({"table": (1024, 2)}, placement="host")

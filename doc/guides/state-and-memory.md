@@ -34,7 +34,9 @@ class Probe(pllm.Workload):
     encoder = pllm.InstanceState(
         {"weight": lambda m: (4, m.hidden_size)},   # 形状回调拿到模型事实
         dtype=torch.float32,
-        initialize=lambda tensors, generator: tensors["weight"].copy_(torch.eye(4, tensors["weight"].shape[-1])),
+        init=pllm.Computed(
+            lambda tensors, generator: tensors["weight"].copy_(torch.eye(4, tensors["weight"].shape[-1]))
+        ),
         optimizer=None,                              # 可省略，默认即 None
     )
 ```

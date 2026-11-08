@@ -38,7 +38,9 @@ import pllm
 
 class ESampLite(pllm.Workload):
     distiller = pllm.RequestState(
-        module=lambda m: nn.Sequential(nn.Linear(m.hidden_size, 4), nn.Linear(4, m.hidden_size)),
+        init=pllm.FromModule(
+            lambda m: nn.Sequential(nn.Linear(m.hidden_size, 4), nn.Linear(4, m.hidden_size))
+        ),
         optimizer=pllm.AdamW(1e-3),
     )
 
@@ -168,7 +170,7 @@ Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构验
 | [08 In-Place TTT](doc/tutorials/08_inplace_ttt.ipynb) | In-Place TTT（社区 4B 检查点） | 按块更新的快权重；decode 中跨块更新；与官方实现比吞吐 |
 | [09 自写算子](doc/tutorials/09_custom_kernels.ipynb) | 相对引导（Triton kernel） | 用 `torch.library.custom_op` 放进负载；explain 的算子行；check_on_gpu 的设备等价检查 |
 | [10 自定义 attention](doc/tutorials/10_custom_attention.ipynb) | 注意力监控 / Quest / KV 布局 | 只换读法；只读 top-K；滑动窗口、prompt 加窗口、跨层共享各省多少 KV |
-| [11 查表记忆](doc/tutorials/11_lookup_memory.ipynb) | n-gram 先验 / Engram 式残差 | `pllm.input_tokens`；`pretrained=` 读表；表放显存还是主机内存 |
+| [11 查表记忆](doc/tutorials/11_lookup_memory.ipynb) | n-gram 先验 / Engram 式残差 | `pllm.input_tokens`；`pllm.Pretrained` 读表；表放显存还是主机内存 |
 | [12 自适应深度](doc/tutorials/12_adaptive_depth.ipynb) | 按 token 跳层（early exit） | `active=`；跳过的层怎么补 KV；什么时候真的省 |
 | [13 让 agent 搜索算法](doc/tutorials/13_algorithm_search.ipynb) | agent 驱动的搜索循环 | explain + check + 打分 + 重放；怎样判断提升是不是噪声 |
 

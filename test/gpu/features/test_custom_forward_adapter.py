@@ -32,7 +32,7 @@ class LoopedAdapter(pllm.Workload):
                 "a": pllm.Field(lambda inputs, outputs: (4, inputs)),
                 "b": pllm.Field(lambda inputs, outputs: (outputs, 4)),
             },
-            initialize=self.initialize,
+            init=pllm.Computed(self.initialize),
         )
 
     def initialize(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:

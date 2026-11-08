@@ -226,7 +226,7 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
                 "a": pllm.Field(lambda in_features, out_features: (2, in_features), dtype=torch.float64),
                 "b": pllm.Field(lambda in_features, out_features: (out_features, 2), dtype=torch.float64),
             },
-            imported=True,
+            init=pllm.Imported(),
             dtype=torch.float64,
         )
 

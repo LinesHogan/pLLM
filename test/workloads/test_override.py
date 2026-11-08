@@ -221,7 +221,9 @@ def _chained_heads(facts) -> None:
         parameters["weight"].copy_(torch.linspace(-0.2, 0.3, 28).reshape(4, 7))
 
     class ChainedHeads(pllm.Workload):
-        heads = pllm.InstanceState({"weight": (4, 7)}, optimizer=pllm.AdamW(lr=0.03), initialize=initialize_chain)
+        heads = pllm.InstanceState(
+            {"weight": (4, 7)}, optimizer=pllm.AdamW(lr=0.03), init=pllm.Computed(initialize_chain)
+        )
 
         @pllm.add_logits()
         @pllm.differentiate(inputs=("hidden",), parameters=True)
@@ -297,7 +299,7 @@ class Domains(pllm.Workload):
         self.heads = state(
             {"weight": (4, 7)},
             optimizer=pllm.AdamW(lr=0.03, weight_decay=0.1),
-            initialize=initialize,
+            init=pllm.Computed(initialize),
             carry={"carry": (7,)},
         )
 

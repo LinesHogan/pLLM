@@ -176,7 +176,7 @@ class RewardHeadWorkload(pllm.Workload):
         return pllm.InstanceState(
             {"head": lambda m: (rank * (m.hidden_size + 1),)},
             optimizer=pllm.AdamW(lr=self.config.learning_rate),
-            initialize=self.initialize,
+            init=pllm.Computed(self.initialize),
         )
 
     def initialize(self, parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:

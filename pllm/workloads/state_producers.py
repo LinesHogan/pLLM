@@ -43,7 +43,7 @@ class FactorAdapterWorkload(pllm.Workload):
                 "b": pllm.Field(lambda in_features, out_features: (out_features, self.factor_rank)),
             },
             optimizer=self.optimizer,
-            initialize=seed_factors,
+            init=pllm.Computed(seed_factors),
         )
 
     @property
@@ -59,10 +59,12 @@ class PromptFactorsWorkload(FactorAdapterWorkload):
     def network(self) -> pllm.InstanceState:
         """Keep shared network weights separate from request factors."""
         return pllm.InstanceState(
-            module=lambda model: nn.Sequential(
-                nn.Linear(model.hidden_size, model.hidden_size),
-                nn.Tanh(),
-                nn.Linear(model.hidden_size, self.factor_rank * sum(i + o for i, o in model.target_shapes)),
+            init=pllm.FromModule(
+                lambda model: nn.Sequential(
+                    nn.Linear(model.hidden_size, model.hidden_size),
+                    nn.Tanh(),
+                    nn.Linear(model.hidden_size, self.factor_rank * sum(i + o for i, o in model.target_shapes)),
+                )
             )
         )
 
@@ -128,7 +130,9 @@ class PromptMixtureWorkload(PromptFactorsWorkload):
     def network(self) -> pllm.InstanceState:
         """Allocate the gate and factor bank as shared instance state."""
         return pllm.InstanceState(
-            module=lambda model: Mixture(model.hidden_size, model.target_shapes, self.rank, self.components)
+            init=pllm.FromModule(
+                lambda model: Mixture(model.hidden_size, model.target_shapes, self.rank, self.components)
+            )
         )
 
 

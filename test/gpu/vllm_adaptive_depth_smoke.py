@@ -34,7 +34,7 @@ class Exit(pllm.Workload):
 
     @property
     def router(self) -> pllm.InstanceState:
-        return pllm.InstanceState(module=self.zero_router, dtype=torch.float32)
+        return pllm.InstanceState(init=pllm.FromModule(self.zero_router), dtype=torch.float32)
 
     def zero_router(self, dimensions: pllm.Dimensions) -> torch.nn.Module:
         """Build a learned head whose initial decision equals a constant gate."""

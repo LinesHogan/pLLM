@@ -98,11 +98,11 @@ class PretrainedFile:
         """Identify a safetensors file at the authoring boundary, before an engine starts."""
         if not Path(path).is_file():
             raise ValueError(
-                f"pretrained={path!r} for state {state!r} does not exist; "
+                f"pllm.Pretrained({path!r}) for state {state!r} does not exist; "
                 "save it with safetensors.torch.save_file before make_llm"
             )
         if Path(path).suffix != ".safetensors":
-            raise ValueError("pretrained= needs a .safetensors file; save it with safetensors.torch.save_file")
+            raise ValueError("pllm.Pretrained needs a .safetensors file; save it with safetensors.torch.save_file")
         with open(path, "rb") as stream:
             return cls(path, state, file_digest(stream, "sha256").hexdigest())
 

@@ -393,7 +393,7 @@ class Head(torch.nn.Module):
 
 
 class ModuleDistillation(pllm.Workload):
-    head = pllm.RequestState(module=lambda m: Head(m.hidden_size), optimizer=pllm.AdamW(lr=0.03))
+    head = pllm.RequestState(init=pllm.FromModule(lambda m: Head(m.hidden_size)), optimizer=pllm.AdamW(lr=0.03))
 
     def ready(self, versions: torch.Tensor = pllm.version("head")) -> torch.Tensor:
         return versions > 0

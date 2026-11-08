@@ -53,7 +53,7 @@ class LoopedTTT(pllm.Workload):
                 "proj": pllm.Field(lambda d, _: (d, d)),
             },
             layers=LOOPED,
-            initialize=self.initial_targets,
+            init=pllm.Computed(self.initial_targets),
         )
 
     def initial_targets(self, fields: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:
@@ -72,7 +72,7 @@ class LoopedTTT(pllm.Workload):
     def laurel(self) -> pllm.InstanceState:
         return pllm.InstanceState(
             {"alpha": lambda m: (2 * m.layer_count,), "beta": lambda m: (2 * m.layer_count,)},
-            initialize=self.initial_gains,
+            init=pllm.Computed(self.initial_gains),
             dtype=torch.float32,
         )
 

@@ -65,6 +65,7 @@ from pllm.execution.model_sites import (
 from pllm.execution.overlay_parallel import admit_update
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, overlay_gradient
 from pllm.execution.row_task_binding import declare_parameters, declare_weighted_train
+from pllm.execution.state_init import Fed, FromModule
 from pllm.execution.tensor_frame import Tensors, UpdateOutput
 from pllm.execution.tensor_program import PoolSGD
 from pllm.execution.tensor_task import TensorExport
@@ -143,8 +144,8 @@ class Write(Effect):
     def declare(self, operation: Operation) -> None:
         context = operation.context
         definition = context.state_definition(self.state, "write needs a declared state")
-        if definition.feed is not None:
-            raise ValueError(f"@pllm.write: {self.state!r} is filled by its feed; write a state without feed=")
+        if isinstance(definition.init, Fed):
+            raise ValueError(f"@pllm.write: {self.state!r} is filled by its feed; write a state without init=pllm.Fed")
         if not self.fields or len(set(self.fields)) != len(self.fields) or operation.rows:
             raise ValueError("@pllm.write needs distinct field names and no rows=; it writes every row")
         for key in self.fields:
@@ -651,7 +652,7 @@ class TrainInForward(Effect):
         )
         identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = freeze(operation.function)
-        initialize = context.initializer(self.state, tuple(definition.fields))
+        initialize = definition.init.initializer(context.binding, self.state, tuple(definition.fields))
         if self.chunk is not None:
             function, initialize = _chunked_in_forward(
                 function,
@@ -907,7 +908,7 @@ class CustomResidual(Effect):
         if (
             definition.scope is not StateScope.REQUEST
             or definition.optimizer is not None
-            or definition.module is not None
+            or isinstance(definition.init, FromModule)
             or len(definition.fields) != 1
             or self.chunk is None
             or len(places) != 1
@@ -924,7 +925,7 @@ class CustomResidual(Effect):
         if isinstance(shape, Field):
             raise TypeError(f"{name}: give the carry a fixed shape or a function of the model dimensions")
         rows: Shape = lambda dimensions: (max(1, chunk - 1), dimensions.hidden_size)  # noqa: E731
-        initialize = context.initializer(self.state, (name,))
+        initialize = definition.init.initializer(context.binding, self.state, (name,))
         if initialize is not None:
             initialize = partial(_author_fields, initialize, (name,))
         state, ports = declare_parameters(

@@ -28,7 +28,7 @@ class FeedWorkload(pllm.Workload):
 
     @property
     def source(self) -> pllm.InstanceState:
-        return pllm.InstanceState({"value": (2,)}, feed=self.order)
+        return pllm.InstanceState({"value": (2,)}, init=pllm.Fed(self.order))
 
     @property
     def target(self) -> pllm.InstanceState:
@@ -102,9 +102,9 @@ def test_selection_preserves_explicit_missing_and_end_barriers(order, expected):
 
 def test_feed_rejects_local_writers_and_request_scopes():
     with pytest.raises(ValueError, match="InstanceState"):
-        pllm.RequestState(shape=(2,), feed="ordered")
+        pllm.RequestState(shape=(2,), init=pllm.Fed("ordered"))
     with pytest.raises(ValueError, match="optimizer"):
-        pllm.InstanceState(shape=(2,), feed="ordered", optimizer=pllm.SGD(0.1))
+        pllm.InstanceState(shape=(2,), init=pllm.Fed("ordered"), optimizer=pllm.SGD(0.1))
 
     @dataclass(frozen=True)
     class WritesSource(FeedWorkload):
@@ -175,9 +175,9 @@ def test_write_field_and_feed_field_order_are_signed():
     vars(Fields.transform).pop("__pllm_effect__")  # re-declare the same method with another field
     pllm.write(state="target", fields=("second",))(Fields.transform)
     assert Fields().build(facts_for()).graph.execution_parameters_digest != first
-    Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, feed="ordered")
+    Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, init=pllm.Fed("ordered"))
     first = Fields().build(facts_for()).graph.execution_parameters_digest
-    Fields.source = pllm.InstanceState({"extra": (2,), "value": (2,)}, feed="ordered")
+    Fields.source = pllm.InstanceState({"extra": (2,), "value": (2,)}, init=pllm.Fed("ordered"))
     assert Fields().build(facts_for()).graph.execution_parameters_digest != first
 
 
@@ -186,7 +186,7 @@ def test_fed_buffer_fields_use_the_same_declared_ports():
     class BufferFeed(FeedWorkload):
         @property
         def source(self) -> pllm.InstanceState:
-            return pllm.InstanceState({"value": pllm.Field((2,), dtype=torch.float32)}, feed=self.order)
+            return pllm.InstanceState({"value": pllm.Field((2,), dtype=torch.float32)}, init=pllm.Fed(self.order))
 
     workload = BufferFeed()
     execution = workload.compile_backend(facts_for(), pllm.ExecutionOptions()).execution

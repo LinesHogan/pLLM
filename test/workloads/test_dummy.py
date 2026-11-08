@@ -197,7 +197,7 @@ def _frozen_state_is_readable_by_an_observation() -> None:
         def on_export(self, event):
             delivered.append(event)
 
-        encoder = pllm.InstanceState(module=lambda model: Encoder(model.hidden_size))
+        encoder = pllm.InstanceState(init=pllm.FromModule(lambda model: Encoder(model.hidden_size)))
 
     bindings = tuple(testing.hidden_binding(layer, 18) for layer in (3, 5, 17))
     execution = testing.compile_execution(FrozenEncoder(), backend_facts(32, bindings, layer_count=18))

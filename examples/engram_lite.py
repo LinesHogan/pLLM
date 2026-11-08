@@ -42,14 +42,16 @@ class EngramLite(pllm.Workload):
     @property
     def memory(self) -> pllm.InstanceState:
         """Only the gathered table uses the declared placement; projections stay on device."""
-        return pllm.InstanceState({"table": (self.buckets, self.width)}, pretrained=self.path, placement=self.placement)
+        return pllm.InstanceState(
+            {"table": (self.buckets, self.width)}, init=pllm.Pretrained(self.path, placement=self.placement)
+        )
 
     @property
     def projections(self) -> pllm.InstanceState:
         """Small key/value projections loaded from the same offline fit."""
         return pllm.InstanceState(
             {"wk": lambda m: (2 * self.width, m.hidden_size), "wv": lambda m: (2 * self.width, m.hidden_size)},
-            pretrained=self.path,
+            init=pllm.Pretrained(self.path),
         )
 
     def lookup(

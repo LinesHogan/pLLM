@@ -358,7 +358,7 @@ def test_hf_trained_probe_deploys_from_safetensors(tmp_path):
     del probe, optimizer, features, labels, loss
     gc.collect()
     torch.cuda.empty_cache()
-    workload = PretrainedProbe(pllm.InstanceState({"w": (896,), "b": (1,)}, pretrained=path))
+    workload = PretrainedProbe(pllm.InstanceState({"w": (896,), "b": (1,)}, init=pllm.Pretrained(path)))
     config = pllm.ModelConfig(
         model, max_model_len=64, max_num_seqs=2, max_num_batched_tokens=64, gpu_memory_utilization=0.25
     )

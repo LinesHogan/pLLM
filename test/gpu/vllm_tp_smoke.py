@@ -232,7 +232,9 @@ def test_j2(lag):
 class Steering(pllm.Workload):
     """Activation steering (CAA): add an imported vector to layer 12's MLP output on decode rows."""
 
-    steer: pllm.InstanceState = pllm.InstanceState({"vector": pllm.Field(lambda width, _: (width,))}, imported=True)
+    steer: pllm.InstanceState = pllm.InstanceState(
+        {"vector": pllm.Field(lambda width, _: (width,))}, init=pllm.Imported()
+    )
     patch: pllm.model.ActivationPatch = pllm.model.ActivationPatch("steer", layers=(12,), operator="add", decode=True)
 
 

@@ -62,13 +62,13 @@ class OutputLoRAWorkload(pllm.Workload):
             return pllm.RequestState(
                 fields,
                 optimizer=pllm.SGD(self.config.learning_rate),
-                initialize=initialize,
+                init=pllm.Computed(initialize),
                 key_fields=self.config.key_fields,
             )
         return pllm.InstanceState(
             fields,
             optimizer=pllm.SGD(self.config.learning_rate),
-            initialize=initialize,
+            init=pllm.Computed(initialize),
         )
 
     def reset(self, parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:

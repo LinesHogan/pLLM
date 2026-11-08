@@ -27,7 +27,11 @@ class PromptSteering(pllm.Workload):
     @property
     def steer(self) -> pllm.InstanceState:
         fields = {"vector": pllm.Field(lambda width, _: (width,))}
-        return pllm.RequestState(fields, imported=True) if self.request else pllm.InstanceState(fields, imported=True)
+        return (
+            pllm.RequestState(fields, init=pllm.Imported())
+            if self.request
+            else pllm.InstanceState(fields, init=pllm.Imported())
+        )
 
     @property
     def offset(self) -> pllm.InstanceState:

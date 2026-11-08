@@ -48,7 +48,7 @@ class FTTTWorkload(pllm.Workload):
         return pllm.InstanceState(
             {"down": lambda m: (rank, m.hidden_size + feedback), "up": lambda m: (m.hidden_size, rank)},
             optimizer=pllm.AdamW(self.config.learning_rate, self.config.betas, self.config.eps),
-            initialize=self.initialize,
+            init=pllm.Computed(self.initialize),
         )
 
     def initialize(self, parameters: Mapping[str, torch.Tensor], generator: torch.Generator) -> None:

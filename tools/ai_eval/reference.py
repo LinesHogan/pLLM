@@ -18,7 +18,7 @@ class CAA(pllm.Workload):
     """Apply a population direction at the MLP residual."""
 
     alpha: float = 0.7
-    steer = pllm.InstanceState({"vector": pllm.Field(lambda i, o: (i,))}, imported=True, dtype=torch.float32)
+    steer = pllm.InstanceState({"vector": pllm.Field(lambda i, o: (i,))}, init=pllm.Imported(), dtype=torch.float32)
 
     @pllm.custom_residual(site="mlp", layers=(1,))
     def intervene(
@@ -33,7 +33,9 @@ class ITI(pllm.Workload):
     """Add already projected head directions to the attention residual."""
 
     alpha: float = 0.6
-    heads = pllm.InstanceState({"directions": pllm.Field(lambda i, o: (2, i))}, imported=True, dtype=torch.float32)
+    heads = pllm.InstanceState(
+        {"directions": pllm.Field(lambda i, o: (2, i))}, init=pllm.Imported(), dtype=torch.float32
+    )
 
     @pllm.custom_residual(site="attention", layers=(1,))
     def intervene(
@@ -94,7 +96,7 @@ class ESamp(pllm.Workload):
         {"a": lambda m: (2, m.hidden_size), "b": lambda m: (m.hidden_size, 2)},
         dtype=torch.float32,
         optimizer=pllm.AdamW(lr=0.01),
-        initialize=initialize_student,
+        init=pllm.Computed(initialize_student),
     )
 
     @pllm.guide_sampling(beta=0.5)

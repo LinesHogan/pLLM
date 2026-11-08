@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from functools import partial
 from inspect import signature
 from math import prod
 from types import FunctionType, MethodType
@@ -37,24 +36,22 @@ from pllm.contracts.semantic_graph import (
     TimingConstraint,
     TrainingMode,
 )
-from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.binding_base import Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.checkpoint import PretrainedFile, initialize_checkpoint
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, State, When
 from pllm.execution.freeze import fingerprint, freeze
 from pllm.execution.host_runtime import HostConfig, bind_host
-from pllm.execution.method_effects import TRAINING_INPUTS, CustomAttention, Effect, Gradient, Initializer, Sampler
+from pllm.execution.method_effects import TRAINING_INPUTS, CustomAttention, Effect, Gradient, Sampler
 from pllm.execution.method_inputs import Carried, Carry, InputMarker, Parameter, Result, method_inputs
-from pllm.execution.model_effect_binding import declare_activation_patch, declare_custom_forward, import_update
+from pllm.execution.model_effect_binding import declare_activation_patch, declare_custom_forward
 from pllm.execution.model_sites import StateInput
-from pllm.execution.module_state import initial_values
 from pllm.execution.position_state import PositionState
 from pllm.execution.row_task_binding import declare_logits, declare_parameters, declare_tensor, validate_gradients
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.state_init import Computed, Fed, Imported, Zeros
 from pllm.execution.step_input import StepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources, shape_site_results
 from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
@@ -259,13 +256,6 @@ class WorkloadContext:
     # Each @pllm.train method and the state it trains.
     trainers: list[tuple[Call, State]] = field(default_factory=lambda: [])
 
-    def initializer(self, name: str, fields: tuple[str, ...]) -> Initializer | None:
-        """One starting-value source for ordinary state and model-side state lowerings."""
-        if name in self.binding.pretrained:
-            return partial(self.binding.pretrained[name].initialize, fields)
-        initialize = self.state_definitions[name].initialize
-        return None if initialize is None else freeze(initialize)
-
     def validate_pretrained(self) -> None:
         """Validate declared weights on CPU after every lowering has resolved its field shapes."""
         for resource in self.binding.pretrained:
@@ -399,24 +389,6 @@ class WorkloadContext:
         for name, state in self.state_definitions.items():
             with self.declaring(name):
                 declare_state(self, name, state)
-            if state.imported:
-                allocated = self.states[name]
-                self.binding.effects = replace(
-                    self.binding.effects,
-                    import_fields=tuple(
-                        (field, view)
-                        for (resource, field), view in self.binding.field_views.items()
-                        if resource == name
-                    ),
-                )
-                self.binding.imports[name] = tuple(
-                    view for (resource, _), view in self.binding.field_views.items() if resource == name
-                )
-                update = import_update(self.binding, allocated, f"{name}:import@1")
-                self.writes[name] = (
-                    update,
-                    self.binding.publish(update, allocated, when=When.BEFORE_FORWARD, name=f"{name}.publish"),
-                )
         self.signature.extend(
             (name, fingerprint(value)) for name, value in {**self.activations, **self.adapters}.items()
         )
@@ -592,40 +564,27 @@ class WorkloadContext:
                 function=lambda data, batch: TaskOutput(),
             )
 
-        for name, state in self.state_definitions.items():
-            if state.checkpoint and any(
-                effect.resource == name and effect.kind is not StateEffectKind.READ
-                for task in b.graph.tasks
-                for effect in task.effects
-            ):
-                raise ValueError(f"checkpoint state {name!r} is frozen; write to a separate state")
+        written = {
+            str(effect.resource)
+            for task in b.graph.tasks
+            for effect in task.effects
+            if effect.kind is not StateEffectKind.READ
+        }
+        for name, definition in self.state_definitions.items():
+            definition.init.check_use(name, written=name in written, model_read=name in b.graph.model_reads)
+        # Fed and imported states change from outside the graph; trained or written states change inside it.
         frozen = {
             name
             for name, state in self.state_definitions.items()
-            if state.optimizer is None
-            and not state.imported
-            and state.feed is None
-            and not any(
-                effect.resource == name and effect.kind is not StateEffectKind.READ
-                for task in b.graph.tasks
-                for effect in task.effects
-            )
+            if state.optimizer is None and not isinstance(state.init, (Fed, Imported)) and name not in written
         }
-        for name, definition in self.state_definitions.items():
-            if definition.placement == "host" and name in b.graph.model_reads:
-                raise ValueError(
-                    f"{name}: gather host rows in a helper and read pllm.result in the model site; "
-                    'or use placement="device"'
-                )
-            if definition.placement == "host" and name not in frozen:
-                raise ValueError(f'{name}: placement="host" needs read-only state; use placement="device" for writes')
         b.graph = replace(
             b.graph,
             states=tuple(
                 replace(
                     state,
                     immutable=state.resource in frozen,
-                    placement=self.state_definitions[state.resource].placement,
+                    placement=self.state_definitions[state.resource].init.placement,
                 )
                 for state in b.graph.states
             ),
@@ -638,45 +597,26 @@ class WorkloadContext:
 
 def declare_state(context: WorkloadContext, name: str, definition: InstanceState) -> None:
     """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
-    pretrained = PretrainedFile.read(definition.pretrained, name) if definition.pretrained else None
-    context.signature.append(
-        (
-            name,
-            boundary_digest(
-                fingerprint(definition), tuple(definition.fields), "" if pretrained is None else pretrained.sha256
-            ),
-        )
-    )
-    context.binding.state_sources[name] = definition.source() if pretrained is None else pretrained.source
-    if pretrained is not None:
-        context.binding.pretrained[name] = pretrained
+    digest = definition.init.register(context.binding, name, definition.scope)
+    context.signature.append((name, boundary_digest(fingerprint(definition), tuple(definition.fields), digest)))
     if name in context.in_forward_states or name in context.states:
         return
-    if definition.feed is not None:
-        if context.binding.feeds:
-            raise ValueError(f"{context.binding.feeds[0].resource} and {name}: declare one fed state per workload")
-        context.binding.feeds = (FeedBinding(name, FeedOrder(definition.feed), tuple(definition.fields)),)
     fields = _layout_fields(context, name, definition)
     if context.binding.dimensions.tensor_parallel_size > 1 and any(field.shard is not None for field in fields):
-        if (
-            definition.optimizer is not None
-            or definition.imported
-            or definition.checkpoint
-            or definition.pretrained
-            or definition.module is not None
-        ):
+        # Initialization runs on the whole field before each rank takes its slice.
+        if definition.optimizer is not None or not isinstance(definition.init, (Zeros, Computed)):
             raise ValueError(
-                "TP Adapter fields use initialize= and shard-local @pllm.train_in_forward updates; "
-                "optimizer/import/checkpoint/module-backed adapters need tensor_parallel_size=1"
+                "TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local "
+                "@pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1"
             )
     context.states[name], ports = declare_parameters(
         context.binding,
         name,
         fields,
         optimizer=definition.optimizer,
-        initialize=context.initializer(name, tuple(item.name for item in fields) + tuple(definition.carry))
-        if definition.module is None
-        else None,
+        initialize=definition.init.initializer(
+            context.binding, name, tuple(item.name for item in fields) + tuple(definition.carry)
+        ),
         scope=definition.scope,
         keys=definition.request_keys,
         carry=tuple(
@@ -685,17 +625,7 @@ def declare_state(context: WorkloadContext, name: str, definition: InstanceState
         ),
     )
     context.parameters.update({(name, field): port for field, port in ports.items()})
-    if definition.checkpoint:
-        context.binding.initializers[name] = partial(
-            initialize_checkpoint, context.binding.checkpoint, definition.checkpoint_names()
-        )
-    if definition.module is not None:
-        context.binding.initial_values[name] = partial(
-            initial_values,
-            definition.module,
-            dtype=context.field_dtype(name, "parameters", definition.dtype).torch,
-            pretrained=pretrained,
-        )
+    definition.init.declare(context, name, definition)
 
 
 def _layout_fields(context: WorkloadContext, name: str, definition: InstanceState) -> tuple[LayoutField, ...]:
@@ -727,12 +657,10 @@ def _layout_fields(context: WorkloadContext, name: str, definition: InstanceStat
     if (
         consumer.operator is ParameterOverlayOperator.LOW_RANK_ADD
         and definition.optimizer is not None
-        and definition.initialize is None
-        and not definition.pretrained
-        and not definition.imported
+        and isinstance(definition.init, Zeros)
     ):
         raise ValueError(
-            f"{name}: add initialize= (e.g. random A, zero B); with both low_rank factors at zero "
+            f"{name}: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero "
             "every gradient is zero and the adapter never learns"
         )
     context.binding.overlay_targets = consumer.targets
@@ -747,7 +675,7 @@ def _layout_fields(context: WorkloadContext, name: str, definition: InstanceStat
 def declare_patch(context: WorkloadContext, name: str, patch: ActivationPatch) -> None:
     """Read the state at the activation sites; its writer, if the workload has one, is connected later."""
     definition = context.state_definition(patch.state, "pllm.model.ActivationPatch needs a declared state")
-    if definition.feed is not None:
+    if isinstance(definition.init, Fed):
         raise ValueError(
             "pllm.model.ActivationPatch reads a state the workload writes; it cannot read a fed state directly"
         )

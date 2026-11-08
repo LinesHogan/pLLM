@@ -38,7 +38,9 @@ class MiniESamp(pllm.Workload):
 
     @property
     def distiller(self) -> pllm.RequestState:
-        return pllm.RequestState(module=lambda m: Distiller(m.hidden_size, self.rank), optimizer=pllm.AdamW(1e-3))
+        return pllm.RequestState(
+            init=pllm.FromModule(lambda m: Distiller(m.hidden_size, self.rank)), optimizer=pllm.AdamW(1e-3)
+        )
 
     def trained(self, versions: torch.Tensor = pllm.version("distiller")) -> torch.Tensor:
         return versions > 0
@@ -108,7 +110,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 ```python
 class SharedLoRA(pllm.Workload):
     lora = pllm.InstanceState({"a": pllm.Field(lambda inputs, outputs: (4, inputs)),
-                               "b": pllm.Field(lambda inputs, outputs: (outputs, 4))}, imported=True)
+                               "b": pllm.Field(lambda inputs, outputs: (outputs, 4))}, init=pllm.Imported())
     apply = pllm.model.Adapter("lora", (pllm.model.Projection("q_proj", 12), pllm.model.Projection("v_proj", 12)),
                                operator="low_rank")
 

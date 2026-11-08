@@ -128,7 +128,7 @@ def validate_host_batch(
     if not consumers:
         raise ValueError(
             f"this workload reads no {type(value).__name__}; pass batch=None or add a method that reads it"
-            + (" or declare a state with imported=True" if isinstance(value, StateImport) else "")
+            + (" or declare a state with init=pllm.Imported()" if isinstance(value, StateImport) else "")
         )
 
     def shape(tensor: T) -> tuple[int, ...]:

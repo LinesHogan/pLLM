@@ -69,7 +69,7 @@ class LogitLookup(pllm.Workload):
     @property
     def memory(self) -> pllm.InstanceState:
         return pllm.InstanceState(
-            {"table": lambda m: (self.buckets, m.vocab_size)}, pretrained=self.path, placement=self.placement
+            {"table": lambda m: (self.buckets, m.vocab_size)}, init=pllm.Pretrained(self.path, placement=self.placement)
         )
 
     def lookup(self, ids=pllm.input_tokens(history=1), table=pllm.parameter("memory", "table")):
@@ -95,17 +95,21 @@ def test_pretrained_equals_initialize_and_signs_file_bytes(tmp_path, state_type,
         values["hidden"] = torch.tensor([7.0])
     save_file(values, path)
     if module:
-        state = state_type(module=lambda m: MetaProbe(m.hidden_size), pretrained=str(path), optimizer=optimizer)
+        state = state_type(
+            init=pllm.FromModule(lambda m: MetaProbe(m.hidden_size), pretrained=str(path)), optimizer=optimizer
+        )
         workload = ModuleProbe(state)
     else:
         state = state_type(
             {"w": lambda m: (m.hidden_size,), "b": pllm.Field((1,))},
-            pretrained=str(path),
+            init=pllm.Pretrained(str(path)),
             optimizer=optimizer,
             carry=carry,
         )
         workload = FieldProbe(state)
-    reference = FieldProbe(state_type({"w": (4,), "b": (1,)}, initialize=fill_probe, optimizer=optimizer, carry=carry))
+    reference = FieldProbe(
+        state_type({"w": (4,), "b": (1,)}, init=pllm.Computed(fill_probe), optimizer=optimizer, carry=carry)
+    )
     tap = testing.final_hidden_binding(1)
     facts = testing.backend_facts(4, (tap,), layer_count=1, memory_bytes=1 << 20)
     binding = workload.build(facts)
@@ -137,7 +141,7 @@ def test_pretrained_equals_initialize_and_signs_file_bytes(tmp_path, state_type,
 
 def test_pretrained_boundary_messages_and_import_first_export(tmp_path):
     path = tmp_path / "probe.safetensors"
-    state = pllm.InstanceState({"w": (4,), "b": (1,)}, pretrained=str(path))
+    state = pllm.InstanceState({"w": (4,), "b": (1,)}, init=pllm.Pretrained(str(path)))
     workload = FieldProbe(state)
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -162,7 +166,9 @@ def test_pretrained_boundary_messages_and_import_first_export(tmp_path):
     save_file({"w": torch.ones(4), "b": torch.ones(2)}, path)
     with pytest.raises(ValueError, match="adjust the declared field shape"):
         pllm.explain(workload, config)
-    module = ModuleProbe(pllm.InstanceState(module=lambda m: MetaProbe(m.hidden_size), pretrained=str(path)))
+    module = ModuleProbe(
+        pllm.InstanceState(init=pllm.FromModule(lambda m: MetaProbe(m.hidden_size), pretrained=str(path)))
+    )
     for values in (
         {"weight": torch.ones(1, 4)},
         {"weight": torch.ones(1, 4), "bias": torch.ones(1), "extra": torch.ones(1)},
@@ -177,20 +183,12 @@ def test_pretrained_boundary_messages_and_import_first_export(tmp_path):
     save_file({"w": torch.ones(4), "b": torch.ones(1)}, path)
     report = pllm.explain(workload, config)
     assert report.states[0].source in str(report) and str(path) in report.states[0].source
-    for options in (
-        {"initialize": fill_probe},
-        {"imported": True},
-        {"feed": "latest"},
-        {"checkpoint": {"w": "w", "b": "b"}},
-    ):
-        with pytest.raises(ValueError, match="pretrained= supplies starting values"):
-            replace(state, **options)
     for captured in (nn.Linear(4, 1), torch.ones(4)):
         factory = lambda m: captured
         with pytest.raises(ValueError, match="pretrained="):
             fingerprint(factory)
     assert testing.check(workload, config).passed
-    imported = replace(workload, state=replace(state, pretrained="", imported=True))
+    imported = replace(workload, state=replace(state, init=pllm.Imported()))
     tap = testing.final_hidden_binding(1)
     facts = testing.backend_facts(4, (tap,), layer_count=1, memory_bytes=1 << 20)
     facts = replace(facts, timeline=model_timeline(torch.device("cpu"), ("transition/full_root@1",)))
@@ -219,7 +217,7 @@ def test_pretrained_uses_model_side_initializer_paths(tmp_path):
 
         @property
         def dense_fast_weights(self) -> pllm.RequestState:
-            return replace(super().dense_fast_weights, pretrained=self.path)
+            return replace(super().dense_fast_weights, init=pllm.Pretrained(self.path))
 
     @dataclass(frozen=True)
     class SavedMemory(FastWeightMemory):
@@ -227,7 +225,7 @@ def test_pretrained_uses_model_side_initializer_paths(tmp_path):
 
         @property
         def memory(self) -> pllm.RequestState:
-            return replace(super().memory, pretrained=self.path)
+            return replace(super().memory, init=pllm.Pretrained(self.path))
 
     path = str(tmp_path / "memory.safetensors")
     target = Projection("down_proj", 0)

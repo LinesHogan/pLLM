@@ -17,7 +17,7 @@ class NGramPrior(pllm.Workload):
 
     @property
     def memory(self) -> pllm.InstanceState:
-        return pllm.InstanceState({"table": lambda m: (self.buckets, m.vocab_size)}, pretrained=self.path)
+        return pllm.InstanceState({"table": lambda m: (self.buckets, m.vocab_size)}, init=pllm.Pretrained(self.path))
 
     def lookup(
         self,

@@ -64,7 +64,7 @@ class TLMWorkload(pllm.Workload):
                 "b": pllm.Field(lambda in_features, out_features: (out_features, self.rank)),
             },
             optimizer=self.config.optimizer,
-            initialize=self.initialize,
+            init=pllm.Computed(self.initialize),
         )
 
     @property

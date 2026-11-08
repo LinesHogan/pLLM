@@ -61,7 +61,7 @@ class OverRIDEWorkload(pllm.Workload):
                 "up": lambda m: (config.num_iterations - 1, m.vocab_size, config.rank),
             },
             optimizer=pllm.AdamW(lr=config.learning_rate),
-            initialize=initialize,
+            init=pllm.Computed(initialize),
         )
 
     def num_iterations(self) -> int:

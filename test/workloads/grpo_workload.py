@@ -32,7 +32,7 @@ class TTRL(pllm.Workload):
                 "b": pllm.Field(lambda inputs, outputs: (outputs, self.rank)),
             },
             optimizer=self.optimizer,
-            initialize=self.initialize,
+            init=pllm.Computed(self.initialize),
         )
 
     @property

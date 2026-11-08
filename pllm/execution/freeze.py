@@ -127,7 +127,8 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     if isinstance(value, (torch.nn.Module, torch.Tensor)):
         raise ValueError(
             f"{type(value).__name__}: a workload cannot hold a module or tensor; save its weights and declare "
-            "pllm.InstanceState(module=<factory>, pretrained=path) or field state with pretrained=path"
+            "pllm.InstanceState(init=pllm.FromModule(<factory>, pretrained=path)), or field state with "
+            "init=pllm.Pretrained(path)"
         )
     if is_dataclass(value):
         return boundary_digest(

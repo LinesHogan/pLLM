@@ -135,7 +135,7 @@ class Feed(Patch):
 
     @property
     def source(self) -> pllm.InstanceState:
-        return pllm.InstanceState({"v": (4,)}, feed="ordered")
+        return pllm.InstanceState({"v": (4,)}, init=pllm.Fed("ordered"))
 
     @pllm.write(state="patch_state", fields=("v",))
     def transform(self, v=pllm.parameter("source", "v")):

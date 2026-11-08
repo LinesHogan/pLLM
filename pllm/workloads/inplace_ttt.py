@@ -97,10 +97,12 @@ class InPlaceTTTWorkload(pllm.Workload):
                 "proj": pllm.Field(lambda d, _: (d, d)),
             },
             layers=tuple(target.layer for target in self.config.targets if target.layer is not None),
-            checkpoint={
-                "conv": "model.layers.{layer}.mlp.ttt_conv.weight",
-                "proj": "model.layers.{layer}.mlp.ttt_proj.weight",
-            },
+            init=pllm.ModelCheckpoint(
+                {
+                    "conv": "model.layers.{layer}.mlp.ttt_conv.weight",
+                    "proj": "model.layers.{layer}.mlp.ttt_proj.weight",
+                }
+            ),
         )
 
     @property

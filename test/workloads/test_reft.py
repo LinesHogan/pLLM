@@ -151,7 +151,7 @@ def _decode_declarations_are_checked(facts):
 
         @property
         def intervention(self) -> pllm.InstanceState:
-            return pllm.InstanceState({"delta": pllm.Field((4,), dtype=torch.float32)}, imported=True)
+            return pllm.InstanceState({"delta": pllm.Field((4,), dtype=torch.float32)}, init=pllm.Imported())
 
     workload = DeclaredActivation(replace(legacy, decode=True, on_missing="hold"))
     workload.plan_backend(*workload.specialize(facts, pllm.ExecutionOptions()))

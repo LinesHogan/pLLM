@@ -201,7 +201,7 @@ def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch
     class Imported(FactorAdapterWorkload):
         @property
         def factors(self) -> pllm.RequestState:
-            return replace(super().factors, imported=True)
+            return replace(super().factors, init=pllm.Imported())
 
     class Written(FactorAdapterWorkload):
         @pllm.write(state="factors", fields=("a_0", "b_0", "a_1", "b_1"))

@@ -68,7 +68,7 @@ class ReFTWorkload(pllm.Workload):
         state = pllm.RequestState if self.config.scope == "request" else pllm.InstanceState
         return state(
             {f"layer_{layer}_{offset}": field for layer in self.config.layers for offset, field in enumerate(fields)},
-            imported=True,
+            init=pllm.Imported(),
         )
 
     @property

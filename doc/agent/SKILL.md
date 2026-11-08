@@ -45,7 +45,9 @@ class Distill(pllm.Workload):
 
     # What it owns: every request gets its own small network and AdamW state.
     distiller = pllm.RequestState(
-        module=lambda m: nn.Sequential(nn.Linear(m.hidden_size, 4), nn.Linear(4, m.hidden_size)),
+        init=pllm.FromModule(
+            lambda m: nn.Sequential(nn.Linear(m.hidden_size, 4), nn.Linear(4, m.hidden_size))
+        ),
         optimizer=pllm.AdamW(1e-3),
     )
 
@@ -219,7 +221,7 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | `... both declare @pllm.guide_sampling; keep at most one guidance method` | Keep one `@pllm.guide_sampling` method per workload, components included; several `@pllm.add_logits` methods may coexist and are applied before guidance. |
 | `tensor export needs positive every, max_rows and max_cols, with max_cols * 8 <= ... bytes (32 KiB), so one row fits an export event` | Lower `max_cols` to at most 4096. Rows beyond `max_rows` in one step are dropped (`event.dropped_rows`), so pass at most `max_rows` prompts per `generate` call when you read prompt-end rows (see reference.md, Export observations). |
 | `property ... needs a return annotation; ...` | Annotate state properties `-> pllm.RequestState` / `-> pllm.InstanceState`, other properties with their type. |
-| `pllm.parameter(..., ...) names no declared field; declared: ...` | Use a declared state and field name; a `shape=` state has the single field `"value"`, a `module=` state is read with `pllm.module(s)`. |
+| `pllm.parameter(..., ...) names no declared field; declared: ...` | Use a declared state and field name; a `shape=` state has the single field `"value"`, an `init=pllm.FromModule(...)` state is read with `pllm.module(s)`. |
 | `@pllm.train reads ..., which trains with ...; declare ... with optimizer=...` (for example: reads rows of running requests, which trains with pllm.AdamW(lr)) | Put the optimizer the message names on the state. |
 | `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | Training on request rows next to `@pllm.guide_sampling`, or with no model effect, updates every running request; select rows on the sampler method instead (`rows=` on `@pllm.guide_sampling`). |
 | `... pllm funds one training mode per workload, so move one of them to a separate workload` | Do not mix request-row training and host-batch training in one workload. |
@@ -245,7 +247,7 @@ Messages are quoted from pllm; `...` marks text that depends on your code.
 | `@pllm.custom_forward` | Your program over layer slices: loops, early exit (`active=`), KV peeks. | vLLM's whole-model graph is replaced by graphs pllm captures per slice (`eager_reason` names it); no `pllm.hidden` / `pllm.final_hidden` readers in the same workload; a `pllm.model.Adapter` applies at every projection call; may need a larger `cuda_graph_pool_budget_bytes`, which explain does not estimate; tensor parallelism only on vLLM 0.32.0 MRv2. |
 | `@pllm.custom_residual` | Your residual update at a sublayer, value rows or the final stream. | Runs inside the model's CUDA graphs (vLLM captures source operators, not inductor-fused ones); `tensor_parallel_size=1`; prefix caching off; stateful sublayers need a larger `cuda_graph_pool_budget_bytes`. |
 | `@pllm.custom_attention` | Your attention read per layer: `kv.attend(q, window=, topk=)`; static KV layouts with `keep=` / `window=` / `sink=` / `source=`. | `tensor_parallel_size=1`; FlashAttention 2 and unquantized KV; prefix caching off; layouts need MRv2 and exclude `pllm.PositionState` and `@pllm.custom_forward`; top-K selection saves reads, not memory; score-based memory eviction is unsupported. |
-| `pllm.InstanceState(..., pretrained=path, placement="host")` | Keeps a read-only pretrained table that methods only gather from in pinned host memory (default `"device"` never falls back to host). | Rows cross PCIe each step, but token-only lookups run on the `side` lane from `request.prepare` with a bounded gather, so the transfer overlaps the forward; `explain` reports bytes per row and the lane; supported reads: indexing (`table[idx]`, including after views such as `table[:, ::2]`), `torch.index_select`, `torch.nn.functional.embedding`, `torch.vmap` (other operations are rejected at planning). |
+| `pllm.InstanceState(..., init=pllm.Pretrained(path, placement="host"))` | Keeps a read-only pretrained table that methods only gather from in pinned host memory (default `"device"` never falls back to host). | Rows cross PCIe each step, but token-only lookups run on the `side` lane from `request.prepare` with a bounded gather, so the transfer overlaps the forward; `explain` reports bytes per row and the lane; supported reads: indexing (`table[idx]`, including after views such as `table[:, ::2]`), `torch.index_select`, `torch.nn.functional.embedding`, `torch.vmap` (other operations are rejected at planning). |
 | `pllm.model.ActivationPatch` | Edits layer outputs from a state. | Runs through custom residual sites inside CUDA graphs. |
 
 `explain` prints every non-default setting in its `timing` lines.

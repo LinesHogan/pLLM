@@ -24,7 +24,7 @@ class HuberWorkload(pllm.Workload):
         rank = self.rank
         return pllm.RequestState(
             {"a": lambda m: (m.hidden_size, rank), "b": lambda m: (rank, m.hidden_size)},
-            initialize=initialize,
+            init=pllm.Computed(initialize),
             optimizer=pllm.AdamW(lr=0.03, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.1),
         )
 

@@ -48,7 +48,7 @@
 
 | 算法（例子） | 今天怎么写 / 为什么不行 | 状态 | 教程 |
 |---|---|---|---|
-| Engram 式 n-gram 记忆（加在现有模型上） | `pllm.input_tokens(history=n)` 取 token 历史，`InstanceState(pretrained=...)` 读表，`placement="device"/"host"` 由你决定，`@pllm.custom_residual` 把查到的向量加进残差流；表要在别处训练好，pllm 不训练、不更新表 | 能写 | [11](../tutorials/11_lookup_memory.ipynb) |
+| Engram 式 n-gram 记忆（加在现有模型上） | `pllm.input_tokens(history=n)` 取 token 历史，`InstanceState(init=pllm.Pretrained(...))` 读表，`placement="device"/"host"` 由你决定，`@pllm.custom_residual` 把查到的向量加进残差流；表要在别处训练好，pllm 不训练、不更新表 | 能写 | [11](../tutorials/11_lookup_memory.ipynb) |
 | n-gram 语言模型先验（按上下文给 logits 加分） | 同样的查表接 `@pllm.add_logits` | 能写 | [11](../tutorials/11_lookup_memory.ipynb) |
 | memory layers / product-key memory | 键由 hidden 算出再取 top-k、值从大表里按行取，可以在 `custom_residual` 里写成张量数学（大表可以放主机内存）；本仓库没有示例，未验证 | 应能写（未验证） | — |
 | 模型自带的 Engram（DeepSeek V4.1 等） | 由 vLLM 的模型代码实现；在 pllm 里跑这些模型属于“模型准入”，且需要 sm90 及以上 | 不在范围 | — |
