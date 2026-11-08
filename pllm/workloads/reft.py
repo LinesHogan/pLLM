@@ -46,11 +46,9 @@ class ReFTConfig:
         if (
             not self.layers
             or tuple(sorted(set(self.layers))) != self.layers
-            or self.layers[0] < 0
-            or self.rank < 1
             or min(self.first_tokens, self.last_tokens) < 0
         ):
-            raise ValueError("activation edits require sorted layers, positive rank and nonnegative token bounds")
+            raise ValueError("activation edits require sorted unique layers and nonnegative token bounds")
 
 
 @dataclass(frozen=True)

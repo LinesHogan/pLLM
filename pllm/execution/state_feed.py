@@ -215,22 +215,14 @@ class Feed:
 
     def publish(self, **fields: torch.Tensor) -> None:
         """Copy all declared fields, then publish one immutable version; block on capacity."""
-        if (
-            self.failed
-            or self.closed
-            or self.moved
-            or self._ended
-            or fields.keys() != self._fields.keys()
-            or any(
-                fields[name].layout != torch.strided
-                or tuple(fields[name].shape) != field.shape
-                or fields[name].dtype != field.dtype.torch
-                or fields[name].device != self._device
-                for name, field in self._fields.items()
-            )
+        # A mismatched call is rejected before _live, so it does not fail-stop the feed.
+        if fields.keys() != self._fields.keys() or any(
+            fields[name].layout != torch.strided
+            or tuple(fields[name].shape) != field.shape
+            or fields[name].dtype != field.dtype.torch
+            or fields[name].device != self._device
+            for name, field in self._fields.items()
         ):
-            with self._live():
-                pass
             raise ValueError(
                 f"{self._binding.resource}: publish strided tensors on {self._device} matching "
                 f"{ {name: (field.shape, str(field.dtype)) for name, field in self._fields.items()} }"

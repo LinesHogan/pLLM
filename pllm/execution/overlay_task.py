@@ -609,12 +609,9 @@ class OverlayTransition:
 
     def result(self, operand: ProjectionOperands, values: Tensors) -> UpdateOutput:
         """Validate the author's result at its tensor boundary without observing CUDA values."""
-        result = (
-            self.function(**self.inputs(operand, values))
-            if operand.phase in self.phases
-            else UpdateOutput.unchanged(self.apply(operand.hidden, values))
-        )
-        return self.validate(result, operand)
+        if operand.phase not in self.phases:
+            return UpdateOutput.unchanged(self.apply(operand.hidden, values))
+        return self.validate(self.function(**self.inputs(operand, values)), operand)
 
     def validate(self, result: UpdateOutput, operand: ProjectionOperands) -> UpdateOutput:
         """Check authored results at the same boundary for eager and batched execution."""

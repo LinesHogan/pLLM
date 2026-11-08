@@ -24,7 +24,6 @@ class ESampConfig:
     weight_decay: float = 0.0
 
     def __post_init__(self) -> None:
-        pllm.AdamW(self.learning_rate, self.betas, self.eps, self.weight_decay)
         if self.rank < 1 or not isfinite(self.intervention_beta) or self.intervention_beta < 0.0:
             raise ValueError("ESamp needs rank >= 1 and a finite, nonnegative intervention_beta")
 

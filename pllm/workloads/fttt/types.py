@@ -7,7 +7,6 @@ from math import isfinite
 
 import torch
 
-from pllm.authoring import AdamW
 from pllm.host import Completion, CompletionInput, RetryAction, RetryControl, RewardOutcome, UpdateBarrier
 from pllm.io import StateImport
 
@@ -56,7 +55,6 @@ class FTTTConfig:
         return self.feedback_feature_size + 1
 
     def __post_init__(self) -> None:
-        AdamW(self.learning_rate, self.betas, self.eps)
         if (
             self.rank < 1
             or self.feedback_feature_size < 1

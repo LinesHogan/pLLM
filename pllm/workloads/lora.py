@@ -31,16 +31,14 @@ class OutputLoRAConfig:
 
     def __post_init__(self) -> None:
         if (
-            min(self.rank, self.steps) < 1
+            self.rank < 1
             or not isfinite(self.alpha)
             or self.alpha <= 0
-            or not isfinite(self.learning_rate)
-            or self.learning_rate <= 0
             or not 0 <= self.seed < 2**63
             or self.scope not in ("instance", "request")
         ):
             raise ValueError(
-                "output LoRA requires positive rank/steps/scale/rate, 0 <= seed < 2**63, and instance or request scope"
+                "output LoRA requires positive rank and alpha, 0 <= seed < 2**63, and instance or request scope"
             )
 
 

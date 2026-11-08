@@ -143,7 +143,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return boundary_digest(value)
     except ValueError as error:
         raise ValueError(
-            f"{value!r}: workload methods may depend only on torch, math, pllm, plain values, enums and dataclasses"
+            f"{value!r}: workload methods may depend only on torch, math, pllm, finite plain values, enums and dataclasses"
         ) from error
 
 

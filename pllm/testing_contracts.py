@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import partial
 from math import lcm, prod
@@ -585,18 +586,16 @@ def _run(
         immutable_resources=frozenset(str(state.resource) for state in declaration.graph.states if state.immutable),
     )
     tasks = declaration.tensor_tasks
-    declaration.tensor_tasks = {
+    observed = copy(declaration)
+    observed.tensor_tasks = {
         symbol: replace(task, observe=partial(run.record, task, rowwise=reads_rows(task, tasks)))
         if task.writer is None
         else task
         for symbol, task in tasks.items()
     }
-    try:
-        deployment = workload.bind_backend(
-            facts, workload.plan_backend(facts, declaration), declaration, map_host=get_accelerator_view_from_cpu_tensor
-        )
-    finally:
-        declaration.tensor_tasks = tasks
+    deployment = workload.bind_backend(
+        facts, workload.plan_backend(facts, observed), observed, map_host=get_accelerator_view_from_cpu_tensor
+    )
     execution = deployment.execution
     forward = None if declaration.custom_forward_programs is None else CheckForward(execution)
     attention = (

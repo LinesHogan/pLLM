@@ -112,10 +112,10 @@ def _request_lifecycle(monkeypatch):
         )
     with pytest.raises(ValueError):
         ExecutionOptions(publish_lag=-1)
-    with pytest.raises(ValueError):
-        ESampConfig(learning_rate=float("nan"))
     config = ESampConfig(rank=2, intervention_beta=0.2, learning_rate=0.03, weight_decay=0.1)
     facts = facts_for(torch.device("cpu"), 4, 6)
+    with pytest.raises(ValueError, match="finite"):
+        ESampWorkload(replace(config, learning_rate=float("nan"))).compile_backend(facts)
     execution = ESampWorkload(config).compile_backend(facts).execution
     identities = (RequestIdentity("first", 0, 0), RequestIdentity("second", 0, 1))
     latest = list(execution.admit(identities))

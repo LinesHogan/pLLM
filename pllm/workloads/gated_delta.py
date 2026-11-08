@@ -22,17 +22,8 @@ class GatedDeltaConfig:
     visibility: Literal["forward_pinned", "exact"] = "exact"
 
     def __post_init__(self) -> None:
-        if (
-            not self.targets
-            or tuple(sorted(set(self.targets))) != self.targets
-            or self.head_width < 1
-            or self.chunk_size < 1
-            or not 0 < self.alpha <= 1
-            or not 0 < self.beta < 2
-        ):
-            raise ValueError(
-                "Gated delta needs unique targets, positive head/chunk sizes, 0 < alpha <= 1 and 0 < beta < 2"
-            )
+        if self.head_width < 1 or not 0 < self.alpha <= 1 or not 0 < self.beta < 2:
+            raise ValueError("Gated delta needs a positive head_width, 0 < alpha <= 1 and 0 < beta < 2")
 
 
 @dataclass(frozen=True)
