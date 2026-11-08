@@ -31,10 +31,10 @@ class SGD:
 class Field:
     """A state field with an explicit dtype, or a shape computed from a projection's (in_features, out_features);
     a field read by an adapter gets one copy per target projection. Storage follows its declared role by default:
-    accumulators use FP32, other fields use model precision. An explicit dtype overrides this; None follows the model."""
+    accumulators use FP32, other fields use model precision. An explicit dtype overrides this."""
 
     shape: tuple[int, ...] | Callable[[int, int], tuple[int, ...]]
-    dtype: torch.dtype | Literal["auto"] | None = "auto"
+    dtype: torch.dtype | Literal["auto"] = "auto"
 
     def size(self, in_features: int, out_features: int) -> tuple[int, ...]:
         """The shape for one target projection's widths, or for the hidden width outside adapters."""

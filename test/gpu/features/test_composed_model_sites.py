@@ -49,8 +49,8 @@ class LoopedTTT(pllm.Workload):
     def target_parameters(self) -> pllm.InstanceState:
         return pllm.InstanceState(
             {
-                "conv": pllm.Field(lambda d, _: (d, 1, 5), dtype=None),
-                "proj": pllm.Field(lambda d, _: (d, d), dtype=None),
+                "conv": pllm.Field(lambda d, _: (d, 1, 5)),
+                "proj": pllm.Field(lambda d, _: (d, d)),
             },
             layers=LOOPED,
             initialize=self.initial_targets,

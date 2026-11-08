@@ -315,10 +315,9 @@ CUDA stream（`side`）上，并只用约四分之一的 SM 读主机内存，�
 `@train_in_forward` 不接受 `optimizer=`。固定 `shape=` 使用默认的 `value` 字段；具名 `pllm.Field` 字段可以按每个 target
 解析 `(in_features, out_features)`。`pllm.Field` 默认按角色选择存储：优化器参数、
 chunk carry 和声明读取旧值的写回字段使用 FP32；其余使用模型 dtype。
-字段自身的 `dtype=` 覆盖默认值（不会继承 `RequestState.dtype`）。
-`dtype=None` 显式选择模型 dtype，整数字段 保留自己的 dtype。
+字段自身的 `dtype=` 覆盖默认值（不会继承 `RequestState.dtype`），整数字段保留自己的 dtype。
 Dense / low-rank overlay 在投影读取时转换到输入 dtype，"per_head" 至少用 FP32 计算，存储仍按字段角色选择；
-FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选择模型 dtype 时也一样。
+FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选择低精度存储时也一样。
 自定义更新函数也必须在自己的投影运算中显式转换操作数。`pllm.operand("input"/"target"/"weight")` 命名捕获的张量；
 `pllm.parameter(state, field)` 命名私有 buffer 视图。只有这些被授权的 buffer 可以
 被原地修改，操作数永远不行。方法返回

@@ -683,7 +683,7 @@ class InstanceState:
     # Run once per resource when binding; every admission copies the same seeded initial tensors.
     initialize: Callable[[Tensors, torch.Generator], None] | None = None
     shape: Shape | None = None
-    dtype: torch.dtype | Literal["auto"] | None = "auto"
+    dtype: torch.dtype | Literal["auto"] = "auto"
     alignment: int = field(default=16, kw_only=True)
     # A fed state is filled by a producer process (VllmLlm.feed): "ordered" consumes every publication in order,
     # "latest" only the newest.
@@ -1420,7 +1420,7 @@ def _chunked_in_forward(
     optimizer: SGD | None,
     flush: str | None,
     invariants: tuple[str, ...],
-    hidden_size: int,
+    dimensions: Dimensions,
 ) -> tuple[Callable[..., UpdateOutput], Initializer | None]:
     """Generate pending state before layout interning and bind the existing chunk executor."""
     if initialize is not None:
@@ -1438,15 +1438,16 @@ def _chunked_in_forward(
             raise ValueError(
                 "a chunked update without an optimizer takes the weight carry, then input/target/embedding operands"
             )
+        rows = dimensions.dtype.torch
         pending = {
-            f"_pending_rows_{name}": TargetRows((chunk,), dtype=None)
+            f"_pending_rows_{name}": TargetRows((chunk,), dtype=rows)
             if source == "target"
             else Field(
                 lambda inputs, _outputs, source=source: (
                     chunk,
-                    inputs if source == "input" else hidden_size,
+                    inputs if source == "input" else dimensions.hidden_size,
                 ),
-                dtype=None,
+                dtype=rows,
             )
             for name, source in zip(arguments[1:], sources[1:], strict=True)
         }
@@ -1624,7 +1625,7 @@ class _TrainInForward(_Effect):
                 optimizer,
                 self.flush,
                 invariant_names,
-                context.binding.dimensions.hidden_size,
+                context.binding.dimensions,
             )
         declare_parameter_overlay(
             context.binding,
@@ -2467,10 +2468,10 @@ class _Reflection:
                 )
                 self.binding.initializers[resource](tensors, torch.Generator())
 
-    def field_dtype(self, state: str, field: str, dtype: torch.dtype | Literal["auto"] | None) -> TensorDType:
+    def field_dtype(self, state: str, field: str, dtype: torch.dtype | Literal["auto"]) -> TensorDType:
         """Choose storage once from the declared field role; explicit precision always wins."""
         if dtype != "auto":
-            return self.binding.dimensions.dtype if dtype is None else TensorDType(str(dtype).removeprefix("torch."))
+            return TensorDType(str(dtype).removeprefix("torch."))
         definition = self.state_definitions[state]
         if definition.optimizer is not None or any(
             operation.effect.state == state and operation.effect.accumulates(operation, field)

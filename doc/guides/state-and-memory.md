@@ -47,7 +47,7 @@ class Probe(pllm.Workload):
 场景按目标输入/输出宽度解析）。声明可以写在类上、实例上；形状依赖配置时，
 写成带类型的 property。默认 `dtype="auto"` 按字段角色选择：优化器参数、chunk carry、
 声明读取并写回同一字段的方法使用 FP32；其他字段使用模型 dtype。`pllm.Field.dtype`
-覆盖该字段的默认值，`dtype=None` 显式跟随模型。`RequestState.dtype` 只作用于普通形状字段。
+覆盖该字段的默认值。`RequestState.dtype` 只作用于普通形状字段。
 梯度与 loss 归约至少使用 FP32，不随存储精度降低；布局的 `dtype` 是解析后的具体值。
 浮点导入值在边界转换为布局的 dtype；整数字段仍需匹配。只读字段若参与固定 FP32 的矩阵乘法，
 请显式声明 `dtype=torch.float32` 或在数学函数中转换操作数。

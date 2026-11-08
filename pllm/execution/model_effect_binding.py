@@ -95,9 +95,7 @@ def declare_parameter_overlay(
         fields,
         effect,
         b.dimensions,
-        lambda key, value: (
-            b.dimensions.dtype if value.dtype is None else TensorDType(str(value.dtype).removeprefix("torch."))
-        ),
+        lambda key, value: TensorDType(str(value.dtype).removeprefix("torch.")),
     )
     targets = effect.targets
     b.overlay_targets = targets
