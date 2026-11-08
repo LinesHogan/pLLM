@@ -68,17 +68,14 @@ class _ConfigShape:
         if any(target.layer is None or target.layer >= self.num_hidden_layers for target in expanded):
             raise ValueError("choose projection layers below the model's num_hidden_layers")
         projections: list[ProjectionShape] = []
+        heads = {"q_proj": self.num_attention_heads, "k_proj": kv_heads, "v_proj": kv_heads}
         for target in expanded:
             inputs, outputs = sizes[target.name]
-            partitions = min(size, kv_heads) if target.name in ("k_proj", "v_proj") else size
-            heads = kv_heads if target.name in ("k_proj", "v_proj") else self.num_attention_heads
-            if target.name in ("q_proj", "k_proj", "v_proj") and max(heads, size) % min(heads, size):
-                raise ValueError(f"{target.name} heads must divide tensor_parallel_size or partition evenly across it")
+            partitions = _head_partitions(target.name, heads[target.name], size) if target.name in heads else size
+            # down_proj is row-parallel and splits its input features; the others split their outputs.
             row = target.name == "down_proj"
             if (inputs if row else outputs) % partitions:
                 raise ValueError(f"{target.name} features must divide tensor_parallel_size evenly")
-            if target.name == "q_proj" and heads < size:
-                raise ValueError("q_proj needs at least tensor_parallel_size query heads")
             projections.append(
                 ProjectionShape(
                     target,
@@ -89,6 +86,15 @@ class _ConfigShape:
                 )
             )
         return tuple(projections)
+
+
+def _head_partitions(name: str, heads: int, size: int) -> int:
+    """How many ranks split an attention projection: whole heads per rank, or fewer KV heads replicated."""
+    if heads % size and size % heads:  # neither divides the other
+        raise ValueError(f"{name} heads must divide tensor_parallel_size or partition evenly across it")
+    if name == "q_proj" and heads < size:
+        raise ValueError("q_proj needs at least tensor_parallel_size query heads")
+    return min(heads, size)
 
 
 def _head_rejection(model: VllmModelConfig, shape: _ConfigShape, architecture: str) -> str | None:

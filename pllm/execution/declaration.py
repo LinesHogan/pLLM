@@ -50,12 +50,11 @@ class Dimensions:
     target_partitions: tuple[tuple[int, int], ...] = ()
 
     def projections(self, targets: tuple[Projection, ...]) -> tuple[ProjectionShape, ...]:
-        """Resolve rank-local widths; declarations without partitions describe replicated projections."""
-        partitions = self.target_partitions or ((1, 1),) * len(self.target_shapes)
+        """Resolve rank-local widths."""
         return tuple(
             ProjectionShape(target, inputs // input_parts, outputs // output_parts, input_parts, output_parts)
             for target, (inputs, outputs), (input_parts, output_parts) in zip(
-                targets, self.target_shapes, partitions, strict=True
+                targets, self.target_shapes, self.target_partitions, strict=True
             )
         )
 
