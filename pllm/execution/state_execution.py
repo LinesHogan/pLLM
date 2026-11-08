@@ -302,7 +302,8 @@ class StateTaskContext(Generic[DataT]):
         if group.instance and not latest:
             pins = tuple(directory.inference_pin(identity) for identity in identities)
             return tuple(
-                (pin, next(ref for ref in pin.refs if self.arena.root(ref).resource == resource)) for pin in pins
+                (pin, next(ref for ref in pin.refs if self.arena.ref_resource(StateRefs.of((ref,))) == resource))
+                for pin in pins
             )
         if group.instance:
             entry = group.refs.take((0,) * len(identities))
