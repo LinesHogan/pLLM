@@ -19,7 +19,14 @@ def checkpoint_directory(model: str, revision: str | None = None) -> str:
     """Resolve the local snapshot that the model loader has already downloaded."""
     from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
 
-    return model if Path(model).is_dir() else snapshot_download(model, revision=revision, local_files_only=True)
+    # Only the files read here need to be cached: the loader downloads weights and configs, not README.md.
+    return (
+        model
+        if Path(model).is_dir()
+        else snapshot_download(
+            model, revision=revision, local_files_only=True, allow_patterns=["*.safetensors", "*.json"]
+        )
+    )
 
 
 def checkpoint_files(checkpoint: str, names: tuple[str, ...], *, state: str = "") -> tuple[Path, ...]:
