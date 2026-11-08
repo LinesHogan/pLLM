@@ -603,6 +603,7 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
     arity = 2 if kind.startswith("low_rank") else 1
     observed = []
     initials = []
+    controls = []
     rates = []
     params = _m4_params()
     for tp in (1, 2):
@@ -612,6 +613,11 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
             multiprocessing=True,
             execution=ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
         )
+        if kind == "dense_sgd_train":
+            # Decode-only training uses eager prefill and its native norm kernels.
+            # A zero delta keeps that path in the unadapted TP rounding reference.
+            with pllm.make_llm(settings, workload=replace(workload, scale=0.0)) as control:
+                controls.append(_m4_scores(control.generate(PROMPTS, params)))
         report = pllm.explain(workload, settings)
         with pllm.make_llm(settings, workload=workload) as handle:
             llm = handle.require_llm()
@@ -658,10 +664,15 @@ def test_tp_projection(kind, targets, monkeypatch, m4_reference):
         observed.append((tokens(output), roots, _m4_scores(output)))
     assert observed[0][0] == observed[1][0]
     assert all(torch.equal(a, b) for a, b in zip(*initials))
-    # Use native TP drift plus one model-precision ULP; the FP64 oracle checks the projection arithmetic.
-    torch.testing.assert_close(
-        observed[1][2], observed[0][2], rtol=0, atol=m4_reference.max().item() + _m4_rounding_unit(observed[0][2])
-    )
+    if controls:
+        m4_reference = (controls[1] - controls[0]).abs()
+        print(f"Decode-only native TP logprob max_abs={m4_reference.max():.6g}", flush=True)
+    # Both model paths round their added deltas before later layers amplify them.
+    # Bound RMS drift and allow one output ULP per path; the FP64 oracle checks each projection more tightly.
+    rounding = max(_m4_rounding_unit(result[2]) for result in observed)
+    error = (observed[1][2] - observed[0][2]).abs()
+    assert error.square().mean().sqrt() <= m4_reference.square().mean().sqrt() + rounding
+    torch.testing.assert_close(observed[1][2], observed[0][2], rtol=0, atol=m4_reference.max().item() + 2 * rounding)
     for index in range(len(targets)):
         _projection_reference(kind, observed[0][1][0][index * arity : (index + 1) * arity], row)
     for whole, sharded in zip(observed[0][1], observed[1][1]):

@@ -87,6 +87,7 @@ class DenseGradientTraining(ProjectionState):
     """Differentiate a sum over independent output rows and let the framework apply SGD."""
 
     optimizer: pllm.SGD | None = pllm.SGD(1e-6)
+    scale: float = 1.0
 
     @property
     def weights(self) -> pllm.RequestState:
@@ -101,7 +102,14 @@ class DenseGradientTraining(ProjectionState):
         rows = torch.stack((value[0], value[len(value) // 2])).double()
         fields["initial_norm"].copy_(rows.square().sum(-1))
 
-    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="decode", chunk=2)
+    @pllm.train_in_forward(
+        state="weights",
+        targets=pllm.Attr("targets"),
+        scale=pllm.Attr("scale"),
+        visibility="exact",
+        tokens="decode",
+        chunk=2,
+    )
     def loss(self, value=pllm.parameter("weights", "value"), inputs=pllm.operand("input")):
         return (inputs.float() @ value.T).square().sum(-1)
 
