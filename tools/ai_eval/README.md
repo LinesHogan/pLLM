@@ -28,7 +28,8 @@ failures. `--tasks` selects a subset; `--gpu` adds CUDA tensor comparisons under
 
 ## What the author sees
 
-`git archive REV README.md doc/` makes a clean documentation snapshot. The runner
+`git archive REV README.md doc/ ':(exclude)doc/dev'` makes a clean documentation snapshot without the
+contributor docs, which describe pllm's internals rather than how to write a workload. The runner
 adds exactly one spec as `TASK.md`. A bubblewrap mount allowlist exposes that
 workspace, fresh CLI home, operating-system binaries/libraries and the selected CLI
 executable. It hides the entire host checkout, `.git`, venv, `test/`, `examples/`,

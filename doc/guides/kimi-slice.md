@@ -11,7 +11,7 @@
 python tools/model_slice.py \
   --repo moonshotai/Kimi-K2.5 \
   --revision 4d01dfe0332d63057c186e0b262165819efb6611 \
-  --text-only --output /home/zengdeveloper/pllm/model-slices/moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611
+  --text-only --output model-slices/moonshotai/Kimi-K2.5@4d01dfe0332d63057c186e0b262165819efb6611
 ```
 
 张量 payload 为 54,735,407,616 bytes（50.98 GiB），另有元数据与 tokenizer。
@@ -29,7 +29,7 @@ K2.5 的 Modified MIT License 允许本地使用，要求保留版权和许可�
 
 使用 vLLM 0.32 的 `LLM(model=path, trust_remote_code=True, enforce_eager=True)`，
 或 pllm 的 `ModelConfig(path, trust_remote_code=True, cuda_graphs=False)`。
-切片的模型配置已移除 `auto_map`，所以只有 tokenizer 需要远程代码许可；模型使用
+切片的模型配置去掉了 `auto_map`，所以只有 tokenizer 需要远程代码许可；模型使用
 vLLM 原生 DeepSeek V3 实现。不要省掉该许可而依赖自动 tokenizer 转换：本环境的
 Transformers 转换对 `I'm` 得到 `[40,14404]`，Moonshot 实现得到 `[17172]`。
 

@@ -10,6 +10,7 @@
 
 按你正在做的事定位小节。每节开头有一段引子，说明这节约束什么、为什么存在、
 违反会怎样；引子只负责导航，条款本身才是契约。术语以[词汇表](glossary.md)为准。
+改框架本身（原生数学绑定、原语与资源契约、结果存储）时读[贡献者文档](../dev/README.md)。
 
 | 你在做的事 | 读这几节 |
 | --- | --- |
@@ -20,13 +21,10 @@
 | 让多个请求按路由键共享适配器 | [路由键](#路由键) |
 | 逐 token prefill 循环（Recirculation） | [逐 Token 循环](#逐-token-循环) |
 | 外部加权批量训练、多步 SGD（Output LoRA 风格） | [加权批量训练](#加权批量训练) |
-| 自定义数据流、写原生数学、结构化宿主事务 | [高级数据流](#高级数据流)、[编写原生数学](#编写原生数学) |
-| completion / reward 驱动学习（多数投票奖励头） | [Completion 学习](#completion-学习) |
+| completion / reward 驱动学习（多数投票奖励头）、宿主反馈循环（FTTT、GTTA） | [Completion 学习](#completion-学习)、[宿主循环](#宿主循环) |
 | 因果批训练（TLM） | [因果批训练](#因果批训练) |
-| 改运行时、加原语、声明资源成本、排查有限准入失败 | [原语与资源契约](#原语与资源契约) |
 | 排查签名不匹配 / worker 重建失败 | [采样引导、logits 与导出](#采样引导logits-与导出)末尾的冷绑定器段落 |
 | 查某个内置负载用了哪些声明 | [全负载覆盖](#全负载覆盖) |
-| 确认某项优化是否已有证据支撑 | [证据与边界](#证据与边界) |
 
 **内置负载与共享入口。** 普通负载使用 `import pllm` 的普通张量方法。
 [Dummy](../../pllm/workloads/dummy.py)、
@@ -179,16 +177,6 @@ loss 方法只收到选中行，空前向集不调用。有界导出有各自的
 导数掩码作用于每个消费者一条独立 PyTorch 梯度边，不需要参数尺寸的前向副本，
 也不改变另一个消费者的梯度。原始选择拥有其共享只读恒等索引。
 
-### 结果存储、释放与活性
-
-结果张量共享本次调用的原始 `(task, output)` 存储。Rust 规划它们的最后使用 —
-— 包括下游声明的梯度消费者 —— 并在原始物理任务上签名释放 ID。Python 只
-应用这些释放；导出的值存续到完成。没有单独的 TensorFrame 结果缓存或 Python
-活性规划器。压实可能同步，autograd 仍可能为 detach 的行保存中间量。
-完整的 scratch/保存张量规划和选择性 backward 融合仍未完成；不作捕获或
-零分配声称。完成/取消释放调用数据与保留的反向图；失败的结算只保留到原始
-receipt 能结算为止。
-
 ## 采样引导、logits 与导出
 
 本节约束负载与采样器/导出的接口，以及冷绑定器的签名与传输规则。前半部分
@@ -214,11 +202,6 @@ Python 函数。反射式数学或未受检的依赖需要显式原生绑定。
 EngineCore 多进程按**引用**传输负载（类坐标 + 冻结字段 + 模块摘要），
 worker 重新导入并重建，安装时其编译签名必须与驱动端签名计划逐字节相等；
 模块级函数替换同样按引用走，签名校验兜底。函数体从不序列化。
-
-只有 `pllm/usage.py` 允许冷创作反射/类型擦除。严格类型检查仍覆盖该模块，
-运行时执行不检查签名。旧的 `TensorWorkload`、`TensorBuilder` 和
-`TensorFunction` 公共 API 已移除。任意模块锚点、捕获和结构化宿主事务仍需
-高级绑定。
 
 ## 效果组合
 
@@ -495,70 +478,6 @@ loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独
 `implementations` 与 `operations` 可为签名任务选择原生实现；实现仍须保持所声明的
 数学。修改普通方法会重新推导成本，不需要资源公式或方法锁。
 
-## 高级数据流
-
-本节约束绕过结构化入口、直接继承 `BackendWorkload` 的高级创作。读它的前提是
-前面各节的结构化入口表达不了你的数据流。这里的声明直接构成语义图：`Call` /
-`When` 命名依赖与时机窗口，绑定不做函数体检查也不自动追踪——所以声明必须
-描述数学函数的真实访问，撒谎不会被当场发现，但会产生错误的计划。
-
-自定义高级数据流：继承 `a.BackendWorkload[Data, Result]`，从 `declaration` 返回持有原始
-图/布局/附着的 `TensorDeclaration`，带原生 `bind_math` 与 `backend_requirements`。旧的 `a.Workload`
-build 包装已移除。新的局部操作获得基于负载/名字的 ID，除非绑定了显式实现。
-持久布局命名空间与实现标识不做机械重命名。
-
-`Call["output"]` 命名原始任务输出。它建立依赖，不是 Python 执行顺序。
-`When` 命名语义时机窗口；锚点与排序仍由 Rust 选择。输入、状态与输出名必须
-描述数学函数的真实访问。不做函数体检查或自动追踪。带类型的 `Data` 记录保存
-这些函数使用的调用局部中间量；声明一个端口不会自动提取或赋值 Python 属性。
-
-Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运行；需求发现不猜
-维度、不分配参数。`state.read()` 是逻辑输入版本引用。
-`state.version(publication)` 显式读生产者的版本，永远不是 latest。
-
-## 编写原生数学
-
-本节约束原生数学绑定（`bind_math` / `FunctionMath` / `TaskOutput`）。这是负载数学与
-执行层的接缝：流排序、捕获、私有分配、回滚与发布仍留在原始执行层，原生函数只拿到
-借来的操作数与显式授权的迁移根。空梯度与零梯度的区别、预算与成本声明的失败模式
-都在这里。给 ESamp / LoRA 的捕获内核写数学时读本节。
-
-高级 `BackendWorkload.bind_math(facts, plan, declaration)` 把规划过的声明绑成原始 `MathBinding`。其
-`FunctionMath` 提供初始化、输入行选择、准备与结果构造；负载不构造执行器。
-结构化创作入口自己组装这个绑定。
-
-原生函数接收带类型的 `Data` 与 `TensorBatch`。后者持有原始选择/出处与借来的
-张量操作数，不是 arena 或发布 API。只读操作数按契约不可变，不得逃出本次调用。
-只有显式选中的迁移根可写。流排序、捕获、私有分配、回滚与发布仍留在原始
-执行层。
-
-返回 `TaskOutput`，携带数学梯度、引导与有效工作量计数。空梯度元组跳过优化器
-更新；零梯度元组仍推进步数、动量与权重衰减。多参数组时，梯度按状态优先、
-然后声明的参数组序排列，一次发布覆盖所有组。直接迁移原地修改被授权的私有
-视图，使用单独的 `b.publish`；replay 消费该原始发布与变化状态选择。
-优化器支持的迁移在发布必须延迟时也用 `b.publish`，如 TLM。
-梯度跳过时没有私有分配或发布。
-
-`InvocationOutput` 暴露原始引导与发布，允许在不拥有生命周期的情况下构造结果。
-`FunctionMath` 对输入/数据/结果类型泛型：完成与宿主负载不转换成纯张量 DTO。
-
-宿主循环只有一种写法：反馈回调 `CompletionInput -> 反馈`（带 `retry_controls`、
-`update_barriers`、`update_count`）传给 `generate_feedback(feedback=...)`。需要框架管理的
-张量状态写成普通 `pllm.Workload`：模型生成时读的状态经 `llm.generate(..., batch=...)` 训练；
-只有宿主代码读的状态用 `pllm.host.make_host(HostConfig(...), workload)` 编译成 `HostTrainer`，
-回调里 `train(batch)`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
-`FTTTWorkload`（AdamW 写在状态上）；`FTTTFeedback(service, HostConfig(...))` 用 `make_host` 编译它
-（`feedback.edit` 是 `HostTrainer`，可取 `diagnostics()`），`feedback(batch)` 评判、入队，
-在失败行上 `train` 一次，再用返回的 `TrainStep.parameters` 里更新后的编辑算出重试要加的
-增量（`step()` 只处理已排队的反馈）；失败的一步清空队列，已经发布的编辑保留。
-[GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`GTTAWorkload.run(request)`
-从 `GTTAEnvironment` 的 FIFO 队列取出事件，用 Python 字典中的 FP64 EMA 更新动力学记忆，再回答查询。
-分数、稳定排名和历史格式保持不变；`GTTAResult` 直接返回 `processed` 与 `query`。
-查询失败时，已消费的事件和已更新的记忆保留。私有 snapshot/restore、版本计数、transaction ID、intent、receipt 与两阶段结算已移除。
-
-`Observation` 把选中行或身份出处带到既有 trace。显式有界导出用 `export=True`；
-可选的数学观测仍遵循原始 trace 选择。两者都不需要访问执行器或 arena。
-
 ## Completion 学习
 
 本节说明“宿主侧算奖励、框架做优化器更新”的负载，范例是多数投票奖励头
@@ -592,6 +511,22 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 有界宿主执行使用 `HostConfig(max_input_rows=..., execution_peak_budget_bytes=...)`。框架用
 最大形状的 `WeightedRowBatch`（含 `target_shape`）执行实际 loss/update 路径来推导资源，不要求负载申报字节；
 超过 `max_input_rows` 的输入在 `train` 前被拒绝。
+
+### 宿主循环
+
+宿主循环只有一种写法：反馈回调 `CompletionInput -> 反馈`（带 `retry_controls`、
+`update_barriers`、`update_count`）传给 `generate_feedback(feedback=...)`。需要框架管理的
+张量状态写成普通 `pllm.Workload`：模型生成时读的状态经 `llm.generate(..., batch=...)` 训练；
+只有宿主代码读的状态用 `pllm.host.make_host(HostConfig(...), workload)` 编译成 `HostTrainer`，
+回调里 `train(batch)`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
+`FTTTWorkload`（AdamW 写在状态上）；`FTTTFeedback(service, HostConfig(...))` 用 `make_host` 编译它
+（`feedback.edit` 是 `HostTrainer`，可取 `diagnostics()`），`feedback(batch)` 评判、入队，
+在失败行上 `train` 一次，再用返回的 `TrainStep.parameters` 里更新后的编辑算出重试要加的
+增量（`step()` 只处理已排队的反馈）；失败的一步清空队列，已经发布的编辑保留。
+[GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`GTTAWorkload.run(request)`
+从 `GTTAEnvironment` 的 FIFO 队列取出事件，用 Python 字典中的 FP64 EMA 更新动力学记忆，再回答查询。
+分数、稳定排名和历史格式保持不变；`GTTAResult` 直接返回 `processed` 与 `query`。
+查询失败时，已消费的事件和已更新的记忆保留。
 
 ## 因果批训练
 
@@ -656,133 +591,6 @@ Adapter 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mas
 新工作，但保留引擎与任何未确认的共享输入作用域；`close()` 可以重试，只在
 关闭成功后释放该作用域。保留已关闭的句柄本身不会保留已成功关闭的引擎。
 
-## 原语与资源契约
-
-本节约束框架最底层的三件事：输入容量与预检、显式原生原语
-（`TensorRows` / `PagedRows` / 捕获）、资源事实与内存预算。它存在的原因是
-性能路径的每一条捷径都有对应的显式声明义务：**捕获不等于直接页表 GEMM**；
-缺失任务成本意味着无界执行，而不是推断出的安全；原始 timeline、资源事实与
-用户限制三者求交，任何声明都不能放松既有限制。改运行时、加原语、写成本
-声明、排查有限准入失败时读本节；只写普通负载可以跳过。
-
-### 输入容量与预检
-
-后端绑定输入使用原始探针的 `max_packed_rows`：该上限计入所有打包的模型 token，
-包括 prefill，不是选中的 decode 行或去重请求数。超容量输入在状态选择前被拒；
-分阶段提交在被拒时取消其既有调用。vLLM 在打开步或捕获前检查。无状态后端
-观测者同样强制签名的 hidden 宽度。辅助输入有针对原始任务输入界或检查点字段
-布局与状态作用域的自己的预检。请求检查点输入可以包含超出同时 arena 容量的
-排队请求；原始 arena 仍在其额度内准入每个活跃队列。缺失任务成本仍意味着无界
-执行，而不是推断出的安全；形状/dtype 检查不证明任意用户数学的 scratch 成本。
-纯宿主观测没有后端探针。
-
-### 原语目录与 `MathContract`
-
-PLLM 区分普通数学执行与显式高性能
-原语绑定。`compute` 是不透明的原生操作；`a.ops` 放维护中的原语绑定。当前目录
-包含门控预测/loss/更新实现候选与既有的低秩 loss/AdamW 捕获绑定。它不是通用
-算子库，也不是任意 autograd 程序的自动下沉。
-
-`MathContract` 挂在原始 SemanticTask 上并计入其签名。它分别声明输入梯度、
-参数状态梯度、detach 输入、前向/输入梯度/参数梯度行域、更新状态域与归约。
-域命名原始输入端口；原生数学在这些域内做显式过滤，迁移选择器标识实际可写
-状态。Rust 拒绝不存在的端口/资源与矛盾的 detach/梯度声明。改动归约或需求会使
-旧签名失效。这些检查不证明任意 Python 数学实现了其声明的导数或归约。
-
-原生输入梯度必须显式计算并由声明的输出/数据边界携带；普通一阶方法用
-`differentiate`。冻结参数梯度不意味着 detach 输入。共享 loss 归约与按请求归约
-是不同算法，不是调度选择。Output LoRA 的独立路径使用按适配器加权归一化后再
-跨适配器取均值；迁移时不得变成一个全局加权均值。
-
-### `TensorRows` / `PagedRows`：显式张量与分页操作
-
-显式张量与分页数学现在共享 `pllm.TensorRows` / `pllm.PagedRows` 操作：
-`linear`、`input_gradient`、`parameter_gradient`、`values`、`reduce` 与 `write`。
-`TensorRows(packed_fields, row_state_indices)` 用显式张量打包；整数第二参数表示
-连续等大行组，使用分批 GEMM 而不做逐 token 矩阵展开。负张量索引是闲置填充。
-写要求调用方自有私有字段；`PagedRows` 继续要求原始 arena 签发的写能力。
-两个对象都不拥有逻辑版本、发布或回收。ESamp 对两种实现使用同一个
-残差/loss/反向表达式。Output LoRA 对张量/分页 eager 与捕获使用同一个显式
-reset/加权 CE/多步 SGD 循环；其原先独立的 `weighted_lora.py` 实现已移除。
-普通 Tensor 方法声明图与输入；这些显式原生替换绑定同一张图。
-
-### 分页捕获实现（`paged=True`）
-
-逻辑参数在绑定选择实现前一直留在原始图中。张量实现借用或打包视图；其捕获的
-训练仍做 arena gather/scatter。**捕获不等于直接页表 GEMM。** ESamp 与共享/独立
-Output LoRA 额外在配置中接受 `paged=True`。该签名实现直接在原始 FP32 矩阵池上
-使用共享 Triton 分组内核，包括输入反向与逻辑状态参数梯度归约。需要 CUDA
-（已在 SM89、PyTorch 2.13、Triton 3.7 验证）。支持任意正矩阵维度与跨步池切片；
-使用 IEEE FP32 而非 TF32。偏置/范数向量仍用行读取。默认张量实现保持显式，
-不是分页失败后的兜底。原先那个在 SM89 上把偏移同步到宿主的库分组调用已移除。
-公开 trace 确认 ESamp loss 的分组在设备侧完成，无 DtoH。特化键使用布局/方向与
-两档归约容量桶，不用请求身份、版本或单行数。小归约用直接 FMA，而不是填充到
-完整点积 tile。长内维窄输出用共享的 split-inner 内核与 FP32 部分归约，直接读
-同一授权槽/活跃映射。不使用负载专属 GPU 实现或逐 token 矩阵拷贝。
-
-### 分页视图、选择与写
-
-高级 `batch.paged(fields, row_state_indices)` 每字段返回一个视图，借用来自原始
-精确 pin 或私有写的不可变调用局部映射操作数。`linear`、`input_gradient`、
-`parameter_gradient` 与 `reduce` 共享这些映射；矩阵偏移/形状是逻辑字段切片，
-不是物理槽选择。`parameter_gradient(inputs, gradient, selected)` 可以只返回选中
-逻辑状态，按该设备索引序。索引必须属于原始映射；这不授予写权限。分页归约直接
-写紧凑结果，不做全状态梯度再 gather。省略选择则保留完整逻辑状态结果。
-`PagedRows.select_rows(fields, mask)` 用原始行上的设备布尔掩码限制计算。前向、
-输入梯度与参数梯度可以分别喂不同选择；矩阵内核不加载被排除行的操作数（包括
-NaN），其输出/梯度贡献为零。所有选中字段共享一个稳定过滤序。选择不能重新启用
-被排除的行，也不能授予写权限：更新资格仍来自原始私有 PageWrite。这是显式原生
-绑定，不是普通 `differentiate` 的自动下沉。过滤用一次前缀扫描启动，最多 16384
-行；更大容量用固定尺寸 tile、块计数 cumsum 与 scatter。它拥有一个 int64 行序、
-一个布尔活跃掩码与 int32 状态末端，大输入另有每 tile 一个 int32 计数；不 gather
-任何张量操作数或参数。这些分配属于签名工作区/捕获驻留。空行、跨步掩码与
-65537 行动态捕获都被覆盖。分页原语拒绝 `requires_grad` 操作数，而不是静默丢弃
-普通 autograd 图。映射在释放/中止后或另一流上不可使用。eager 字段共享一个行
-序、宿主计算的状态末端与每次借用一张字段槽表。全私有字段复用该表做写；混合
-访问保留只读槽掩码。标量字段（包括 Adam 步数）用同样的页视图。ESamp 的捕获
-loss 则从原始 arena 的稳定槽表推导设备映射，替换前有原始跨流排序，固定容量
-填充被排除在 loss/梯度之外。捕获字段共享一个逻辑状态分组。矩阵前向与导数在
-内核内直接消费原始行序，不做物理页排序、逆映射或显式操作数/输出行 gather。
-页槽按逻辑状态索引，不按行和字段复制；矩阵内核直接解引用行/状态/槽。向量
-偏置/范数读取仍 gather。ESamp 的显式 LayerNorm 导数调用同一原生 PyTorch
-反向算子，不构造 autograd 磁带；原始输入、均值与逆标准差仍是必要 scratch。
-普通用户函数保留正常 autograd 语义，不 gather 矩阵参数。
-
-### 张量步、分页更新与捕获
-
-框架用同一个 StepCapture body 执行普通张量步、形状追踪与 CUDA 图捕获。
-它读行/状态表、gather 字段、执行前后向，再更新授权的私有页。FP32 CUDA
-AdamW 直接更新页池；CPU 和其他 dtype 共享 PyTorch 优化器路径。缺席槽为 -1，
-永不写入；发布、跨流排序、回滚与页生命周期仍归 PTTS。
-
-捕获使用固定输入上限和私有图池；绑定前检查表容量，捕获后核对真实池大小与
-`cuda_graph_pool_budget_bytes`。负载不计算槽表、校正张量或优化器临时空间的字节公式。
-
-### 资源事实与内存预算
-
-框架的 `resource_facts(facts, options)` 在最大输入形状上执行已绑定的任务，
-不另写一套数学或字节公式。它追踪真实的 StepCapture/TensorTask、加权训练、
-原生 overlay 与区域扫描；Triton 内核使用 Torch 注册的 fake 实现。存储别名共享
-计数，autograd 保存值和返回后保留值持续计入；分配按 512 字节对齐，并计入大块不拆分余量。
-输入页另行计账，捕获池仍使用 `cuda_graph_pool_budget_bytes`，规划不初始化 CUDA。
-
-任务对象提供自己的资源投影，发布只改变已有页的所有权元数据。并发生产者声明
-可执行 `TensorComputation` 与输入形状，框架将其峰值保留到每个 worker anchor。
-In-Place-TTT 的区域源码留在负载，TensorScan 负责区域预算和恢复生命周期。
-宿主有限训练需要 `max_input_rows`；有宿主选择条件时提供最大形状样例。
-
-`execution_peak_budget_bytes` 约束 AER 中的状态、驻留、工作区和结果，不等于整个进程
-显存或 arena 的 `state_page_budget_bytes`。原时间轴与用户预算求交，不能放松限制；
-`None` 不加限制，零就是零字节。未声明的模型/KV、分配器及外部库内存仍不在此界内。
-
-输入与导出结果仍遵循原有生命周期：连续行可借用视图，不规则行会打包；
-输入对用户数学只读，结果与梯度保留到消费者完成。普通训练终点释放 autograd
-图及导数叶，无训练分支也一样；失败结算保留重试所需的数据。
-
-vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay 缓冲；新推导不重复
-计入这些输入。就绪排序和消费流记录防止读完前复用。采样器、GEMM 与模型/KV 的
-外部工作区不因此获得新保证。直接分页访问、语义执行和捕获/融合仍是独立能力。
-
 ## 全负载覆盖
 
 本节是速查表：十一个内置负载各自使用了哪些声明与数学需求。用它快速定位
@@ -803,26 +611,5 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | GTTA | Python 字典中的动力学记忆；FIFO 轨迹、update-before-query，查询失败保留更新 |
 | 奖励头 | 宿主 `majority_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
-`TensorDeclaration.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
-的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Adapter/激活绑定与两种原始 replay 效果保持彼此独立。
-可表达不等于支持任意组合：后端能力检查仍拒绝不支持的组合。表中所有条目都执行
-通过这个接口构造的声明。它们既有的数学 oracle 独立于构建器；本次迁移不蕴含
-任意跨负载组合。
+可表达不等于支持任意组合：后端能力检查仍拒绝不支持的组合。
 
-## 证据与边界
-
-本节约束证据纪律：哪些声称已有编号证据支撑，哪些不被既有实验蕴含。
-改优化实现前先固定独立参考；对输出、梯度、优化器状态、无更新、隔离、
-取消与结算扩展现有证据，不要重建负载/运行时矩阵。
-
-人类作者与编码代理使用同一契约和维护中的源码范例。不要为了让优化通过对比而
-改动独立参考。对输出、梯度、优化器状态、无更新、隔离、取消与结算扩展现有证据；
-不要重建负载/运行时矩阵。公开基准使用同一工厂。
-
-显式选择的观测与内核计时使用原始有界 trace。不需要反射钩子、重复的性能数据库、
-运行时代理服务或生成代码下载。EngineCore 按引用传输负载并要求签名逐字节复核，
-从不做任意函数序列化。
-
-证据 47 对照冻结的 PyTorch 参考检查独立 Huber 适配，包括 CPU/CUDA 梯度、全部
-Adam 字段与生命周期。它只声称普通 eager。其余的优化器融合、完整资源审计与
-发布/性能研究不被该实验或已完成的共享映射替换所蕴含。

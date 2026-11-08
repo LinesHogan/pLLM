@@ -92,41 +92,12 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
 | 逐 token prefill replay | [层路由](overlays-and-replay.md#层路由让更新当步生效) | [Recirculation](../../pllm/workloads/recirculation.py) |
 | 完整因果模型训练适配 | [因果批训练](../reference/authoring-contract.md#因果批训练) | [TLM](../../pllm/workloads/tlm/workload.py) |
 | completion／reward 驱动训练 | [Completion learning](../reference/authoring-contract.md#completion-学习) | [reward head](../../pllm/workloads/reward_head.py) |
-| judge、环境查询与队列 | [Write mathematics：宿主循环](../reference/authoring-contract.md#编写原生数学) | [FTTT](../../pllm/workloads/fttt/workload.py)、[GTTA](../../pllm/workloads/gtta/workload.py) |
-| 显式分页／反向／capture 优化 | [原语与资源契约](../reference/authoring-contract.md#原语与资源契约) | ESamp、Output LoRA 中的显式绑定 |
+| judge、环境查询与队列 | [宿主循环](../reference/authoring-contract.md#宿主循环) | [FTTT](../../pllm/workloads/fttt/workload.py)、[GTTA](../../pllm/workloads/gtta/workload.py) |
+| 显式分页／反向／capture 优化 | [原语与资源契约](../dev/execution-internals.md#原语与资源契约)（贡献者文档） | ESamp、Output LoRA 中的显式绑定 |
 
 范例的 imports 反映它自己的资源绑定层级。**不要因为范例含高级资源绑定，
 就把它的全部内部 imports 复制进一个普通 workload**——那会引入你的算法
 并未声明的绑定层级，也让读者无法分辨哪些是契约、哪些是范例的优化选择。
-
-## 区域源编写约定
-
-只有当契约入口要求你直接构造区域 IR（如 `DecoderSource` 一类的源构造器）
-时才适用本节；普通 workload 不接触这一层。区域 IR 的分析能力完全取决于
-你写下的结构：分析器只相信你显式声明的事实，不会反过来猜你的意图。
-三条约定都来自真实迁移教训（recirculation 曾把 10 个 If 中的 8 个用于
-表达构造期就已知的事实，调度域因此无谓爆炸）：
-
-1. **静态事实不要用动态谓词表达。** 构造期已知的分支结果直接展开：命中
-   与否、循环第几次迭代触发某段逻辑，如果这些在写源码时就是常量，就不要
-   生成 `Constant` + 比较 + `If` 的逐迭代谓词。命中位置可构造期判定时，
-   把 Scan 在命中点分段，段间直传 carry，而不是每迭代问一次"是不是这轮"。
-   动态谓词只留给真正依赖运行时数据的 branch（如按请求资格标志）。
-2. **坐标用 `Coordinate` 直接声明仿射关系。** 索引运算（基址 + 游标、
-   前缀 + 偏移、常数倍）写成一个 `Coordinate` op 的 `AffineIndex`，terms
-   按位置引用本 op 的输入。不要用 `Constant` + `Scalar(ADD/SUB/MUL)` 链
-   拼接坐标——分析器不恢复这种链，它们一律成为 opaque 语句，相应的索引
-   证明、调度自由度和容量界都会丢失；越界或非仿射的操作数会被硬拒绝，
-   不会静默退化。`Scalar` 只用于真正的动态标量（如 While 计数器）和
-   布尔谓词（LESS/EQUAL）。
-3. **Scan 只携带真 carry，固定输入放 `invariants`。** 每轮都会更新的值
-   （隐藏状态、残差）才是 carry；整轮不变的输入（坐标、层号表、资源句柄）
-   声明为 invariant 尾随输入，不进入逐轮返回。body 内不修改的 carry 槽位
-   直接原样 yield（分析器识别为未变携带），不要用多余 op 中转。
-
-写出区域源后，`verify()` 会做结构校验；调度/依赖分析对 opaque 语句只是
-保守处理而非报错，所以"能跑"不等于"写法正确"——对照本节约定自查结构，
-再参考 [Recirculation](../../pllm/workloads/recirculation.py) 的源构造。
 
 ## 当前支持边界
 
@@ -168,7 +139,7 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
 - 支持的设备／执行模式、资源限制。只有测过等算法、等有效工作量的对照，
   才报告性能收益。
 
-验证入口见[验证指南](validation.md)，性能解释见[测量指南](benchmarking.md)。
+检查负载见[检查自己写的负载](validation.md)，性能解释见[基准解读](benchmarking.md)。
 例如修改 Huber 时，可在仓库根目录用
 `.venv/bin/python -m pytest -q test/workloads/test_huber.py` 检查已有
 reference 对照；这不是所有新算法的通用验收。类型检查入口是

@@ -157,120 +157,16 @@ head = pllm.RequestState(
 路由用户特别注意：休眠 lineage 仍占准入容量（见上文路由键一节），所以
 「route 基数 × 每 lineage 字节」才是你的稳态占用，不是并发请求数。
 
-`ExecutionOptions.execution_peak_budget_bytes` 约束 pllm 的执行峰值：PTTS 状态页、任务工作区与存活结果、anchor 缓冲以及 CUDA Graph 池预留。模型权重与 KV 池不在内。框架在 meta/fake
+`ExecutionOptions.execution_peak_budget_bytes` 约束 pllm 的执行峰值：状态页、任务工作区与存活结果、anchor 缓冲以及 CUDA Graph 池预留。模型权重与 KV 池不在内。框架在 meta/fake
 输入上执行实际张量步及前后向，按 512 字节追踪存储，不初始化 CUDA；负载不维护
 字节公式。每个任务和模型的捕获池预算用 `cuda_graph_pool_budget_bytes`；它不是所有捕获池的合计上限。默认 `None` 按负载追踪任务预留，模型池默认 64 MiB；exact decode overlay 另按形状计入工作区。宿主有限训练声明 `max_input_rows`，
-并为奖励等宿主选择提供最大形状样例；详见[资源事实](../reference/authoring-contract.md#资源事实与内存预算)。
+并为奖励等宿主选择提供最大形状样例；详见[资源事实](../dev/execution-internals.md#资源事实与内存预算)。
 
 ## 我想看状态到底占了多少：state_usage
 
-`handle.diagnostics().state_usage` 给出 arena 的冻结快照：预留、逻辑/物理
-载荷、填充、页所有权与待收 receipt 等字段。它是从原始 arena 根、字段槽、
-私有写与 receipt **推导**出来的视图，自己不保留这些所有者。
-
-读它之前，先建立三个正确预期：
-
-- **逻辑字节 ≠ 物理字节**。`logical_live_bytes` 把每个保留/私有版本都计
-  入；`allocated_payload_bytes` 对 COW 共享的字段页只计一次。两者的差
-  正是字段级 COW 省下的部分，不是账目错误。`reserved_bytes` 的填充包含
-  所有容量对齐/余量。
-- **页所有权类别不是 GPU 活动度量**。空闲、最新根、仅私有、仅退役是互斥
-  的所有权分类（最新根优先于私有，再优先于退役引用）；被 pin 的版本数
-  包括内部写/发布持有与待释放。待收 receipt 包括已结算但尚未收集的发布，
-  不只是未完成的 GPU 工作。
-- **快照本身什么都不做**。`usage()` 不收集、不同步、不选版本；它是调用
-  时刻的冻结快照，不是采样峰值，也不是一份独立的分配台账。
-
-这些口径的完整表述在[当前架构](../design/architecture.md)的「运行时边界」
-一节。
-
-## 生命周期：谁回收状态
-
-### 跨进程借用与独立快照
-
-短期消费同一 GPU 上的精确状态版本，可以使用低层 `PageBundleArena.send_field`
-与 `receive_field`。发送者必须持有原 arena 签发的 `PagePin`，提供者必须在
-原计划中声明 `state/shared_cuda@1`。接收者先验证自己持有的同一 `PlanBundle`，
-再接收字段；签名、布局、设备和容量不能因跨进程而放宽。每个字段借用使用
-独立完成通道。接收者不获得页的所有权，也不获得修改或发布权限。
-
-`BorrowedPage` 返回 native tensor，只读是同一可信程序内的使用约定，不是
-OS 写保护或进程身份认证。用完全部别名和依赖它们的计算后，接收者在原接收
-stream 上 `close()`；它同步该 stream 后发回精确完成凭证。其他 stream 的
-计算须先归并到该 stream。发送者 `release_pin` 只签发释放 receipt，原 arena
-仍保留页，直到本地完成事件和全部远程读凭证满足；较新版本发布不会覆盖旧页。
-有界容量耗尽时拒绝新写，不能驱逐尚未完成的远程读者。
-
-实际消费者是[视频会话示例](../../examples/video_session.py)：摄取进程读取真实
-灰度帧，产出 QP 代理、残差能量、位移幅度、纹理/活动分区四个字段；LLM 子进程
-借用它们进行编码，再经原 `Activation ADD` 注入残差流。这些是帧导出的近似
-信号，不是生产 AV1/NVDEC 元数据，固定投影也不代表训练好的视觉编码器。
-
-两进程持有并验证同一完整计划，按资源拥有关系分配池：摄取方只拥有 features，
-worker 只拥有 inject。本地与借用集合必须互斥且覆盖全部所需资源；worker 没有
-features 的本地准入、lineage 或副本，普通 `pllm.parameter("features", field)` 直接
-读取映射根。最终 hidden 写入 worker 的私有 inject 页并原子发布，属于计算
-结果物化。四字段 Parameter 数学签名不变；ActivationPatch 的 decode 策略使用
-keyword-only 字段，变更声明必须重新编译签署定义并重建 worker。
-
-一次 chunk 的时序如下：
-
-1. 摄取方写满四个私有字段，发布版本 v，再 pin 住 v 后排队；四字段从同一个
-   pin、经各自的完成通道导出。积压受签署页容量约束，满时等待消费完成，不扩容
-   或覆盖旧槽位。当前版本、私有写和旧版本 pin 都占容量，不能只按队列长度估算。
-2. worker 收齐同一版本的合法 grant 后绑定到该步；在 request.prepare 读取特征、
-   编码、写入并发布本地 inject。新请求随后取得 inject 的 inference pin，模型
-   通过原 ADD 消费它。示例支持一个请求内多个 decode 步，每个新输入步使用新
-   grant/root，发布后按该步 exact ref 注入；旧的请求准入 pin 不重指。
-3. 步结束时清除映射别名、完成原接收 stream 上的依赖，再逐字段 close/ACK。
-   摄取方持有的 release receipt 收齐凭证及本地完成事件后，才可回收旧页并推进
-   generation。inject 发布或模型返回结果本身都不是远程读完成凭证。
-
-### 没有新特征时：签署的 HOLD / STOP
-
-视频负载声明 `decode=True、refresh="step"、on_missing="hold"`。完整输入与保持
-共用一个 invocation 和完整静态 DAG；签署的条件生产组在解析输入之前分支。
-HOLD 步不读取 borrowed features，不执行 encode/write/publish；模型只读本地
-最后成功注入的 exact pin。静态依赖和最坏情况预算保留，不在运行时删任务。
-
-供给方必须明确发送本步 Absent 或正常 End：示例的 `session.missing()` 声明
-本步缺席，`session.missing(end=True)` 声明当前请求的输入流结束。End 后保持到
-该请求结束；下一请求必须重新提供首版。空 roots、超时、EOF 和部分收到的字段
-都不是 Absent。α 使用显式 next-step 协议，FIFO/latest-ready/跳帧仍不在此协议中。
-
-同一借用资源组原子分流，绑定中任一 `on_missing=STOP` 就在缺席时停实例。
-HOLD 也必须已有成功首版：只有模型实际使用过、sampler 完成、ACK 与提交
-全部成功的版本才能成为保持凭据。初始化版本零、仅发布尚未收束的版本不算。
-同 ref 再发新 grant 是一次新消费和本地更新，不能记作 HOLD。
-
-`hold_count` 只在保持步成功收束时增加，`last_hold` 给出缺席原因、当前步号、
-held refs 与各请求的最后成功输入步；`update_count` 只计真实写入。
-保持步的本地 pin 仍持有到 sampler/收束后，没有远端根便不产生 ACK。例子每步
-独立报告，保持步的 feature ref 为 `None`，不会把上一帧结果冒充新消费。
-
-这是可配置的**数据缺席**策略；完整性、别名、ACK 故障及活动借用/保持步的取消
-仍然 fail-stop。HOLD 必须在 begin 前通过签署分支入口，不能先触发 E1 缺根错误
-再捕获继续。没有条件组的直接缺根、STEP 未授权无发布与故障后续跑仍响亮拒绝。
-
-`snapshot` 则复制出独立 tensor，适合要在 arena/worker 关闭后继续保留的结果。
-普通辅助输入和独立 completion 输出沿用 `SharedTensor`；它们不是版本页授权。
-页授权现在仅支持 CUDA 只读，CPU 本地 arena、CPU SharedTensor 和本地私有写
-仍保留。没有远程私有写或 CPU 页授权接口。
-
-坏凭证、断连或等待超时都不能作为完成：原 owner 保留相关资源。会话集成必须
-停止新工作，终止全部参与进程后丢弃实例；当前低层 arena 不提供自动崩溃恢复。
-进程退出码不能替代字段完成凭证，owner 崩溃后也不能依靠遗留 IPC mapping 继续服务。
-本机单独运行成功视频会话无 IPC 清理警告；故意杀进程/坏凭证的故障测试组会出现
-CudaIPCTypes 警告，这是未获完成证明的诊断，不能用强制回收或屏蔽警告消除它。
-
-本地状态由 PTTS 的 pin 与完成协议管理寿命。训练、状态生产和注入更新都写入
-私有页，发布是原子的；未发布的私有写可以按原协议中止。发布成功后的结算失败
-不能当成未提交而重放。观测与预测读到的是 pin 住的精确版本，不随 latest 改变。
-
-**COW 什么时候真拷贝？** 字段级：一次迁移只给它要**写**的字段分配私有
-页，未改动的字段与旧版本共享物理槽。所以「发布一个新版本」的成本正比于
-被写字段，不是整个状态——这也是上面 `state_usage` 里逻辑与物理字节可以
-相差很大的原因。
+`llm.diagnostics().state_usage` 给出状态页的冻结快照：预留字节、逻辑与物理载荷、填充和页所有权。
+逻辑字节把每个保留的版本都计入，物理字节对写时复制共享的字段页只计一次，所以两者可以相差很大。
+各字段的完整口径与状态的生命周期见[贡献者文档](../dev/state-internals.md)。
 
 精确边界（零梯度语义、empty 选择、捕获 detach、外部导入通道）见
 [创作契约](../reference/authoring-contract.md#训练与梯度)。

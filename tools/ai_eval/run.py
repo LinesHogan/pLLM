@@ -96,7 +96,7 @@ def prepare(destination: Path, revision: str) -> tuple[Path, str]:
     """Export only committed docs and the task into a clean author workspace."""
     workspace = destination / "workspace"
     workspace.mkdir(parents=True)
-    archive = subprocess.check_output(["git", "archive", revision, "README.md", "doc/"], cwd=ROOT)
+    archive = subprocess.check_output(["git", "archive", revision, "README.md", "doc/", ":(exclude)doc/dev"], cwd=ROOT)
     subprocess.run(["tar", "-x", "-C", str(workspace)], input=archive, check=True)
     task = destination.name
     shutil.copyfile(HERE / "specs" / f"{task}.md", workspace / "TASK.md")

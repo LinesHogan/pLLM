@@ -173,21 +173,12 @@ example predicts the hidden row's mean at every projection output coordinate.
 GatedDelta input reconstruction needs equal input and output widths; on
 Qwen3-0.6B, its target is the value projection.
 
-Graph parity uses identical padded model shapes for eager execution and capture.
-Different prefill widths can change BF16 hidden inputs before a producer runs;
-subsequent factor updates and near-tied greedy tokens can therefore differ.
-Replay checks compare carry, normalization of the materialized tap and KV with native vLLM
-at the same shape and paged history. The FP32 diagnosis establishes the numerical
-error separately; cross-shape token equality is not the execution contract.
-
 Prefix reuse and speculative decoding are unsupported here. When vLLM preempts a
 request and recomputes its history, a workload whose request state is keyed by request id,
 with no mutable instance state and no external feeds, imports or host inputs, simply
 recomputes; any other overlay or activation workload raises and asks for more KV cache
 (`gpu_memory_utilization`) or fewer concurrent sequences (`max_num_seqs`). Old KV retains the factors used when it was computed; updates
-do not recompute the prefix. A separate SHINE context pass and checkpoint or
-memory-token integration still need implementation. Finite-value checks may
-synchronize CUDA.
+do not recompute the prefix. Finite-value checks may synchronize CUDA.
 
 ## 外部生产的 overlay（SHINE 式）
 
@@ -226,18 +217,9 @@ weight/bias/rotation 字段，`ADD` 用一个默认模型 dtype 的向量。见�
 字段声明：`decode=True`、
 `refresh="step"`、`on_missing="hold"`
 （默认分别为 `False`、`"admission"`、`"stop"`）。`decode=False` 携带非默认刷新/缺席策略会在声明期拒绝。
-INHERIT 保留原作用域的版本选择，STEP 每步读取本 invocation 新发布的 exact ref；
-只有签署且成功验证的 HOLD 分支可以在没有新 publication 时读已成功的输入版本。
-单独声明 HOLD 不会给任意缺根图添加保持能力，完整生命周期见
-[状态与记忆](state-and-memory.md#没有新特征时签署的-hold--stop)。
-
-ActivationPatch 可与 `custom_forward` 组合：注入在 DecoderSource 层输出之后、tap 之前，
-normal/replay 使用同一 ref 和选择位；低秩算子用 replay 新 hidden 重算 delta，
-ADD 不在已注入的结果上重复累加。HOLD 的 source 数学与正常输入相同，只改变
-签署的版本来源；borrowed 输入生产组全部关闭，模型 READ 仍精确绑定 inject。
-公共作者入口只放行状态/任务符号精确匹配签署 activation 链的组合；额外状态或
-普通训练不能借此绕过 standalone 限制。REQUEST 组合保留原请求行，INSTANCE
-仍通过实例目录取值。
+`refresh="step"` 让每个 decode 步读本步新发布的版本；`on_missing="hold"` 在本步没有新输入时沿用上一次
+成功使用的版本，默认的 `"stop"` 则在缺席时停下实例。逐步送入新输入可以用 `pllm.io.Feed`，见
+[视频会话示例](../../examples/video_session.py)。
 
 干预遵循 forward-only KV：层后注入不改变该层自身已计算的 KV，可能影响更深层
 和后续 token；旧 token 的 KV 不回改。同 invocation replay 仍重放本步版本，
