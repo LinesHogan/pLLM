@@ -20,7 +20,7 @@ import pllm
 from pllm.backends.vllm.runtime import VllmLlm
 from pllm.config import ModelConfig
 from pllm.testing_gpu import CHECK_PROMPTS, plain_model
-from pllm.usage import Workload
+from pllm.workload import Workload
 
 _Sample = ParamSpec("_Sample")
 _DataT = TypeVar("_DataT")

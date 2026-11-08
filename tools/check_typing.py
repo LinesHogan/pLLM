@@ -15,6 +15,7 @@ UNTYPED_BOUNDARIES = {
     ROOT / "pllm/execution/module_graph.py",
     ROOT / "pllm/contracts/codec.py",
     ROOT / "pllm/usage.py",
+    ROOT / "pllm/workload.py",
     ROOT / "pllm/execution/freeze.py",
     ROOT / "pllm/workload_transport.py",
 }

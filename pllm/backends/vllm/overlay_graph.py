@@ -25,7 +25,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
-from pllm.authoring import BackendRequirements
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.admission import model_cuda_graph_pool_budget_bytes, model_hooks
 from pllm.backends.vllm.architecture import DecoderBody, bind_model
@@ -34,6 +33,7 @@ from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.cuda_graph import conditional_graph_pool
 from pllm.execution.torch_private import compilation_cleanups, cuda_graph_pool_bytes, release_compilation
 

@@ -40,7 +40,7 @@ from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import read_batch
 from pllm.explanation import explain, explain_facts
 from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, check_contracts
-from pllm.usage import Workload
+from pllm.workload import Workload
 
 _Allocation = ParamSpec("_Allocation")
 

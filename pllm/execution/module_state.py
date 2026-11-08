@@ -1,9 +1,9 @@
 """State declared as an `nn.Module`: its parameters live flattened in one state field.
 
 `pllm.InstanceState(module=...)` and `pllm.RequestState(module=...)` let an author keep an existing PyTorch
-module. Authoring (`pllm.usage`) uses `parameter_count` for the field shape and `module_graph.ModuleCall` to hand
-operations a callable with the module's interface; the workload binding uses `initial_values` once at bind
-time to seed every new state version.
+module. Authoring (`pllm.usage`) uses `parameter_count` for the field shape; the pllm.module input marker uses
+`skeleton` and `module_graph.ModuleCall` to hand operations a callable with the module's interface; lowering uses
+`initial_values` once at bind time to seed every new state version.
 """
 
 from __future__ import annotations

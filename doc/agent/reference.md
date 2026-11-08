@@ -658,6 +658,7 @@ pllm.KVOffload(connector: Literal['OffloadingConnector', 'SimpleCPUOffloadConnec
 pllm.Workload()
     Python methods and effects compiled once, with independent sub-workloads in dataclass fields.
 pllm.Phase: BEFORE_FORWARD | AFTER_FORWARD | BEFORE_SAMPLE | AFTER_SAMPLE | IN_FORWARD | AUTOMATIC
+    The windows of one engine step a method can run in (@pllm.on); each effect has a default window.
 pllm.on(phase: 'Phase | Callable[[Any], Phase]') -> 'Callable[[F], F]'
     Run the method in `phase`; needed for methods without an effect or to move an effect's phase.
 pllm.write(*, state: 'str', fields: 'tuple[str, ...]') -> 'Callable[[F], F]'
@@ -702,7 +703,7 @@ pllm.sampled_tokens() -> 'Any'
     The tokens the sampler drew this step.
 pllm.operand(name: 'OperandName | Callable[[Any], OperandName]') -> 'Any'
     A projection input/target/weight, input token embedding, or scalar prompt-end bool.
-pllm.carry(source: '_Source', *, state: 'str', field: 'str') -> 'Any'
+pllm.carry(source: 'InputMarker', *, state: 'str', field: 'str') -> 'Any'
     Read `source` and, when the training update publishes, write its value into the carried `state.field`.
 pllm.causal_model(adapter: 'str') -> 'Any'
     The causal LM with the named pllm.model.Adapter applied, as a pllm.model.CausalModel; .base skips it.

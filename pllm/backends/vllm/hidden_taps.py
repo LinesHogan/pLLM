@@ -16,7 +16,6 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from pllm.authoring import BackendRequirements
 from pllm.backends.vllm.architecture import hidden_binding
 from pllm.config import ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, logit_layers
@@ -28,6 +27,7 @@ from pllm.contracts.packed_hidden import (
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, tap_selection
 from pllm.contracts.semantic_graph import HiddenInputSource
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec, TensorLayoutSpec
+from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging, upload
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.state_execution import DataT, StateTaskContext

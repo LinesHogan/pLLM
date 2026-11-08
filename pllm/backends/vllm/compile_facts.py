@@ -5,7 +5,6 @@ from hashlib import sha256
 
 import torch
 
-from pllm.authoring import BackendRequirements
 from pllm.backends.vllm.architecture import hidden_binding, kv_rejection
 from pllm.backends.vllm.hidden_taps import HiddenTapLayout
 from pllm.backends.vllm.model_shape import ModelShape
@@ -23,7 +22,7 @@ from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, version_capacity
 from pllm.execution.runtime_facts import model_timeline
 

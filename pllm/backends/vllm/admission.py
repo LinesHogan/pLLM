@@ -2,10 +2,10 @@
 
 from collections.abc import Iterator
 
-from pllm.authoring import BackendRequirements
 from pllm.backends.vllm import compat
 from pllm.config import ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.execution.compile_facts import BackendRequirements
 
 
 def model_hooks(requirements: BackendRequirements) -> bool:

@@ -58,7 +58,7 @@ from pllm.execution.trace import TraceEventKind
 from pllm.testing_forward import CheckAttention, CheckForward
 from pllm.testing_kernels import check_sites, compare_method, replay_cells
 from pllm.testing_timing import VersionChecks
-from pllm.usage import Workload, component_workloads
+from pllm.workload import Workload, component_workloads
 
 
 @dataclass(frozen=True, slots=True)

@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from pllm.backends.vllm.model_shape import ModelShape
     from pllm.execution.compile_facts import BackendCompileFacts
     from pllm.execution.tensor_declaration import TensorDeclaration
-    from pllm.usage import Workload
+    from pllm.workload import Workload
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 import torch
@@ -12,7 +12,6 @@ import torch
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import (
     CausalTrainBatch as CausalTrainBatch,
     HostBatch as HostBatch,
@@ -21,10 +20,7 @@ from pllm.contracts.host_batch import (
     WeightedRowBatch as WeightedRowBatch,
     map_host_batch as map_host_batch,
 )
-from pllm.contracts.kv_layout import KVLayout
-from pllm.contracts.parameter_overlay import Projection
-from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import AnchorId, HiddenInputSource, SchedulerTimeline, StateScope
+from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline, StateScope
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
@@ -32,7 +28,7 @@ from pllm.execution.backend_attachment import (
     derive_attachment_resources,
 )
 from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.declaration import Dimensions as Dimensions
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
@@ -49,7 +45,6 @@ __all__ = [
     "AdamW",
     "HostBatch",
     "BackendDeployment",
-    "BackendRequirements",
     "BackendWorkload",
     "CausalTrainBatch",
     "Dimensions",
@@ -61,34 +56,6 @@ __all__ = [
     "WeightedRowBatch",
     "map_host_batch",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class BackendRequirements:
-    checkpoint_names: tuple[str, ...] = field(default=(), kw_only=True)
-    exact_phases: tuple[HiddenPhase, ...] = field(default=(), kw_only=True)
-    hidden_inputs: tuple[HiddenInputSource, ...] = ()
-    input_token_history: int = -1
-    # The layers pllm.layer_logits reads, as declared (negative from the end).
-    layer_logits: tuple[int, ...] = ()
-    parameter_targets: tuple[Projection, ...] = ()
-    activation_layers: tuple[int, ...] = ()
-    sampler_stages: tuple[SamplerStage, ...] = ()
-    sampler_feedback: bool = False
-    position_states: tuple[tuple[str, float], ...] = ()
-    # Whether a @pllm.custom_forward reruns model layers, which vLLM's CUDA graphs cannot capture.
-    custom_forward: bool = False
-    # Whether a @pllm.custom_residual rewrites sublayer adds or value rows.
-    custom_residual: bool = False
-    stateful_residual: bool = False
-    custom_attention: bool = False
-    kv_layouts: tuple[KVLayout, ...] = ()
-    # Whether a pllm.model.Adapter reads an InstanceState; CUDA-graph overlays bind request state only.
-    instance_adapter: bool = False
-    causal_training: bool = False
-    feeds: bool = False
-    # The smallest pllm.sample_index(limit=); requests must use a lower sample index.
-    sample_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

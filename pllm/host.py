@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from pllm.execution.state_execution import StateDiagnostics, StateExecution
     from pllm.execution.tensor_declaration import TensorOutput
     from pllm.execution.tensor_frame import TensorFrame
-    from pllm.usage import Workload
+    from pllm.workload import Workload
 
 
 @dataclass(frozen=True, slots=True)

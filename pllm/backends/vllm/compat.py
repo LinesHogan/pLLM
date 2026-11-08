@@ -14,8 +14,8 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
 from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 
-from pllm.authoring import BackendRequirements
 from pllm.config import ModelConfig
+from pllm.execution.compile_facts import BackendRequirements
 
 SUPPORTED_VLLM = ("0.27.1", "0.32.0")
 if __version__ not in SUPPORTED_VLLM:

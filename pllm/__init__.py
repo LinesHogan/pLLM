@@ -28,7 +28,6 @@ from pllm.usage import (
     PositionState as PositionState,
     RequestState as RequestState,
     UpdateOutput as UpdateOutput,
-    Workload as Workload,
     add_logits as add_logits,
     attention as attention,
     base_logits as base_logits,
@@ -61,6 +60,7 @@ from pllm.usage import (
     version as version,
     write as write,
 )
+from pllm.workload import Workload as Workload
 
 if TYPE_CHECKING:
     from pllm.authoring import BackendWorkload
