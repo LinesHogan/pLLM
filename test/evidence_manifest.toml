@@ -231,16 +231,6 @@ observable_contract = "Independent feature projection and PyTorch Adam match edi
 replaces = "test/core/test_canonical_fttt_workload_unit.py; no consumer hierarchy fixtures"
 
 [[evidence]]
-id = 22
-name = "gtta_updates_environment_and_rolls_back_fifo"
-group = "workload"
-path = "test/workloads/test_gtta.py"
-command = "/workspace/pllm/.venv/bin/python -m pytest -q test/workloads/test_gtta.py"
-environment = "Repository Python venv with torch and Rust extension; CPU"
-observable_contract = "Executed transaction abort restores state and FIFO; subsequent commit produces exact EMA rankings and prompt rewards; empty update preserves version; zero fallback"
-replaces = "test/core/test_canonical_gtta_workload_unit.py; DTO tamper fixtures are excluded"
-
-[[evidence]]
 id = 23
 name = "inplace_ttt_matches_multitarget_oracle_and_cleans_versions"
 group = "workload"

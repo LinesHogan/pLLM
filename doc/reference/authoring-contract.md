@@ -21,7 +21,7 @@
 | 让多个请求按路由键共享适配器 | [路由键](#路由键) |
 | 逐 token prefill 循环（Recirculation） | [逐 Token 循环](#逐-token-循环) |
 | 外部加权批量训练、多步 SGD（Output LoRA 风格） | [加权批量训练](#加权批量训练) |
-| completion / reward 驱动学习（多数投票奖励头）、宿主反馈循环（FTTT、GTTA） | [Completion 学习](#completion-学习)、[宿主循环](#宿主循环) |
+| completion / reward 驱动学习（多数投票奖励头）、宿主反馈循环（FTTT） | [Completion 学习](#completion-学习)、[宿主循环](#宿主循环) |
 | 因果批训练（TLM） | [因果批训练](#因果批训练) |
 | 排查签名不匹配 / worker 重建失败 | [采样引导、logits 与导出](#采样引导logits-与导出)末尾的冷绑定器段落 |
 | 查某个内置负载用了哪些声明 | [全负载覆盖](#全负载覆盖) |
@@ -32,7 +32,6 @@
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[reward head](../../pllm/workloads/reward_head.py) 使用普通 `Workload`
 的宿主路径（奖励投票是宿主函数 `majority_vote`），FTTT 的编辑也是（`FTTTFeedback` 作反馈回调）；
-GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp.py) 使用普通具名参数、预测与 loss，
 并在同一张图上做显式分页/捕获替换；Output LoRA 使用普通 `Batch` 输入与多步 SGD。
@@ -523,10 +522,6 @@ loss；绑定在每个 SGD 步微分它们的**均值**。这不是 ESamp 的独
 （`feedback.edit` 是 `HostTrainer`，可取 `diagnostics()`），`feedback(batch)` 评判、入队，
 在失败行上 `train` 一次，再用返回的 `TrainStep.parameters` 里更新后的编辑算出重试要加的
 增量（`step()` 只处理已排队的反馈）；失败的一步清空队列，已经发布的编辑保留。
-[GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`GTTAWorkload.run(request)`
-从 `GTTAEnvironment` 的 FIFO 队列取出事件，用 Python 字典中的 FP64 EMA 更新动力学记忆，再回答查询。
-分数、稳定排名和历史格式保持不变；`GTTAResult` 直接返回 `processed` 与 `query`。
-查询失败时，已消费的事件和已更新的记忆保留。
 
 ## 因果批训练
 
@@ -608,7 +603,6 @@ Adapter 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mas
 | ReFT | 无优化器外部字段替换、发布、激活目标与选中行 |
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |
 | FTTT | 宿主 judge 与有界队列、向量目标 `WeightedRowBatch`、AdamW 编辑、用 `parameters` 做 update-before-predict 与重试输出 |
-| GTTA | Python 字典中的动力学记忆；FIFO 轨迹、update-before-query，查询失败保留更新 |
 | 奖励头 | 宿主 `majority_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
 可表达不等于支持任意组合：后端能力检查仍拒绝不支持的组合。

@@ -76,7 +76,7 @@ outputs = llm.generate(["Explain gradient descent:"] * 8, SamplingParams(n=16, m
 
 完整的清单（包括哪些写不了、为什么）见 [能力地图](doc/guides/capability-map.md)。例子：按分数释放 KV 显存（H2O、SnapKV）不支持；DSA 一类训练出来的稀疏 attention 需要 sm90 以上的 GPU；从头预训练和全新模型结构不在范围内。
 
-`pllm.workloads` 里有一批现成实现，和你写的负载走完全相同的路径：ESamp、ReFT/LoReFT、DoLa、TLM、In-Place TTT、输出层 LoRA、层间再循环、多数投票奖励头、OverRIDE、FTTT、GTTA。
+`pllm.workloads` 里有一批现成实现，和你写的负载走完全相同的路径：ESamp、ReFT/LoReFT、DoLa、TLM、In-Place TTT、输出层 LoRA、层间再循环、多数投票奖励头、OverRIDE、FTTT。
 
 ## 框架替你做了什么
 

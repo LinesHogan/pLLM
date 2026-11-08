@@ -8,7 +8,6 @@ from pathlib import Path
 
 # First match wins; shared execution, backend and verification changes reach the fallback.
 PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("pllm/workloads/gtta*", ()),
     ("pllm/workloads/dola*", ()),
     ("pllm/workloads/dummy*", ("enginecore", "tp")),
     ("examples/huber.py", ("enginecore",)),

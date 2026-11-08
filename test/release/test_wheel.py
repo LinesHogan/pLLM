@@ -83,7 +83,7 @@ request = json.dumps({'layouts': [{
 decision = _core.intern_tensor_layouts(request)
 assert json.loads(decision)['bindings'][0]['layout_id'] == 0
 assert callable(pllm.make_llm)
-for workload in ('dummy', 'esamp', 'fttt', 'gtta', 'inplace_ttt', 'tlm',
+for workload in ('dummy', 'esamp', 'fttt', 'inplace_ttt', 'tlm',
                  'reft', 'recirculation', 'override', 'reward_head', 'lora'):
     module = importlib.import_module('pllm.workloads.' + workload)
     assert Path(module.__file__).resolve().is_relative_to(installed)

@@ -70,7 +70,6 @@ CONSUMER_NAMES = (
     "recirculation",
     "reward_head",
     "fttt",
-    "gtta",
     "override",
     "tlm",
 )

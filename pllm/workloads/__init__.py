@@ -7,7 +7,6 @@ from pllm.workloads.esamp import (
     ESampWorkload as ESampWorkload,
 )
 from pllm.workloads.fttt import FTTTConfig as FTTTConfig, FTTTWorkload as FTTTWorkload
-from pllm.workloads.gtta import GTTAConfig as GTTAConfig, GTTAWorkload as GTTAWorkload
 from pllm.workloads.inplace_ttt import InPlaceTTTConfig as InPlaceTTTConfig, InPlaceTTTWorkload as InPlaceTTTWorkload
 from pllm.workloads.lora import OutputLoRAConfig as OutputLoRAConfig, OutputLoRAWorkload as OutputLoRAWorkload
 from pllm.workloads.override import OverRIDEConfig as OverRIDEConfig, OverRIDEWorkload as OverRIDEWorkload
