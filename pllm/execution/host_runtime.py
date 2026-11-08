@@ -55,9 +55,7 @@ def bind_host(
         if layouts.layouts
         else ()
     )
-    plan = compile_page_bundle_plan(
-        (graph, layouts), timeline, providers, 1, config.state_page_budget_bytes, config.device
-    )
+    plan = compile_page_bundle_plan((graph, layouts), timeline, providers, 1, config.state_page_budget_bytes)
     (anchor,) = (AnchorId(item.ordinal) for item in timeline.anchors if item.symbol == "host.next")
     return math.bind(PageBundleArena(plan, device=config.device), anchor)
 

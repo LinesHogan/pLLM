@@ -149,7 +149,6 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             facts.providers,
             facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
             facts.state_page_budget_bytes,
-            facts.device,
         )
         return bind_backend_attachment(
             plan, facts.probe, replace(attachment, guidance_capacity=facts.guidance_capacity)

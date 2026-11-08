@@ -4,13 +4,10 @@ from dataclasses import dataclass
 from math import prod
 from pathlib import Path
 
-import torch
-
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import SchedulerTimeline, SemanticGraph, StateScope
 from pllm.contracts.state_representation import (
     StateDeviceKind,
-    StateLayoutRequirement,
     StateProviderPlan,
     StateRepresentationRequest,
 )
@@ -29,7 +26,6 @@ def compile_page_bundle_plan(
     providers: tuple["PageBundleProviderFacts", ...],
     max_admitted_lineages: int,
     state_page_budget_bytes: int,
-    device: torch.device,
 ) -> PlanBundle:
     """Compile original declarations once; all choices remain Rust-owned."""
     graph, layouts = declaration
@@ -60,25 +56,8 @@ def compile_page_bundle_plan(
             raise ValueError(
                 'host tables do not fit available host memory; reduce the tables or declare placement="device"'
             )
-    required = (f"device/{device.type}@1", "state/exact_versions@1")
-    if device.type == "cuda":
-        required += ("state/fenced_reclaim@1",)
     request = StateRepresentationRequest(
-        state_page_budget_bytes,
-        tuple(
-            StateLayoutRequirement(
-                binding.resource,
-                binding.layout_id,
-                next(
-                    candidate.max_admitted_lineages
-                    for candidate in candidates
-                    if candidate.resource == binding.resource
-                ),
-                required,
-            )
-            for binding in layout_decision.bindings
-        ),
-        candidates,
+        state_page_budget_bytes, tuple(binding.resource for binding in layout_decision.bindings), candidates
     )
     states, schedule = compile_state_schedule(graph, timeline, request)
     return PlanBundle(graph, timeline, schedule, states, layouts, layout_decision)

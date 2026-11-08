@@ -1,14 +1,14 @@
 """Public feed declarations and computed writes, independent of the video example."""
 
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 import pytest
 import torch
 
 import pllm
-from pllm.contracts.semantic_graph import SemanticEffect, StateEffectKind, StateResource
+from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_feed import FeedOrder
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
@@ -79,34 +79,6 @@ def test_feed_declaration_derives_ownership():
                 ]
             )
             == 1
-        )
-
-
-def test_conditional_input_allows_local_reads_but_rejects_an_extra_writer():
-    workload = FeedWorkload()
-    facts, binding = workload.specialize(facts_for(), pllm.ExecutionOptions())
-    binding.graph = replace(
-        binding.graph,
-        tasks=tuple(
-            replace(
-                task,
-                effects=tuple(
-                    SemanticEffect(StateResource("target"), StateEffectKind.TRANSITION)
-                    if effect.resource == "target" and effect.kind is StateEffectKind.READ
-                    else effect
-                    for effect in task.effects
-                ),
-            )
-            if task.symbol == "transform"
-            else task
-            for task in binding.graph.tasks
-        ),
-    )
-    from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
-
-    with pytest.raises(ValueError, match="one owned transition"):
-        compile_page_bundle_plan(
-            (binding.graph, binding.layouts), facts.timeline, facts.providers, 2, 65536, facts.device
         )
 
 

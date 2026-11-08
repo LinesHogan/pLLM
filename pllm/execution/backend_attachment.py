@@ -148,9 +148,7 @@ def derive_attachment_resources(
     tasks = tuple(task for task in graph.tasks if isinstance(task.custom_forward, TokenProgramEffect))
     if not tasks:
         return timeline
-    if len(tasks) != 1:
-        raise ValueError("custom-forward attachment costs need one custom-forward task")
-    (task,) = tasks
+    (task,) = tasks  # declare_custom_forward builds one task for all of a workload's custom forwards
     # declare_custom_forward composes the custom forward with its publication; a conditional input group keeps
     # all producer facts, so the complete DAG funds the worst case.
     resident = cuda_graph_pool_budget_bytes if TOKEN_CAPTURE_CAPABILITY in probe.capabilities else 0

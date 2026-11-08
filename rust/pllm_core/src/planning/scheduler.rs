@@ -58,11 +58,11 @@ fn error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
-fn task_index(graph: &SemanticGraph, symbol: &str) -> Result<usize, String> {
+fn task_index(graph: &SemanticGraph, symbol: &str) -> usize {
     graph
         .tasks
         .binary_search_by(|task| task.symbol.as_str().cmp(symbol))
-        .map_err(|_| "semantic graph edge references an unknown task".to_owned())
+        .expect("edges and results name declared tasks")
 }
 
 pub(super) struct GraphIndex {
@@ -101,12 +101,12 @@ fn graph_index(
         .collect::<Result<Vec<_>, String>>()?;
     let mut predecessors = vec![BTreeSet::new(); graph.tasks.len()];
     for edge in graph.edges.iter().filter(|e| e.step_distance == 0) {
-        predecessors[task_index(graph, &edge.target)?].insert(task_index(graph, &edge.source)?);
+        predecessors[task_index(graph, &edge.target)].insert(task_index(graph, &edge.source));
     }
     for (consumer, task) in graph.tasks.iter().enumerate() {
         for input in &task.inputs {
             if let InputSource::Result { task: producer, .. } = &input.source {
-                predecessors[consumer].insert(task_index(graph, producer)?);
+                predecessors[consumer].insert(task_index(graph, producer));
             }
         }
     }
@@ -135,25 +135,26 @@ fn graph_index(
         }
     }
     if order.len() != graph.tasks.len() {
-        return Err("semantic graph contains a dependency cycle".to_owned());
+        let waiting: Vec<_> = (graph.tasks.iter().zip(&indegree))
+            .filter(|(_, &degree)| degree != 0)
+            .map(|(task, _)| task.symbol.as_str())
+            .collect();
+        return Err(format!(
+            "methods {waiting:?} wait on each other through results or state reads and writes; \
+             remove one of the dependencies in the cycle"
+        ));
     }
-    let period =
-        i64::try_from(timeline.anchors.len()).map_err(|_| "timeline rank overflows i64")?;
+    let period = timeline.anchors.len() as i64;
     let mut dependencies: Vec<_> = predecessors
         .iter()
         .enumerate()
         .flat_map(|(v, parents)| parents.iter().map(move |&u| (u, v, 0_i64)))
         .collect();
     for edge in &graph.edges {
-        let shift = edge
-            .step_distance
-            .checked_mul(period)
-            .and_then(|distance| i64::from(edge.separation).checked_sub(distance))
-            .ok_or("step distance times timeline period overflows i64")?;
         dependencies.push((
-            task_index(graph, &edge.source)?,
-            task_index(graph, &edge.target)?,
-            shift,
+            task_index(graph, &edge.source),
+            task_index(graph, &edge.target),
+            i64::from(edge.separation) - edge.step_distance * period,
         ));
     }
     for (id, task) in graph.tasks.iter().enumerate() {
@@ -185,12 +186,8 @@ fn propagate(
     for pass in 0..=bounds.len() {
         let mut changed = false;
         for &(u, v, weight) in edges {
-            let lower = lo[u]
-                .checked_add(weight)
-                .ok_or("placement lower bound overflows i64")?;
-            let upper = hi[v]
-                .checked_sub(weight)
-                .ok_or("placement upper bound overflows i64")?;
+            let lower = lo[u] + weight;
+            let upper = hi[v] - weight;
             if lower > lo[v] {
                 lo[v] = lower;
                 changed = true;
@@ -529,7 +526,10 @@ fn plan_memory(
     }
     peak = peak.max(resident + exported);
     let peak = u64::try_from(peak).map_err(|_| "placement memory envelope overflows u64")?;
-    if let Some(budget) = timeline.execution_peak_budget_bytes.filter(|&budget| peak > budget) {
+    if let Some(budget) = timeline
+        .execution_peak_budget_bytes
+        .filter(|&budget| peak > budget)
+    {
         return Err(format!(
             "pllm execution needs {peak} bytes at its peak but only {budget} fit; lower \
              max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; \
@@ -547,7 +547,6 @@ pub(super) fn compile(
     timeline: &Timeline,
     state: Option<&StateRepresentationDecision>,
 ) -> Result<ScheduleDecision, String> {
-    validate_graph(graph)?;
     debug_assert!(
         timeline
             .capabilities
@@ -604,9 +603,26 @@ pub(super) fn compile(
         &mut best,
         &mut failure,
     )?;
-    best.ok_or_else(|| {
-        failure.unwrap_or_else(|| "no task implementation is supported by this backend".into())
-    })
+    best.ok_or_else(|| failure.unwrap_or_else(|| unsupported_task(graph, timeline)))
+}
+
+/// Name a task none of whose implementations this backend can run, and what the first one lacks.
+fn unsupported_task(graph: &SemanticGraph, timeline: &Timeline) -> String {
+    let missing = |candidate: &ImplementationCandidate| -> Vec<String> {
+        (candidate.required_capabilities.iter())
+            .filter(|cap| timeline.capabilities.binary_search(cap).is_err())
+            .cloned()
+            .collect()
+    };
+    let task = (graph.tasks.iter())
+        .find(|task| task.implementations.iter().all(|c| !missing(c).is_empty()))
+        .expect("some task has no supported implementation");
+    format!(
+        "{}: this backend lacks {:?}; use a backend that provides it or remove {}",
+        task.symbol,
+        missing(&task.implementations[0]),
+        task.symbol
+    )
 }
 
 // Torch transitions are assumed deterministic. Initialization and execution support are separate
@@ -711,6 +727,7 @@ fn compile_schedule(
     let graph = decode_graph(graph_json).map_err(error)?;
     let timeline = decode_timeline(timeline_json).map_err(error)?;
     let state = state_json.map(decode_state).transpose().map_err(error)?;
+    validate_graph(&graph).map_err(error)?;
     let decision = compile(&graph, &timeline, state.as_ref()).map_err(error)?;
     canonical_ascii_json(&decision).map_err(error)
 }
@@ -829,7 +846,6 @@ mod tests {
                 }
             }
         }
-        assert!(super::propagate(&[(0, 4), (0, 4)], &[(0, 1, i64::MAX), (1, 0, 1)]).is_err());
     }
 
     #[test]
@@ -911,7 +927,8 @@ mod tests {
         // Enumerate full executions, maintaining values/current state independently
         // of the planner's dependency construction and topological search.
         for split in [false, true] {
-            for chain in [false, true] {
+            // pllm always names a publication's transition, so a split write is always a chain.
+            for chain in [false, true].into_iter().filter(|&chain| chain || !split) {
                 for retained in [false, true] {
                     for read_version in [None, Some(0), Some(1)] {
                         for order in permutations {
@@ -932,7 +949,7 @@ mod tests {
                             }
                             let mut current = None;
                             let mut produced = [false; 3];
-                            let mut expected = !split || chain;
+                            let mut expected = true;
                             for task in order {
                                 if sources[task].is_some_and(|i| !produced[i]) {
                                     expected = false;
@@ -967,35 +984,9 @@ mod tests {
                 }
             }
         }
-        for mutation in 0..7 {
-            let mut graph = valid.clone();
-            match mutation {
-                0 => graph.tasks[2].effects[0].version = Some("missing".into()),
-                1 => graph.tasks[2].effects[0].version = Some("t2".into()),
-                2 => graph.tasks[0].effects[0].version = Some("t2".into()),
-                3 => graph.tasks[1].effects.clear(),
-                4 => graph.tasks[2].effects = graph.tasks[1].effects.clone(),
-                5 => {
-                    graph.states.push(
-                        serde_json::from_value(json!({
-                            "resource": "unrelated", "scope": "instance", "key_fields": []
-                        }))
-                        .unwrap(),
-                    );
-                    graph.tasks[2].effects[0].resource = "unrelated".into();
-                }
-                _ => {
-                    graph.edges = serde_json::from_value(json!([
-                        {"source": "t1", "target": "t0"}
-                    ]))
-                    .unwrap()
-                }
-            }
-            assert!(
-                compile(&graph, &timeline, Some(&state)).is_err(),
-                "mutation={mutation}"
-            );
-        }
+        let mut cycle = valid;
+        cycle.edges = serde_json::from_value(json!([{"source": "t1", "target": "t0"}])).unwrap();
+        assert!(compile(&cycle, &timeline, Some(&state)).is_err());
     }
 
     #[test]

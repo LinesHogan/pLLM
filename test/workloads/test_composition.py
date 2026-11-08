@@ -196,8 +196,8 @@ EFFECTS = {
     )
 }
 CUSTOM_FORWARD_TAPS = "which a @pllm.custom_forward does not produce"
-FEED_STATES = "may declare only the fed states"
-FEED_READERS = "conditional reader requires only its publication"
+FEED_STATES = "may declare only the fed state and the state its @pllm.write fills"
+FEED_READERS = "runs only its @pllm.write and the model forward"
 POSITIONS = "PositionState needs a @pllm.custom_forward without"
 # Every rejected combination and the conflict its message names; every other single effect and pair is admitted.
 REJECTED = {

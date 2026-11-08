@@ -74,7 +74,6 @@ def mean_capture(publish_lag: int = 0) -> None:
         facts.providers,
         1,
         facts.state_page_budget_bytes,
-        device,
     )
     execution = workload.bind_math(facts, plan, declaration).bind(PageBundleArena(plan), AnchorId(3))
     assert plan.timeline.visibility is not None

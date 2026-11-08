@@ -15,7 +15,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.contracts.parameter_overlay import Projection, ProjectionShape
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import AnchorId, SemanticState, StateResource, StateScope
-from pllm.contracts.state_representation import StateDeviceKind, StateLayoutRequirement, StateRepresentationRequest
+from pllm.contracts.state_representation import StateDeviceKind, StateRepresentationRequest
 from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorLayoutRequest
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
@@ -107,7 +107,7 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
     )
     request = StateRepresentationRequest(
         memory_bytes,
-        tuple(StateLayoutRequirement(p.resource, p.layout_id, p.max_admitted_lineages) for p in candidates),
+        tuple(p.resource for p in candidates),
         candidates,
     )
     states, schedule = compile_state_schedule(graph, plan.timeline, request)

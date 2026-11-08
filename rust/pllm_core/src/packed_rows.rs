@@ -93,7 +93,6 @@ impl RowLabeler {
             column(&computed)?,
             column(&ids)?,
         );
-        self.validate(scheduled, prompt, computed, ids)?;
         // numpy's readonly borrows stay alive until preparation finishes; no tensor or CUDA access.
         let labels = py.allow_threads(|| self.label(scheduled, prompt, computed, ids, keep));
         let rows = numpy::ndarray::Array2::from_shape_vec(
@@ -128,37 +127,6 @@ impl RowLabeler {
 }
 
 impl RowLabeler {
-    fn validate(
-        &self,
-        scheduled: &[i32],
-        prompt: &[i32],
-        computed: &[i32],
-        ids: &[i64],
-    ) -> PyResult<()> {
-        if [prompt.len(), computed.len(), ids.len()]
-            .iter()
-            .any(|&n| n != scheduled.len())
-        {
-            return Err(PyValueError::new_err(
-                "provide equally sized scheduled, prompt, computed and request ID columns",
-            ));
-        }
-        for (((&count, &length), &done), &id) in scheduled.iter().zip(prompt).zip(computed).zip(ids)
-        {
-            if count < 0 || length < 0 || done < 0 || done.checked_add(count).is_none() {
-                return Err(PyValueError::new_err(
-                    "use nonnegative scheduled counts and int32 token positions",
-                ));
-            }
-            if id < 0 || self.frontiers.get(id as usize).is_none_or(Option::is_none) {
-                return Err(PyValueError::new_err(
-                    "admit each request before labeling its rows",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn label(
         &mut self,
         scheduled: &[i32],

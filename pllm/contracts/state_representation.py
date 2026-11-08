@@ -31,19 +31,11 @@ class StateProviderPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class StateLayoutRequirement:
-    """Representation-neutral frozen facts for one request state."""
-
-    resource: str
-    layout_id: LayoutId
-    max_admitted_lineages: int
-    required_capabilities: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
 class StateRepresentationRequest:
+    """Choose one provider candidate per state resource, in `resources` order, within the page budget."""
+
     state_page_budget_bytes: int
-    states: tuple[StateLayoutRequirement, ...]
+    resources: tuple[str, ...]
     candidates: tuple[StateProviderPlan, ...]
 
 
@@ -55,7 +47,6 @@ class StateRepresentationDecision:
 
 __all__ = [
     "StateDeviceKind",
-    "StateLayoutRequirement",
     "StateProviderPlan",
     "StateRepresentationDecision",
     "StateRepresentationRequest",

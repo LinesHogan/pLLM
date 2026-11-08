@@ -1,4 +1,4 @@
-//! Clean-room selection and validation for request-state representations.
+//! Selection of one provider plan per state resource within the state-page budget.
 //!
 //! This module owns a closed, pure-data FFI contract.  It deliberately knows
 //! no workload names, Tensor objects, Python callbacks, or runtime handles.
@@ -20,31 +20,22 @@ pub(crate) struct StateProviderPlan {
     pub(crate) resource: String,
     provider_id: String,
     pub(crate) device_kind: StateDeviceKind,
-    pub(crate) layout_id: u64,
-    pub(crate) max_admitted_lineages: u64,
-    pub(crate) page_capacity: u64,
+    layout_id: u64,
+    max_admitted_lineages: u64,
+    page_capacity: u64,
     root_page_count: u64,
     pub(crate) reserved_bytes: u64,
     #[serde(default)]
-    pub(crate) host_bytes: u64,
+    host_bytes: u64,
     capture_stable: bool,
     pub(crate) capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct StateLayoutRequirement {
-    resource: String,
-    layout_id: u64,
-    max_admitted_lineages: u64,
-    required_capabilities: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct StateRepresentationRequest {
     state_page_budget_bytes: u64,
-    states: Vec<StateLayoutRequirement>,
+    resources: Vec<String>,
     pub(crate) candidates: Vec<StateProviderPlan>,
 }
 
@@ -65,66 +56,11 @@ pub(crate) fn decode_decision(payload: &str) -> Result<StateRepresentationDecisi
         .map_err(|source| format!("invalid StateRepresentationDecision: {source}"))
 }
 
-fn validate_request(request: &StateRepresentationRequest) -> Result<(), String> {
-    for candidate in &request.candidates {
-        let requirement = request
-            .states
-            .iter()
-            .find(|state| state.resource == candidate.resource)
-            .ok_or_else(|| {
-                format!(
-                    "candidate resource {:?} has no state requirement",
-                    candidate.resource
-                )
-            })?;
-        validate_candidate_matches(requirement, candidate)?;
-    }
-    for requirement in &request.states {
-        if !request
-            .candidates
-            .iter()
-            .any(|candidate| candidate.resource == requirement.resource)
-        {
-            return Err(format!(
-                "state resource {:?} has no provider candidates",
-                requirement.resource
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_candidate_matches(
-    requirement: &StateLayoutRequirement,
-    candidate: &StateProviderPlan,
-) -> Result<(), String> {
-    if candidate.layout_id != requirement.layout_id
-        || candidate.max_admitted_lineages != requirement.max_admitted_lineages
-    {
-        return Err(format!(
-            "candidate {:?}/{:?} does not match its state layout requirement",
-            candidate.resource, candidate.provider_id
-        ));
-    }
-    if requirement
-        .required_capabilities
-        .iter()
-        .any(|capability| candidate.capabilities.binary_search(capability).is_err())
-    {
-        return Err(format!(
-            "candidate {:?}/{:?} lacks a required capability",
-            candidate.resource, candidate.provider_id
-        ));
-    }
-    Ok(())
-}
-
 pub(super) fn compile(
     request: &StateRepresentationRequest,
     graph: &SemanticGraph,
     timeline: &Timeline,
 ) -> Result<(StateRepresentationDecision, ScheduleDecision), String> {
-    validate_request(request)?;
     validate_graph(graph)?;
     // Candidate catalogs are sorted. Strict score improvement therefore also
     // gives a stable provider-key tie-break without another decision ledger.
@@ -137,11 +73,12 @@ pub(super) fn compile(
         best: &mut Option<(StateRepresentationDecision, ScheduleDecision)>,
         failure: &mut Option<String>,
     ) -> Result<(), String> {
-        if request.state_page_budget_bytes != 0 && reserved_bytes > request.state_page_budget_bytes {
+        if request.state_page_budget_bytes != 0 && reserved_bytes > request.state_page_budget_bytes
+        {
             return Ok(());
         }
-        if plans.len() < request.states.len() {
-            let resource = &request.states[plans.len()].resource;
+        if plans.len() < request.resources.len() {
+            let resource = &request.resources[plans.len()];
             for candidate in request
                 .candidates
                 .iter()
@@ -196,13 +133,13 @@ pub(super) fn compile(
     best.ok_or_else(|| {
         failure.unwrap_or_else(|| {
             let required: u64 = request
-                .states
+                .resources
                 .iter()
-                .map(|state| {
+                .map(|resource| {
                     request
                         .candidates
                         .iter()
-                        .filter(|candidate| candidate.resource == state.resource)
+                        .filter(|candidate| &candidate.resource == resource)
                         .map(|candidate| candidate.reserved_bytes)
                         .min()
                         .unwrap()
@@ -229,10 +166,6 @@ mod tests {
 
     #[test]
     fn representation_selection_and_capacity_match_oracle() {
-        let requirement = |resource| {
-            json!({"resource": resource, "layout_id": 0,
-            "max_admitted_lineages": 1, "required_capabilities": []})
-        };
         let candidate = |resource, provider, bytes, retained| {
             json!({
                 "resource": resource, "provider_id": provider,
@@ -242,8 +175,6 @@ mod tests {
                 "capabilities": if retained {vec!["state/exact_versions@1"]} else {vec![]}
             })
         };
-        let mut undersized = candidate("state", "a_too_small", 4, true);
-        undersized["page_capacity"] = json!(1);
         for late_read in [false, true] {
             let graph = decode_graph(&json!({
                 "input_groups": [], "edges": [], "states": (["state", "unused"].map(|resource| json!({
@@ -258,8 +189,8 @@ mod tests {
             for arena_budget in [0, 8, 16, 24, 32] {
                 let request = decode_request(&json!({
                     "state_page_budget_bytes": arena_budget,
-                    "states": [requirement("state"), requirement("unused")],
-                    "candidates": [undersized, candidate("state", "cow", 16, true), candidate("state", "mutable", 8, false),
+                    "resources": ["state", "unused"],
+                    "candidates": [candidate("state", "cow", 16, true), candidate("state", "mutable", 8, false),
                         candidate("unused", "large", 5, false), candidate("unused", "small", 3, false)]
                 }).to_string()).unwrap();
                 for memory_budget in [8, 16, 20, 24, 28, 32, 40] {

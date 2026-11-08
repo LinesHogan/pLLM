@@ -1,5 +1,5 @@
 //! Semantic graph and timeline as the Rust planner reads them, and the checks of the declaration facts
-//! a user can get wrong (conditional input groups, overlay visibility).
+//! a user can get wrong around a fed InstanceState.
 //!
 //! Python's declaration layer produces these structs; Rust decodes only the fields it reads.
 
@@ -149,7 +149,6 @@ pub(crate) struct ConditionalInputGroup {
     pub(crate) resource: String,
     pub(crate) borrowed_resources: Vec<String>,
     pub(crate) tasks: Vec<String>,
-    pub(crate) publication: String,
     pub(crate) readers: Vec<String>,
 }
 
@@ -224,20 +223,6 @@ pub(crate) fn decode_timeline(payload: &str) -> Result<Timeline, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid Timeline: {source}"))
 }
 
-fn validate_task(task: &SemanticTask) -> Result<(), String> {
-    if task
-        .visibility
-        .as_ref()
-        .is_some_and(|visibility| visibility.policy == VisibilityKind::StepLag)
-    {
-        return Err(format!(
-            "{}: set visibility=\"exact\" or visibility=\"forward_pinned\"",
-            task.symbol
-        ));
-    }
-    Ok(())
-}
-
 /// Check the declaration facts a user can get wrong; everything else is pllm-produced and trusted.
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     debug_assert!(
@@ -247,153 +232,59 @@ pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
             .all(|pair| pair[0].symbol < pair[1].symbol),
         "tasks are sorted by symbol for binary search"
     );
-    for task in &graph.tasks {
-        validate_task(task)?;
+    for group in &graph.input_groups {
+        validate_feed_chain(graph, group)?;
     }
-    validate_input_groups(graph)
+    Ok(())
 }
 
-fn validate_input_groups(graph: &SemanticGraph) -> Result<(), String> {
-    if graph.input_groups.len() > 1 {
-        return Err("one atomic conditional input group is supported".into());
+/// Check what a user put around a fed InstanceState. pllm builds the group itself (the publication closure
+/// of the @pllm.write that fills the patched state, and the custom forwards that read it), so its shape is
+/// trusted; a step without a new fed value skips the whole closure, which is why nothing else may run.
+fn validate_feed_chain(graph: &SemanticGraph, group: &ConditionalInputGroup) -> Result<(), String> {
+    if graph.states.len() != group.borrowed_resources.len() + 1 {
+        return Err(
+            "a workload with a fed InstanceState may declare only the fed state and the state its \
+             @pllm.write fills; remove the other states"
+                .into(),
+        );
     }
-    for group in &graph.input_groups {
-        let producer = |name: &String| group.tasks.contains(name);
-        if graph.states.len() != group.borrowed_resources.len() + 1 {
-            return Err(
-                "a workload with a fed InstanceState may declare only the fed states and the one \
-                 state its writer produces"
-                    .into(),
-            );
+    for task in &graph.tasks {
+        if group.tasks.contains(&task.symbol) {
+            continue;
         }
-        if group.tasks.is_empty()
-            || group.borrowed_resources.is_empty()
-            || group.borrowed_resources.contains(&group.resource)
-            || !producer(&group.publication)
-            || group
-                .tasks
-                .iter()
-                .chain(&group.readers)
-                .any(|name| !graph.tasks.iter().any(|task| &task.symbol == name))
-            || group.readers.iter().any(producer)
-            || !graph
-                .states
-                .iter()
-                .any(|state| state.resource == group.resource)
-            || group.borrowed_resources.iter().any(|resource| {
-                !graph
-                    .states
+        if !group.readers.contains(&task.symbol) {
+            return Err(format!(
+                "{}: a workload with a fed InstanceState runs only its @pllm.write and the model \
+                 forward, because a step without a new fed value skips the write; remove {} or feed=",
+                task.symbol, task.symbol
+            ));
+        }
+        if let Some(effect) =
+            (task.effects.iter()).find(|effect| group.borrowed_resources.contains(&effect.resource))
+        {
+            return Err(format!(
+                "{}: the model sees the fed state {:?} only through the state its @pllm.write fills; \
+                 read {:?} instead",
+                task.symbol, effect.resource, group.resource
+            ));
+        }
+    }
+    let writer_reads = |resource: &String| {
+        (graph.tasks.iter())
+            .filter(|task| group.tasks.contains(&task.symbol))
+            .any(|task| {
+                task.effects
                     .iter()
-                    .any(|state| &state.resource == resource && state.scope == StateScope::Instance)
+                    .any(|effect| &effect.resource == resource)
             })
-        {
-            return Err(
-                "conditional input group must name its exact producer closure and states".into(),
-            );
-        }
-        let publication = graph
-            .tasks
-            .iter()
-            .find(|task| task.symbol == group.publication)
-            .unwrap();
-        if publication.effects.len() != 1
-            || publication.effects[0].kind != StateEffectKind::Publish
-            || publication.effects[0].resource != group.resource
-        {
-            return Err("conditional input requires its exact owned publication".into());
-        }
-        let writes: Vec<_> = graph
-            .tasks
-            .iter()
-            .filter(|task| producer(&task.symbol) && task.symbol != group.publication)
-            .flat_map(|task| &task.effects)
-            .filter(|effect| {
-                effect.resource == group.resource && effect.kind != StateEffectKind::Read
-            })
-            .collect();
-        if writes.len() != 1
-            || !matches!(
-                writes[0].kind,
-                StateEffectKind::Transition | StateEffectKind::TransitionMaybe
-            )
-            || writes[0].version.is_some()
-        {
-            return Err(
-                "conditional input requires one owned transition and no hidden writers".into(),
-            );
-        }
-        let mut closure = std::collections::BTreeSet::from([group.publication.clone()]);
-        loop {
-            let before = closure.len();
-            for task in &graph.tasks {
-                if closure.contains(&task.symbol) {
-                    for port in &task.inputs {
-                        if let InputSource::Result { task, .. } = &port.source {
-                            closure.insert(task.clone());
-                        }
-                    }
-                }
-            }
-            if before == closure.len() {
-                break;
-            }
-        }
-        if closure.into_iter().collect::<Vec<_>>() != group.tasks {
-            return Err(
-                "conditional producer group must be the complete publication closure".into(),
-            );
-        }
-        for task in &graph.tasks {
-            if producer(&task.symbol) {
-                if task.custom_forward.is_some()
-                    || task.effects.iter().any(|effect| {
-                        if group.borrowed_resources.contains(&effect.resource) {
-                            effect.kind != StateEffectKind::Read || effect.version.is_some()
-                        } else {
-                            effect.resource != group.resource
-                        }
-                    })
-                    || task.inputs.iter().any(|port| {
-                        matches!(&port.source,
-                        InputSource::Result { task, .. } if !producer(task))
-                    })
-                {
-                    return Err(
-                        "conditional producer cannot read outside its closed input group".into(),
-                    );
-                }
-            } else if !group.readers.contains(&task.symbol)
-                || task.effects.len() != 1
-                || task.effects[0].kind != StateEffectKind::Read
-                || task.effects[0].resource != group.resource
-                || task.effects[0].version.as_ref() != Some(&group.publication)
-                || task.inputs.iter().any(|port| match &port.source {
-                    InputSource::PackedRows => false,
-                    InputSource::Result { task, .. } => task != &group.publication,
-                    _ => true,
-                })
-            {
-                return Err(
-                    "conditional reader requires only its publication or pinned input version"
-                        .into(),
-                );
-            }
-        }
-        if group.borrowed_resources.iter().any(|resource| {
-            !graph.tasks.iter().any(|task| {
-                producer(&task.symbol)
-                    && task
-                        .effects
-                        .iter()
-                        .any(|effect| &effect.resource == resource)
-            })
-        }) {
-            return Err(
-                "the writer that consumes a fed InstanceState must read it; read the fed \
-                 state or remove feed="
-                    .into(),
-            );
-        }
+    };
+    if !group.borrowed_resources.iter().all(writer_reads) {
+        return Err(
+            "the writer that consumes a fed InstanceState must read it; read the fed \
+             state or remove feed="
+                .into(),
+        );
     }
     Ok(())
 }
