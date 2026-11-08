@@ -17,7 +17,6 @@ workload = InPlaceTTTWorkload(InPlaceTTTConfig(
     targets=(Projection("down_proj", 0),),
     chunk_size=4096,
     learning_rate=1e-3,
-    tokens="prefill",
 ))
 with pllm.make_llm(ModelConfig("Qwen/Qwen2.5-0.5B-Instruct"), workload=workload) as llm:
     outputs = llm.generate(["Explain matrix multiplication:"], SamplingParams(max_tokens=32))
@@ -29,17 +28,14 @@ target 的 delta 权重与固定尾部缓冲。完整块以当前有效权重发
 迁移推进 PTTS 状态，但不伪造参数发布。权重变化时，一次原子发布把所有 target
 字段绑定暴露为 `"dense"`。
 
-eager MRv2 适配器从不修改模型参数，也不拥有版本表。它 pin 住精确的 PTTS 根，
+MRv2 适配器从不修改模型参数，也不拥有版本表。它 pin 住精确的 PTTS 根，
 只对签名打包行加 `F.linear(hidden, delta)`，捕获真实的 MLP/down 投影操作数对，
 跑一次批处理的签名迁移/发布，并通过采样器完成栅栏释放旧 pin。请求结束只在
 pin 与写入栅栏完成后才退役根。
 
-当前真实运行时证据为 Qwen2、vLLM 0.27.1 MRv2、eager 进程内、TP1/PP1/DP1、
-非投机 decode。一次两请求运行观察到六次更新、六个训练行、八次稠密应用行
-（两次来自 V0 以上的版本）、零活跃根、零待释放与零回退。MRv1、
-EngineCore-MP、TP/PP>1 与投机 decode 未被声称（量化 target 另见 README）。`visibility="exact"` 的 decode
-更新可以进 CUDA graph（默认的数值容差模式），prefill 仍是 eager，见教程 08；
-后端适配器与负载调度保持分离。
+默认设置下模型前向在 CUDA graph 里运行，decode 中途的精确块边界更新（`visibility="exact"`）
+也能进 CUDA graph；关闭引擎会释放模型、请求状态与 graph，同一进程可以继续创建引擎（见教程 08）。
+投机 decode 不支持；量化 target 见 README。后端适配器与负载调度保持分离。
 
 发布刻意是模型步粒度的：一次模型调用 pin 一个版本，为之后的调用发布其后继。
 在单个长 prefill 内的块之间更新，需要签名的层/块子区域 —— 这不会被藏在

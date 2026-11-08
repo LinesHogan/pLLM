@@ -682,7 +682,7 @@ class SkipMiddle(pllm.Workload):
 
 > **实用建议与限制**
 > * **TP 不会减少单卡上 `pllm` 状态的显存占用**：因为状态是按 rank 复制而非分片的（`pllm.explain` 会在输出中提示 `reservations are per rank`）。TP 省下的是底座模型权重在单卡上的占用。
-> * **TP > 1 不支持的特性**：以下能力在 `tensor_parallel_size > 1` 时会被直接拒绝：`@pllm.custom_residual`、`@pllm.custom_attention`、权重改写（`pllm.model.Adapter`、`@pllm.train_in_forward`）、经 `pllm.causal_model` 的整模型训练、状态投喂（`feed`），以及 `pllm.testing.check_on_gpu`（请先在 `tensor_parallel_size=1` 下跑通 `check_on_gpu`）。
+> * **TP > 1 不支持的特性**：以下能力在 `tensor_parallel_size > 1` 时会被直接拒绝：`@pllm.custom_residual`、`@pllm.custom_attention`、除按分片的 dense / low-rank 改写（只由 `@pllm.train_in_forward` 在本卡分片上更新）之外的权重改写、经 `pllm.causal_model` 的整模型训练、状态投喂（`feed`），以及 `pllm.testing.check_on_gpu`（请先在 `tensor_parallel_size=1` 下跑通 `check_on_gpu`）。
 
 ---
 
@@ -695,7 +695,7 @@ class SkipMiddle(pllm.Workload):
 ```python
 @dataclass(frozen=True)
 class Monitor(pllm.Workload):
-    # 每 8 步导出一次，最多 4 行 × 16 列（需满足 max_rows * max_cols * 8 <= 32768 B）
+    # 每 8 步导出一次，最多 4 行 × 16 列（一行须装进一个 32 KiB 事件：max_cols * 8 <= 32768 B）
     @pllm.export(name="head", every=8, max_rows=4, max_cols=16)
     def peek(self, h: torch.Tensor = pllm.final_hidden()) -> torch.Tensor:
         return h[:, :16].float()

@@ -61,6 +61,9 @@ print(result)
 成功返回不可变的 `CheckResult(passed, skipped)`；`dataclasses.asdict(result)` 可转成 JSON。
 共享训练后的依赖输出、export 的限行规则、host batch/feed 和需要模型的效果都有明确的
 skip 原因。CPU 检查不验证 preemption、publish_lag/visibility 或模型里的实际应用；这些仍需 GPU 证据。
+想知道负载把模型的输出分布推开了多少，用 `testing.check_distribution(workload, config, max_mean_kl=..., max_p99_kl=...)`：
+它在 GPU 上以原模型的续写做 teacher forcing，给出两个方向的全词表 KL 与 TV（见
+[agent 参考](../agent/reference.md#inspect-the-plan-and-check-contracts)）。
 
 ## CPU 全过了，能说明 CUDA 没问题吗？
 

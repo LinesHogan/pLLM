@@ -76,12 +76,12 @@ outputs = llm.generate(["Explain gradient descent:"] * 8, SamplingParams(n=16, m
 
 完整的清单（包括哪些写不了、为什么）见 [能力地图](doc/guides/capability-map.md)。例子：按分数释放 KV 显存（H2O、SnapKV）不支持；DSA 一类训练出来的稀疏 attention 需要 sm90 以上的 GPU；从头预训练和全新模型结构不在范围内。
 
-`pllm.workloads` 里有一批现成实现，和你写的负载走完全相同的路径：ESamp、ReFT/LoReFT、DoLa、TLM、In-Place TTT、输出层 LoRA、层间再循环、TTRL、OverRIDE、FTTT、GTTA。
+`pllm.workloads` 里有一批现成实现，和你写的负载走完全相同的路径：ESamp、ReFT/LoReFT、DoLa、TLM、In-Place TTT、输出层 LoRA、层间再循环、多数投票奖励头、OverRIDE、FTTT、GTTA。
 
 ## 框架替你做了什么
 
 - **每个请求的状态**：声明 `pllm.RequestState`，每个请求自动得到一份独立参数（和优化器状态），请求结束即回收；pllm 在启动时为它自己的状态页和捕获缓冲核对预算（vLLM 自己的 KV cache 和激活不在这个核对里），预算不够是一个明确的报错，不会悄悄退回慢路径。
-- **CUDA graph**：逐行预测、训练（含反向和 AdamW）、状态写入、`@pllm.custom_residual`、`@pllm.custom_attention` 和按 token 历史查表都在 CUDA graph 里运行。`@pllm.custom_forward` 的程序由 pllm 按段调度并捕获自己的 graph（[教程 12](doc/tutorials/12_adaptive_depth.ipynb) 实测，一个不跳层的 custom forward 是原生 CUDA graph 吞吐的 93%）。暂时不能进 graph 的（例如激活补丁）以 eager 运行，原因写在 `llm.diagnostics().eager_reason` 里。
+- **CUDA graph**：逐行预测、训练（含反向和 AdamW）、状态写入、`@pllm.custom_residual`、`@pllm.custom_attention` 和按 token 历史查表都在 CUDA graph 里运行。`@pllm.custom_forward` 的程序由 pllm 按段调度并捕获自己的 graph（[教程 12](doc/tutorials/12_adaptive_depth.ipynb) 实测，一个不跳层的 custom forward 是原生 CUDA graph 吞吐的 93%）。暂时不能进 graph 的（例如读共享 `InstanceState` 的 `pllm.model.Adapter`）以 eager 运行，原因写在 `llm.diagnostics().eager_reason` 里。
 - **自动调度**：你只声明每个方法读什么、写什么。pllm 据此决定每段计算放在哪里、能否放到旁路 stream 和下一步 forward 重叠、用哪种实现，你不用写一行同步代码。
 - **训练语义**：训练方法只返回 loss；屏蔽填充行、求平均、应用优化器、发布新版本都由框架负责。默认情况下，第 N 步的训练结果在第 N+2 步被读到，这一步的延迟换来了重叠；需要严格顺序时设 `ExecutionOptions(publish_lag=0)`。
 - **写代码时就看到成本**：`pllm.explain(workload, config)` 在 CPU 上、不加载权重，列出每个方法会不会进 CUDA graph、放在哪个 stream、状态预留多少显存；也列出自写算子每行的 FLOP 和字节、每层每个请求的 KV 上限、放在主机内存的表每行要搬多少字节。它不估计吞吐和延迟。详见 [写代码时就看到成本](doc/guides/explain.md)。
@@ -146,7 +146,7 @@ logits）。
   对量化模型做 LoRA 一样，在量化算子的输出上加一份高精度修正，不需要稠密权重；整模型训练
   按 QLoRA 的方式在反向时临时反量化。
 - **vLLM 版本**：0.27.1 与 0.32.0，其他版本启动即报错。
-- **多卡**：vLLM 0.32.0 的 MRv2 runner 上支持单节点张量并行（`ModelConfig(tensor_parallel_size=2)`）。hidden 读取、采样引导、按请求训练的状态（ESamp、输出层 LoRA 等）、`@pllm.custom_forward` 都能用；LoRA 类改写、整模型训练、状态 feed、`@pllm.custom_residual` 和 `@pllm.custom_attention` 目前需要 `tensor_parallel_size=1`，构造时就会提示。
+- **多卡**：vLLM 0.32.0 的 MRv2 runner 上支持单节点张量并行（`ModelConfig(tensor_parallel_size=2)`）。hidden 读取、采样引导、按请求训练的状态（ESamp、输出层 LoRA 等）、`@pllm.custom_forward` 都能用；q/k/v、gate/up、down 上的 dense / low-rank 权重改写按分片运行（由 `@pllm.train_in_forward` 在本卡分片上更新）；per-head 改写、带优化器或外部导入的权重改写、整模型训练、状态 feed、`@pllm.custom_residual` 和 `@pllm.custom_attention` 目前需要 `tensor_parallel_size=1`，构造时就会提示。
 
 Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构验证，见
 [Kimi 切片](doc/guides/kimi-slice.md)。

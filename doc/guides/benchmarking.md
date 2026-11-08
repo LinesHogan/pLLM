@@ -61,7 +61,11 @@ from pllm.benchmark import BenchmarkOptions, compare
 results = compare(my_workload, BenchmarkOptions(batch=4, tokens=64, rounds=1))
 ```
 
-这测量普通实现；CUDA 张量任务自动捕获。`require_training=True` 要求
+这测量普通实现；CUDA 张量任务自动捕获。每个结果都带着同一组 prompt 与采样设置下原生 vLLM 的速率
+（`vanilla_tokens_per_second`），和该臂的 `tokens_per_second`（各轮速率的中位数）直接可比。
+只想给一个已经建好的引擎计时，用 `pllm.benchmark.throughput(llm, prompts, sampling, warmup=1, rounds=3)`，
+它返回整次 `generate`（含 prefill）的输出 token/s 中位数，见
+[agent 参考](../agent/reference.md#measure-throughput)。`require_training=True` 要求
 正的 loss、update 与训练行计数——观测或仅激活算法不要开，否则会误报失败。
 无论开不开，所有运行都检查 token 数、清理、回退与等效工作量。
 

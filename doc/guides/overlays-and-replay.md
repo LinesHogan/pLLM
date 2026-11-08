@@ -73,7 +73,9 @@ class MyLoRA(pllm.Workload):
 [Prefill adapters](../../pllm/workloads/prefill_adapters.py)。
 
 `initialize=` 可以初始化逻辑字段。普通 LoRA 训练通常随机初始化 A、将 B 置零，
-这样初始模型增量为零，第一次优化器更新仍能学习 B。
+这样初始模型增量为零，第一次优化器更新仍能学习 B。带优化器的 `"low_rank"` 状态必须给出
+`initialize=`（或 `pretrained=`、`imported=True`）：两个因子都从零开始时梯度恒为零，补丁永远学不动，
+所以声明期就会报错。
 
 **`tokens` 控制什么？** 更新资格（默认 `tokens="prefill"`，可选 `"decode"`、`"all"`）。
 被禁用的阶段不更新，但仍会应用既有 overlay——它读的是已发布的版本。
@@ -82,8 +84,11 @@ class MyLoRA(pllm.Workload):
 `value` 字段；低秩用 `"low_rank"` + `factors`，应用 `scale · b @ a`。
 算子选择与请求作用域正交：同样的发布、pin 与隔离规则对两者都适用。
 
-两个边界提前说清：后端目前定位 MLP down 与 attention q/v 投影；overlay
-不能用共享前缀缓存（绑定时就拒绝，不是运行时才出错）。
+两个边界提前说清：可定位的投影是 attention 的 q/k/v 与 MLP 的 gate/up/down；overlay
+不能用共享前缀缓存（绑定时就拒绝，不是运行时才出错）。张量并行（vLLM 0.32 MRv2）下，
+`"dense"` 与 `"low_rank"` 补丁按投影的分片切开：状态用 `initialize=` 起步，只能由
+`@pllm.train_in_forward` 用本卡分片上的数据更新；`"per_head"` 补丁，以及带优化器、导入、
+checkpoint、`pretrained=` 或 `module=` 的补丁状态，仍需要 `tensor_parallel_size=1`。
 
 ## 层路由：让更新当步生效
 
@@ -159,7 +164,7 @@ def produce(
 AFTER_FORWARD 或 AFTER_SAMPLE。前向入口 pin 在整个 forward 内不变；prefill 结果只影响第一次 decode
 forward，不改变已完成的 prompt forward 或由它采样的第一个生成 token。
 
-These examples use eager execution with TP=PP=1. See
+These examples run with TP=PP=1. See
 [Supported models](../../README.md#支持的模型) for
 architectures and the exact-class admission rule: overlays and replay need a
 Qwen2, Llama or Qwen3 model, quantized or not. Q/V factor sizes come from

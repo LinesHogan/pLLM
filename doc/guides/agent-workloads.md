@@ -159,7 +159,8 @@ PLLM 的加速技术（内置的 advanced 精细操作）；但自动页表总�
 ## 最小交付
 
 - workload 源码，以及通过 `make_llm(..., workload=...)` 使用它的最小调用；
-  host 算法是 `generate_feedback` 的反馈回调，训练的状态用 `pllm.host.make_host(HostConfig(...), workload)`。调用示例沿用 [README](../../README.md)
+  host 算法是 `generate_feedback` 的反馈回调；模型读的状态经 `llm.generate(..., batch=...)` 训练，
+  只有宿主代码读的状态用 `pllm.host.make_host(HostConfig(...), workload)` 得到 `HostTrainer` 后 `train(batch)`。调用示例沿用 [README](../../README.md)
   和对应范例。
 - reference 来源／版本、你作出的语义选择，以及尚需用户决定的事项。
 - 实际运行的针对性检查、Python 环境、结果及未验证范围。**不能把 CPU 通过

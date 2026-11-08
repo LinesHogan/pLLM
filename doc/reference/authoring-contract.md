@@ -21,7 +21,7 @@
 | 逐 token prefill 循环（Recirculation） | [逐 Token 循环](#逐-token-循环) |
 | 外部加权批量训练、多步 SGD（Output LoRA 风格） | [加权批量训练](#加权批量训练) |
 | 自定义数据流、写原生数学、结构化宿主事务 | [高级数据流](#高级数据流)、[编写原生数学](#编写原生数学) |
-| completion / reward 驱动学习（TTRL） | [Completion 学习](#completion-学习) |
+| completion / reward 驱动学习（多数投票奖励头） | [Completion 学习](#completion-学习) |
 | 因果批训练（TLM） | [因果批训练](#因果批训练) |
 | 改运行时、加原语、声明资源成本、排查有限准入失败 | [原语与资源契约](#原语与资源契约) |
 | 排查签名不匹配 / worker 重建失败 | [采样引导、logits 与导出](#采样引导logits-与导出)末尾的冷绑定器段落 |
@@ -33,7 +33,7 @@
 [OverRIDE](../../pllm/workloads/override.py)、[In-Place-TTT](../../pllm/workloads/inplace_ttt.py)
 和 [ReFT](../../pllm/workloads/reft.py) 使用这个接口；[Recirculation](../../pllm/workloads/recirculation.py)
 使用普通的 `Recurrence` 声明；[reward head](../../pllm/workloads/reward_head.py) 使用普通 `Workload`
-的宿主路径（奖励投票是宿主函数 `ttrl_vote`），FTTT 的编辑也是（`FTTTFeedback` 作反馈回调）；
+的宿主路径（奖励投票是宿主函数 `majority_vote`），FTTT 的编辑也是（`FTTTFeedback` 作反馈回调）；
 GTTA 是普通宿主类，其 `run` 作反馈回调；
 [TLM](../../pllm/workloads/tlm/workload.py) 使用普通 `Workload` 的因果批输入与模型端口；
 [ESamp](../../pllm/workloads/esamp.py) 使用普通具名参数、预测与 loss，
@@ -48,7 +48,7 @@ Tensor 方法表达请求内低秩学习与持久 AdamW，不需要改动核心�
 如何声明状态、这些值的生命周期与可写性。它存在的原因是：普通数学拿到的
 输入与参数视图都是借来的只读值——把它们当普通 PyTorch 张量原地修改、
 或假设它们随 Python 对象存活，就越过了签名边界。违反本节的典型后果是
-绑定失败（输入歧义、字符串注解）或读写了不属于你的版本。
+绑定失败（输入歧义）或读写了不属于你的版本。
 写 Dummy / OverRIDE / Huber 风格负载时先读本节。
 
 ```python
@@ -98,7 +98,7 @@ class CenteredHidden(pllm.Workload):
 保留导数边、梯度如何归约、结果如何存储与释放。核心原则是「声明即授权」：
 只有被 update 掩码选中的原始状态会被写，其余一律只读；归约方式由声明决定，
 绑定不会发明归一化。最容易踩的坑：空 update 与零梯度仍会推进 Adam 步数；
-`StateVersion` 永远不是 latest。本节所有导数规则都是调用局部、一阶的，
+`pllm.version(state)` 永远不是 latest。本节所有导数规则都是调用局部、一阶的，
 不是穿透 vLLM 或跨越 replay/发布边界的全模型反向传播。
 
 ### `@train`：状态资格与更新掩码
@@ -122,29 +122,29 @@ class CenteredHidden(pllm.Workload):
 空的 update 选择保留所有字段与版本；被授权的零梯度仍会推进 Adam 步数、
 动量与衰减，包括空前向调用。标量函数自己拥有归约；绑定不会发明归一化。
 
-### 按状态归约与 `StateIndex` / `StateVersion`
+### 按状态归约与 `pllm.index` / `pllm.version`
 
 `@train(state=...)` 的逐行方法返回 `[rows]` loss。框架默认用 `reduction="mean"`
 平均本步每个状态选中的行，`reduction="sum"` 则求和；再对各状态的 loss 求**和**后微分，
 不会跨状态求均值。宿主批次方法自己归约，非默认 `reduction=` 在声明期报错。
 loss 与优化器在原始图中分阶段成为独立任务，保持声明的时机。
-`StateIndex` 给出每行在本次调用内的状态索引，用于归约；
-`StateVersion` 给出该行的原始输入 pin 版本 —— 永远不是 latest 或优化器步数。
+`pllm.index(state)` 给出每行在状态池里的槽位；
+`pllm.version(state)` 给出该行输入 pin 的版本（已收到的更新次数）—— 永远不是 latest。
 两者都不可微。显式的 `RequestState.keys` 仍是原始隔离键；省略则按请求 ID。
 ESamp 保留其仅请求 ID 的后端限制。
 
-### Memory 字段
+### Carry 字段
 
 状态还可以携带普通 **carry 字段**：`InstanceState(..., carry={"carry": shape})`
 声明跟随训练迁移、但不参与优化器展开的每 lineage 张量（没有梯度/动量槽，
-永不被 Adam 更新）。memory 读取（`Parameter(state, field)`）看到的是步开始时
+永不被 Adam 更新）。读取（`pllm.parameter(state, field)`）看到的是步开始时
 pin 住的输入版本 —— 上一步发布的值 —— 所以训练操作消费的是它上一步写下的内容。
-写入是按行捕获：训练输入上的第三个注解标记
-`Annotated[Tensor, source, pllm.carry(state, field)]` 在同一迁移与发布中，
+写入是按行捕获：把训练方法的输入默认值包一层
+`pllm.carry(source, state=..., field=...)`，在同一迁移与发布中，
 把该输入每个 lineage 最后一个选中行的值写进它的 carry 字段。捕获目标必须是
 任务自己的训练状态，要求已声明的 carry 字段，并且是 detach 的。页零初始化，
 所以第一步读到的是零。跨请求共享由已有的宿主导出/导入通道或共享 route
-lineage 组合而成；memory 本身永远不逃离其 lineage 的 pin。
+lineage 组合而成；carry 字段本身永远不逃离其 lineage 的 pin。
 
 ### `@differentiate` 与导数边
 
@@ -160,7 +160,7 @@ lineage 组合而成；memory 本身永远不逃离其 lineage 的 pin。
 
 `differentiate(input_rows="dx", parameter_rows="dw", ...)` 独立掩码声明的导数边，
 不改变前向值。选择器使用原始行，不是前向压实后的位置。对共享状态，按行的
-参数导数要求 `Parameter(state, field, per_row=True)` —— 一个逻辑
+参数导数要求 `pllm.parameter(state, field, per_row=True)` —— 一个逻辑
 `[rows, *parameter_shape]` 视图，由 `bmm` 等按行数学消费。请求参数本就带这个
 行轴。未分批的共享参数配参数梯度掩码会被拒绝；没有隐藏的形状转换或替代 backward。
 前向选中的非 loss 方法保留行轴并接受空批次；其结果用零值恢复到原始行位置。
@@ -197,8 +197,7 @@ receipt 能结算为止。
 改动函数体或受检依赖会重新签名，多进程 worker 重建时签名必须与驱动端逐字节
 相等。排查签名不匹配、函数替换不生效、worker 重建失败时回到本节末尾。
 
-`@guide_sampling(beta=...)` 返回过滤后的 hidden 预测，可由 `@on(..., rows=...)`
-选择。绑定把它们关联到原始采样器链接（包括重排的链接）；不要求词表维度。
+`@guide_sampling(beta=..., rows=...)` 返回过滤后的 hidden 预测，`rows=` 命名的选择器决定哪些行受引导。绑定把它们关联到原始采样器链接（包括重排的链接）；不要求词表维度。
 ESamp 用它做版本感知引导和普通的 Tensor loss/初始化；其五字段 Adam 布局与
 初始化种子推进保持不变。
 
@@ -234,7 +233,6 @@ worker 重新导入并重建，安装时其编译签名必须与驱动端签名�
 | 两个 `@guide_sampling` 方法（包括来自不同组件的） | 每步只应用一个引导方法；多个 `@add_logits` 可以并存，先于引导应用 |
 | 请求行训练与宿主批训练 | 每个负载只资助一种训练方式 |
 | `@custom_forward` 与读 `pllm.hidden` / `pllm.final_hidden` 的方法 | custom forward 可能每个 token 跑某层多次或不跑，这些行没有唯一值；`pllm.residual` 与 `pllm.layer_logits` 读每层最后一次访问的流，可以并存 |
-| `@custom_forward` 与 `pllm.model.Adapter` | Adapter 的投影钩子按模型自己的行索引 |
 | `@train_in_forward` 与 `pllm.model.Adapter` | 两者共用同一组投影钩子 |
 | 带 feed 的状态与其他状态或方法 | feed 的条件输入组只容纳它的写链与读取它的模型 |
 | 同一子层上的两个 `@custom_residual` 方法 | 一个方法拥有一个子层的残差更新 |
@@ -339,8 +337,8 @@ chunk carry 和声明读取旧值的写回字段使用 FP32；其余使用模型
 `dtype=None` 显式选择模型 dtype，整数字段 保留自己的 dtype。
 Dense / low-rank overlay 在投影读取时转换到输入 dtype，"per_head" 至少用 FP32 计算，存储仍按字段角色选择；
 FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选择模型 dtype 时也一样。
-自定义更新函数也必须在自己的投影运算中显式转换操作数。`Operand.INPUT/TARGET/WEIGHT` 命名捕获的张量；
-`Parameter(state, field)` 命名私有 buffer 视图。只有这些被授权的 buffer 可以
+自定义更新函数也必须在自己的投影运算中显式转换操作数。`pllm.operand("input"/"target"/"weight")` 命名捕获的张量；
+`pllm.parameter(state, field)` 命名私有 buffer 视图。只有这些被授权的 buffer 可以
 被原地修改，操作数永远不行。方法返回
 `UpdateOutput(output, changed=..., update_count=..., trained_rows=...)`。
 可选的 `metrics` 属于算法，不属于状态或 replay 协议。
@@ -350,7 +348,7 @@ FP64 可用于数值 oracle。SGD 的梯度累积至少使用 FP32，显式选�
 有限 `scale`，则应用 `scale * b @ a`：down 因子是每个 target 的
 `(rank, input_size)`，up 因子是 `(output_size, rank)`。算子选择与请求作用域
 正交：同样的发布、pin 与隔离规则对两者都适用。targets 可以命名任何可定位的
-投影；后端目前定位 MLP down 与 attention q/v 投影。
+投影；后端定位 attention 的 q/k/v 与 MLP 的 gate/up/down 投影。
 
 `prefill`/`decode` 决定更新资格。被禁用的阶段只应用既有 overlay。
 `@pllm.custom_forward(tokens="prefill" | "decode" | "all")` 内的 `layers(...)` 捕获每次
@@ -472,8 +470,8 @@ reset 与多步训练。这条路径把「外部数据喂入 + 实例/请求共�
 一个生成器。reset 按训练批次进行，区别于准入初始化；两个函数都被冻结并与普通
 数学一起签名。SGD 保留原始状态字段，没有 Adam 槽。
 
-训练输入用 `Annotated[Tensor, Batch("hidden"|"base_logits"|"labels"|"weights")]`
-和 `Parameter(state, field)`。它们消费原始 `WeightedCEBatch`，不是新的 DTO。
+训练输入用 `pllm.batch("hidden"|"base_logits"|"labels"|"weights")`
+和 `pllm.parameter(state, field)`。它们消费原始 `WeightedCEBatch`，不是新的 DTO。
 共享输入用 `pllm.host.WeightedCEBatch(hidden, logits, labels, weights)`；独立输入用
 `pllm.host.WeightedCEBatch.for_prompts(hidden, logits, labels, weights, prompt_indices)`，
 同样的索引传给 `generate`，可选 `sample_index=0`。两者都借用所供张量，不拷贝。
@@ -538,7 +536,7 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 更新；零梯度元组仍推进步数、动量与权重衰减。多参数组时，梯度按状态优先、
 然后声明的参数组序排列，一次发布覆盖所有组。直接迁移原地修改被授权的私有
 视图，使用单独的 `b.publish`；replay 消费该原始发布与变化状态选择。
-优化器支持的迁移在发布必须延迟时也用 `b.publish`，如 TLM 与 TTRL。
+优化器支持的迁移在发布必须延迟时也用 `b.publish`，如 TLM。
 梯度跳过时没有私有分配或发布。
 
 `InvocationOutput` 暴露原始引导与发布，允许在不拥有生命周期的情况下构造结果。
@@ -546,11 +544,12 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 
 宿主循环只有一种写法：反馈回调 `CompletionInput -> 反馈`（带 `retry_controls`、
 `update_barriers`、`update_count`）传给 `generate_feedback(feedback=...)`。需要框架管理的
-张量状态写成普通 `pllm.Workload`，用 `pllm.host.make_host(HostConfig(...), workload)` 编译，
-回调里 `step`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
-`FTTTWorkload`（AdamW 写在状态上）；`FTTTFeedback(service, HostConfig(...))` 用 `make_host` 编译并准入它
-（`feedback.edit` 是普通执行句柄，可取 `diagnostics()`），`feedback(batch)` 评判、入队，
-在失败行上 `step` 一次，再用 `StepResult.parameters` 里更新后的编辑算出重试要加的
+张量状态写成普通 `pllm.Workload`：模型生成时读的状态经 `llm.generate(..., batch=...)` 训练；
+只有宿主代码读的状态用 `pllm.host.make_host(HostConfig(...), workload)` 编译成 `HostTrainer`，
+回调里 `train(batch)`。[FTTT](../../pllm/workloads/fttt/workload.py) 的低秩编辑就是这样的
+`FTTTWorkload`（AdamW 写在状态上）；`FTTTFeedback(service, HostConfig(...))` 用 `make_host` 编译它
+（`feedback.edit` 是 `HostTrainer`，可取 `diagnostics()`），`feedback(batch)` 评判、入队，
+在失败行上 `train` 一次，再用返回的 `TrainStep.parameters` 里更新后的编辑算出重试要加的
 增量（`step()` 只处理已排队的反馈）；失败的一步清空队列，已经发布的编辑保留。
 [GTTA](../../pllm/workloads/gtta/workload.py) 是普通宿主类：`GTTAWorkload.run(request)`
 从 `GTTAEnvironment` 的 FIFO 队列取出事件，用 Python 字典中的 FP64 EMA 更新动力学记忆，再回答查询。
@@ -562,36 +561,37 @@ Hidden 需求从声明推导。形状/dtype 回调只在模型事实可用后运
 
 ## Completion 学习
 
-本节说明 TTRL 这类“宿主侧算奖励、框架做优化器更新”的负载。它们是普通
-`pllm.Workload`，只是走宿主路径：`pllm.host.make_host(HostConfig(...), workload)`。
+本节说明“宿主侧算奖励、框架做优化器更新”的负载，范例是多数投票奖励头
+（[reward_head.py](../../pllm/workloads/reward_head.py)）。它们是普通
+`pllm.Workload`，只是走宿主路径：`pllm.host.make_host(HostConfig(...), workload)` 返回
+`pllm.host.HostTrainer`，`train(batch)` 在调用方当前的 CUDA 流上做一步，返回
+`TrainStep(loss, parameters)`；另有 `version`、`diagnostics()` 与 `close()`（也可用 `with`）。
 没有请求状态、没有跨调用反向、没有自动捕获。
 
 奖励投票是宿主字符串逻辑，不是张量数学，所以是一个普通函数：
-`ttrl_vote(completion_input, config)` 返回 `TTRLResult`（`reward_outcomes`、
-`retry_controls`、`update_barriers`，以及训练步 `step`）。调用方先算它，再
-`execution.step(rewards.step, stream)`；CUDA 上在传给 `step` 的同一条流里调用它。
-`generate_feedback` 的 `feedback` 回调可以先 `step` 再返回 `rewards`，它带
-`update_count`。
+`majority_vote(completion_input, config)` 返回 `MajorityVote`（`reward_outcomes`、
+`retry_controls`、`update_barriers`，以及训练批 `batch`）。`RewardHeadFeedback(head, config)`
+是现成的 `generate_feedback` 回调：投票、`head.train(vote.batch)`、返回带 `update_count` 的投票结果。
 
 训练步携带 `WeightedRowBatch(hidden, targets, weights)`（`pllm.host`）：`hidden` 是
 `[行数, hidden_size]`，`weights` 是同 dtype 的 `[行数]`，权重为 0 的行不参与；`targets` 是
-`[行数, *HostConfig.target_shape]`——默认 `target_shape=()` 即每行一个值（TTRL），FTTT 每行
+`[行数, *HostConfig.target_shape]`——默认 `target_shape=()` 即每行一个值（奖励头），FTTT 每行
 一个向量（反馈特征加奖励，`FTTTFeedback` 自己设置 `target_shape`）。
 训练方法用 `@pllm.train(state=...)`，通过 `pllm.batch("hidden")`、`pllm.batch("targets")`、
 `pllm.batch("weights")` 与 `pllm.parameter(state, field)` 取输入，返回
 `pllm.UpdateOutput(loss, changed, update_count, trained_rows)`、标量 loss（每行都训练），或返回 `None` 跳过整个
 更新。`changed` 是设备张量：空选择（权重全 0）时发布不变的值，优化器字段保持原样，
-训练路径没有主机同步。宿主训练步的 `StepResult.parameters` 按字段名给出这次更新后的
+训练路径没有主机同步。`TrainStep.parameters` 按字段名给出这次更新后的
 状态（在步所在流上的独立拷贝，计入资源测量），回调在同一步里就能用更新后的值。
 
 参数是带 `pllm.AdamW` 的普通 `InstanceState`；具名形状只是同一个打包 AdamW 组的视图
 （AdamW 逐元素，所以与独立参数逐位一致）。标量配置在绑定时快照（包括类属性），
-之后的 monkey patch 只影响新绑定的执行。TTRL 是维护中的范例：多数投票、
-平局规则、采样限制与重试/栅栏构造是 `ttrl_vote` 的数学，原始 completion 对象保留。
+之后的 monkey patch 只影响新绑定的执行。奖励头是维护中的范例：多数投票、
+平局规则、采样限制与重试/栅栏构造是 `majority_vote` 的数学，原始 completion 对象保留。
 
 有界宿主执行使用 `HostConfig(max_input_rows=..., execution_peak_budget_bytes=...)`。框架用
 最大形状的 `WeightedRowBatch`（含 `target_shape`）执行实际 loss/update 路径来推导资源，不要求负载申报字节；
-超过 `max_input_rows` 的输入在 `step` 前被拒绝。
+超过 `max_input_rows` 的输入在 `train` 前被拒绝。
 
 ## 因果批训练
 
@@ -631,16 +631,16 @@ TLM 的 `InstanceState` 用 a/b `pllm.Field` 声明因子，形状回调接收�
 训练方法声明 `model: pllm.model.CausalModel = pllm.causal_model("adapter")`，其中
 `"adapter"` 是 Adapter 声明的名称。`model(ids, attention_mask=mask)` 返回带该
 Adapter 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mask)` 返回
-冻结基座的 logits。负载不持有或传输活模型。
+冻结基座的 logits。`model.token_logprobs(ids, labels, attention_mask=mask)` 直接返回每个标签的
+对数概率 `[序列数, token 数 - 1]`：它分块计算 LM head，不在显存里物化整批 `[序列数, token 数, 词表]` 的 logits。
+负载不持有或传输活模型。
 `@pllm.on(pllm.Attr("phase"))` 在绑定时读取负载的 `phase` 属性并解析为 `Phase`；
 也可用 `Attr("config.phase")` 读取嵌套配置。TLM 的 ONLINE 选择
 `AFTER_SAMPLE`，用适配后的 logits 选句；OFFLINE 选择 `BEFORE_FORWARD`，用
 `torch.no_grad()` 下的基座 logits 选句，再训练选中的句子。
 
 因果训练当前要求实例 AdamW 状态、BF16 基座（投影可量化，嵌入与 LM head 不可）、单设备（TP1），返回标量 loss
-或 `UpdateOutput`。直接执行可用 `StepInput(batch=batch)`；返回的
-`StepResult.value` 是报告值，`loss` 是优化目标，`publication` 给出发布前后的版本，
-`metrics` 是算法自定义的设备张量映射。TLM 的 `metrics["selected_count"]` 是选中的
+或 `UpdateOutput`；`metrics` 是算法自定义的设备张量映射。TLM 的 `metrics["selected_count"]` 是选中的
 句子数，执行时不把它同步到宿主。
 
 **空选择仍发布一个新版本**：参数、梯度、Adam 步数与动量保持原值；loss 计数增加一，
@@ -801,7 +801,7 @@ vLLM 继续按真实容量预留 hidden 快照、采样反馈和效果/replay �
 | Recirculation | 无状态逐 token replay；有序 prefill、原始 KV/RNG 与正常输出 |
 | FTTT | 宿主 judge 与有界队列、向量目标 `WeightedRowBatch`、AdamW 编辑、用 `parameters` 做 update-before-predict 与重试输出 |
 | GTTA | Python 字典中的动力学记忆；FIFO 轨迹、update-before-query，查询失败保留更新 |
-| TTRL | 宿主 `ttrl_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
+| 奖励头 | 宿主 `majority_vote` 投票、`WeightedRowBatch` 加权梯度、空选择不变发布与重试/栅栏结果 |
 
 `TensorDeclaration.input` 命名既有带类型服务端口；无字段的 `state` 描述不分配张量 arena
 的宿主状态。宿主图由 `make_host`（`Workload.compile_host`）规划并绑定。Adapter/激活绑定与两种原始 replay 效果保持彼此独立。

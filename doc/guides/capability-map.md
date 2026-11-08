@@ -16,7 +16,7 @@
 
 | 算法（例子） | 今天怎么写 / 为什么不行 | 状态 | 教程 |
 |---|---|---|---|
-| 激活引导（ActAdd、CAA）、ReFT / LoReFT | `pllm.model.ActivationPatch`；现成的 `pllm.workloads.ReFTWorkload`。激活补丁目前让模型以 eager 运行 | 能写 | [00](../tutorials/00_quickstart.ipynb) |
+| 激活引导（ActAdd、CAA）、ReFT / LoReFT | `pllm.model.ActivationPatch`；现成的 `pllm.workloads.ReFTWorkload`。激活补丁在模型的 CUDA graph 里运行 | 能写 | [00](../tutorials/00_quickstart.ipynb) |
 | 线性探针、SAE 监控 | `pllm.hidden` / `pllm.residual` + `@pllm.export`，模型留在 CUDA graph 里 | 能写 | [01](../tutorials/01_observe_probe.ipynb) |
 | logit lens、DoLa | `pllm.layer_logits`；现成的 DoLa 负载 | 能写 | [06](../tutorials/06_reading_inside.ipynb) |
 | value residual、超连接（hyper-connections / mHC 的推理结构）、LAuReL | `@pllm.custom_residual(site="value" / streams=n / site="both")`，在 CUDA graph 里运行；这些结构的参数需要按该结构训练过的检查点 | 能写 | [07](../tutorials/07_custom_residual.ipynb) |

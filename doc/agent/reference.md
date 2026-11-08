@@ -41,7 +41,9 @@ CONFIG = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8)
 | `pllm.layer_logits(layers)` | The final norm and LM head applied to the residual stream after each of `layers`: float32 `[rows, len(layers), vocab]` (the logit lens). Layer `-1` gives the model's own logits. One row per token the sampler draws: a prompt's last token and every decode token. |
 
 `tokens="decode"` gives one row per running request: its latest decode token. `tokens="prefill"` gives one
-row per request whose prompt just finished prefilling: its last prompt token. All four inputs run inside
+row per request whose prompt just finished prefilling: its last prompt token. `tokens="all"` gives one row per
+token the step computes fresh, prompt chunks included; only `@pllm.export` methods (without `pllm.result`
+inputs) may read these rows, and each event lists the rows' token positions. All four inputs run inside
 CUDA graphs. A reading method needs an effect (usually `@pllm.export`, next section) or nothing schedules it.
 
 `pllm.input_tokens(history=n)` reads int64 `[rows, n + 1]` current and preceding request token IDs, with `-1` before position zero; MRv2 is required. Helpers consumed by `@pllm.custom_residual` use every scheduled row through `pllm.result`; other readers use sampled rows.
@@ -64,9 +66,9 @@ print(testing.check(Lens(), CONFIG).passed)
 
 | Name | Meaning |
 | --- | --- |
-| `@pllm.export(*, name="value", every=1, max_rows=1, max_cols=16, enabled=True, overflow="drop")` | Deliver the method's `[rows, cols]` result to `on_export`: per step at most `max_rows` rows (the rest of that step's rows are dropped and counted in `event.dropped_rows`) and the first `max_cols` columns, every `every` steps. `max_rows * max_cols * 8` must be at most 32768 bytes. Runs after the forward by default. `overflow="block"` waits on a full delivery queue instead of dropping the event. |
+| `@pllm.export(*, name="value", every=1, max_rows=1, max_cols=16, enabled=True, overflow="drop")` | Deliver the method's `[rows, cols]` result to `on_export`: per step at most `max_rows` rows (the rest of that step's rows are dropped and counted in `event.dropped_rows`) and the first `max_cols` columns, every `every` steps, split into events of whole rows of at most 32 KiB each. `max_cols * 8` must be at most 32768 bytes, so one row fits an event. Runs after the forward by default. `overflow="block"` waits on a full delivery queue (256 events) instead of dropping the event. `pllm.explain` prints each export's rows, bytes and events per step. |
 | `pllm.Workload.on_export(self, event)` | Override to receive each export as a `pllm.io.TraceEvent`, in the process that runs the model, asynchronously; `close()` (or leaving `with`) drains delivery. Never call the engine from it. |
-| `pllm.io.TraceEvent` | One trace record. For exports: `tensor_name` (the export name), `identities` (one `pllm.testing.RequestIdentity` per row: `prompt_index` is the prompt's position in the `generate` call, or the value from `generate(..., prompt_indices=...)`; `sample_index`; `request_id` is pllm's internal id, not vLLM's `RequestOutput.request_id`), `step_id`, `dropped_rows`, `tensor()` (an independent CPU tensor). |
+| `pllm.io.TraceEvent` | One trace record. For exports: `tensor_name` (the export name), `identities` (one `pllm.testing.RequestIdentity` per row: `prompt_index` is the prompt's position in the `generate` call, or the value from `generate(..., prompt_indices=...)`; `sample_index`; `request_id` is pllm's internal id, not vLLM's `RequestOutput.request_id`), `positions` (each row's token position in its request), `step_id`, `dropped_rows`, `tensor()` (an independent CPU tensor). |
 | `pllm.io.TraceSnapshot` | `llm.trace_snapshot()`: the retained events (`events`), drop counters (`export_dropped`: events dropped on a full queue) and host/device task timings. |
 | `pllm.io.TraceSelection` | `llm.select_trace(TraceSelection(...))` opts into extra tensor/gradient snapshots and kernel profiling; empty filters match everything. |
 
@@ -98,10 +100,10 @@ with pllm.make_llm(GPU_CONFIG, workload=StreamNorm()) as llm:
 print({prompt: len(norms) for prompt, norms in seen.items()})  # 7: the first of 8 tokens comes from the prompt
 ```
 
-A full hidden-width row is 896 columns for Qwen2.5-0.5B, so at most 4 rows fit one export
-(4 * 896 * 8 = 28672 bytes). To capture one full row per prompt at the prompt's last token, read with
-`tokens="prefill"` and pass at most `max_rows` prompts per `generate` call: prompts that finish prefill in
-the same step share one export.
+A full hidden-width row is 896 columns for Qwen2.5-0.5B (7168 bytes), so four rows share one 32 KiB event and
+a step with more rows arrives as several events. To capture one full row per prompt at the prompt's last token,
+read with `tokens="prefill"` and pass at most `max_rows` prompts per `generate` call: prompts that finish prefill
+in the same step share that step's `max_rows`.
 
 ```python
 prompt_ends: dict[int, torch.Tensor] = {}
@@ -263,8 +265,9 @@ print(report.update_count > 0, report.trained_rows > 0, repr(report.eager_reason
 | `pllm.base_logits()` | The model's logits before any workload adjustment. Readable only after sampling (in `@pllm.train` or `@pllm.on(pllm.Phase.AFTER_SAMPLE)`). |
 | `pllm.sampled_tokens()` | The tokens drawn this step. Readable only after sampling. |
 
-Read the logits you want to adjust with `pllm.layer_logits((-1,))`, not `pllm.base_logits()`. A workload has
-at most one `@pllm.add_logits` or `@pllm.guide_sampling` method. For the `neutral=` check, give the workload
+Read the logits you want to adjust with `pllm.layer_logits((-1,))`, not `pllm.base_logits()`. Several
+`@pllm.add_logits` methods may coexist; their sums apply before guidance. A workload has at most
+one `@pllm.guide_sampling` method, components included. For the `neutral=` check, give the workload
 a strength setting whose value 0 makes the method return exactly zero.
 
 ```python
@@ -308,13 +311,20 @@ forward.
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.model.ActivationPatch(state, layers, first_tokens=0, last_tokens=2, operator="low_rank_affine", *, decode=False, refresh="admission", on_missing="stop")` | Edit the output of `layers` (the residual stream after them) from a state, whoever writes it. `operator="add"` adds one vector field per layer; `"low_rank_affine"` reads three fields per layer (ReFT). Applies to the first `first_tokens` and last `last_tokens` prompt tokens, and with `decode=True` to every decode token. `refresh="step"` reads the newest version every decode step. Runs eagerly (no CUDA graphs). |
-| `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0)` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `"dense"` and `"per_head"` read the field `weight`. |
-| `pllm.model.Projection(name, layer=None)` | A linear projection by its Hugging Face module name (`"q_proj"`, `"v_proj"`, `"down_proj"`, ...); `layer=None` means every layer. |
+| `pllm.model.ActivationPatch(state, layers, first_tokens=0, last_tokens=2, operator="low_rank_affine", *, decode=False, refresh="admission", on_missing="stop")` | Edit the output of `layers` (the residual stream after them) from a state, whoever writes it. `operator="add"` adds one vector field per layer; `"low_rank_affine"` reads three fields per layer (ReFT). Applies to the first `first_tokens` and last `last_tokens` prompt tokens, and with `decode=True` to every decode token. `refresh="step"` reads the newest version every decode step. Runs inside the model's CUDA graphs. |
+| `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0)` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `"dense"` and `"per_head"` read the field `weight`. A trainable `"low_rank"` state needs `initialize=` (e.g. random A, zero B), `pretrained=` or `imported=True`: with both factors at zero every gradient is zero, so it is rejected. An Adapter on an `InstanceState` makes the model forward eager; on a `RequestState` it stays in CUDA graphs. Inside `@pllm.custom_forward` the delta applies at every projection call, including repeated layers. |
+| `pllm.model.Projection(name, layer=None)` | A linear projection by its Hugging Face module name: `"q_proj"`, `"k_proj"`, `"v_proj"`, `"gate_proj"`, `"up_proj"` or `"down_proj"`; `layer=None` means every layer. |
 
 Declare both as class attributes or typed properties. A `pllm.Field` shape callable of a state an `Adapter`
 reads receives each target's `(in_features, out_features)`; the state then has one copy of each field per
 target, named `a_0`, `b_0`, `a_1`, ... in target order.
+
+With `tensor_parallel_size > 1` (vLLM 0.32 MRv2), `"dense"` and `"low_rank"` deltas follow each projection's
+shards: q/k/v and gate/up partition dense weights and B by output rows, down partitions dense weights and A by
+input columns; the other factor is replicated. The state starts from `initialize=` and only
+`@pllm.train_in_forward` may update it, using the local shard (training replicated A from column-sharded outputs,
+or B from row-sharded inputs, is rejected). `"per_head"` deltas and adapter states with an optimizer, `imported=`,
+`checkpoint=`, `pretrained=` or `module=` need `tensor_parallel_size=1`.
 
 ```python
 class Steering(pllm.Workload):
@@ -359,7 +369,7 @@ with pllm.make_llm(GPU_CONFIG, workload=Steering()) as llm:
     for strength in (0.0, 1.0):
         out = llm.generate(["I think that today"], GREEDY, batch=pllm.io.StateImport((strength * vector,)))
         print(strength, repr(out[0].outputs[0].text))
-    print(repr(llm.diagnostics().eager_reason))  # activation patches run eagerly
+    print(repr(llm.diagnostics().eager_reason))  # '': activation patches run inside CUDA graphs
 ```
 
 | Attention reads | |
@@ -408,8 +418,8 @@ print(pllm.explain(ValueResidual(), CONFIG).eager_reason)
 
 pllm schedules a custom forward's layer slices itself and captures its own CUDA graphs for them, so vLLM's
 whole-model graph is not used and `eager_reason` names `@pllm.custom_forward`. Methods reading `pllm.hidden` or
-`pllm.final_hidden` and `pllm.model.Adapter` are rejected; `pllm.residual` and `pllm.layer_logits` read each layer's
-last visited stream. Tensor parallelism needs vLLM 0.32.0 with `runner="mrv2"`. The slice graphs may need a larger
+`pllm.final_hidden` are rejected; `pllm.residual` and `pllm.layer_logits` read each layer's last visited stream.
+A `pllm.model.Adapter` in the same workload applies its delta at every projection call the program makes. Tensor parallelism needs vLLM 0.32.0 with `runner="mrv2"`. The slice graphs may need a larger
 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)` than the default; explain does not estimate it, and the error names the
 bytes required. Bounded Python `for` loops over workload settings are unrolled when traced.
 
@@ -486,9 +496,9 @@ A training method that reads `pllm.batch(...)` fields trains on a batch you pass
 | --- | --- |
 | `pllm.batch(field)` | One field of the host batch. The fields a `@pllm.train` method reads pick the batch type and the optimizer. |
 | `pllm.host.WeightedRowBatch(hidden, targets, weights)` | `[rows, hidden]` features, one target and one weight per row (weight 0 skips a row); one AdamW step per batch. |
-| `pllm.host.CausalTrainBatch(input_ids, labels, attention_mask=None)` | int64 `[sequences, tokens]` ids and labels for causal LM training through `pllm.causal_model`; one AdamW step per batch. |
+| `pllm.host.CausalTrainBatch(input_ids, labels, attention_mask=None, weights=None)` | int64 `[sequences, tokens]` ids and labels for causal LM training through `pllm.causal_model`, with optional floating `weights` (one per sequence, read with `pllm.batch("weights")`, e.g. GRPO advantages); one AdamW step per batch. |
 | `pllm.host.WeightedCEBatch(hidden, base_logits, labels, weights)` | Weighted cross-entropy rows; trains with `pllm.SGD`, `steps=` steps per state after the `reset=` method restores it. `WeightedCEBatch.for_prompts(..., prompt_indices)` keys one batch per prompt. |
-| `pllm.causal_model(adapter)` | A `pllm.model.CausalModel` with the named `pllm.model.Adapter` applied: `model(ids, attention_mask=...)` returns logits whose gradients reach the adapter's state; `model.base(...)` skips it. |
+| `pllm.causal_model(adapter)` | A `pllm.model.CausalModel` with the named `pllm.model.Adapter` applied: `model(ids, attention_mask=...)` returns logits whose gradients reach the adapter's state; `model.base` is the same model without the adapter. `model.token_logprobs(ids, labels, *, attention_mask=None, ignore_index=-100)` returns at least-FP32 `[sequences, tokens - 1]` log-probabilities of `labels[:, 1:]`, running the LM head in blocks so the `[sequences, tokens, vocab]` logits never exist at once (positions labelled `ignore_index` read 0). |
 | `pllm.host.make_host(config, workload)` | Compile a batch-training workload without a model and return its `pllm.host.HostTrainer`: `train(batch)` per batch, `version`, `diagnostics()`, `close()` (or use it in `with`). |
 | `pllm.host.HostConfig(device, hidden_size=0, target_shape=(), seed=0, state_page_budget_bytes=..., max_input_rows=None, execution_peak_budget_bytes=None)` | What `make_host` compiles against: device, hidden width of the batches and the shape of each row's target. |
 | `pllm.host.TrainStep` | What `train` returns: `loss` and `parameters` (the updated fields by name). |
@@ -528,7 +538,7 @@ with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=8
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.make_llm(config, *, workload=None)` | A vLLM engine running `workload`; use as a context manager. Methods: `generate(prompts, sampling_params, *, batch=None, sample_index=0, prompt_indices=None, routes=None)`, `generate_completions`, `generate_feedback`, `diagnostics()` (`eager_reason`, `update_count`, `trained_rows`, `loss_count`, ...), `trace_snapshot()`, `select_trace(...)`, `feed(name)`, `close()`. Without a workload it is plain vLLM. |
+| `pllm.make_llm(config, *, workload=None)` | A vLLM engine running `workload`; use as a context manager. Methods: `generate(prompts, sampling_params, *, batch=None, sample_index=0, prompt_indices=None, routes=None)`, `generate_completions`, `generate_feedback`, `diagnostics()` (`eager_reason`, `update_count`, `trained_rows`, `loss_count`, ...), `trace_snapshot()`, `select_trace(...)`, `feed(name)`, `close()`. Without a workload it is plain vLLM. `close()` (or leaving `with`) also releases the engine's compile state, so engines can be created and closed repeatedly in one process. |
 | `pllm.ModelConfig(model, dtype="bfloat16", max_model_len=512, max_num_seqs=8, max_num_batched_tokens=512, gpu_memory_utilization=0.5, seed=0, ..., multiprocessing=False, execution=ExecutionOptions(), cuda_graphs="auto", kv_offload=None, tensor_parallel_size=1, ...)` | The model and engine. `cuda_graphs="auto"` uses CUDA graphs when the workload allows it (else eager, reason in `diagnostics().eager_reason`); `True` requires them. `multiprocessing=True` needs the workload class in an importable module. |
 | `pllm.ExecutionOptions(max_host_training_rows=1, cuda_graph_pool_budget_bytes=None, state_page_budget_bytes=0, execution_peak_budget_bytes=None, allow_numerical_transforms=True, tuning="heuristic", publish_lag=1)` | Framework policy. `publish_lag=0`: updates at step n are read at n + 1 and training no longer overlaps the next forward. `state_page_budget_bytes` bounds PTTS device pages (0 uses observed free capacity); `execution_peak_budget_bytes` bounds the pllm execution peak including those pages, task workspace/live outputs and graph/anchor reservations (None is unlimited), excluding model weights/KV. `cuda_graph_pool_budget_bytes` budgets each task/model CUDA-graph pool (None traces tasks; model default 64 MiB before exact-decode overlay allowances). `max_host_training_rows` bounds host-fed training rows per state per step, default 1; decode request rows are separate. |
 | `pllm.KVOffload(connector="OffloadingConnector", cpu_bytes=536870912, prompt_only=False)` | Offload complete KV pages to CPU memory (`ModelConfig(kv_offload=...)`). |
@@ -538,7 +548,7 @@ with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=8
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.explain(workload, config)` | Plan on CPU from `config.json` without weights or CUDA: per method its timing anchor, CUDA stream lane and graph capture; why the forward is eager; state bytes; peak memory pllm reserves; host syncs in your math; timing settings. `str()` prints a table; `dataclasses.asdict()` gives JSON-ready data (`eager_reason`, `members`, `states`, `peak_memory_bytes`, `budget_errors`, ...). |
+| `pllm.explain(workload, config)` | Plan on CPU from `config.json` without weights or CUDA: per method its timing anchor, CUDA stream lane and graph capture; why the forward is eager; state bytes; peak memory pllm reserves; host syncs in your math; timing settings. `str()` prints a table; `dataclasses.asdict()` gives JSON-ready data (`eager_reason`, `members`, `states`, `peak_memory_bytes`, `budget_errors`, `exports`, ...). `workload_digest` signs the declaration, method code and workload values (equal digests run the same workload); `flops_per_token_estimate` is the base forward's dense projection and LM-head FLOPs per token plus every task's matmul and projection FLOPs per row (attention over the KV history excluded; `None` when the base is unknown). |
 | `pllm.testing.check(workload, config, *, neutral=None)` | Run fixed three-request schedules on CPU through the real planner and executor: row permutation, request isolation, mixed prefill/decode, chunked prompts, preemption replay, publish_lag versions, and with `neutral=` that the disabled workload adds exactly zero. Returns a `CheckResult`; raises `ContractError`. |
 | `pllm.testing.check_on_gpu(workload, config, *, neutral=None)` | Load real engines: planning, eight steady decode steps, forced KV eviction and recompute, and with `neutral=` greedy and seeded sampling bitwise equal to the plain model. Run it in its own process with `multiprocessing=False`, `max_num_seqs >= 2`, `max_model_len >= 32`. |
 | `pllm.testing.check_distribution(workload, config, *, prompts=None, tokens=16, temperature=0, max_mean_kl=None, max_p99_kl=None, worst=5)` | Teacher-force the plain model's continuation through the workload with matching graph/compile settings. Full-vocabulary FP32 KL in both directions and TV; thresholds bound both KL directions. Returns numbers and pass/fail; no thresholds measures only. |
@@ -552,6 +562,30 @@ with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=8
 report = pllm.explain(ShallowDistiller(), CONFIG)
 print(repr(report.eager_reason), [(state.name, state.reserved_bytes) for state in report.states])
 print(testing.check(Lens(), CONFIG))
+```
+
+## Measure throughput
+
+`pllm.benchmark` times the public engine path; compare a workload with plain vLLM on equal work before claiming
+a speedup.
+
+| Name | Meaning |
+| --- | --- |
+| `pllm.benchmark.throughput(llm, prompts, sampling, *, warmup=1, rounds=3)` | Median output tokens per second over `rounds` whole `llm.generate` calls (prefill included) after `warmup` untimed calls. Works for any engine, with or without a workload. |
+| `pllm.benchmark.compare(workload, options, *, prepare=None, max_host_training_rows=1, require_training=False, prompt_indices=None, alternatives=())` | The aligned comparison the `tools/benchmark_*.py` scripts run: builds plain vLLM and each arm with the same prompts and sampling (ignore-EOS, `sampling_n` samples per prompt) and checks equal work. Returns one `BenchmarkResult` per arm. |
+| `pllm.benchmark.BenchmarkOptions(model=..., batch=8, tokens=256, rounds=3, warmup=1, gpu_memory_utilization=0.25, ..., sampling_n=16, cuda_graphs=True)` | The shape and memory settings `compare` uses. |
+| `pllm.benchmark.BenchmarkResult` | `tokens_per_second` (median round rate), `round_rates`, `vanilla_tokens_per_second` (plain vLLM on the same prompts and sampling, in the arm's CUDA-graph mode), `loss_count`, `update_count`, `trained_rows`, peak memory and `state_usage`. |
+
+```python gpu
+from pllm.benchmark import throughput
+
+prompts = ["Explain gradient descent:"] * 4
+timed = SamplingParams(max_tokens=32, temperature=0.8, seed=0, ignore_eos=True)
+with pllm.make_llm(GPU_CONFIG) as plain:
+    vanilla = throughput(plain, prompts, timed, rounds=1)
+with pllm.make_llm(GPU_CONFIG, workload=ShallowDistiller()) as llm:
+    guided = throughput(llm, prompts, timed, rounds=1)
+print(f"{guided / vanilla:.2f} of plain vLLM")
 ```
 
 ## Step a workload by hand in tests

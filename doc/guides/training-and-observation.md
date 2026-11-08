@@ -160,14 +160,18 @@ def features(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
 ```
 
 导出值送到负载的 `on_export(event)` 方法，按顺序、在执行进程里调用；在这里打印、
-落盘或累积（见 [SAE 导出示例](../../examples/sae_export.py)）。
+落盘或累积（见 [SAE 导出示例](../../examples/sae_export.py)）。想看一步里每个新算出的 token
+（包括 prompt 的每个分块）而不只是最新一行，读 `pllm.hidden(layer, tokens="all")`；这些行只有
+`@pllm.export` 方法能读，每个事件带各行的 token 位置（见
+[agent 参考](../agent/reference.md#read-a-hidden-state-the-residual-stream-or-per-layer-logits)）。
 
-这条通道是方法自带的输出效果：有界、按步长门控、给出 CPU 自持副本。三个
+这条通道是方法自带的输出效果：有界、按步长门控、给出 CPU 自持副本。几个
 数字约束需要记住：
 
 - `max_rows`/`max_cols` 会同时截断输入帧与输出帧（先按行选，再按列截）；
 - 每个导出事件的 `dropped_rows` 精确记录因 `max_rows` 被截去的行数；`export_dropped` 仍只计队列丢弃的事件数。
-- 每事件字节上限 32 KiB，即 `max_rows × max_cols × 8 ≤ 32768`；
+- 一步的行按整行拆成若干事件，每个事件不超过 32 KiB；一行必须装进一个事件，即 `max_cols × 8 ≤ 32768`；
+  `pllm.explain` 的 `export` 行列出每步的行数、字节数和事件数；
 - 导出事件进容量 256 的全局有界队列，溢出时丢最旧的事件并计入 `dropped`。
 
 ### trace 选择器：运行时观测

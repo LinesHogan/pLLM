@@ -9,9 +9,9 @@
   （`request.prepare`、`model.execute`、`state.publish`、`sampler.pre_draw`、
   `token.commit`、`next.prepare`）之间的签名区间，操作在其中运行。
   `Phase` 是 `When` 窗口的 DSL 拼写。
-- **来源标记（Source marker）** —— 命名输入来源的 `Annotated[Tensor, ...]`
-  参数：`Hidden`、`Samples`、`Batch`、`Parameter`、`StateIndex`、
-  `StateVersion`、`Result`、`BaseLogits`、`SampledTokens`。
+- **来源标记（Source marker）** —— 写成方法参数默认值、命名输入来源的标记：`pllm.hidden`、
+  `pllm.residual`、`pllm.batch`、`pllm.parameter`、`pllm.index`、`pllm.version`、`pllm.result`、
+  `pllm.base_logits`、`pllm.sampled_tokens` 等（完整列表见 [agent 参考](../agent/reference.md)）。
 - **Hidden / BLOCK_OUTPUT** —— `pllm.hidden(L)` 读取第 L 个 decoder 层的 MLP 输出，
   位于残差加法之前；它不是残差流（残差流见 `pllm.residual`）。每个请求读取最新 decode token 或 prompt 最后一个 token。
 - **残差流读取（pllm.residual）** —— 某层之后（或 attention 与 MLP 之间）的残差流：
@@ -30,13 +30,14 @@
 - **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
   `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入
-  `pllm.model.CausalModel`；`model(...)` 应用命名 Adapter，`model.base(...)` 只用冻结基座。
+  `pllm.model.CausalModel`；`model(...)` 应用命名 Adapter，`model.base(...)` 只用冻结基座；
+  `model.token_logprobs(ids, labels)` 按块跑 LM head，直接给出每个标签的对数概率，不物化整批 logits。
 - **属性引用（pllm.Attr）** —— `pllm.Attr("phase")` 在绑定时读取负载属性；
   `@pllm.on(...)` 可据此决定阶段，如 TLM 的在线/离线训练时机。
-- **张量结果（StepResult）** —— 一次执行的报告值、loss、发布与观测；
-  `metrics` 保存算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数；
-  宿主训练步的 `parameters` 是更新后的状态字段。
-- **携带标记（pllm.carry）** —— 训练输入上的第三注解参数
+- **训练步结果（TrainStep）** —— `pllm.host.HostTrainer.train(batch)` 的返回值：`loss`
+  与 `parameters`（更新后的状态字段，按名字）。训练方法返回的 `UpdateOutput.metrics` 保存
+  算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数。
+- **携带标记（pllm.carry）** —— 包住训练方法输入默认值的标记
   `pllm.carry(source, state=, field=)`：发布时，每个 lineage 的 carry 字段收到该输入
   最后一个选中行的值。
 - **指纹（Fingerprint）** —— 所创作数学的冷结构签名（marshaled 字节码加
