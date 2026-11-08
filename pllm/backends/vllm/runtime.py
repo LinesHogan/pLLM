@@ -286,12 +286,8 @@ class VllmLlm(Generic[DataT, ResultT]):
         remove_bytecode_hooks(self.compile_hooks)
         torch.compiler.reset()
         # vLLM's shutdown runs its collection while this handle still owns the runner. Collect model/session
-        # cycles only after dropping those owners; finalizers free further cycles, so collect until none are left.
-        while gc.collect():
-            pass
-        if torch.cuda.is_initialized():
-            clear_blas_workspaces()
-            torch.cuda.empty_cache()
+        # cycles only after dropping those owners.
+        free_cuda_garbage()
 
     def generate_feedback(
         self,
@@ -626,6 +622,15 @@ def _per_prompt(outputs: list[RequestOutput], n: int) -> list[RequestOutput]:
     return merged
 
 
+def free_cuda_garbage() -> None:
+    """Collect until no cycles remain (finalizers free further cycles), then return cached CUDA memory."""
+    while gc.collect():
+        pass
+    if torch.cuda.is_initialized():
+        clear_blas_workspaces()
+        torch.cuda.empty_cache()
+
+
 def vllm_engine(
     config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str], *, cuda_graphs: bool
 ) -> tuple[LLM, tuple[int, ...]]:
@@ -650,6 +655,9 @@ def vllm_engine(
             f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose matching runner/multiprocessing settings"
         )
     os.environ.update(environment)
+    # vLLM's startup profile asserts that free memory does not grow while it measures, and it collects garbage
+    # mid-profile: CUDA tensors kept alive only by cycles (say, a caught exception's traceback) must go first.
+    free_cuda_garbage()
     hooks = bytecode_hooks()
     try:
         llm = LLM(
