@@ -319,16 +319,17 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
             self.identity = identity
         self.output = torch.empty_like(self.hidden)
         self.observations = torch.empty_like(self.hidden)
+        records = tuple(self.rows)  # inspect each packed row once; indexing self.rows builds a record per access
         ordinary = tuple(
             (effect.rows != "all" and row.role.value != effect.rows)
             or (
                 row.role.value == "prefill" and program[row.role.value].prompt_pass_is_identity and self.overlay is None
             )
-            for row in self.rows
+            for row in records
         )
         requests = [
-            list(row for row in self.rows if row.request_ordinal == request)
-            for request in dict.fromkeys(row.request_ordinal for row in self.rows)
+            list(row for row in records if row.request_ordinal == request)
+            for request in dict.fromkeys(row.request_ordinal for row in records)
         ]
         while any(requests):
             spans: dict[TokenProgram | None, list[PackedPhaseRow]] = {}
@@ -368,7 +369,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
                     row_overlay.collect(results, pending)
                     assert self.overlay is not None
                     self.overlay.ordinary.extend(row_overlay.ordinary)
-        for row in self.rows:
+        for row in records:
             if effect.rows == "all" or row.role.value == effect.rows:
                 observe(row.packed_row_index, self.observations[row.packed_row_index : row.packed_row_index + 1])
 
