@@ -550,6 +550,24 @@ class TopPages(pllm.Workload):
 | **实测单请求 KV 显存上限**<br>（0.5B，教程 10：`max_model_len=2048`，256 token 分块 prefill） | 全量 **$24.0\text{ MiB}$** $\rightarrow$ 偶数层窗口 256 降至 **$16.6\text{ MiB}$**；共享一半层降至 **$12.0\text{ MiB}$**（可同时容纳的 2048-token 请求从 358.8 个增至 717.6 个）。`sink=True` 保留整个 prompt，上限仍为 $24.0\text{ MiB}$，实际节省取决于生成长度 | 仍为 **$24.0\text{ MiB}$** |
 | **实测吞吐**<br>（RTX 4090，0.5B，128 并发） | 原生读取（`NativeRead`）**97%**；偶数层窗口（`LocalGlobal`）**97%**；跨层共享（`CrossLayerShared`）**95%** | 教程 10 中 `QuestRead` 仅为原生的 **7%**（$2,727\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
 
+#### 窗口布局：先看 GQA 内核，再看少读了多少 KV
+
+窗口首先改变模型能看见的历史，并回收窗口外的物理块；它能否加速，还取决于内核是否让同组 query 头共享 KV。Qwen2.5-0.5B 有 14 个 query 头、2 个 KV 头，每组 7 个 query 头。FA2 的窗口路径会关闭 decode 的 GQA 打包：同一次读的 grid 从按 2 个 KV 头组织变成按 14 个 query 头组织，重复处理 KV，窗口更小也未必更快。Ampere/Ada 上，普通存储窗口使用 vLLM 的 FlashInfer decode/prefill wrappers 和 `window_left`；全量、prompt-sink、共享层读取及临时改变窗口或头数的读取保留各自适用的路径；要求 batch invariant、头维不在 FlashInfer 支持范围内或 query 头维不连续时保留 FA2。
+
+下面只比较同一个 `LocalGlobal` 布局的内核选择：RTX 4090，BF16，Qwen2.5-0.5B-Instruct，8 个 prompt × 16 个分支，生成 256 token，窗口 256、偶数层使用窗口，`max_model_len=2048`、每批最多 256 token、显存比例 0.4、CUDA Graph 开启、自定义执行图池 1 GiB；vLLM 0.27.1、PyTorch 2.13，预热 1 轮后取 3 轮吞吐中位数。原生列是每次独立启动的全量 vLLM 对照。单次读的 GPU 时间来自 torch profiler 中 3,024 次稳态窗口读，包含 LSE 所需的收尾操作。
+
+| 窗口内核 | 原生 vLLM（tok/s） | LocalGlobal（tok/s） | 相对原生 | 每次窗口读 |
+| :--- | ---: | ---: | ---: | ---: |
+| FA2 | 39,120 | 30,846 | 78.8% | 86.43 μs |
+| FlashInfer | 39,069 | 38,050 | 97.4% | 18.04 μs |
+| 专用 Triton 单段读（实验对照） | 39,281 | 38,654 | 98.4% | 16.23 μs |
+
+FlashInfer 的 tensor-core decode 使用 16×128 的 Q/KV tile、4 个 warp，按 2 个 KV 头组织；图中的 grid 为 `[183, 1, 2]`。读本体为 14.84 μs，图模式的 split-KV 规划还保留一次 2.23 μs 的状态合并，自然对数转换为 0.97 μs。单段 Triton 对照用 16×32 tile，grid 为 `[192, 2, 1]`，本体 14.17 μs，加 2.06 μs 收尾。FlashInfer 的局部读仍慢约 11%，但整机吞吐差距约 1%–2%；这里保留上游实现，没有使用专用内核。本设置还使用由 vLLM 分配的默认 394 MiB 共享工作区。
+
+带宽账单也要按 KV 头数计算：128 行、BF16、头维 64 时，有效 KV 载荷为 `128 × min(历史长度, 256) × 2(K/V) × 2(KV头) × 64 × 2` 字节。历史长度 128/256 分别是 8/16 MiB，按 4090 标称 1,008 GB/s 显存带宽，对应约 8.3/16.6 μs 的理想搬运时间；短输入的前半程窗口尚未填满。FA2 按 query 头分 CTA 时，同组 KV 的逻辑载荷请求可重复约 7 次，缓存命中决定有多少真的到达显存。这是逻辑载荷的 roofline 估算，实际显存流量还受缓存、分块和重复读取影响。FA2 的 86 μs 不能只用有效载荷解释；FlashInfer 与单段读的差距则还包含分块、合并与发射成本，不能把窗口字节减少直接等同于端到端加速。
+
+FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2 转成自然对数；FP32 返回类型不代表与 FA2 位相同。窗口回收的独立参考计算中，输出相对 FP32 的最大绝对误差约 0.0079，LSE 约 0.0017。同一组 query 上，FlashInfer 与 FA2 对 FP64 输出的最大误差都是约 0.0076；LSE 与按该 BF16 分母计算的 FP64 参考差异不超过 0.00005。若算法对很小的 LSE 差异敏感，应把这个舍入量级纳入质量验证。
+
 > **实用建议与限制**
 > * **布局改的是模型数学**：未经相应训练的模型直接换成窗口或跨层共享布局，回答质量可能明显变差（教程 10 中 `LocalGlobal` 和 `CrossLayerShared` 都答错了长文检索问题，`PromptPlusWindow` 答对）。先在自己的任务上验证质量，再看吞吐。
 > * **不支持按注意力分数动态淘汰物理 KV 块（如 SnapKV / H2O）**：vLLM 对每个请求只维护单一的 `num_computed_tokens` 计数，位置编码与物理槽位均由它线性推导，且块表（block table）只能追加、不能在中间挖洞。如果你的目标是省 KV 显存，请改用静态 `keep="window"`（可加 `sink=True`）或 `keep="none", source=...`；如果只想少读，用 `kv.attend(q, topk=...)`。

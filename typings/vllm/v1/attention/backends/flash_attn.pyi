@@ -3,6 +3,9 @@
 from dataclasses import dataclass
 
 import torch
+from vllm.config import VllmConfig
+from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 @dataclass
 class FlashAttentionMetadata:
@@ -55,3 +58,11 @@ class FlashAttentionImpl:
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor: ...
+
+class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
+    def __init__(
+        self, kv_cache_spec: AttentionSpec, layer_names: list[str], vllm_config: VllmConfig, device: torch.device
+    ) -> None: ...
+    def build(
+        self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
+    ) -> FlashAttentionMetadata: ...

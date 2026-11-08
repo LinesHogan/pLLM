@@ -1,9 +1,11 @@
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec
 import torch
 from torch.nn import Module
 
 class Attention(Module):
+    attn_backend: type[AttentionBackend]
     impl: object
     kv_cache: torch.Tensor
     kv_cache_dtype: str

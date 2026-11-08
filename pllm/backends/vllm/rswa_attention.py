@@ -1,6 +1,6 @@
 """Read R-SWA output through vLLM's launcher and recover its otherwise discarded LSE.
 
-Custom attention uses FA2 for full/sliding-window reads. vLLM 0.27.1/0.32.0
+Custom attention uses FA2/FlashInfer for full and ordinary window reads. vLLM 0.27.1/0.32.0
 TritonAttentionImpl.forward calls unified_attention, which returns only output.
 Its 2-D branch discards M/L, including all prefill; its 3-D branch exposes only
 split-decode scratch. Neither the backend nor reduce_segments returns LSE.

@@ -55,6 +55,8 @@ def install_layouts(decoder: Decoder, layouts: tuple[KVLayout, ...]) -> None:
     """Declare native cache ownership before profiling or allocation, including shared chains."""
     if not layouts:
         return
+    from pllm.backends.vllm.flashinfer_attention import install_window
+
     model = decoder.kv_writable("static KV layouts")
     layouts = expand_layouts(layouts, len(model.model.layers))
     owners = {layout.layer for layout in layouts} | {storage_layout(layouts, layout.layer).layer for layout in layouts}
@@ -74,7 +76,7 @@ def install_layouts(decoder: Decoder, layouts: tuple[KVLayout, ...]) -> None:
             if layout.sink:
                 attention.get_kv_cache_spec = partial(sink_spec, attention, layout.window)
             else:
-                attention.sliding_window = layout.window
+                install_window(attention, layout.window)
 
 
 def layout_capacity(shape: ModelShape, config: ModelConfig, layouts: tuple[KVLayout, ...]) -> tuple[KVCapacity, ...]:

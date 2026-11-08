@@ -166,7 +166,7 @@ def _layout_read(read, errors, kernel, q, window, topk):
             max_seqlen_q=kernel.metadata.max_query_len,
             seqused_k=kv.seq_lens,
             max_seqlen_k=kernel.metadata.max_seq_len,
-            softmax_scale=kernel.impl.scale,
+            softmax_scale=kernel.scale,
             causal=True,
             block_table=kv.block_table,
             window_size=(window - 1, 0) if window else (-1, -1),
@@ -183,7 +183,8 @@ def _layout_read(read, errors, kernel, q, window, topk):
             )
         else:
             flash_attn_varlen_func(**args, fa_version=2, num_splits=kernel.metadata.max_num_splits)
-        assert torch.equal(out, native)
+        if kernel.infer is None:
+            assert torch.equal(out, native)
     if kernel.metadata.max_query_len > 1 or kernel.metadata.max_seq_len > 96:
         kv = kernel.kv
         # Independent FP32 softmax over logical positions. No production masking/gather helper.
@@ -210,7 +211,10 @@ def _layout_read(read, errors, kernel, q, window, topk):
             scores = (q[row].float()[:, None] @ k.transpose(1, 2)).squeeze(1) * q.shape[-1] ** -0.5
             expected = (scores.softmax(-1)[:, None] @ v).squeeze(1)
             torch.testing.assert_close(out[row].float(), expected, atol=0.016, rtol=0.016)
-            torch.testing.assert_close(lse[row], scores.logsumexp(-1), atol=0.0001, rtol=0.0001)
+            # FlashInfer's tensor-core path sums BF16-rounded probabilities for its denominator.
+            torch.testing.assert_close(
+                lse[row], scores.logsumexp(-1), atol=0.004 if kernel.infer is not None else 0.0001, rtol=0.0001
+            )
             errors.append(float((out[row].float() - expected).abs().max()))
     return out, lse
 

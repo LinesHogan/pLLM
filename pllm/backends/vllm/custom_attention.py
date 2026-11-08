@@ -1,6 +1,6 @@
 """Install authored dense reads inside vLLM's opaque attention op, after its native KV write.
 
-The upstream op already supplies graph ordering and capture. Full and sliding-window reads use FA2; prompt-sink reads use vLLM's Triton path.
+The upstream op already supplies graph ordering and capture. Full reads use FA2; stored windows use FlashInfer; prompt-sink reads use vLLM's Triton path.
 Selected reads gather logical positions without changing block tables.
 """
 
@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
-from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl, FlashAttentionMetadata
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -25,14 +25,20 @@ from pllm.execution.attention_methods import AttentionFact, AttentionProgram
 from pllm.execution.cuda_stream import upload
 from pllm.execution.model_sites import DepthInput, StateInput
 
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.flashinfer import FlashInferImpl, FlashInferMetadata
+
+    from pllm.backends.vllm.flashinfer_attention import WindowMetadata
+
 
 @dataclass
 class FlashRead:
-    """One invocation's FA2 metadata and first read's LSE, exposed as the layer's fact."""
+    """One invocation's native metadata and first read's LSE, exposed as the layer's fact."""
 
-    impl: FlashAttentionImpl
+    scale: float
     metadata: FlashAttentionMetadata
     output: torch.Tensor
+    infer: WindowMetadata | None = None
     kv: PagedKV | None = None
     lse: torch.Tensor | None = None
 
@@ -51,11 +57,21 @@ class FlashRead:
             # Native R-SWA does not express a wider-window intersection or mixed query/cache precision.
             topk = torch.arange(self.metadata.max_seq_len, device=q.device)[None, :].expand(len(q), -1)
         if topk is not None:
-            result = selected_attention(self.kv, q, self.impl.scale, window, topk)
+            result = selected_attention(self.kv, q, self.scale, window, topk)
         elif self.kv.prompt_lens is not None and not window and q.dtype == self.kv.key_cache.dtype:
             result = rswa_attention(
-                self.kv, q, self.impl.scale, output, self.metadata.max_query_len, self.metadata.max_seq_len
+                self.kv, q, self.scale, output, self.metadata.max_query_len, self.metadata.max_seq_len
             )
+        elif (
+            self.infer is not None
+            and window == self.kv.storage_window
+            and q.shape[1] == self.output.shape[1]
+            and q.dtype == self.kv.key_cache.dtype
+            and q.stride(-1) == 1
+        ):
+            from pllm.backends.vllm.flashinfer_attention import window_attention
+
+            result = window_attention(self.infer, q, self.kv.key_cache, self.kv.value_cache, output)
         else:
             out, lse = flash_attn_varlen_func(
                 q=q,
@@ -66,12 +82,12 @@ class FlashRead:
                 max_seqlen_q=self.metadata.max_query_len,
                 seqused_k=self.metadata.seq_lens,
                 max_seqlen_k=self.metadata.max_seq_len,
-                softmax_scale=self.impl.scale,
+                softmax_scale=self.scale,
                 causal=True,
-                alibi_slopes=self.impl.alibi_slopes,
+                alibi_slopes=None,
                 window_size=[window - 1, 0] if window else [-1, -1],
                 block_table=self.metadata.block_table,
-                softcap=self.impl.logits_soft_cap,
+                softcap=0.0,
                 scheduler_metadata=self.metadata.scheduler_metadata,
                 fa_version=2,
                 num_splits=self.metadata.max_num_splits,
@@ -87,16 +103,14 @@ class CustomAttention:
     """A session's attention hooks; restore native implementations when the session closes."""
 
     def __init__(self, decoder: Decoder, program: AttentionProgram, sites: ModelSites) -> None:
+        from pllm.backends.vllm.flashinfer_attention import attention_impl
+
         self.program, self.sites = program, sites
-        self.installed: list[tuple[FlashAttentionImpl, Callable[..., torch.Tensor]]] = []
+        self.installed: list[tuple[FlashAttentionImpl | FlashInferImpl, Callable[..., torch.Tensor]]] = []
         model = decoder.kv_writable("@pllm.custom_attention")
         for layer in sorted(program.methods):
             attention = model.model.layers[layer].self_attn.attn
-            impl = attention.impl
-            if not isinstance(impl, FlashAttentionImpl) or impl.vllm_flash_attn_version != 2:
-                raise ValueError(
-                    "@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2"
-                )
+            impl = attention_impl(attention)
             layout = storage_layout(program.layouts, layer)
             sharing = any(item.layer == layer and item.keep == "none" for item in program.layouts)
             window = layout.window if layout.keep == "window" and not layout.sink and not sharing else None
@@ -104,10 +118,8 @@ class CustomAttention:
                 raise ValueError("custom_attention needs full attention or a layout declared with keep/window/source")
             if attention.kv_cache_dtype != "auto":
                 raise ValueError("@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto")
-            if impl.alibi_slopes is not None or impl.logits_soft_cap != 0 or impl.sinks is not None:
-                raise ValueError("@pllm.custom_attention needs ordinary RoPE attention without ALiBi, softcap or sinks")
             self.installed.append((impl, impl.forward))
-            impl.forward = AttentionHook(self, attention, impl, layer).forward
+            impl.forward = AttentionHook(self, impl.scale, layer).forward
 
     def prepare(self, rows: PackedPhaseRowBatch, sampler: PackedSamplerRowBatch) -> None:
         """Stage sampled-to-packed indices before model and fact-snapshot tasks run."""
@@ -134,26 +146,29 @@ class AttentionHook:
     """One layer's read at the upstream attention boundary; native cache writes precede it."""
 
     owner: CustomAttention
-    attention: Attention
-    impl: FlashAttentionImpl
+    scale: float
     layer: int
 
     def forward(
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata | None,
+        attn_metadata: FlashAttentionMetadata | FlashInferMetadata | None,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output_scale is None and output_block_scale is None
-        metadata = attn_metadata
-        if metadata is None:
+        if attn_metadata is None:
             return output.zero_()
+        from pllm.backends.vllm.flashinfer_attention import WindowMetadata
+
+        infer = attn_metadata if isinstance(attn_metadata, WindowMetadata) else None
+        metadata = infer.flash if infer is not None else attn_metadata
+        assert isinstance(metadata, FlashAttentionMetadata)
         if (
             VLLM_027
             and metadata.use_cascade
@@ -167,7 +182,7 @@ class AttentionHook:
         q = query[:count]
         keys, values = kv_cache.transpose(1, 2).chunk(2, dim=-1)
         self.owner.sites.count = count
-        read = FlashRead(self.impl, metadata, output[:count])
+        read = FlashRead(self.scale, metadata, output[:count], infer)
         layout = storage_layout(self.owner.program.layouts, self.layer)
         kv = PagedKV(
             keys,
