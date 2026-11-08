@@ -7,7 +7,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from functools import partial
+from graphlib import CycleError, TopologicalSorter
 from inspect import Parameter as SignatureParameter, signature
+from itertools import pairwise
 from types import FunctionType, MethodType
 from typing import ClassVar, TypeVar
 
@@ -265,6 +267,7 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
             ) is not None:
                 seeds.append(function)
     _declare_result_helpers(context, candidates, seeds)
+    _reject_result_cycles(context)
     _freeze_helpers(context, candidates, seeds)
     context.bindings = tuple(
         (key, fingerprint(value)) for key, value in sorted(values.items()) if not isinstance(value, Workload)
@@ -361,6 +364,26 @@ def _declare_result_helpers(
             declared.add(source.operation)
             seeds.append(candidates[source.operation])
             pending.append((helper, phase))
+
+
+def _reject_result_cycles(context: WorkloadContext) -> None:
+    """A step runs each method once, so results must flow one way; name the methods that read each other."""
+    reads = {
+        operation.name: [
+            parameter.default.operation
+            for parameter in signature(operation.function).parameters.values()
+            if isinstance(parameter.default, Result)
+        ]
+        for operation in context.operations
+    }
+    try:
+        TopologicalSorter(reads).prepare()
+    except CycleError as error:
+        cycle = error.args[1][::-1]  # graphlib lists each producer before its reader
+        chain = " and ".join(
+            f"{context.qualify(reader)} reads pllm.result({producer!r})" for reader, producer in pairwise(cycle)
+        )
+        raise ValueError(f"{chain}; results can only flow one way within a step, remove one of the reads") from None
 
 
 def _freeze_helpers(context: WorkloadContext, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:

@@ -177,6 +177,17 @@ def sampler_feedback(source):
     return Feedback()
 
 
+class ResultCycle(pllm.Workload):
+    """Two methods read each other's results, so neither can run first."""
+
+    def first(self, value=pllm.result("second")):
+        return value
+
+    @pllm.add_logits()
+    def second(self, h=pllm.hidden(0), value=pllm.result("first")):
+        return h + value
+
+
 class SelectedTrainer(PrefillTrainer):
     """Standalone request training cannot select updates."""
 
@@ -258,6 +269,7 @@ class PromptMask(pllm.Workload):
                 sampler_feedback(pllm.sampled_tokens()),
                 r"pllm.sampled_tokens\(\).*Phase.AFTER_SAMPLE.*pllm.final_hidden",
             ),
+            (ResultCycle(), r"(first|second) reads pllm.result\('(second|first)'\) and .*remove one of the reads"),
             (SelectedTrainer(), "rows=.*require a model effect without sampler guidance, or @pllm.add_logits"),
             (
                 PromptMask(),
