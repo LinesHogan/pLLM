@@ -532,3 +532,6 @@ def compare(
             torch.cuda.empty_cache()
     assert len({item.effective_work for item in reports}) == 1
     return tuple(reports)
+
+
+__all__ = ["BenchmarkOptions", "BenchmarkResult", "compare", "throughput"]

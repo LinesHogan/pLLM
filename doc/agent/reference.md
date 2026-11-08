@@ -1,6 +1,6 @@
 # pllm reference for coding agents
 
-Every public name in `pllm`, `pllm.model`, `pllm.host`, `pllm.io` and `pllm.testing`, grouped by the task you
+Every public name in `pllm`, `pllm.model`, `pllm.host`, `pllm.io`, `pllm.testing` and `pllm.benchmark`, grouped by the task you
 are doing. Each section lists the names with a one-line meaning and a minimal example; the full signatures,
 generated from the code, are at the end ([All signatures](#all-signatures)). The workflow and the rules that
 cause rejections are in [SKILL.md](SKILL.md).
@@ -828,5 +828,16 @@ pllm.testing.step_input(identities: 'Sequence[RequestIdentity]', hidden: 'Mappin
     One packed step: row i belongs to `identities[i]` and decodes unless `tokens` says otherwise.
 pllm.testing.scheduled_step(identities: 'tuple[RequestIdentity, ...]', scheduled: 'list[int]', prompt: 'list[int]', computed: 'list[int]', hidden: 'Mapping[AttachmentHiddenResource, torch.Tensor]', *, step_id: 'int' = 0, operands: 'tuple[ProjectionOperands, ...]' = ()) -> 'StepInput'
     Build a CPU step from scheduler counts, selecting only the runners' tapped rows.
+```
+
+### pllm.benchmark
+
+```text
+pllm.benchmark.BenchmarkOptions(model: 'str' = 'Qwen/Qwen2.5-0.5B-Instruct', batch: 'int' = 8, tokens: 'int' = 256, rounds: 'int' = 3, warmup: 'int' = 1, gpu_memory_utilization: 'float' = 0.25, profile: 'Path | None' = None, cuda_graph_pool_budget_bytes: 'int' = 268435456, state_page_budget_bytes: 'int' = 268435456, execution_peak_budget_bytes: 'int | None' = None, sampling_n: 'int' = 16, cuda_graphs: 'bool' = True, guidance_capacity: 'int | None' = 4096)
+pllm.benchmark.BenchmarkResult(implementation: 'str', cold_seconds: 'float', round_seconds: 'tuple[float, ...]', output_tokens: 'int', loss_count: 'int', update_count: 'int', trained_rows: 'int', peak_allocated_bytes: 'int', baseline_allocated_bytes: 'int', plan_digest: 'str', task_implementations: 'tuple[tuple[str, str], ...]', planned_peak_memory_bytes: 'int', round_process_cpu_seconds: 'tuple[float, ...]', state_usage: 'PageBundleUsage', vanilla_tokens_per_second: 'float')
+pllm.benchmark.compare(workload: 'BackendWorkload[D, R]', options: 'BenchmarkOptions', *, prepare: 'Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None' = None, max_host_training_rows: 'int' = 1, require_training: 'bool' = False, prompt_indices: 'tuple[int, ...] | None' = None, alternatives: 'tuple[tuple[str, BackendWorkload[D, R]], ...]' = ()) -> 'tuple[BenchmarkResult, ...]'
+    Measure ordinary model workloads against plain vLLM; optimized arms and nonzero training are opt-in.
+pllm.benchmark.throughput(llm: 'VllmLlm[D, R]', prompts: 'list[str]', sampling: 'SamplingParams', *, warmup: 'int' = 1, rounds: 'int' = 3) -> 'float'
+    Median output tokens per second over `rounds` generate calls after `warmup` untimed ones.
 ```
 <!-- end of generated signatures -->
