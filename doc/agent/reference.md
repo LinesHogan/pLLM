@@ -239,7 +239,10 @@ class ShallowDistiller(pllm.Workload):
              f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow.float()) - deep.float()).square().mean(-1)
 
-    @pllm.guide_sampling(beta=pllm.Attr("beta"), rows="trained")
+    def strength(self) -> float:
+        return self.beta
+
+    @pllm.guide_sampling(beta=strength, rows="trained")
     def predict(self, shallow: torch.Tensor = pllm.hidden(0),
                 f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return f(shallow.float())
@@ -301,7 +304,7 @@ print(testing.check(LogitBias(), CONFIG, neutral=LogitBias(strength=0.0)).passed
 | `pllm.Phase` | Windows of one engine step: `BEFORE_FORWARD`, `IN_FORWARD`, `AFTER_FORWARD`, `BEFORE_SAMPLE`, `AFTER_SAMPLE`, `AUTOMATIC`. |
 | `@pllm.on(phase)` | Run the method in `phase`. Effects have defaults (export: after the forward; sampler methods: before sampling; request training and writes: automatic), so most methods need no `@pllm.on`. |
 | `rows="method"` | On `@pllm.add_logits`, `@pllm.guide_sampling` and `@pllm.train`: names a method with marker inputs that returns a bool `[rows]` mask; only those rows apply the effect (for training: count in the loss). Request-row training alone or next to `@pllm.guide_sampling` updates every request and rejects `rows=`. |
-| `pllm.Attr(name)` | A dotted path to a workload attribute, read once when the workload is built: `beta=pllm.Attr("beta")`, `layer_logits(pllm.Attr("lens"))`. Use it to make decorator arguments and marker arguments configurable. |
+| Settings from the instance | A decorator or marker argument may be a function of the workload instead of a value, called once when the workload is built: usually a method defined above, `beta=strength` with `def strength(self) -> float: return self.beta`, or `layer_logits(lens)`; `lambda self: self.beta` also works. The IDE follows the method and pyright checks its return type. Naming a dataclass field in the class body (`beta=beta`) reads its class default, not the instance. |
 
 Each method takes at most one decorator of each kind. A value can be read only in or after the phase that
 produces it: sampled tokens and `pllm.base_logits()` after sampling, the current step's hidden rows after the
@@ -411,7 +414,7 @@ print(pllm.explain(ValueResidual(), CONFIG).eager_reason)
 
 | Name | Meaning |
 | --- | --- |
-| `@pllm.custom_forward(*, tokens="all", over="token")` | Replace the forward of the selected tokens (`"prefill"`, `"decode"`, `"all"`) with the method `f(self, layers, ...) -> stream`, returning the residual stream the final norm reads. Inputs after `layers` may be `pllm.parameter` / `pllm.module` of an `InstanceState`, or `pllm.Attr`. |
+| `@pllm.custom_forward(*, tokens="all", over="token")` | Replace the forward of the selected tokens (`"prefill"`, `"decode"`, `"all"`) with the method `f(self, layers, ...) -> stream`, returning the residual stream the final norm reads. Inputs after `layers` may be `pllm.parameter` / `pllm.module` of an `InstanceState`; the body reads plain settings from `self`. |
 | `pllm.model.Layers` | The method's `layers` argument. `layers(start=0, stop=None, hidden=None, *, kv="commit", active=None)` runs layers `start..stop-1` and returns their outputs; `kv="peek"` attends without writing the KV cache; `active` (bool `[rows, 1]`, only with `tokens="decode"`) freezes the rows that are False (early exit). Also `embeddings`, `generated` (bool `[rows, 1]`), `load(name)` / `save(name, value)` for a `pllm.PositionState`, `apply_updates()` for `@pllm.train_in_forward`. |
 | `pllm.model.LayerOutputs` | What `layers(...)` returns: the post-layer residual streams, indexed by absolute layer (`out[-1]` is the last layer run). |
 | `pllm.scan(step, *, carry, over, chunk, invariants=(), valid_rows=None)` | Run `step(carry, *slices, *invariants) -> (carry, readout)` over `over` in chunks of `chunk` rows, in order, returning the final carry and the readouts. |
@@ -637,15 +640,15 @@ pllm.scan(step: collections.abc.Callable[..., tuple[torch.Tensor, torch.Tensor]]
     Run ``step(carry, *slices, *invariants)`` in chunk order, returning exclusive readouts.
 pllm.custom_forward(*, tokens: 'Tokens' = 'all', over: 'Over' = 'token') -> 'Callable[[F], F]'
     Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
-pllm.custom_residual(*, site: 'Site', layers: 'tuple[int, ...] | Attr | None' = None, read: 'str' = '', streams: 'int | Attr' = 1, state: 'str' = '', chunk: 'int | Attr | None' = None) -> 'Callable[[F], F]'
+pllm.custom_residual(*, site: 'Site', layers: 'tuple[int, ...] | Callable[[Any], tuple[int, ...]] | None' = None, read: 'str' = '', streams: 'int | Callable[[Any], int]' = 1, state: 'str' = '', chunk: 'int | Callable[[Any], int] | None' = None) -> 'Callable[[F], F]'
     Own the residual update at `site` of `layers` (default: every layer) with this method.
-pllm.custom_attention(*, layers: 'tuple[int, ...] | Attr | None' = None, keep: 'Keep' = 'all', window: 'int | Attr' = 0, source: 'int | Attr' = 0, sink: 'bool | Attr' = False) -> 'Callable[[F], F]'
+pllm.custom_attention(*, layers: 'tuple[int, ...] | Callable[[Any], tuple[int, ...]] | None' = None, keep: 'Keep' = 'all', window: 'int | Callable[[Any], int]' = 0, source: 'int | Callable[[Any], int]' = 0, sink: 'bool | Callable[[Any], bool]' = False) -> 'Callable[[F], F]'
     Replace dense FlashAttention reads, retaining native projections and KV writes.
 pllm.attention(layer: 'int', fact: 'Fact') -> 'Any'
     Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers.
 pllm.depth() -> 'Any'
     Inside a @pllm.custom_residual method, the index of the place it runs at, a Python int: the layer, or 2 * layer (+ 1 for the MLP) with site="both".
-pllm.value(layer: 'int | Attr') -> 'Any'
+pllm.value(layer: 'int | Callable[[Any], int]') -> 'Any'
     Inside a @pllm.custom_residual method, the value rows [rows, kv_heads, head_dim] layer `layer` computed for the same token in this forward (after its own value rewrite).
 pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, runner: Literal['mrv1', 'mrv2'] = 'mrv2', execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
 pllm.ExecutionOptions(max_host_training_rows: int = 1, cuda_graph_pool_budget_bytes: int | None = None, state_page_budget_bytes: int = 0, execution_peak_budget_bytes: int | None = None, allow_numerical_transforms: bool = True, tuning: Literal['heuristic', 'measured'] = 'heuristic', publish_lag: int = 1, guidance_capacity: int | None = 4096)
@@ -655,29 +658,27 @@ pllm.KVOffload(connector: Literal['OffloadingConnector', 'SimpleCPUOffloadConnec
 pllm.Workload()
     Python methods and effects compiled once, with independent sub-workloads in dataclass fields.
 pllm.Phase: BEFORE_FORWARD | AFTER_FORWARD | BEFORE_SAMPLE | AFTER_SAMPLE | IN_FORWARD | AUTOMATIC
-pllm.on(phase: 'Phase | Attr') -> 'Callable[[F], F]'
+pllm.on(phase: 'Phase | Callable[[Any], Phase]') -> 'Callable[[F], F]'
     Run the method in `phase`; needed for methods without an effect or to move an effect's phase.
 pllm.write(*, state: 'str', fields: 'tuple[str, ...]') -> 'Callable[[F], F]'
     Atomically publish a tuple of computed fields; request values have a leading request axis.
-pllm.export(*, name: 'str | Attr' = 'value', every: 'int | Attr' = 1, max_rows: 'int | Attr' = 1, max_cols: 'int | Attr' = 16, enabled: 'bool | Attr' = True, overflow: "Literal['drop', 'block']" = 'drop') -> 'Callable[[F], F]'
+pllm.export(*, name: 'str | Callable[[Any], str]' = 'value', every: 'int | Callable[[Any], int]' = 1, max_rows: 'int | Callable[[Any], int]' = 1, max_cols: 'int | Callable[[Any], int]' = 16, enabled: 'bool | Callable[[Any], bool]' = True, overflow: "Literal['drop', 'block']" = 'drop') -> 'Callable[[F], F]'
     Deliver bounded observations of executed forward rows to on_export.
 pllm.add_logits(*, rows: 'str' = '') -> 'Callable[[F], F]'
     Add the returned tensor to the logits before sampling.
-pllm.guide_sampling(*, beta: 'float | Attr', rows: 'str' = '') -> 'Callable[[F], F]'
+pllm.guide_sampling(*, beta: 'float | Callable[[Any], float]', rows: 'str' = '') -> 'Callable[[F], F]'
     Push sampling away from the returned hidden-state prediction for positive `beta`.
-pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction' = 'mean', steps: 'int | Attr' = 1, reset: 'str' = '', rows: 'str' = '') -> 'Callable[[F], F]'
+pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction' = 'mean', steps: 'int | Callable[[Any], int]' = 1, reset: 'str' = '', rows: 'str' = '') -> 'Callable[[F], F]'
     Minimize the returned loss with `state`'s optimizer; updates publish after sampling by default.
 pllm.differentiate(*, inputs: 'tuple[str, ...]' = (), parameters: 'bool' = False, input_rows: 'str' = '', parameter_rows: 'str' = '') -> 'Callable[[F], F]'
     Keep derivative edges; parameters may stay frozen while inputs differentiate.
-pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Attr', weight: 'str' = 'value', operator: 'AdapterOperator | Attr' = 'dense', factors: 'tuple[str, str] | Attr' = ('a', 'b'), scale: 'float | Attr' = 1.0, tokens: 'Tokens | Attr' = 'prefill', visibility: "Literal['forward_pinned', 'exact'] | Attr" = 'forward_pinned', chunk: 'int | Attr | None' = None, flush: "Literal['prompt_end'] | None" = None) -> 'Callable[[F], F]'
+pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]]', weight: 'str' = 'value', operator: 'AdapterOperator | Callable[[Any], AdapterOperator]' = 'dense', factors: 'tuple[str, str] | Callable[[Any], tuple[str, str]]' = ('a', 'b'), scale: 'float | Callable[[Any], float]' = 1.0, tokens: 'Tokens | Callable[[Any], Tokens]' = 'prefill', visibility: 'VisibilityKind | Callable[[Any], VisibilityKind]' = 'forward_pinned', chunk: 'int | Callable[[Any], int] | None' = None, flush: "Literal['prompt_end'] | None" = None) -> 'Callable[[F], F]'
     Train a request state inside the forward and add its residual at each target projection.
-pllm.Attr(name: 'str')
-    A reference to a workload attribute by dotted path, e.g. pllm.Attr("config.chunk_size"), resolved once when the workload is built.
-pllm.hidden(layer: 'int | Attr' = 0, *, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
+pllm.hidden(layer: 'int | Callable[[Any], int]' = 0, *, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
     The MLP output before the residual add in decoder layer `layer` (negative from the end).
-pllm.residual(layer: 'int | Attr', *, after: "Literal['layer', 'attention']" = 'layer', tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
+pllm.residual(layer: 'int | Callable[[Any], int]', *, after: "Literal['layer', 'attention']" = 'layer', tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
     The residual stream after decoder layer `layer` (negative from the end): the embedding plus every earlier sublayer's output, which the next sublayer normalizes. This is what steering vectors, sparse autoencoders and the logit lens read; pllm.hidden(layer) is only the layer's MLP output before it is added to this stream. after="attention" reads the stream between the layer's attention and its MLP. Rows are chosen by `tokens` as in pllm.hidden.
-pllm.layer_logits(layers: 'tuple[int, ...] | Attr') -> 'Any'
+pllm.layer_logits(layers: 'tuple[int, ...] | Callable[[Any], tuple[int, ...]]') -> 'Any'
     The model's final norm and LM head applied to the residual stream after each of `layers` (negative from the end), as float32 [rows, len(layers), vocab]: the logit lens. The last layer's logits are the model's own. One row for each token the sampler draws: a prompt's last token and every decode token.
 pllm.final_hidden(*, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
     The hidden state after the model's final norm, which the LM head reads (Hugging Face's last_hidden_state); rows are chosen by `tokens` as in pllm.hidden.
@@ -691,7 +692,7 @@ pllm.index(state: 'str') -> 'Any'
     Each row's slot in the state pool, for indexing pooled tensors.
 pllm.input_tokens(*, history: 'int' = 0) -> 'Any'
     Int64 [rows, history + 1] token ids: current token first, then lookbacks; -1 before the request starts.
-pllm.sample_index(limit: 'int | Attr | None' = None) -> 'Any'
+pllm.sample_index(limit: 'int | Callable[[Any], int] | None' = None) -> 'Any'
     The sample index of each row's request: 0 for a prompt's first sample.
 pllm.result(operation: 'str') -> 'Any'
     The value another operation of this workload returned in the same step.
@@ -699,7 +700,7 @@ pllm.base_logits() -> 'Any'
     The model's logits before any workload adjustment.
 pllm.sampled_tokens() -> 'Any'
     The tokens the sampler drew this step.
-pllm.operand(name: 'OperandName | Attr') -> 'Any'
+pllm.operand(name: 'OperandName | Callable[[Any], OperandName]') -> 'Any'
     A projection input/target/weight, input token embedding, or scalar prompt-end bool.
 pllm.carry(source: '_Source', *, state: 'str', field: 'str') -> 'Any'
     Read `source` and, when the training update publishes, write its value into the carried `state.field`.

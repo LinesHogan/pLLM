@@ -62,10 +62,19 @@ class ESampWorkload(pllm.Workload):
     def trained(self, versions: torch.Tensor = pllm.version("distiller")) -> torch.Tensor:
         return versions > 0
 
-    @pllm.guide_sampling(beta=pllm.Attr("config.intervention_beta"), rows="trained")
+    def beta(self) -> float:
+        return self.config.intervention_beta
+
+    def source_layer(self) -> int:
+        return self.config.source_layer
+
+    def target_layer(self) -> int:
+        return self.config.target_layer
+
+    @pllm.guide_sampling(beta=beta, rows="trained")
     def predict(
         self,
-        source: torch.Tensor = pllm.hidden(pllm.Attr("config.source_layer")),
+        source: torch.Tensor = pllm.hidden(source_layer),
         distiller: Distiller = pllm.module("distiller"),
     ) -> torch.Tensor:
         return distiller(source)
@@ -73,8 +82,8 @@ class ESampWorkload(pllm.Workload):
     @pllm.train(state="distiller")
     def loss(
         self,
-        source: torch.Tensor = pllm.hidden(pllm.Attr("config.source_layer")),
-        target: torch.Tensor = pllm.hidden(pllm.Attr("config.target_layer")),
+        source: torch.Tensor = pllm.hidden(source_layer),
+        target: torch.Tensor = pllm.hidden(target_layer),
         distiller: Distiller = pllm.module("distiller"),
     ) -> torch.Tensor:
         return (distiller(source) - target).square().mean(1)

@@ -55,8 +55,12 @@ class Distill(pllm.Workload):
              f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow.float()) - deep.float()).square().mean(-1)  # [rows]
 
+    # A setting read from the instance is a method the decorator names (the IDE follows it).
+    def strength(self) -> float:
+        return self.beta
+
     # A hidden-state prediction that guides sampling with strength beta.
-    @pllm.guide_sampling(beta=pllm.Attr("beta"))
+    @pllm.guide_sampling(beta=strength)
     def predict(self, shallow: torch.Tensor = pllm.hidden(0),
                 f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return f(shallow.float())

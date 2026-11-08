@@ -51,7 +51,7 @@ class ProjectionAdapter(ProjectionState):
 class DenseTraining(ProjectionState):
     """Train dense shards from operands available on this rank."""
 
-    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="all")
+    @pllm.train_in_forward(state="weights", targets=lambda self: self.targets, visibility="exact", tokens="all")
     def update(
         self,
         value=pllm.parameter("weights", "value"),
@@ -73,7 +73,9 @@ class DenseTraining(ProjectionState):
 class DenseChunkTraining(ProjectionState):
     """Retain replicated target rows across chunk boundaries while updating dense shards."""
 
-    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="all", chunk=2)
+    @pllm.train_in_forward(
+        state="weights", targets=lambda self: self.targets, visibility="exact", tokens="all", chunk=2
+    )
     def update(
         self, value=pllm.parameter("weights", "value"), inputs=pllm.operand("input"), target=pllm.operand("target")
     ):
@@ -104,8 +106,8 @@ class DenseGradientTraining(ProjectionState):
 
     @pllm.train_in_forward(
         state="weights",
-        targets=pllm.Attr("targets"),
-        scale=pllm.Attr("scale"),
+        targets=lambda self: self.targets,
+        scale=lambda self: self.scale,
         visibility="exact",
         tokens="decode",
         chunk=2,
@@ -121,7 +123,7 @@ class LowRankTraining(ProjectionState):
     operator: Literal["dense", "low_rank"] = "low_rank"
 
     @pllm.train_in_forward(
-        state="weights", targets=pllm.Attr("targets"), operator="low_rank", visibility="exact", tokens="all"
+        state="weights", targets=lambda self: self.targets, operator="low_rank", visibility="exact", tokens="all"
     )
     def update(
         self,
@@ -192,7 +194,12 @@ class TrainColumnA(ProjectionState):
     optimizer: pllm.SGD | None = pllm.SGD(1e-6)
 
     @pllm.train_in_forward(
-        state="weights", targets=pllm.Attr("targets"), operator="low_rank", visibility="exact", tokens="all", chunk=2
+        state="weights",
+        targets=lambda self: self.targets,
+        operator="low_rank",
+        visibility="exact",
+        tokens="all",
+        chunk=2,
     )
     def loss(self, a=pllm.parameter("weights", "a"), b=pllm.parameter("weights", "b"), inputs=pllm.operand("input")):
         return ((inputs.float() @ a.T) @ b.T).square().sum(-1)
@@ -204,7 +211,7 @@ class TensorConstantUpdate(ProjectionState):
 
     targets: tuple[pllm.model.Projection, ...] = (pllm.model.Projection("q_proj", 0),)
 
-    @pllm.train_in_forward(state="weights", targets=pllm.Attr("targets"), visibility="exact", tokens="all")
+    @pllm.train_in_forward(state="weights", targets=lambda self: self.targets, visibility="exact", tokens="all")
     def update(self, value=pllm.parameter("weights", "value"), inputs=pllm.operand("input")):
         value.add_(torch.tensor(1.0 if value.shape[0] > value.shape[1] // 2 else 2.0))
         output = inputs.float() @ value.T

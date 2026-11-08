@@ -60,7 +60,10 @@ class EngramLite(pllm.Workload):
         """Prefetch two rows per model token, independently of the hidden state."""
         return table[ngram_keys(ids, self.buckets)].flatten(1)
 
-    @pllm.custom_residual(site="attention", layers=pllm.Attr("layers"))
+    def residual_layers(self) -> tuple[int, ...]:
+        return self.layers
+
+    @pllm.custom_residual(site="attention", layers=residual_layers)
     def add(
         self,
         x: torch.Tensor,

@@ -172,8 +172,9 @@ class _Source:
 
     differentiable: ClassVar[bool] = True
 
-    def qualify(self, context: _Reflection) -> _Source:
-        """Resolve component-local references once at the declaration boundary."""
+    def bind(self, context: _Reflection) -> _Source:
+        """Resolve the marker against the bound workload once: settings read from it, state and method names
+        qualified within its component."""
         return self
 
     def port(self, context: _Reflection) -> TensorPort:
@@ -195,47 +196,33 @@ class _Source:
 
 
 @dataclass(frozen=True)
-class Attr:
-    """A reference to a workload attribute by dotted path, e.g. pllm.Attr("config.chunk_size"), resolved once when
-    the workload is built."""
+class _Deferred(_Source):
+    """A marker whose settings read the workload, e.g. pllm.hidden(source_layer); built when the workload is bound."""
 
-    name: str
+    build: Callable[[Any], _Source]
 
-    @staticmethod
-    def resolve(value: object, owner: object) -> object:
-        """Resolve an attribute path against the snapshotted owner."""
-        match value:
-            case Attr(name=name):
-                for part in name.split("."):
-                    try:
-                        owner = object.__getattribute__(owner, part)
-                    except AttributeError:
-                        raise ValueError(
-                            f"pllm.Attr({name!r}): {type(owner).__name__} has no attribute {part!r}"
-                        ) from None
-                return owner
-            case _:
-                return value
+    def bind(self, context: _Reflection) -> _Source:
+        return self.build(context.owner).bind(context)
 
 
 @dataclass(frozen=True)
 class Hidden(_Source):
-    layer: int | Attr = 0
-    site: HiddenSite = HiddenSite.BLOCK_OUTPUT
-    phase: HiddenPhase = HiddenPhase.DECODE
+    layer: int
+    site: HiddenSite
+    phase: HiddenPhase
 
-    def resolve(self, owner: Workload) -> HiddenInputSource:
+    def resolve(self) -> HiddenInputSource:
         """Resolve the model dependency without building a tensor binding."""
-        return HiddenInputSource(_setting(self.layer, owner, int), self.site, self.phase)
+        return HiddenInputSource(self.layer, self.site, self.phase)
 
     def port(self, context: _Reflection) -> TensorPort:
-        return hidden_port(self.resolve(context.owner))
+        return hidden_port(self.resolve())
 
     def site_input(self, context: _Reflection) -> SiteInput:
         """Inside a custom residual, pllm.residual reads the same token's stream earlier in this forward."""
         if self.site not in (HiddenSite.RESIDUAL, HiddenSite.ATTENTION_RESIDUAL):
             return super().site_input(context)
-        layer = _setting(self.layer, context.owner, int) % context.binding.dimensions.layer_count
+        layer = self.layer % context.binding.dimensions.layer_count
         return EarlierInput("residual" if self.site is HiddenSite.RESIDUAL else "attention_residual", layer)
 
 
@@ -259,31 +246,25 @@ def attention(layer: int, fact: Fact) -> Any:
 
 @dataclass(frozen=True)
 class LayerLogits(_Source):
-    layers: tuple[int, ...] | Attr
+    layers: tuple[int, ...]
 
-    def resolve(self, owner: Workload) -> HiddenInputSource:
+    def resolve(self) -> HiddenInputSource:
         """All layer-logit readers of a workload share one input holding every layer any of them names, for every
         row the sampler draws (phase NONE: prompt ends and decode rows)."""
         return HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, HiddenPhase.NONE)
-
-    def layer_tuple(self, owner: Workload) -> tuple[int, ...]:
-        layers = _setting(self.layers, owner, tuple)
-        if not layers or any(type(layer) is not int for layer in layers):
-            raise TypeError(f"pllm.layer_logits({layers!r}) takes a non-empty tuple of layer indices")
-        return layers
 
     def port(self, context: _Reflection) -> TensorPort:
         probe = context.binding.probe
         if probe is None:
             raise ValueError("pllm.layer_logits reads the model's LM head; compile this workload with make_llm")
         count = context.binding.dimensions.layer_count
-        columns = tuple(probe.layer_logits.index(layer % count) for layer in self.layer_tuple(context.owner))
-        return layer_logits_port(self.resolve(context.owner), columns)
+        columns = tuple(probe.layer_logits.index(layer % count) for layer in self.layers)
+        return layer_logits_port(self.resolve(), columns)
 
 
 @dataclass(frozen=True)
 class SampleIndex(_Source):
-    limit: int | Attr | None = None
+    limit: int | None
 
     differentiable: ClassVar[bool] = False
 
@@ -318,7 +299,7 @@ class Parameter(_Source):
     field: str
     per_row: bool = False
 
-    def qualify(self, context: _Reflection) -> Parameter:
+    def bind(self, context: _Reflection) -> Parameter:
         return replace(self, state=context.qualify(self.state))
 
     def training_port(self, context: _Reflection, schema: str) -> CausalPort:
@@ -357,7 +338,7 @@ class _CausalModelMarker(_Source):
 
     name: str
 
-    def qualify(self, context: _Reflection) -> _CausalModelMarker:
+    def bind(self, context: _Reflection) -> _CausalModelMarker:
         return replace(self, name=context.qualify(self.name))
 
     def training_port(self, context: _Reflection, schema: str) -> CausalPort:
@@ -424,7 +405,7 @@ class StateIndex(_Source):
 
     differentiable: ClassVar[bool] = False
 
-    def qualify(self, context: _Reflection) -> StateIndex:
+    def bind(self, context: _Reflection) -> StateIndex:
         return replace(self, state=context.qualify(self.state))
 
     def port(self, context: _Reflection) -> TensorPort:
@@ -437,7 +418,7 @@ class StateVersion(_Source):
 
     differentiable: ClassVar[bool] = False
 
-    def qualify(self, context: _Reflection) -> StateVersion:
+    def bind(self, context: _Reflection) -> StateVersion:
         return replace(self, state=context.qualify(self.state))
 
     def port(self, context: _Reflection) -> TensorPort:
@@ -448,7 +429,7 @@ class StateVersion(_Source):
 class Result(_Source):
     operation: str
 
-    def qualify(self, context: _Reflection) -> Result:
+    def bind(self, context: _Reflection) -> Result:
         return replace(self, operation=context.qualify(self.operation))
 
     def port(self, context: _Reflection) -> TensorPort:
@@ -482,10 +463,10 @@ class Depth(_Source):
 
 @dataclass(frozen=True)
 class Value(_Source):
-    layer: int | Attr
+    layer: int
 
     def site_input(self, context: _Reflection) -> SiteInput:
-        return EarlierInput("value", _setting(self.layer, context.owner, int) % context.binding.dimensions.layer_count)
+        return EarlierInput("value", self.layer % context.binding.dimensions.layer_count)
 
 
 @dataclass(frozen=True)
@@ -509,7 +490,7 @@ OperandName = Literal["input", "target", "embedding", "weight", "prompt_end"]
 class Operand(_Source):
     """A named model operand, selected when the workload is declared."""
 
-    name: OperandName | Attr
+    name: OperandName
 
 
 @dataclass(frozen=True)
@@ -519,19 +500,23 @@ class _Carried(_Source):
     source: _Source
     carry: Carry
 
-    def qualify(self, context: _Reflection) -> _Carried:
+    def bind(self, context: _Reflection) -> _Carried:
         return replace(
             self,
-            source=self.source.qualify(context),
+            source=self.source.bind(context),
             carry=replace(self.carry, state=context.qualify(self.carry.state)),
         )
 
 
 # Inputs are declared as parameter defaults: `h: torch.Tensor = pllm.hidden(0)`. The factories return the
 # source marker typed `Any`, so the annotation can name the value the method body receives.
+#
+# A setting that depends on the workload's configuration is a function of the workload instead of a value: usually
+# a method defined above, `pllm.hidden(source_layer)` with `def source_layer(self) -> int`, which the IDE follows and
+# the type checker checks. pllm calls it once when the workload is bound.
 
 
-def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
+def hidden(layer: int | Callable[[Any], int] = 0, *, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
     """The MLP output before the residual add in decoder layer `layer` (negative from the end).
 
     One row per request: the latest decode token, or with tokens="prefill" the last prompt token of completed prefill.
@@ -540,11 +525,12 @@ def hidden(layer: int | Attr = 0, *, tokens: Literal["decode", "prefill", "all"]
     step can carry max_num_batched_tokens of them, so give the export max_rows that large (pllm.explain reports the
     host copy volume).
     """
-    return Hidden(layer, HiddenSite.BLOCK_OUTPUT, HiddenPhase(tokens))
+    phase = HiddenPhase(tokens)
+    return _Deferred(lambda owner: Hidden(_setting(layer, owner, int), HiddenSite.BLOCK_OUTPUT, phase))
 
 
 def residual(
-    layer: int | Attr,
+    layer: int | Callable[[Any], int],
     *,
     after: Literal["layer", "attention"] = "layer",
     tokens: Literal["decode", "prefill", "all"] = "decode",
@@ -556,16 +542,22 @@ def residual(
     pllm.hidden."""
     if after not in ("layer", "attention"):
         raise ValueError(f'pllm.residual(after={after!r}): use "layer" or "attention"')
-    return Hidden(
-        layer, HiddenSite.RESIDUAL if after == "layer" else HiddenSite.ATTENTION_RESIDUAL, HiddenPhase(tokens)
-    )
+    site, phase = HiddenSite.RESIDUAL if after == "layer" else HiddenSite.ATTENTION_RESIDUAL, HiddenPhase(tokens)
+    return _Deferred(lambda owner: Hidden(_setting(layer, owner, int), site, phase))
 
 
-def layer_logits(layers: tuple[int, ...] | Attr) -> Any:
+def layer_logits(layers: tuple[int, ...] | Callable[[Any], tuple[int, ...]]) -> Any:
     """The model's final norm and LM head applied to the residual stream after each of `layers` (negative from the
     end), as float32 [rows, len(layers), vocab]: the logit lens. The last layer's logits are the model's own. One row
     for each token the sampler draws: a prompt's last token and every decode token."""
-    return LayerLogits(layers)
+    return _Deferred(lambda owner: LayerLogits(_layers(layers, owner)))
+
+
+def _layers(layers: tuple[int, ...] | Callable[[Any], tuple[int, ...]], owner: object) -> tuple[int, ...]:
+    resolved = _setting(layers, owner, tuple)
+    if not resolved or any(type(layer) is not int for layer in resolved):
+        raise TypeError(f"pllm.layer_logits({resolved!r}) takes a non-empty tuple of layer indices")
+    return resolved
 
 
 def final_hidden(*, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
@@ -599,12 +591,12 @@ def index(state: str) -> Any:
     return StateIndex(state)
 
 
-def sample_index(limit: int | Attr | None = None) -> Any:
+def sample_index(limit: int | Callable[[Any], int] | None = None) -> Any:
     """The sample index of each row's request: 0 for a prompt's first sample.
 
     With `limit`, generate rejects requests whose sample index is `limit` or more.
     """
-    return SampleIndex(limit)
+    return _Deferred(lambda owner: SampleIndex(None if limit is None else _setting(limit, owner, int)))
 
 
 def result(operation: str) -> Any:
@@ -618,10 +610,10 @@ def depth() -> Any:
     return Depth()
 
 
-def value(layer: int | Attr) -> Any:
+def value(layer: int | Callable[[Any], int]) -> Any:
     """Inside a @pllm.custom_residual method, the value rows [rows, kv_heads, head_dim] layer `layer` computed for the
     same token in this forward (after its own value rewrite)."""
-    return Value(layer)
+    return _Deferred(lambda owner: Value(_setting(layer, owner, int)))
 
 
 def base_logits() -> Any:
@@ -645,13 +637,13 @@ def sampled_tokens() -> Any:
     return SampledTokens()
 
 
-def operand(name: OperandName | Attr) -> Any:
+def operand(name: OperandName | Callable[[Any], OperandName]) -> Any:
     """A projection input/target/weight, input token embedding, or scalar prompt-end bool.
 
-    An Attr selects the operand name at declaration time. Embeddings are the residual stream
-    entering the first decoder layer, before its input norm, aligned with each projection row.
+    Embeddings are the residual stream entering the first decoder layer, before its input norm, aligned with each
+    projection row.
     """
-    return Operand(name)
+    return _Deferred(lambda owner: Operand(_option(name, owner, get_args(OperandName), "operand")))
 
 
 def carry(source: _Source, *, state: str, field: str) -> Any:
@@ -1058,8 +1050,8 @@ class _Effect:
     update_rows: str = ""
     reduction: TrainReduction
 
-    def description(self, owner: Workload) -> MemberDeclaration:
-        """The public effect name, with timing settings resolved at the authoring boundary."""
+    def description(self) -> MemberDeclaration:
+        """The public effect name and its timing settings."""
         return MemberDeclaration(self.kind)
 
     def accumulates(self, operation: _Operation, field: str) -> bool:
@@ -1115,18 +1107,18 @@ class _Write(_Effect):
 
 def write(*, state: str, fields: tuple[str, ...]) -> Callable[[F], F]:
     """Atomically publish a tuple of computed fields; request values have a leading request axis."""
-    return _mark(effect=_Write(state=state, fields=fields))
+    return _mark(effect=lambda owner: _Write(state=state, fields=fields))
 
 
 @dataclass(frozen=True)
 class _Export(_Effect):
     kind: ClassVar[str] = "export"
 
-    name: str | Attr
-    every: int | Attr
-    max_rows: int | Attr
-    max_cols: int | Attr
-    enabled: bool | Attr
+    name: str
+    every: int
+    max_rows: int
+    max_cols: int
+    enabled: bool
     overflow: Literal["drop", "block"]
 
     phase: ClassVar[Phase | None] = Phase.AFTER_FORWARD
@@ -1134,13 +1126,12 @@ class _Export(_Effect):
 
     def declare(self, operation: _Operation) -> None:
         """Publish bounded tensor observations to the host."""
-        owner = operation.context.owner
         export = TensorExport(
-            name=operation.context.emitted(_setting(self.name, owner, str)),
-            every=_setting(self.every, owner, int),
-            max_rows=_setting(self.max_rows, owner, int),
-            max_cols=_setting(self.max_cols, owner, int),
-            enabled=_setting(self.enabled, owner, bool),
+            name=operation.context.emitted(self.name),
+            every=self.every,
+            max_rows=self.max_rows,
+            max_cols=self.max_cols,
+            enabled=self.enabled,
             overflow=self.overflow,
         )
         operation.context.binding.exports(operation.tensor(result_schema="hidden_export@1", export=export))
@@ -1182,7 +1173,7 @@ class _Train(_Effect):
     state: str
     update_rows: str
     reduction: TrainReduction
-    steps: int | Attr
+    steps: int
     reset: str
 
     training: ClassVar[bool] = True
@@ -1302,7 +1293,7 @@ class _Train(_Effect):
                 context.states[self.state],
                 identity=f"{operation.identity}:{identity}",
                 optimizer=optimizer,
-                steps=_setting(self.steps, context.owner, int),
+                steps=self.steps,
                 reset=freeze(reset),
                 function=freeze(operation.function),
                 arguments=sources,
@@ -1315,24 +1306,25 @@ class _Train(_Effect):
 @dataclass(frozen=True)
 class _Sampler(_Effect):
     stage: SamplerStage
-    beta: float | Attr | None = None  # None for additive logits, which have no guidance strength
+    beta: float | None = None  # None for additive logits, which have no guidance strength
 
     phase: ClassVar[Phase | None] = Phase.BEFORE_SAMPLE
 
-    def description(self, owner: Workload) -> MemberDeclaration:
+    def description(self) -> MemberDeclaration:
         return MemberDeclaration("add_logits" if self.beta is None else "guide_sampling")
 
-    def enabled(self, owner: Workload) -> bool:
+    @property
+    def enabled(self) -> bool:
         """Zero-strength guidance has no sampler attachment."""
-        return self.beta is None or _setting(self.beta, owner, float) != 0
+        return self.beta != 0
 
     def declare(self, operation: _Operation) -> None:
         """Zero-strength guidance declares no computation or sampler attachment."""
-        if self.enabled(operation.context.owner):
+        if self.enabled:
             call = operation.tensor(
                 output_kind=SemanticOutputKind.SAMPLER,
                 sampler_stage=self.stage,
-                sampler_beta=0.0 if self.beta is None else _setting(self.beta, operation.context.owner, float),
+                sampler_beta=0.0 if self.beta is None else self.beta,
             )
             binding = operation.context.binding
             binding.tensor_tasks[call.symbol] = replace(
@@ -1378,8 +1370,18 @@ class _Gradient:
         )
 
 
-def _mark(**markers: object) -> Callable[[F], F]:
-    """Attach authoring markers; reflection consumes them once during declaration."""
+def _mark(
+    *,
+    effect: Callable[[Any], _Effect] | None = None,
+    phase: Callable[[Any], Phase] | None = None,
+    **markers: object,
+) -> Callable[[F], F]:
+    """Attach authoring markers; reflection consumes them once during declaration, building the effect and phase
+    from the bound workload."""
+    if effect is not None:
+        markers["effect"] = effect
+    if phase is not None:
+        markers["phase"] = phase
 
     def decorate(function: F) -> F:
         # A second marker of one kind would silently replace the first, e.g. @export over @train never trains.
@@ -1494,35 +1496,26 @@ class _TrainInForward(_Effect):
     kind: ClassVar[str] = "train_in_forward"
 
     state: str
-    targets: tuple[Projection, ...] | Attr
+    targets: tuple[Projection, ...]
     weight: str
-    operator: AdapterOperator | Attr
-    factors: tuple[str, str] | Attr
-    scale: float | Attr
-    tokens: Tokens | Attr
-    visibility: VisibilityKind | Attr
-    chunk: int | Attr | None
+    operator: AdapterOperator
+    factors: tuple[str, str]
+    scale: float
+    tokens: Tokens
+    visibility: VisibilityKind
+    chunk: int | None
     flush: Literal["prompt_end"] | None
 
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
 
-    def __post_init__(self) -> None:
-        if self.flush not in (None, "prompt_end"):
-            raise ValueError("@pllm.train_in_forward(flush=...) takes 'prompt_end' or None")
-
     def accumulates(self, operation: _Operation, field: str) -> bool:
         return (self.chunk is not None and field == self.weight) or operation.reads_field(self.state, field)
 
-    def projection_delta(self, owner: Workload, layers: int) -> ProjectionDelta:
+    def projection_delta(self, layers: int) -> ProjectionDelta:
         """The configured projection delta, with all-layer targets resolved against the model."""
         return ProjectionDelta(
-            self.state,
-            _targets(_setting(self.targets, owner, tuple)),
-            self.weight,
-            _OPERATORS[_option(self.operator, owner, get_args(AdapterOperator), "operator")],
-            _setting(self.factors, owner, tuple),
-            _setting(self.scale, owner, float),
+            self.state, self.targets, self.weight, _OPERATORS[self.operator], self.factors, self.scale
         ).expand(layers)
 
     def bindings(
@@ -1557,7 +1550,7 @@ class _TrainInForward(_Effect):
                 invariants[name] = (source.state, views)
                 bindings[key] = name
             elif isinstance(source, Operand):
-                bindings[key] = _option(source.name, context.owner, get_args(OperandName), "operand")
+                bindings[key] = source.name
             else:
                 bindings[key] = source.in_forward_binding(self.state, fields)
         invariant_names = tuple(
@@ -1567,12 +1560,8 @@ class _TrainInForward(_Effect):
         )
         return bindings, invariants, invariant_names
 
-    def description(self, owner: Workload) -> MemberDeclaration:
-        return MemberDeclaration(
-            self.kind,
-            tokens=_option(self.tokens, owner, get_args(Tokens), "tokens"),
-            visibility=_option(self.visibility, owner, ("forward_pinned", "exact"), "visibility"),
-        )
+    def description(self) -> MemberDeclaration:
+        return MemberDeclaration(self.kind, tokens=self.tokens, visibility=self.visibility)
 
     def declare(self, operation: _Operation) -> None:
         """Declare the request state's in-forward transition and the delta it applies at the target projections."""
@@ -1600,7 +1589,7 @@ class _TrainInForward(_Effect):
             key: replace(value, dtype=context.field_dtype(self.state, key, value.dtype).torch)
             for key, value in _fields(definition).items()
         }
-        effect = self.projection_delta(context.owner, context.binding.dimensions.layer_count)
+        effect = self.projection_delta(context.binding.dimensions.layer_count)
         bindings, invariants, invariant_names = self.bindings(operation, fields, effect.targets, optimizer)
         if set(fields) & set(get_args(OperandName)):
             raise ValueError(
@@ -1631,7 +1620,7 @@ class _TrainInForward(_Effect):
                 bindings,
                 fields,
                 effect,
-                _setting(self.chunk, context.owner, int),
+                self.chunk,
                 optimizer,
                 self.flush,
                 invariant_names,
@@ -1644,11 +1633,11 @@ class _TrainInForward(_Effect):
             fields,
             initialize=initialize,
             keys=definition.request_keys,
-            phases=_TOKEN_PHASES[_option(self.tokens, context.owner, get_args(Tokens), "tokens")],
+            phases=_TOKEN_PHASES[self.tokens],
             identity=operation.identity,
             function=function,
             arguments=bindings,
-            visibility=_option(self.visibility, context.owner, ("forward_pinned", "exact"), "visibility"),
+            visibility=self.visibility,
             equations_digest=boundary_digest(context.signature, context.bindings, self.chunk, self.flush),
             invariants=invariants,
             reads=tuple(
@@ -1697,31 +1686,31 @@ def _site_inputs(
         source = _typed(parameter.default, _Source)
         if source is None:
             raise TypeError(f"{name}: give every input after the site tensors a source as its default")
-        inputs.append((name, source.qualify(context).site_input(context)))
+        inputs.append((name, source.bind(context).site_input(context)))
     return tuple(inputs)
 
 
 @dataclass(frozen=True, kw_only=True)
 class _CustomAttention(_Effect):
     kind: ClassVar[str] = "custom_attention"
-    layers: tuple[int, ...] | Attr | None
+    layers: tuple[int, ...] | None
     keep: Keep
-    window: int | Attr
-    source: int | Attr
-    sink: bool | Attr
+    window: int
+    source: int
+    sink: bool
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
 
-    def layouts(self, context: _Reflection) -> tuple[KVLayout, ...]:
-        """Resolve layer settings and validate storage declarations at the authoring boundary."""
-        layers = (-1,) if self.layers is None else _setting(self.layers, context.owner, tuple)
-        window = _setting(self.window, context.owner, int)
-        source = _setting(self.source, context.owner, int)
-        sink = _setting(self.sink, context.owner, bool)
+    def layouts(self) -> tuple[KVLayout, ...]:
+        """Validate storage declarations at the authoring boundary."""
+        layers, window, source, sink = (
+            (-1,) if self.layers is None else self.layers,
+            self.window,
+            self.source,
+            self.sink,
+        )
         if self.keep not in ("all", "window", "none"):
             raise ValueError('custom_attention keep must be "all", "window" or "none"')
-        if type(window) is not int or type(source) is not int or type(sink) is not bool:
-            raise ValueError("custom_attention needs integer window/source and boolean sink")
         if self.keep == "window":
             if window < 1 or source:
                 raise ValueError('keep="window" needs window > 0 and source=0')
@@ -1743,7 +1732,7 @@ class _CustomAttention(_Effect):
                 "@pllm.custom_attention runs every model row; remove rows=, on and differentiate, and use make_llm"
             )
         count = binding.dimensions.layer_count
-        layers = tuple(range(count)) if self.layers is None else _setting(self.layers, context.owner, tuple)
+        layers = tuple(range(count)) if self.layers is None else self.layers
         if (
             not layers
             or any(type(layer) is not int or not 0 <= layer < count for layer in layers)
@@ -1761,25 +1750,25 @@ class _CustomAttention(_Effect):
             if isinstance(source, Attention):
                 value = AttentionFact(source.layer, source.fact)
             else:
-                value = source.qualify(context).site_input(context)
+                value = source.bind(context).site_input(context)
                 if not isinstance(value, (StateInput, DepthInput)):
                     raise TypeError(
                         "@pllm.custom_attention reads instance parameters, modules, depth and earlier attention facts"
                     )
             inputs.append((name, value))
         binding.attention.add(AttentionMethod(operation.name, layers, freeze(operation.function), tuple(inputs)))
-        binding.attention.layouts += expand_layouts(self.layouts(context), count)
+        binding.attention.layouts += expand_layouts(self.layouts(), count)
         binding.model_reads(tuple(source.resource for _, source in inputs if isinstance(source, StateInput)))
         context.signature.append((operation.name, boundary_digest(fingerprint(operation.function), self)))
 
 
 def custom_attention(
     *,
-    layers: tuple[int, ...] | Attr | None = None,
+    layers: tuple[int, ...] | Callable[[Any], tuple[int, ...]] | None = None,
     keep: Keep = "all",
-    window: int | Attr = 0,
-    source: int | Attr = 0,
-    sink: bool | Attr = False,
+    window: int | Callable[[Any], int] = 0,
+    source: int | Callable[[Any], int] = 0,
+    sink: bool | Callable[[Any], bool] = False,
 ) -> Callable[[F], F]:
     """Replace dense FlashAttention reads, retaining native projections and KV writes.
 
@@ -1796,7 +1785,15 @@ def custom_attention(
     The prompt-sink FA2 read uses a gathered FP32 softmax; storage and reclamation
     are owned by vLLM's RSWAManager. Score-based memory eviction is unsupported.
     """
-    return _mark(effect=_CustomAttention(layers=layers, keep=keep, window=window, source=source, sink=sink))
+    return _mark(
+        effect=lambda owner: _CustomAttention(
+            layers=None if layers is None else _setting(layers, owner, tuple),
+            keep=keep,
+            window=_setting(window, owner, int),
+            source=_setting(source, owner, int),
+            sink=_setting(sink, owner, bool),
+        )
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1804,31 +1801,25 @@ class _CustomResidual(_Effect):
     kind: ClassVar[str] = "custom_residual"
 
     site: Site
-    layers: tuple[int, ...] | Attr | None
+    layers: tuple[int, ...] | None
     read: str
-    streams: int | Attr
+    streams: int
     state: str
-    chunk: int | Attr | None
+    chunk: int | None
 
     phase: ClassVar[Phase | None] = Phase.IN_FORWARD
     model_effect: ClassVar[bool] = True
 
-    def __post_init__(self) -> None:
-        if self.site not in _SITE_TENSORS:
-            raise ValueError(
-                f"@pllm.custom_residual(site={self.site!r}): use one of {', '.join(map(repr, _SITE_TENSORS))}"
-            )
-
     def accumulates(self, operation: _Operation, field: str) -> bool:
         return bool(self.state) and self.chunk is not None
 
-    def places(self, owner: Workload, count: int) -> tuple[Place, ...]:
+    def places(self, count: int) -> tuple[Place, ...]:
         """The owned places: the chosen layers' sublayer adds or value rows, or the final stream."""
         if self.site == "final":
             if self.layers is not None:
                 raise ValueError('@pllm.custom_residual(site="final") rewrites the one final stream; remove layers=')
             return (("final", count),)
-        layers = tuple(range(count)) if self.layers is None else _setting(self.layers, owner, tuple)
+        layers = tuple(range(count)) if self.layers is None else self.layers
         if (
             not layers
             or tuple(sorted(set(layers))) != layers
@@ -1848,8 +1839,7 @@ class _CustomResidual(_Effect):
             raise ValueError("@pllm.custom_residual runs inside the forward; remove @pllm.on")
         if context.binding.host:
             raise ValueError("@pllm.custom_residual acts inside a model forward; compile this workload with make_llm")
-        owner, count = context.owner, context.binding.dimensions.layer_count
-        places = self.places(owner, count)
+        places = self.places(context.binding.dimensions.layer_count)
         memory = None if not self.state else self.memory(operation, places)
         reader = context.method(self.read) if self.read else None
         rewrite = ResidualRewrite(
@@ -1860,7 +1850,7 @@ class _CustomResidual(_Effect):
             _site_inputs(operation.function, _SITE_TENSORS[self.site], context, operation.name),
             None if reader is None else freeze(reader),
             () if reader is None else _site_inputs(reader, 1, context, self.read),
-            _setting(self.streams, owner, int),
+            self.streams,
             memory,
         )
         if rewrite.streams < 1 or (self.read and self.site in ("value", "final")):
@@ -1907,7 +1897,7 @@ class _CustomResidual(_Effect):
                 f"@pllm.custom_residual(state={self.state!r}) needs one attention or MLP site of one layer, chunk=, "
                 "and a pllm.RequestState with one field, its carry, and no optimizer"
             )
-        chunk = _setting(self.chunk, context.owner, int)
+        chunk = self.chunk
         if chunk < 1:
             raise ValueError("@pllm.custom_residual(chunk=) must be positive")
         ((name, shape),) = definition.fields.items()
@@ -1949,11 +1939,11 @@ class _CustomResidual(_Effect):
 def custom_residual(
     *,
     site: Site,
-    layers: tuple[int, ...] | Attr | None = None,
+    layers: tuple[int, ...] | Callable[[Any], tuple[int, ...]] | None = None,
     read: str = "",
-    streams: int | Attr = 1,
+    streams: int | Callable[[Any], int] = 1,
     state: str = "",
-    chunk: int | Attr | None = None,
+    chunk: int | Callable[[Any], int] | None = None,
 ) -> Callable[[F], F]:
     """Own the residual update at `site` of `layers` (default: every layer) with this method.
 
@@ -1971,20 +1961,31 @@ def custom_residual(
     where every row reads the carry its chunk started with and a chunk's update applies once its last row has run.
     Each row's stream should depend only on that row and the carry.
     """
-    return _mark(effect=_CustomResidual(site=site, layers=layers, read=read, streams=streams, state=state, chunk=chunk))
+    if site not in _SITE_TENSORS:
+        raise ValueError(f"@pllm.custom_residual(site={site!r}): use one of {', '.join(map(repr, _SITE_TENSORS))}")
+    return _mark(
+        effect=lambda owner: _CustomResidual(
+            site=site,
+            layers=None if layers is None else _setting(layers, owner, tuple),
+            read=read,
+            streams=_setting(streams, owner, int),
+            state=state,
+            chunk=None if chunk is None else _setting(chunk, owner, int),
+        )
+    )
 
 
 def train_in_forward(
     *,
     state: str,
-    targets: tuple[Projection, ...] | Attr,
+    targets: tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]],
     weight: str = "value",
-    operator: AdapterOperator | Attr = "dense",
-    factors: tuple[str, str] | Attr = ("a", "b"),
-    scale: float | Attr = 1.0,
-    tokens: Tokens | Attr = "prefill",
-    visibility: Literal["forward_pinned", "exact"] | Attr = "forward_pinned",
-    chunk: int | Attr | None = None,
+    operator: AdapterOperator | Callable[[Any], AdapterOperator] = "dense",
+    factors: tuple[str, str] | Callable[[Any], tuple[str, str]] = ("a", "b"),
+    scale: float | Callable[[Any], float] = 1.0,
+    tokens: Tokens | Callable[[Any], Tokens] = "prefill",
+    visibility: VisibilityKind | Callable[[Any], VisibilityKind] = "forward_pinned",
+    chunk: int | Callable[[Any], int] | None = None,
     flush: Literal["prompt_end"] | None = None,
 ) -> Callable[[F], F]:
     """Train a request state inside the forward and add its residual at each target projection.
@@ -2001,34 +2002,36 @@ def train_in_forward(
     ``optimizer=pllm.SGD(lr)``, return one loss per row instead; gradients accumulate until a chunk completes,
     including a short final chunk with ``flush="prompt_end"``.
     """
+    if flush not in (None, "prompt_end"):
+        raise ValueError("@pllm.train_in_forward(flush=...) takes 'prompt_end' or None")
     return _mark(
-        effect=_TrainInForward(
+        effect=lambda owner: _TrainInForward(
             state=state,
-            targets=targets,
+            targets=_targets(_setting(targets, owner, tuple)),
             weight=weight,
-            operator=operator,
-            factors=factors,
-            scale=scale,
-            tokens=tokens,
-            visibility=visibility,
-            chunk=chunk,
+            operator=_option(operator, owner, get_args(AdapterOperator), "operator"),
+            factors=_setting(factors, owner, tuple),
+            scale=_setting(scale, owner, float),
+            tokens=_option(tokens, owner, get_args(Tokens), "tokens"),
+            visibility=_option(visibility, owner, get_args(VisibilityKind), "visibility"),
+            chunk=None if chunk is None else _setting(chunk, owner, int),
             flush=flush,
         )
     )
 
 
-def on(phase: Phase | Attr) -> Callable[[F], F]:
+def on(phase: Phase | Callable[[Any], Phase]) -> Callable[[F], F]:
     """Run the method in `phase`; needed for methods without an effect or to move an effect's phase."""
-    return _mark(phase=phase)
+    return _mark(phase=lambda owner: _setting(phase, owner, Phase))
 
 
 def export(
     *,
-    name: str | Attr = "value",
-    every: int | Attr = 1,
-    max_rows: int | Attr = 1,
-    max_cols: int | Attr = 16,
-    enabled: bool | Attr = True,
+    name: str | Callable[[Any], str] = "value",
+    every: int | Callable[[Any], int] = 1,
+    max_rows: int | Callable[[Any], int] = 1,
+    max_cols: int | Callable[[Any], int] = 16,
+    enabled: bool | Callable[[Any], bool] = True,
     overflow: Literal["drop", "block"] = "drop",
 ) -> Callable[[F], F]:
     """Deliver bounded observations of executed forward rows to on_export.
@@ -2040,7 +2043,16 @@ def export(
     """
     if overflow not in ("drop", "block"):
         raise ValueError("export overflow must be 'drop' or 'block'")
-    return _mark(effect=_Export(name, every, max_rows, max_cols, enabled, overflow))
+    return _mark(
+        effect=lambda owner: _Export(
+            _setting(name, owner, str),
+            _setting(every, owner, int),
+            _setting(max_rows, owner, int),
+            _setting(max_cols, owner, int),
+            _setting(enabled, owner, bool),
+            overflow,
+        )
+    )
 
 
 def add_logits(*, rows: str = "") -> Callable[[F], F]:
@@ -2048,16 +2060,18 @@ def add_logits(*, rows: str = "") -> Callable[[F], F]:
 
     `rows` (here and on the other effects) names a method returning a boolean mask: only those rows run.
     """
-    return _mark(effect=_Sampler(SamplerStage.PACKED_PRE_FILTER_ADD), rows=rows)
+    return _mark(effect=lambda owner: _Sampler(SamplerStage.PACKED_PRE_FILTER_ADD), rows=rows)
 
 
-def guide_sampling(*, beta: float | Attr, rows: str = "") -> Callable[[F], F]:
+def guide_sampling(*, beta: float | Callable[[Any], float], rows: str = "") -> Callable[[F], F]:
     """Push sampling away from the returned hidden-state prediction for positive `beta`.
 
     On finite top-k/top-p survivors, use `(1 + beta) * logits - beta * pred_logits`, where the model's LM head
     projects the returned hidden states to `pred_logits`.
     """
-    return _mark(effect=_Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, beta), rows=rows)
+    return _mark(
+        effect=lambda owner: _Sampler(SamplerStage.PACKED_POST_FILTER_EXACT, _setting(beta, owner, float)), rows=rows
+    )
 
 
 def train(
@@ -2065,7 +2079,7 @@ def train(
     state: str,
     update_rows: str = "",
     reduction: TrainReduction = "mean",
-    steps: int | Attr = 1,
+    steps: int | Callable[[Any], int] = 1,
     reset: str = "",
     rows: str = "",
 ) -> Callable[[F], F]:
@@ -2097,21 +2111,26 @@ def train(
     if reduction not in ("mean", "sum"):
         raise ValueError(f"@pllm.train(reduction={reduction!r}): use 'mean' or 'sum'")
     return _mark(
-        effect=_Train(state=state, update_rows=update_rows, reduction=reduction, steps=steps, reset=reset), rows=rows
+        effect=lambda owner: _Train(
+            state=state, update_rows=update_rows, reduction=reduction, steps=_setting(steps, owner, int), reset=reset
+        ),
+        rows=rows,
     )
 
 
-def _option(value: L | Attr, owner: Workload, options: tuple[L, ...], name: str) -> L:
-    """Resolve a closed string option, possibly a pllm.Attr, and check it is one of `options`."""
-    resolved = Attr.resolve(value, owner)
+def _option(value: L | Callable[[Any], L], owner: object, options: tuple[L, ...], name: str) -> L:
+    """Read a closed string option, calling it on the workload when it is a function, and check it is one of
+    `options`."""
+    resolved = value(owner) if callable(value) else value
     for option in options:
         if resolved == option:
             return option
     raise ValueError(f"{name}={resolved!r}: use one of {', '.join(map(repr, options))}")
 
 
-def _setting(value: C | Attr, config: Workload, expected: type[C]) -> C:
-    resolved = Attr.resolve(value, config)
+def _setting(value: C | Callable[[Any], C], owner: object, expected: type[C]) -> C:
+    """Read a decorator or marker setting, calling it on the workload when it is a function, and check its type."""
+    resolved = value(owner) if callable(value) else value
     if expected is float and type(resolved) is int:
         resolved = float(resolved)
     if (typed := _typed(resolved, expected)) is None or type(resolved) is not expected:
@@ -2134,7 +2153,7 @@ def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[
     packs each request's contiguous scheduled tokens into [M, H] hidden tensors;
     position and generated flags have shape [M, 1]. Spans cannot load predecessors.
     Inputs after layers use pllm.parameter / pllm.module to read InstanceState, shared
-    by every token, or pllm.Attr for a static constant.
+    by every token; the method body reads plain settings from self.
     """
     if tokens not in ("prefill", "decode", "all"):
         raise ValueError('set @pllm.custom_forward(tokens=) to "prefill", "decode" or "all"')
@@ -2466,7 +2485,7 @@ class _Reflection:
         samplers = tuple(
             sampler
             for operation in self.operations
-            if (sampler := _typed(operation.effect, _Sampler)) is not None and sampler.enabled(operation.context.owner)
+            if (sampler := _typed(operation.effect, _Sampler)) is not None and sampler.enabled
         )
         return next(
             (sampler for sampler in samplers if sampler.stage is SamplerStage.PACKED_POST_FILTER_EXACT),
@@ -2493,7 +2512,8 @@ class _Reflection:
         context, candidates = cls(owner, prefix=prefix), _candidates(owner, values, members)
         seeds: list[FunctionType] = []
         for name, member in members.items():
-            context.read_operation(name, member, candidates, seeds)
+            with context.declaring(name):
+                context.read_operation(name, member, candidates, seeds)
             if (getter := _property(member)) is not None:
                 seeds.append(getter)
         for value in values.values():
@@ -2584,7 +2604,7 @@ class _Reflection:
         self, function: Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | UpdateOutput | None]
     ) -> dict[str, _Source]:
         """Resolve local marker names against this method's component."""
-        return {key: source.qualify(self) for key, source in _arguments(function).items()}
+        return {key: source.bind(self) for key, source in _arguments(function).items()}
 
     def namespace(self) -> None:
         """Qualify emitted names while retaining each method's bound owner and local configuration."""
@@ -2651,8 +2671,8 @@ class _Reflection:
             seeds.append(function)
             return
         phase, marked, gradient, rows = (
-            _typed(Attr.resolve(markers.get("__pllm_phase__"), self.owner), Phase),
-            _typed(markers.get("__pllm_effect__"), _Effect),
+            None if (on := markers.get("__pllm_phase__")) is None else _typed(on(self.owner), Phase),
+            None if (build := markers.get("__pllm_effect__")) is None else _typed(build(self.owner), _Effect),
             _typed(markers.get("__pllm_gradient__"), _Gradient),
             _typed(markers.get("__pllm_rows__", ""), str),
         )
@@ -2845,19 +2865,16 @@ class _Reflection:
             self.binding.conditional_input(tuple(feed.resource for feed in self.binding.feeds), publications[0])
 
     def forward_inputs(self, name: str) -> tuple[Callable[..., torch.Tensor], tuple[tuple[str, StateInput], ...]]:
-        """Bind each forward's instance fields and resolve static attribute defaults."""
+        """Bind each forward's instance fields."""
         function = self.method(name)
         inputs: list[tuple[str, StateInput]] = []
         for key, parameter in tuple(signature(function).parameters.items())[1:]:
             source = parameter.default
-            if isinstance(source, Attr):
-                function = partial(function, **{key: Attr.resolve(source, self.component(name).owner)})
-                continue
             if not isinstance(source, Parameter):
                 raise TypeError(
-                    f"{name}.{key}: use pllm.parameter or pllm.module after layers, or pllm.Attr for a constant"
+                    f"{name}.{key}: use pllm.parameter or pllm.module after layers; read plain settings from self"
                 )
-            binding = source.qualify(self.component(name)).site_input(self)
+            binding = source.bind(self.component(name)).site_input(self)
             if binding.request or source.per_row:
                 raise ValueError(
                     f"{name}.{key}: custom forwards read shared InstanceState; use InstanceState and remove per_row=True"
@@ -3094,7 +3111,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         context.declare_values()
         ordered = sorted(context.operations, key=lambda operation: not isinstance(operation.effect, _CustomAttention))
         for operation in ordered:
-            description = operation.effect.description(operation.context.owner)
+            description = operation.effect.description()
             if operation.phase_override:
                 description = replace(description, phase=operation.phase.name.lower())
             with operation.context.declaring(operation.name), b.member(operation.name, description):
@@ -3159,25 +3176,21 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     def backend_requirements(self) -> BackendRequirements:
         """Read model dependencies from markers before dimensions or tensor readers exist."""
         context = _Reflection.read(self)
-        sources: dict[str, tuple[tuple[_Source, Workload], ...]] = {}
+        sources: dict[str, tuple[_Source, ...]] = {}
         targets = tuple(target for value in context.adapters.values() for target in value.targets)
         for operation in context.operations:
             effect = operation.effect
             if isinstance(effect, _TrainInForward):
-                targets += _targets(_setting(effect.targets, operation.context.owner, tuple))
+                targets += effect.targets
                 continue
             # Custom residual methods read state and earlier values of the forward, never tapped rows.
             if isinstance(effect, (_CustomResidual, _CustomAttention)) or (
-                isinstance(effect, _Sampler) and not effect.enabled(operation.context.owner)
+                isinstance(effect, _Sampler) and not effect.enabled
             ):
                 continue
             with operation.context.declaring(operation.name):
-                sources.update(
-                    (name, tuple((source, operation.context.owner) for source in arguments.values()))
-                    for name, arguments in operation.sources().items()
-                )
-        owned_inputs = tuple(source for name in sorted(sources) for source in sources[name])
-        inputs = tuple(source for source, _ in owned_inputs)
+                sources.update((name, tuple(arguments.values())) for name, arguments in operation.sources().items())
+        inputs = tuple(source for name in sorted(sources) for source in sources[name])
         return BackendRequirements(
             input_token_history=max(
                 (source.history for source in inputs if isinstance(source, InputTokens)), default=-1
@@ -3189,16 +3202,14 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 dict.fromkeys(
                     phase
                     for op in context.operations
-                    if isinstance(op.effect, _TrainInForward)
-                    and _option(op.effect.visibility, op.context.owner, ("exact", "forward_pinned"), "visibility")
-                    == "exact"
-                    for phase in _TOKEN_PHASES[_option(op.effect.tokens, op.context.owner, get_args(Tokens), "tokens")]
+                    if isinstance(op.effect, _TrainInForward) and op.effect.visibility == "exact"
+                    for phase in _TOKEN_PHASES[op.effect.tokens]
                 )
             ),
             hidden_inputs=tuple(
                 dict.fromkeys(
                     (
-                        *(source.resolve(owner) for source, owner in owned_inputs if isinstance(source, Hidden)),
+                        *(source.resolve() for source in inputs if isinstance(source, Hidden)),
                         *(
                             HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, phase)
                             for source in inputs
@@ -3209,25 +3220,16 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 )
             ),
             layer_logits=tuple(
-                layer
-                for source, owner in owned_inputs
-                if isinstance(source, LayerLogits)
-                for layer in source.layer_tuple(owner)
+                layer for source in inputs if isinstance(source, LayerLogits) for layer in source.layers
             ),
             parameter_targets=targets,
             activation_layers=tuple(layer for value in context.activations.values() for layer in value.layers),
             sampler_stages=tuple(
-                op.effect.stage
-                for op in context.operations
-                if isinstance(op.effect, _Sampler) and op.effect.enabled(op.context.owner)
+                op.effect.stage for op in context.operations if isinstance(op.effect, _Sampler) and op.effect.enabled
             ),
             sampler_feedback=any(isinstance(source, (BaseLogits, SampledTokens)) for source in inputs),
             sample_limit=min(
-                (
-                    _setting(source.limit, owner, int)
-                    for source, owner in owned_inputs
-                    if isinstance(source, SampleIndex) and source.limit is not None
-                ),
+                (source.limit for source in inputs if isinstance(source, SampleIndex) and source.limit is not None),
                 default=None,
             ),
             position_states=context.position_states(),
@@ -3235,7 +3237,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
                 layout
                 for operation in context.operations
                 if isinstance(operation.effect, _CustomAttention)
-                for layout in operation.effect.layouts(operation.context)
+                for layout in operation.effect.layouts()
             ),
             custom_forward=bool(context.custom_forwards),
             custom_attention=any(isinstance(operation.effect, _CustomAttention) for operation in context.operations)
@@ -3355,7 +3357,6 @@ __all__ = [
     "add_logits",
     "guide_sampling",
     "train",
-    "Attr",
     "hidden",
     "residual",
     "layer_logits",

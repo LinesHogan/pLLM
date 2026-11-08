@@ -1,7 +1,7 @@
 """pllm: write a workload, then run it inside vLLM.
 
 Membership rule: the top level holds the vocabulary for writing a workload (Workload, every decorator and input
-marker, state types and pllm.Field, optimizers, Phase, Attr, UpdateOutput, pllm.scan) and the entry point
+marker, state types and pllm.Field, optimizers, Phase, UpdateOutput, pllm.scan) and the entry point
 make_llm and explain with ModelConfig and ExecutionOptions. Domain objects live in sub-namespaces: pllm.model (a place in,
 or a change to, the base model's computation), pllm.host (host loops between generate calls), pllm.io (data
 crossing pllm's boundary outside generate's arguments) and pllm.testing (checking and stepping workloads in tests).
@@ -22,7 +22,6 @@ from pllm.execution.scan import scan as scan
 from pllm.explanation import explain as explain
 from pllm.usage import (
     SGD as SGD,
-    Attr as Attr,
     Field as Field,
     InstanceState as InstanceState,
     Phase as Phase,
@@ -123,7 +122,6 @@ __all__ = [
     "train",
     "differentiate",
     "train_in_forward",
-    "Attr",
     "hidden",
     "residual",
     "layer_logits",

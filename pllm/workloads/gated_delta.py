@@ -47,14 +47,26 @@ class GatedDeltaWorkload(pllm.Workload):
             },
         )
 
+    def targets(self) -> tuple[pllm.model.Projection, ...]:
+        return self.config.targets
+
+    def chunk_size(self) -> int:
+        return self.config.chunk_size
+
+    def tokens(self) -> Literal["prefill", "decode", "all"]:
+        return self.config.tokens
+
+    def visibility(self) -> Literal["forward_pinned", "exact"]:
+        return self.config.visibility
+
     @pllm.train_in_forward(
-        visibility=pllm.Attr("config.visibility"),
+        visibility=visibility,
         state="fast_weights",
-        targets=pllm.Attr("config.targets"),
+        targets=targets,
         weight="weights",
-        chunk=pllm.Attr("config.chunk_size"),
+        chunk=chunk_size,
         operator="per_head",
-        tokens=pllm.Attr("config.tokens"),
+        tokens=tokens,
     )
     def step(
         self,

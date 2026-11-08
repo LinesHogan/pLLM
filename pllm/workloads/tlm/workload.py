@@ -52,7 +52,6 @@ class TLMWorkload(pllm.Workload):
         if self.rank < 1 or self.alpha < 1:
             raise ValueError("TLM requires positive rank and alpha")
 
-    @property
     def phase(self) -> pllm.Phase:
         return pllm.Phase.BEFORE_FORWARD if self.config.mode is TLMMode.OFFLINE else pllm.Phase.AFTER_SAMPLE
 
@@ -86,7 +85,7 @@ class TLMWorkload(pllm.Workload):
             else:
                 value.zero_()
 
-    @pllm.on(pllm.Attr("phase"))
+    @pllm.on(phase)
     @pllm.train(state="factors")
     def update(
         self,

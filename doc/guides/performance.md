@@ -85,7 +85,10 @@ class Distill(pllm.Workload):
     ) -> torch.Tensor:
         return (f(shallow.float()) - deep.float()).square().mean(-1)
 
-    @pllm.guide_sampling(beta=pllm.Attr("beta"))
+    def strength(self) -> float:
+        return self.beta
+
+    @pllm.guide_sampling(beta=strength)
     def predict(
         self,
         shallow: torch.Tensor = pllm.hidden(0),

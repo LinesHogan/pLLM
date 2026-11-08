@@ -370,12 +370,12 @@ class LoopedDepth(pllm.Workload):
         return pllm.InstanceState({"w": lambda m: (m.hidden_size,), "b": (1,)}, dtype=torch.float32)
 
     @pllm.custom_forward(tokens="decode")
-    def forward(self, layers, w=pllm.parameter("gate", "w"), b=pllm.parameter("gate", "b"), steps=pllm.Attr("steps")):
+    def forward(self, layers, w=pllm.parameter("gate", "w"), b=pllm.parameter("gate", "b")):
         hidden = layers(stop=1)[0]
         hidden = layers(hidden=hidden, active=layers.generated & (layers.position % 2 == 0))[-1]
-        for step in range(steps):
+        for step in range(self.steps):
             active = torch.sigmoid(hidden.float() @ w + b)[:, None] <= 0.6
-            hidden = layers(hidden=hidden, active=active, kv="peek" if step == steps - 1 else "commit")[-1]
+            hidden = layers(hidden=hidden, active=active, kv="peek" if step == self.steps - 1 else "commit")[-1]
         return hidden
 
 

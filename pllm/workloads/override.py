@@ -39,7 +39,6 @@ def head_logits(hidden: torch.Tensor, down: torch.Tensor, up: torch.Tensor, indi
 
 
 HIDDEN = pllm.final_hidden()
-SAMPLES = pllm.sample_index(pllm.Attr("config.num_iterations"))
 DOWN = pllm.parameter("iteration_heads", "down")
 UP = pllm.parameter("iteration_heads", "up")
 
@@ -65,11 +64,14 @@ class OverRIDEWorkload(pllm.Workload):
             initialize=initialize,
         )
 
+    def num_iterations(self) -> int:
+        return self.config.num_iterations
+
     @pllm.add_logits()
     def reweight(
         self,
         hidden: torch.Tensor = HIDDEN,
-        samples: torch.Tensor = SAMPLES,
+        samples: torch.Tensor = pllm.sample_index(num_iterations),
         down: torch.Tensor = DOWN,
         up: torch.Tensor = UP,
     ) -> torch.Tensor:
@@ -79,14 +81,14 @@ class OverRIDEWorkload(pllm.Workload):
             (samples > 0).unsqueeze(1) * self.config.lambd
         )
 
-    def eligible(self, samples: torch.Tensor = SAMPLES) -> torch.Tensor:
+    def eligible(self, samples: torch.Tensor = pllm.sample_index(num_iterations)) -> torch.Tensor:
         return (samples < self.config.num_iterations - 1) & self.config.enabled
 
     @pllm.train(state="iteration_heads", rows="eligible")
     def train(
         self,
         hidden: torch.Tensor = HIDDEN,
-        samples: torch.Tensor = SAMPLES,
+        samples: torch.Tensor = pllm.sample_index(num_iterations),
         down: torch.Tensor = DOWN,
         up: torch.Tensor = UP,
         base: torch.Tensor = pllm.base_logits(),

@@ -92,11 +92,10 @@ class OutputLoRAWorkload(pllm.Workload):
             self.config.alpha / self.config.rank
         )
 
-    @pllm.train(
-        state="output_factors",
-        steps=pllm.Attr("config.steps"),
-        reset="reset",
-    )
+    def steps(self) -> int:
+        return self.config.steps
+
+    @pllm.train(state="output_factors", steps=steps, reset="reset")
     def train(
         self,
         hidden: torch.Tensor = pllm.batch("hidden"),

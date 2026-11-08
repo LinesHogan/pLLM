@@ -47,7 +47,7 @@ class Updating(pllm.Workload):
         return pllm.RequestState({"delta": pllm.Field((4, 4)), "tail": pllm.Field((), dtype=torch.int64)})
 
     @pllm.train_in_forward(
-        state="weights", targets=(TARGET,), weight="delta", tokens="all", visibility=pllm.Attr("visibility")
+        state="weights", targets=(TARGET,), weight="delta", tokens="all", visibility=lambda self: self.visibility
     )
     def transition(
         self,

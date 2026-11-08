@@ -73,7 +73,7 @@ class FastWeightMemory(pllm.Workload):
     def memory(self) -> pllm.RequestState:
         return pllm.RequestState({"M": lambda m: (m.hidden_size, m.hidden_size)}, dtype=torch.float64)
 
-    @pllm.custom_residual(site="mlp", layers=(1,), state="memory", chunk=pllm.Attr("chunk"))
+    @pllm.custom_residual(site="mlp", layers=(1,), state="memory", chunk=lambda self: self.chunk)
     def remember(self, x, y, M=pllm.parameter("memory", "M")):
         k = torch.nn.functional.normalize(x, dim=-1)
         read = k @ M.T

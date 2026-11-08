@@ -43,12 +43,15 @@ class PrefillAdaptersWorkload(pllm.Workload):
             optimizer=pllm.SGD(self.learning_rate),
         )
 
+    def chunk(self) -> int:
+        return self.chunk_size
+
     @pllm.train_in_forward(
         state="adapters",
         targets=TARGETS,
         operator="low_rank",
         visibility="exact",
-        chunk=pllm.Attr("chunk_size"),
+        chunk=chunk,
         flush="prompt_end",
     )
     def learn(

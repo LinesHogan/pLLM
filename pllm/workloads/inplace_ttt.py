@@ -111,19 +111,28 @@ class InPlaceTTTWorkload(pllm.Workload):
             key_fields=("request_id", "prompt_index", "sample_index"),
         )
 
+    def targets(self) -> tuple[Projection, ...]:
+        return self.config.targets
+
+    def chunk_size(self) -> int:
+        return self.config.chunk_size
+
+    def target_source(self) -> Literal["embedding", "target"]:
+        return self.config.target_source
+
     @pllm.train_in_forward(
         visibility="exact",
         state="dense_fast_weights",
-        targets=pllm.Attr("config.targets"),
+        targets=targets,
         weight="delta",
-        chunk=pllm.Attr("config.chunk_size"),
+        chunk=chunk_size,
         tokens="all",
     )
     def step(
         self,
         delta: torch.Tensor = pllm.parameter("dense_fast_weights", "delta"),
         inputs: torch.Tensor = pllm.operand("input"),
-        targets: torch.Tensor = pllm.operand(pllm.Attr("config.target_source")),
+        targets: torch.Tensor = pllm.operand(target_source),
         base: torch.Tensor = pllm.operand("weight"),
         conv: torch.Tensor = pllm.parameter("target_parameters", "conv"),
         proj: torch.Tensor = pllm.parameter("target_parameters", "proj"),

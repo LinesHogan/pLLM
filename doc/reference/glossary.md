@@ -32,8 +32,8 @@
 - **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入
   `pllm.model.CausalModel`；`model(...)` 应用命名 Adapter，`model.base(...)` 只用冻结基座；
   `model.token_logprobs(ids, labels)` 按块跑 LM head，直接给出每个标签的对数概率，不物化整批 logits。
-- **属性引用（pllm.Attr）** —— `pllm.Attr("phase")` 在绑定时读取负载属性；
-  `@pllm.on(...)` 可据此决定阶段，如 TLM 的在线/离线训练时机。
+- **设置函数（setting function）** —— 装饰器或标记的参数可以是负载的函数而不是值，绑定时调用一次：
+  通常是上方定义的方法，如 `@pllm.on(phase)` 配 `def phase(self) -> pllm.Phase`，TLM 据此决定在线/离线训练时机。
 - **训练步结果（TrainStep）** —— `pllm.host.HostTrainer.train(batch)` 的返回值：`loss`
   与 `parameters`（更新后的状态字段，按名字）。训练方法返回的 `UpdateOutput.metrics` 保存
   算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数。

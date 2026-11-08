@@ -48,7 +48,10 @@ class MiniESamp(pllm.Workload):
              f: Distiller = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow) - deep).square().mean(-1)
 
-    @pllm.guide_sampling(beta=pllm.Attr("beta"), rows="trained")
+    def strength(self) -> float:
+        return self.beta
+
+    @pllm.guide_sampling(beta=strength, rows="trained")
     def predict(self, shallow: torch.Tensor = pllm.hidden(0), f: Distiller = pllm.module("distiller")) -> torch.Tensor:
         return f(shallow)
 

@@ -179,7 +179,7 @@ loss 方法只收到选中行，空前向集不调用。有界导出有各自的
 ## 采样引导、logits 与导出
 
 本节约束负载与采样器/导出的接口，以及冷绑定器的签名与传输规则。前半部分
-（`@guide_sampling`、`@add_logits`、`@export`、`Attr`）是写负载时用的声明面；
+（`@guide_sampling`、`@add_logits`、`@export`、设置函数）是写负载时用的声明面；
 后半部分（函数替换、指纹、冻结、EngineCore 按引用传输）决定「改数学」的代价：
 改动函数体或受检依赖会重新签名，多进程 worker 重建时签名必须与驱动端逐字节
 相等。排查签名不匹配、函数替换不生效、worker 重建失败时回到本节末尾。
@@ -190,8 +190,8 @@ ESamp 用它做版本感知引导和普通的 Tensor loss/初始化；其五字�
 
 `@add_logits` 在过滤前把结果加到 logits 上，不需要 `@train`；与 `@train` 同在时，
 训练方法可读真实采样反馈（`pllm.base_logits`、`pllm.sampled_tokens`）。
-`@export` 拥有有界、按步长门控的 CPU 输出；`Attr("config.layer")` 等属性路径
-在装载时绑定不可变配置。普通负载不需要 `build`、输入字典、`prepare/output`、
+`@export` 拥有有界、按步长门控的 CPU 输出；`pllm.hidden(layer)` 配 `def layer(self) -> int` 这样的设置函数
+在绑定时读取不可变配置。普通负载不需要 `build`、输入字典、`prepare/output`、
 字段 ID、digest 或显式发布节点。
 
 局部函数替换就是 `dataclasses.replace(workload, transform=fn)`；见
@@ -266,7 +266,7 @@ chunk 开始时的携带量；chunk 的最后一行运行后才应用更新，�
 
 布局：`keep="window", window=N` 只保留最近 N 个 token 的 KV（vLLM 的滑动窗口规格释放旧块）；再加 `sink=True` 保留整个
 prompt 加窗口（vLLM 的 R-SWA）；`keep="none", source=k` 这一层不分配 KV，读下面第 k 层的（源只能是更早的层；更深层为源要用
-`@pllm.custom_forward` 的 `kv="peek"`）。`window=` / `sink=` 只接受字面值，不接受 `pllm.Attr`。布局限制所有读取，包括 `topk`。
+`@pllm.custom_forward` 的 `kv="peek"`）。布局限制所有读取，包括 `topk`。
 `pllm.explain` 的 `KV layer` 行给出每层每个请求的分配上限。按分数释放显存的驱逐不支持。
 
 要求：`tensor_parallel_size=1`、FlashAttention 2 后端、未量化 KV、没有 ALiBi/softcap/sink 的普通 RoPE attention、关闭前缀缓存；
@@ -448,7 +448,7 @@ reset 与多步训练。这条路径把「外部数据喂入 + 实例/请求共�
 
 [Output LoRA](../../pllm/workloads/lora.py) 声明具名字段状态（`SGD(lr)` 与
 初始化器）、一个普通的 `@add_logits` 预测，以及一个读取 `WeightedCEBatch` 字段的
-`AFTER_SAMPLE` 方法（`@train(state=..., reset="reset", steps=Attr(...))`）。reset 方法接收具名局部参数张量和
+`AFTER_SAMPLE` 方法（`@train(state=..., reset="reset", steps=steps)`，`steps` 是读配置的方法）。reset 方法接收具名局部参数张量和
 一个生成器。reset 按训练批次进行，区别于准入初始化；两个函数都被冻结并与普通
 数学一起签名。SGD 保留原始状态字段，没有 Adam 槽。
 
@@ -564,8 +564,8 @@ Adapter 的 logits，梯度流向其因子；`model.base(ids, attention_mask=mas
 冻结基座的 logits。`model.token_logprobs(ids, labels, attention_mask=mask)` 直接返回每个标签的
 对数概率 `[序列数, token 数 - 1]`：它分块计算 LM head，不在显存里物化整批 `[序列数, token 数, 词表]` 的 logits。
 负载不持有或传输活模型。
-`@pllm.on(pllm.Attr("phase"))` 在绑定时读取负载的 `phase` 属性并解析为 `Phase`；
-也可用 `Attr("config.phase")` 读取嵌套配置。TLM 的 ONLINE 选择
+`@pllm.on(phase)` 在绑定时调用负载上方定义的 `def phase(self) -> pllm.Phase` 一次，
+它可以读取嵌套配置。TLM 的 ONLINE 选择
 `AFTER_SAMPLE`，用适配后的 logits 选句；OFFLINE 选择 `BEFORE_FORWARD`，用
 `torch.no_grad()` 下的基座 logits 选句，再训练选中的句子。
 

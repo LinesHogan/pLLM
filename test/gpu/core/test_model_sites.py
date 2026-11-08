@@ -230,7 +230,7 @@ def test_dola_greedy_tokens_follow_fp32_oracle():
         prompt_ids, generated = tokenizer(prompt).input_ids, list(output.outputs[0].token_ids)
         # Every sampled token is contrasted: the one after the prompt and each decode token.
         rows = list(range(len(prompt_ids) - 1, len(prompt_ids) + len(generated) - 1))
-        scores = _dola_scores(_layer_logits(prompt_ids + generated, workload.lens, rows), workload.plausibility)
+        scores = _dola_scores(_layer_logits(prompt_ids + generated, workload.lens(), rows), workload.plausibility)
         chosen = scores[torch.arange(len(rows)), torch.tensor(generated, device=scores.device)]
         exact += int((scores.argmax(-1) == torch.tensor(generated, device=scores.device)).sum())
         worst = max(worst, (scores.max(-1).values - chosen).max().item())

@@ -21,12 +21,11 @@ class DoLaWorkload(pllm.Workload):
     layers: tuple[int, ...] = (0, 2, 4, 6, 8, 10, 12, 14)
     plausibility: float = 0.1
 
-    @property
     def lens(self) -> tuple[int, ...]:
         return (*self.layers, -1)
 
     @pllm.add_logits()
-    def contrast(self, logits: torch.Tensor = pllm.layer_logits(pllm.Attr("lens"))) -> torch.Tensor:
+    def contrast(self, logits: torch.Tensor = pllm.layer_logits(lens)) -> torch.Tensor:
         final = logits[:, -1].log_softmax(-1)  # [rows, vocab]
         early = logits[:, :-1].log_softmax(-1)  # [rows, candidates, vocab]
         mixture = (0.5 * (final.exp().unsqueeze(1) + early.exp())).log()

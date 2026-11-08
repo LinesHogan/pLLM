@@ -186,7 +186,7 @@ class WindowAttention(pllm.Workload):
     layers: tuple[int, ...] = (0, 1)
     window: int = 4
 
-    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="window", window=pllm.Attr("window"))
+    @pllm.custom_attention(layers=lambda self: self.layers, keep="window", window=lambda self: self.window)
     def read(self, q, kv):
         return kv.attend(q)[0]
 
@@ -197,7 +197,7 @@ class SinkAttention(pllm.Workload):
 
     sink: bool = True
 
-    @pllm.custom_attention(layers=(2, 3), keep="window", window=4, sink=pllm.Attr("sink"))
+    @pllm.custom_attention(layers=(2, 3), keep="window", window=4, sink=lambda self: self.sink)
     def read(self, q, kv):
         return kv.attend(q)[0]
 
@@ -209,7 +209,7 @@ class SharedAttention(pllm.Workload):
     layers: tuple[int, ...] = (1, 3, 5, 7, 9)
     source: int = 1
 
-    @pllm.custom_attention(layers=pllm.Attr("layers"), keep="none", source=pllm.Attr("source"))
+    @pllm.custom_attention(layers=lambda self: self.layers, keep="none", source=lambda self: self.source)
     def read(self, q, kv):
         return kv.attend(q)[0]
 

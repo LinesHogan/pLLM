@@ -105,7 +105,7 @@ class ValueResidual(pllm.Workload):
     def later(self) -> tuple[int, ...]:
         return tuple(range(1, 24))
 
-    @pllm.custom_residual(site="value", layers=pllm.Attr("later"))
+    @pllm.custom_residual(site="value", layers=lambda self: self.later)
     def mix(
         self,
         v: torch.Tensor,
@@ -150,7 +150,7 @@ class StaticHyperConnections(pllm.Workload):
     ) -> torch.Tensor:
         return torch.einsum("n,rnd->rd", read[s], x.float()).to(x.dtype)
 
-    @pllm.custom_residual(site="both", read="choose", streams=pllm.Attr("n"))
+    @pllm.custom_residual(site="both", read="choose", streams=lambda self: self.n)
     def update(
         self,
         x: torch.Tensor,
@@ -188,7 +188,7 @@ class FastWeightMemory(pllm.Workload):
     def layers_(self) -> tuple[int, ...]:
         return (self.layer,)
 
-    @pllm.custom_residual(site="mlp", layers=pllm.Attr("layers_"), state="memory", chunk=pllm.Attr("chunk"))
+    @pllm.custom_residual(site="mlp", layers=lambda self: self.layers_, state="memory", chunk=lambda self: self.chunk)
     def remember(
         self, x: torch.Tensor, y: torch.Tensor, M: torch.Tensor = pllm.parameter("memory", "M")
     ) -> tuple[torch.Tensor, torch.Tensor]:

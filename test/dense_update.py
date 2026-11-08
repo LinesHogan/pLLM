@@ -46,12 +46,12 @@ class DenseUpdate(pllm.Workload):
         )
 
     @pllm.train_in_forward(
-        visibility=pllm.Attr("config.visibility"),
+        visibility=lambda self: self.config.visibility,
         state="dense_fast_weights",
-        targets=pllm.Attr("config.targets"),
+        targets=lambda self: self.config.targets,
         weight="delta",
-        chunk=pllm.Attr("config.chunk_size"),
-        tokens=pllm.Attr("config.tokens"),
+        chunk=lambda self: self.config.chunk_size,
+        tokens=lambda self: self.config.tokens,
     )
     def step(
         self,

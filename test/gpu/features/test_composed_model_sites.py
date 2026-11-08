@@ -91,9 +91,9 @@ class LoopedTTT(pllm.Workload):
     @pllm.train_in_forward(
         visibility="exact",
         state="fast_weights",
-        targets=pllm.Attr("targets"),
+        targets=lambda self: self.targets,
         weight="delta",
-        chunk=pllm.Attr("chunk"),
+        chunk=lambda self: self.chunk,
         tokens="all",
     )
     def step(
