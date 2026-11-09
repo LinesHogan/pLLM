@@ -175,6 +175,7 @@ def uniform_decode(prefill: bool, counts: tuple[int, ...]) -> bool:
     return not prefill and all(count == 1 for count in counts)
 
 
+# Pinned readers by the address of their index table; see pinned_projection.
 _READERS: dict[int, "ProjectionReader"] = {}
 
 
@@ -188,7 +189,13 @@ def pinned_projection(
     captured: torch.Tensor,
     desired_capture: torch.Tensor,
 ) -> None:
-    """Execute the same prepared tensor callable eagerly or during upstream capture."""
+    """Execute the same prepared tensor callable eagerly or during upstream capture.
+
+    A custom op takes only tensors and scalars, and vLLM's compiled (and AOT-cached) model graph bakes scalars in,
+    so the reader travels as `table`: a runtime graph input whose address finds the reader without specializing
+    the graph on one, as model_site does for sessions. A pinned reader registers in ProjectionReader.__init__ and
+    leaves in close(); it owns the table meanwhile, so the address cannot be reused while registered.
+    """
     _READERS[table.data_ptr()].emit(hidden, desired, pools, table, output, captured, desired_capture)
 
 

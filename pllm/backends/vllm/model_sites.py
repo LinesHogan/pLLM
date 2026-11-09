@@ -43,6 +43,7 @@ from pllm.execution.state_execution import DataT, StateTaskContext
 
 Forward = Callable[..., Tensor | tuple[Tensor, ...]] | Callable[[Tensor], LinearOutput]
 
+# Graph-mode sessions by the address of their row-to-request table; see model_site.
 _SITES: dict[int, "ModelSites"] = {}
 
 
@@ -50,7 +51,14 @@ _SITES: dict[int, "ModelSites"] = {}
 def model_site(
     inputs: list[Tensor], outputs: list[Tensor], reads: list[Tensor], writes: list[Tensor], hook: int
 ) -> None:
-    """Run a bound hook inside vLLM's capture, with stable state and same-forward scratch ports."""
+    """Run a bound hook inside vLLM's capture, with stable state and same-forward scratch ports.
+
+    A custom op takes only tensors and scalars, and vLLM's compiled (and AOT-cached) model graph bakes scalars in,
+    so the session travels as `reads[0]`, its row table: a runtime graph input whose address finds the session
+    without specializing the graph on one. vLLM routes its own opaque ops through a name registry the same way
+    (forward_context.no_compile_layers). A session registers in ModelSites.__init__ and leaves in close(); it
+    owns the table meanwhile, so the address cannot be reused while registered.
+    """
     _SITES[reads[0].data_ptr()].hooks[hook].emit(inputs, outputs)
 
 
