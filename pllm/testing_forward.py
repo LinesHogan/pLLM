@@ -86,12 +86,12 @@ class CheckAttention:
         self, binding: "TensorDeclaration", facts: "BackendCompileFacts", *, device_equivalence: bool = False
     ) -> None:
         from pllm.execution.model_sites import StateInput
-        from pllm.execution.task_memory import site_state
+        from pllm.execution.task_memory import seeded_site_state
 
         self.program, self.probe = binding.attention, facts.probe
         self.cache: dict[tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.parameters = {
-            source: site_state(binding, source, None, facts.initialization_seed)
+            source: seeded_site_state(binding, source, None, facts.initialization_seed)
             for method in self.program.methods.values()
             for _, source in method.inputs
             if isinstance(source, StateInput)

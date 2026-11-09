@@ -465,7 +465,7 @@ class MemoryOperation(Protocol[MemoryDataT]):
 
 
 def native_body(
-    function: Callable[[D, TensorBatch], TaskOutput], data: D, batch: TensorBatch, context: StateTaskContext[D] | None
+    function: Callable[[D, TensorBatch], TaskOutput], data: D, batch: TensorBatch, context: StateTaskContext[D]
 ) -> TaskOutput:
     """Adapt native mathematical functions to the operation's single body interface."""
     return function(data, batch)
@@ -480,7 +480,9 @@ class TensorOperation(Generic[D]):
     """Run one mathematical body and write its declared effects."""
 
     implementation_id: ImplementationId
-    body: Callable[[D, TensorBatch, StateTaskContext[D] | None], TaskOutput]
+    body: Callable[[D, TensorBatch, StateTaskContext[D]], TaskOutput]
+    # The same body for planning: run on meta or example inputs without page writes, so memory is traceable.
+    trace_body: Callable[[D, TensorBatch], TaskOutput]
     mode: Literal["read", "transition", "update", "gradient"] = "read"
     select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None
     optimizer: PageUpdate | None = None
@@ -509,7 +511,7 @@ class TensorOperation(Generic[D]):
         batch = self.scoped(batch)
 
         def run() -> TaskOutput:
-            output = self.body(data, batch, None)
+            output = self.trace_body(data, batch)
             if self.optimizer is not None and output.gradients:
                 self.apply_gradients(batch.roots, batch.field_slots, batch.roots, output)
             return output

@@ -245,7 +245,7 @@ def attention_example(
     trace: TraceRead,
 ) -> tuple[torch.Tensor, PagedKV, dict[str, Argument]]:
     """Build meta operands from declared input types; instance fields never gain or lose a row axis."""
-    from pllm.execution.task_memory import site_state
+    from pllm.execution.task_memory import meta_site_state
 
     probe = facts.probe
     q = torch.empty((rows, probe.attention_heads, probe.head_dim), dtype=probe.tensor_dtype.torch, device="meta")
@@ -267,7 +267,7 @@ def attention_example(
         integer if layout.sink else None,
     )
     arguments = {
-        name: site_state(binding, source, None, None)
+        name: meta_site_state(binding, source, None)
         if isinstance(source, StateInput)
         else layer
         if isinstance(source, DepthInput)

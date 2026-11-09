@@ -337,7 +337,7 @@ class TensorExecutor:
                 ports={name: replace(port, adapt=_tensor_argument) for name, port in task.ports.items()},
             )
         executor = replace(self, task=task, compiled=None, resource_pools={}, layouts={}, views={})
-        measure(partial(executor, data, batch))
+        measure(partial(executor.trace, data, batch))
 
     def execute_body(self, data: TensorFrame, batch: TensorBatch) -> None:
         """Evaluate the tensor task body with its staged inputs and result buffers."""
@@ -408,11 +408,45 @@ class TensorExecutor:
             last = last[: self.state_count]
         return trained, updates, last
 
-    def __call__(
-        self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
-    ) -> TaskOutput:
+    def __call__(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then write invocation outputs."""
-        parent, frame = batch, data
+        scoped = self._scope(data, batch)
+        if scoped is None:
+            return TaskOutput()
+        rows, selected, source_rows = scoped
+        if self.reuse_results:
+            return self._reuse(rows, selected, source_rows)
+        if self.capture is not None:
+            self.capture.order(selected.stream)
+        addresses = self._stage(rows, selected, context) if self.rowwise else ()
+        if self.capture is None:
+            self.execute_body(rows, selected)
+        else:
+            self._replay(rows, selected, addresses)
+        return self._output(data, batch, rows, selected, source_rows)
+
+    def trace(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        """Run the body eagerly over a meta row table and without page writes, so planning can trace its
+        memory, cost and result shapes."""
+        scoped = self._scope(data, batch)
+        if scoped is None:
+            return TaskOutput()
+        rows, selected, source_rows = scoped
+        if self.reuse_results:
+            return self._reuse(rows, selected, source_rows)
+        if self.rowwise:
+            self._inputs(rows, selected)
+            plan = row_plan(rows, selected)
+            self.updated = () if self.optimizer is None else tuple(plan.updated.tolist())
+            self.table = torch.empty(self.table_size, device="meta", dtype=torch.long)
+            self._split()
+        self.execute_body(rows, selected)
+        return self._output(data, batch, rows, selected, source_rows)
+
+    def _scope(self, data: TensorFrame, batch: TensorBatch) -> tuple[TensorFrame, TensorBatch, int] | None:
+        """The rows and states this task reads, and the row count before an export narrows them; None when it
+        has no rows this step."""
+        parent = batch
         if not self.task.resource:
             batch = batch.state_free()
         elif any(group.resource == self.task.resource for group in batch.selection.groups):
@@ -427,45 +461,45 @@ class TensorExecutor:
         if rows != data.rows or batch.selection is not parent.selection:
             data = replace(data, rows=rows, plan=None)
         if not data.rows and self.task.phase is not None:
-            return TaskOutput()
+            return None
         source_rows = len(data.rows)
         prepared = data if self.task.export is None else self.task.export.prepare(data)
-        if prepared is None:
-            return TaskOutput()
-        data = prepared
-        if self.rowwise and not data.rows:
-            return TaskOutput()
-        if self.reuse_results:
-            self.task.evaluate(data, batch)
-            self.results = tuple(batch.results[self.task.symbol, name] for name in self.task.outputs)
-            return self.write_outputs(data, batch, source_rows)
-        addresses: tuple[int, ...] = ()
-        if self.capture is not None and context is not None:
-            self.capture.order(batch.stream)
-        if self.rowwise:
-            addresses = self._inputs(data, batch)
-            plan = row_plan(data, batch)
-            self.updated = () if self.optimizer is None else tuple(plan.updated.tolist())
-            if context is not None and self.optimizer is not None:
-                slots = context.owned_write_slots(batch.selection.refs.take(self.updated), copy_fields=())
-                plan = replace(plan, writes=(self.updated, slots))
-            if context is None:
-                self.table = torch.empty(self.table_size, device="meta", dtype=torch.long)
-                self._split()
-            else:
-                self._prepare(plan, data, batch)
-        if self.capture is None or context is None:
-            self.execute_body(data, batch)
-        else:
-            assert self.table is not None
-            table = self.table
-            self.capture.run(
-                lambda: self.execute_body(data, batch),
-                self.table,
-                self.views[self.task.resource][2],
-                addresses,
-                lambda: self.staging.copy_to(table),
-            )
+        if prepared is None or self.rowwise and not prepared.rows:
+            return None
+        return prepared, batch, source_rows
+
+    def _reuse(self, data: TensorFrame, batch: TensorBatch, source_rows: int) -> TaskOutput:
+        """Evaluate a sampler that reuses its producers' results directly, without a row table."""
+        self.task.evaluate(data, batch)
+        self.results = tuple(batch.results[self.task.symbol, name] for name in self.task.outputs)
+        return self.write_outputs(data, batch, source_rows)
+
+    def _stage(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> tuple[int, ...]:
+        """Stage the row table, with the private pages a training body writes; returns the hidden tap addresses."""
+        addresses = self._inputs(data, batch)
+        plan = row_plan(data, batch)
+        self.updated = () if self.optimizer is None else tuple(plan.updated.tolist())
+        if self.optimizer is not None:
+            slots = context.owned_write_slots(batch.selection.refs.take(self.updated), copy_fields=())
+            plan = replace(plan, writes=(self.updated, slots))
+        self._prepare(plan, data, batch)
+        return addresses
+
+    def _replay(self, data: TensorFrame, batch: TensorBatch, addresses: tuple[int, ...]) -> None:
+        assert self.capture is not None and self.table is not None
+        table = self.table
+        self.capture.run(
+            lambda: self.execute_body(data, batch),
+            table,
+            self.views[self.task.resource][2],
+            addresses,
+            lambda: self.staging.copy_to(table),
+        )
+
+    def _output(
+        self, frame: TensorFrame, parent: TensorBatch, data: TensorFrame, batch: TensorBatch, source_rows: int
+    ) -> TaskOutput:
+        """Write the body's outputs, with changed states numbered in the caller's selection."""
         output = self.write_outputs(data, batch, source_rows)
         frame.parameter_gradient_fields = data.parameter_gradient_fields
         if batch.selection is not parent.selection:
@@ -615,41 +649,55 @@ class FieldWriteExecutor:
         for value, target, destinations in zip(self.buffers, self.targets, self.table, strict=True):
             copy_pages(value, target, self.rows, destinations)
 
-    def __call__(
-        self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame] | None = None
-    ) -> TaskOutput:
+    def __call__(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> TaskOutput:
         """Stage the selected states' values and destinations, then store them in one body or graph replay."""
         writer = self.writer
         selected = writer.select(data, batch.selection)
         if not selected:
             return TaskOutput()
-        values = writer.values(data, batch, selected, validate=context is None)
-        if self.capture is not None and context is not None:
+        values = writer.values(data, batch, selected, validate=False)
+        if self.capture is not None:
             self.capture.order(batch.stream)
-        parent = batch
-        if any(group.resource == writer.resource for group in batch.selection.groups):
-            batch = batch.for_resource(writer.resource)
-        updated = tuple(batch.selection.refs.positions(parent.selection.refs.take(selected)).tolist())
-        states = len(batch.roots) if self.capture is None else self.capture.states
-        if not self.buffers or len(self.buffers[0]) != states:
-            self.buffers = tuple(value.new_zeros((states, *value.shape[1:])) for value in values)
-            self.table = values[0].new_full((len(writer.fields), states), -1, dtype=torch.long)
-            self.rows = torch.arange(states, device=values[0].device)
-        for buffer, value in zip(self.buffers, values, strict=True):
-            buffer[: len(value)].copy_(value.detach())
-        self.targets = tuple(view.read(batch.field_slots(view.field)[0], pooled=True) for view in writer.fields)
+        batch, updated = self._stage(batch, selected, values)
         table = self.table
         assert table is not None
-        if context is not None:
-            slots = context.owned_write_slots(batch.selection.refs.take(updated), copy_fields=None)
-            with self.staging.fill(table) as destinations:
-                destinations.fill(-1)
-                destinations[:, : len(updated)] = slots[:, [view.field for view in writer.fields]].T
-        if self.capture is None or context is None:
+        slots = context.owned_write_slots(batch.selection.refs.take(updated), copy_fields=None)
+        with self.staging.fill(table) as destinations:
+            destinations.fill(-1)
+            destinations[:, : len(updated)] = slots[:, [view.field for view in writer.fields]].T
+        if self.capture is None:
             self._store()
         else:
             self.capture.run(self._store, table, table, (), lambda: self.staging.copy_to(table), self.buffers)
         return TaskOutput(changed=selected, update_count=len(selected))
+
+    def trace(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        """Validate and store the values eagerly into no destination, so planning can trace the write."""
+        selected = self.writer.select(data, batch.selection)
+        if not selected:
+            return TaskOutput()
+        self._stage(batch, selected, self.writer.values(data, batch, selected, validate=True))
+        self._store()
+        return TaskOutput(changed=selected, update_count=len(selected))
+
+    def _stage(
+        self, batch: TensorBatch, selected: tuple[int, ...], values: tuple[torch.Tensor, ...]
+    ) -> tuple[TensorBatch, tuple[int, ...]]:
+        """Copy the values into the persistent buffers and bind the written pools; returns the written resource's
+        batch and the selected states' positions in it."""
+        parent = batch
+        if any(group.resource == self.writer.resource for group in batch.selection.groups):
+            batch = batch.for_resource(self.writer.resource)
+        updated = tuple(batch.selection.refs.positions(parent.selection.refs.take(selected)).tolist())
+        states = len(batch.roots) if self.capture is None else self.capture.states
+        if not self.buffers or len(self.buffers[0]) != states:
+            self.buffers = tuple(value.new_zeros((states, *value.shape[1:])) for value in values)
+            self.table = values[0].new_full((len(self.writer.fields), states), -1, dtype=torch.long)
+            self.rows = torch.arange(states, device=values[0].device)
+        for buffer, value in zip(self.buffers, values, strict=True):
+            buffer[: len(value)].copy_(value.detach())
+        self.targets = tuple(view.read(batch.field_slots(view.field)[0], pooled=True) for view in self.writer.fields)
+        return batch, updated
 
 
 def retain_rows(value: torch.Tensor, count: int, *, copy: bool) -> torch.Tensor:

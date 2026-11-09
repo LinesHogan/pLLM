@@ -178,8 +178,8 @@ class CustomForwardTask(Generic[DataT]):
         self.run(context)
         return {}
 
-    def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT] | None) -> TaskOutput:
-        assert context is not None and isinstance(data, TensorFrame) and self.overlay_math is not None
+    def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT]) -> TaskOutput:
+        assert isinstance(data, TensorFrame) and self.overlay_math is not None
         primitive, operation = self.primitive, self.operation
         assert primitive is not None and operation is not None
         primitive.overlay = ProgramOverlay(self.overlay_math, batch, operation.batch(context, "input"), data)

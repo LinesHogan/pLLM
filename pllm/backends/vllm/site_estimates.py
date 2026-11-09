@@ -17,7 +17,7 @@ from pllm.backends.vllm.model_sites import ModelSites, SublayerBoundary, ValuePr
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.model_sites import PatchInput, Place, ResidualRewrite, StateInput, position
 from pllm.execution.site_memory import SiteMemorySchedule
-from pllm.execution.task_memory import site_state
+from pllm.execution.task_memory import meta_site_state
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.torch_private import KernelCountMode
 
@@ -72,7 +72,7 @@ class _SiteExample(ModelSites):
         )
         self.state_values = {}
         for source in self.state_inputs:
-            value = site_state(binding, replace(source, module=None), self.count if source.request else None, None)
+            value = meta_site_state(binding, replace(source, module=None), self.count if source.request else None)
             assert isinstance(value, Tensor)
             self.state_values[source] = value
         self._result_sources = tuple(dict.fromkeys(source for rewrite in rewrites for source in rewrite.results))

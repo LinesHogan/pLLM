@@ -497,30 +497,64 @@ def _identity(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def site_state(
-    binding: TensorDeclaration, source: StateInput, rows: int | None, seed: int | None
-) -> torch.Tensor | ModuleCall:
+def meta_site_state(binding: TensorDeclaration, source: StateInput, rows: int | None) -> torch.Tensor | ModuleCall:
+    """A site's state input on meta storage, for planning traces."""
     layout = next(item.layout for item in binding.layouts.layouts if item.resource == source.resource)
-    root = tuple(
-        torch.zeros(field.shape, dtype=field.dtype.torch, device="meta" if seed is None else "cpu")
-        for field in layout.fields
-    )
-    if seed is not None:
-        binding.initializer(str(source.resource), torch.device("cpu"), seed)((root,), (None,))
+    return _site_value(source, tuple(meta(*field.shape, dtype=field.dtype.torch) for field in layout.fields), rows)
+
+
+def seeded_site_state(
+    binding: TensorDeclaration, source: StateInput, rows: int | None, seed: int
+) -> torch.Tensor | ModuleCall:
+    """A site's state input initialized on CPU from `seed`, for numerical checks."""
+    layout = next(item.layout for item in binding.layouts.layouts if item.resource == source.resource)
+    root = tuple(torch.zeros(field.shape, dtype=field.dtype.torch) for field in layout.fields)
+    binding.initializer(str(source.resource), torch.device("cpu"), seed)((root,), (None,))
+    return _site_value(source, root, rows)
+
+
+def _site_value(source: StateInput, root: tuple[torch.Tensor, ...], rows: int | None) -> torch.Tensor | ModuleCall:
     value = source.view.read(root[source.view.field])
     if source.request and rows is not None:
         value = value.unsqueeze(0).expand(rows, *value.shape)
     return value if source.module is None else ModuleCall(source.module, value, source.request)
 
 
-def site_arguments(
+def meta_site_arguments(binding: TensorDeclaration, facts: BackendCompileFacts) -> dict[str, dict[str, SiteArgument]]:
+    """Residual method examples on meta storage, for cost estimates."""
+    rows = facts.max_admitted_lineages
+    return _site_arguments(
+        binding,
+        facts,
+        partial(meta_site_state, binding),
+        lambda source: meta(rows, *source.shape, dtype=source.dtype),
+        torch.device("meta"),
+    )
+
+
+def seeded_site_arguments(
     binding: TensorDeclaration,
     facts: BackendCompileFacts,
-    *,
-    seed: int | None = None,
-    results: Mapping[tuple[TaskSymbol, str], torch.Tensor] | None = None,
+    seed: int,
+    results: Mapping[tuple[TaskSymbol, str], torch.Tensor],
 ) -> dict[str, dict[str, SiteArgument]]:
-    """Build residual method examples from declared views, on meta or seeded CPU storage."""
+    """Residual method examples with seeded CPU states and the step's task results, for numerical checks."""
+    return _site_arguments(
+        binding,
+        facts,
+        partial(seeded_site_state, binding, seed=seed),
+        lambda source: results[source.task, "value"],
+        torch.device("cpu"),
+    )
+
+
+def _site_arguments(
+    binding: TensorDeclaration,
+    facts: BackendCompileFacts,
+    state: Callable[[StateInput, int | None], torch.Tensor | ModuleCall],
+    result: Callable[[ResultInput], torch.Tensor],
+    device: torch.device,
+) -> dict[str, dict[str, SiteArgument]]:
     arguments: dict[str, dict[str, SiteArgument]] = {}
     for rewrite in binding.sites.rewrites:
         for name, sources in ((rewrite.name, rewrite.inputs), (rewrite.name + ".read", rewrite.read_inputs)):
@@ -532,18 +566,14 @@ def site_arguments(
                         if rewrite.memory is not None and source == rewrite.memory.carry
                         else facts.max_admitted_lineages
                     )
-                    kwargs[key] = site_state(binding, source, rows, seed)
+                    kwargs[key] = state(source, rows)
                 elif isinstance(source, ResultInput):
-                    if seed is None:
-                        kwargs[key] = meta(facts.max_admitted_lineages, *source.shape, dtype=source.dtype)
-                    else:
-                        assert results is not None
-                        kwargs[key] = results[source.task, "value"]
+                    kwargs[key] = result(source)
                 elif isinstance(source, EarlierInput):
                     kwargs[key] = torch.zeros(
                         (facts.max_admitted_lineages, facts.probe.hidden_size),
                         dtype=facts.probe.tensor_dtype.torch,
-                        device="meta" if seed is None else "cpu",
+                        device=device,
                     )
                 elif isinstance(source, PatchInput):
                     kwargs[key] = _identity

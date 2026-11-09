@@ -20,7 +20,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.freeze import fingerprint
-from pllm.execution.task_memory import example, producers_first, site_arguments, task_example
+from pllm.execution.task_memory import example, meta_site_arguments, producers_first, task_example
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TensorBatch, TensorOperation
@@ -79,7 +79,7 @@ def _estimate_ops(
     binding: TensorDeclaration, facts: BackendCompileFacts, calls: OpCalls
 ) -> tuple[tuple[OpCost, ...], dict[str, int]]:
     """Add model-site math that task tracing leaves to the native model driver."""
-    kwargs = site_arguments(binding, facts)
+    kwargs = meta_site_arguments(binding, facts)
     for rewrite in binding.sites.rewrites:
         rows = facts.max_admitted_lineages if rewrite.memory is None else rewrite.memory.chunk
         x = torch.empty((rows, facts.probe.hidden_size), dtype=facts.probe.tensor_dtype.torch, device="meta")

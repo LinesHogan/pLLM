@@ -489,7 +489,10 @@ class TensorDeclaration:
             operations[symbol] = build() if scans is None else scans.bind(build)()
         if scans is None:
             return operations
-        return {symbol: replace(operation, body=scans.bind(operation.body)) for symbol, operation in operations.items()}
+        return {
+            symbol: replace(operation, body=scans.bind(operation.body), trace_body=scans.bind(operation.trace_body))
+            for symbol, operation in operations.items()
+        }
 
     def _operation(
         self, symbol: TaskSymbol, capture: bool, limits: Mapping[TaskSymbol, TaskResourceFact]
@@ -499,8 +502,9 @@ class TensorDeclaration:
         if math is None or math.chunk is None or symbol != math.task:
             return operation
         overlay = OverlayBatch(math, limits.get(symbol) if capture else None)
+        batched = replace(math, executor=overlay)
         return replace(
-            operation, body=partial(native_body, replace(math, executor=overlay)), capture_resident=overlay.resident
+            operation, body=partial(native_body, batched), trace_body=batched, capture_resident=overlay.resident
         )
 
     def _tensor_operation(
@@ -544,6 +548,7 @@ class TensorDeclaration:
         return TensorOperation(
             declaration.implementations[0].implementation_id,
             executor,
+            executor.trace,
             operation_mode(
                 state,
                 transition=any(
@@ -821,6 +826,7 @@ class TensorDeclaration:
             self.operations[task.symbol] = operation_type(
                 implementations[0].implementation_id,
                 partial(native_body, function),
+                function,
                 operation_mode(
                     changes,
                     transition=effect in (StateEffectKind.TRANSITION, StateEffectKind.TRANSITION_MAYBE),

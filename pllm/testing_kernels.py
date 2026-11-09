@@ -14,7 +14,7 @@ from pllm.contracts.semantic_graph import TaskSymbol
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.model_sites import DepthInput
 from pllm.execution.module_graph import ModuleCall
-from pllm.execution.task_memory import SiteArgument, site_arguments
+from pllm.execution.task_memory import SiteArgument, seeded_site_arguments
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorMath
 from pllm.execution.tensor_task import TensorTask
@@ -103,7 +103,7 @@ def check_sites(
     results: Mapping[tuple[TaskSymbol, str], torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     """Run stateless residual math at each declared place on the check script's token rows."""
-    kwargs = site_arguments(binding, facts, seed=seed, results=results)
+    kwargs = seeded_site_arguments(binding, facts, seed, results)
     outputs: dict[str, torch.Tensor] = {}
     for rewrite in binding.sites.rewrites:
         if rewrite.memory is not None:
