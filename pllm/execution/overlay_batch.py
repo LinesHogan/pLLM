@@ -382,13 +382,18 @@ class DecodeOverlay:
         for name, value in self.math.invariant_values(self.target, batch).items():
             self.invariants[name].copy_(value)
 
+    def page(self, index: int, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """A request's issued page of one field: the field's pool and a one-element slot index."""
+        field = self.math.buffers.index(name)
+        return self.pools[field], self.table[field, index : index + 1]
+
+    def read(self, index: int, name: str) -> torch.Tensor:
+        pool, slot = self.page(index, name)
+        return pool.index_select(0, slot)[0]
+
     def values(self, index: int) -> dict[str, torch.Tensor]:
         """Gather one request without combining its source GEMMs with other requests."""
-        slots = self.table[:-1, index]
-        return {
-            name: pool.index_select(0, slots[i : i + 1])[0]
-            for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True))
-        }
+        return {name: self.read(index, name) for name in self.math.buffers}
 
     def arguments(
         self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
@@ -518,45 +523,27 @@ class DecodeOverlay:
         chunk = self.math.chunk
         assert isinstance(chunk, ChunkUpdate) and self.read_full is not None
         carry, *columns = chunk.arguments
-        slots, count = self.table[:-1, index], self.table[-1, index]
-        fields = {name: i for i, name in enumerate(self.math.buffers)}
-        carry_field, length_field = fields[self.math.arguments[carry]], fields["_pending_length"]
-        state = self.pools[carry_field].index_select(0, slots[carry_field : carry_field + 1])[0]
-        length = (
-            self.pools[length_field]
-            .index_select(0, slots[length_field : length_field + 1])[0]
-            .masked_fill(count == 0, 0)
+        count = self.table[-1, index]
+        idle = count == 0
+        state = self.read(index, self.math.arguments[carry])
+        length = self.read(index, "_pending_length").masked_fill(idle, 0)
+        # The tails stay in place: only the arriving rows and the invariants are bound.
+        bound = self.arguments(
+            {}, hidden[index : index + 1], desired[index : index + 1], embedding[index : index + 1], base
         )
-        inputs = {
-            **self.invariants,
-            "input": hidden[index : index + 1],
-            "target": desired[index : index + 1],
-            "embedding": embedding[index : index + 1],
-            "weight": base,
-        }
-        rows = tuple(inputs[self.math.arguments[name]] for name in columns)
-        invariants = tuple(inputs[self.math.arguments[name]] for name in chunk.invariants)
+        rows = tuple(bound[name] for name in columns)
+        invariants = tuple(bound[name] for name in chunk.invariants)
         for name, row in zip(columns, rows, strict=True):
-            field = fields[f"_pending_rows_{name}"]
-            destination = (slots[field] * chunk.chunk + length).reshape(1).masked_fill(count == 0, -1)
-            copy_pages(row, self.pools[field].flatten(0, 1), self.source, destination)
+            pool, slot = self.page(index, f"_pending_rows_{name}")
+            copy_pages(row, pool.flatten(0, 1), self.source, (slot * chunk.chunk + length).masked_fill(idle, -1))
         if self.read_row is None:
-            tails = tuple(
-                self.pools[fields[f"_pending_rows_{name}"]].index_select(
-                    0, slots[fields[f"_pending_rows_{name}"]].reshape(1)
-                )[0]
-                for name in columns
-            )
+            tails = tuple(self.read(index, f"_pending_rows_{name}") for name in columns)
             output = self.read_full(state, *tails, *invariants).index_select(0, length.reshape(1))
         else:
             output = self.read_row(state, *rows, *invariants)
         valid = length + count
-        complete, remaining = (valid == chunk.chunk) & (count > 0), valid % chunk.chunk
-        copy_pages(
-            remaining.reshape(1),
-            self.pools[length_field],
-            self.source,
-            slots[length_field : length_field + 1].masked_fill(count == 0, -1),
-        )
+        complete, remaining = (valid == chunk.chunk) & ~idle, valid % chunk.chunk
+        pool, slot = self.page(index, "_pending_length")
+        copy_pages(remaining.reshape(1), pool, self.source, slot.masked_fill(idle, -1))
         updates = complete.to(torch.int64)
         return UpdateOutput(output, complete, updates, updates * chunk.chunk, {"tail_rows": remaining})

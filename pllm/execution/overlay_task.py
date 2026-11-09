@@ -527,7 +527,10 @@ class OverlayTransition:
         weight: torch.Tensor,
         prompt_end: torch.Tensor,
     ) -> Tensors:
-        """Bind state, shared fields and projection operands to the author's parameter names."""
+        """Bind state, shared fields and projection operands to the author's parameter names.
+
+        Arguments whose field is absent from `values` stay unbound; decode reads its tails in place.
+        """
         inputs = {
             **values,
             "input": hidden,
@@ -536,7 +539,7 @@ class OverlayTransition:
             "weight": weight,
             "prompt_end": prompt_end,
         }
-        return {key: inputs[source] for key, source in self.arguments.items()}
+        return {key: inputs[source] for key, source in self.arguments.items() if source in inputs}
 
     def inputs(self, operand: ProjectionOperands, values: Tensors) -> Tensors:
         """Bind one request's projection operands."""
@@ -768,14 +771,5 @@ class ProgramOverlay:
         """Apply ordinary pinned rows once as a batch; trailing operands inside a custom forward are discarded."""
         grouped = join_encounters(self.ordinary, lambda operand: (operand.identity, operand.target))
         self.math(replace(self.data, step=replace(self.data.step, operands=grouped)), self.batch)
-        return TaskOutput(
-            counters=None
-            if not self.data.entries
-            else torch.stack(
-                tuple(
-                    torch.stack((target.update.update_count, target.update.trained_rows))
-                    for entry in self.data.entries
-                    for target in entry.targets
-                )
-            ).sum(0)
-        )
+        updates = tuple(target.update for entry in self.data.entries for target in entry.targets)
+        return TaskOutput(counters=count_updates(updates) if updates else None)
