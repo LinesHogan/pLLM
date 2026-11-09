@@ -166,7 +166,10 @@ class Feed:
     @contextmanager
     def _live(self) -> Generator[None]:
         if self.failed or self.closed or self.moved or self._ended:
-            raise RuntimeError("feed is closed, transferred, ended or fail-stopped; start a new session")
+            raise RuntimeError(
+                "this feed is closed, handed to another process, ended, or stopped after an earlier error; "
+                "start a new session"
+            )
         try:
             yield
         except BaseException:

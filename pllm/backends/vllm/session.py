@@ -242,7 +242,7 @@ class VllmSession(Generic[DataT, ResultT]):
 
     def _require_input_live(self) -> None:
         if self._input_failed:
-            raise RuntimeError("canonical step input is fail-stopped; received grants remain retained")
+            raise RuntimeError("this engine stopped after an earlier error; create a new one with pllm.make_llm")
 
     def _receive_readonly(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> HeldInput | None:
         if self.state_feed is None:
@@ -250,8 +250,7 @@ class VllmSession(Generic[DataT, ResultT]):
         try:
             self._received_readonly = self.state_feed(rows, stream)
             received = self._received_readonly
-            if received.step_id != rows.step_id:
-                raise ValueError("read-only input differs from the requested step; grants retained")
+            assert received.step_id == rows.step_id
             held_input = None
             if isinstance(received, (ReadonlyStepAbsent, ReadonlyStepEnd)):
                 held_input = self.deployment.execution.stage_hold(

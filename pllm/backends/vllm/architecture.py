@@ -319,7 +319,10 @@ def bind_model(model: nn.Module) -> Decoder:
     read_only = admit_architecture(type(model).__name__)
     architectures = _architectures()
     if type(model) not in architectures:
-        raise ValueError("choose a native vLLM model class; workload admission does not accept model subclasses")
+        raise ValueError(
+            f"pllm runs vLLM's own model classes, not subclasses of them; got {type(model).__name__}. "
+            "Load the checkpoint with its stock vLLM architecture"
+        )
     assert isinstance(model, architectures)
     return Decoder(model, model.compute_logits, read_only, tuple(norm.forward for norm in sublayer_norms(model)))
 

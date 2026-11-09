@@ -211,7 +211,7 @@ def bad_ack_producer(feed, probe):
             feed.publish(value=torch.ones(2, device="cuda"))
         assert feed.failed and feed.arena.pending_releases
         assert feed.arena.root(feed.current_ref).ref == feed.current_ref
-        with pytest.raises(RuntimeError, match="fail-stopped"):
+        with pytest.raises(RuntimeError, match="earlier error"):
             feed.publish(value=torch.ones(2, device="cuda"))
         probe.send("failed-with-owner")
     finally:

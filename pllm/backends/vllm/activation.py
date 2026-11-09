@@ -156,7 +156,11 @@ class VllmActivationPatch:
                     for task in context.arena.plan.semantic_graph.tasks
                 )
             ):
-                raise RuntimeError("decode STEP requires a new publication; missing-input handling is not enabled")
+                raise RuntimeError(
+                    f'ActivationPatch(refresh="step") found no new version of {resource!r} at this decode step: the '
+                    "method that writes it before the forward did not publish one. Publish every decode step or use "
+                    'refresh="admission"'
+                )
             # Keep the exact admission or publication version alive through this
             # invocation, including custom-forward graph replays on other streams.
             pin = context.pin_for(StateRefs.of((ref,)))

@@ -316,7 +316,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         is not yielded (the callback already saw its completions) and nothing retries.
         """
         if max_rounds < 1 or not prompts:
-            raise ValueError("feedback generation requires a nonempty prompt list and positive finite round bound")
+            raise ValueError("generate_feedback needs at least one prompt and max_rounds >= 1")
         # Round k samples indices k*n..(k+1)*n-1; fail before any round trains state.
         if self._sample_limit is not None and max_rounds * sampling_params.n > self._sample_limit:
             raise ValueError(

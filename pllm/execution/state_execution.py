@@ -582,7 +582,9 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def _require_borrow_live(self) -> None:
         # Only feed (borrowing) paths set _borrow_failed; test_video covers the fail-stop.
         if self._borrow_failed:
-            raise RuntimeError("borrowed execution is fail-stopped with resources retained")
+            raise RuntimeError(
+                "this engine stopped after a fed state failed to arrive; create a new engine with pllm.make_llm"
+            )
 
     def stage_readonly(self, roots: tuple[BorrowedStateRoot, ...]) -> None:
         """Internal transport handoff; no change to workload authoring signatures."""

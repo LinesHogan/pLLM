@@ -745,7 +745,9 @@ class PageBundleArena:
 
     def _require_live(self) -> None:
         if self._poisoned:
-            raise RuntimeError("PageBundle arena is fail-stopped with resources retained")
+            raise RuntimeError(
+                "this engine's state storage stopped after an earlier error; create a new engine with pllm.make_llm"
+            )
 
     def _require_stream(self, stream: torch.cuda.Stream | None) -> None:
         self._require_live()

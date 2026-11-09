@@ -50,8 +50,7 @@ class BorrowedPage:
 
     @property
     def tensor(self) -> torch.Tensor:
-        if self._tensor is None:
-            raise RuntimeError("remote page borrow is closed")
+        assert self._tensor is not None, "read after discard()"
         return self._tensor
 
     def discard(self) -> None:
@@ -125,7 +124,10 @@ class BorrowedStateRoot:
                 for page, field in zip(pages, layout.fields, strict=True)
             )
         ):
-            raise ValueError("borrowed root requires every field of one exact grant owner and version")
+            raise ValueError(
+                "a fed state must arrive as every field of one state version from one producer of this model's plan; "
+                "restart the producer from this engine's plan"
+            )
         self.stream = pages[0].stream
         self._view: ReadonlyTensorView | None = ReadonlyTensorView(
             BorrowedResource(resource, ()), (ReadonlyTensorCell.bind((), tuple(page.tensor for page in pages)),)

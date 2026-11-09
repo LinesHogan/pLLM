@@ -215,4 +215,7 @@ class RemoteCompletion:
 
     def synchronize(self) -> None:
         if not self.query(30):
-            raise TimeoutError("remote access is still pending; its original owner remains retained")
+            raise TimeoutError(
+                "another process has not finished reading a shared state after 30 s; the state stays allocated until "
+                "it does"
+            )

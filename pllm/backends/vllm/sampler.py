@@ -296,7 +296,7 @@ class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
                 self._active_guidance = _SampledGuidance(feedback)
                 return result
             case _:
-                raise RuntimeError("canonical sampler permits one non-speculative draw per guidance")
+                raise AssertionError("each sampler guidance admits one non-speculative draw")
 
     def sample(
         self,
