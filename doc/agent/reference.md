@@ -2,8 +2,11 @@
 
 Every public name in `pllm`, `pllm.model`, `pllm.host`, `pllm.io`, `pllm.testing` and `pllm.benchmark`, grouped by the task you
 are doing. Each section lists the names with a one-line meaning and a minimal example; the full signatures,
-generated from the code, are at the end ([All signatures](#all-signatures)). The workflow and the rules that
-cause rejections are in [SKILL.md](SKILL.md).
+generated from the code, are at the end ([All signatures](#all-signatures)). The workflow and which declaration
+fits which need are in [SKILL.md](SKILL.md); error messages, traps, preemption and the full shape and dtype
+table in [pitfalls.md](pitfalls.md); invariants, refused combinations, the support matrix and the expensive
+choices in [rules.md](rules.md); the nearest example per task in [examples.md](examples.md). Where a
+hand-written default below differs from the generated signature, the signature is right.
 
 Every Python block in this file runs: blocks fenced `python` on CPU in order, blocks fenced `python gpu` on a
 GPU (`tools/check_docs.py --gpu`). They share this setup:
@@ -27,9 +30,14 @@ CONFIG = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8)
 - Row tensors have one row per request on dimension 0 (for `pllm.layer_logits` and sampler methods: one row
   per token the sampler draws). Rows of different requests are packed in an order you do not control:
   compute along the feature dimension (`dim=-1`), never across rows (`dim=0`).
-- Hidden-width tensors are in the model dtype (bfloat16 by default); `pllm.layer_logits` is float32. Cast with
-  `.float()` when you need precision.
+- Hidden rows (`pllm.hidden`, `pllm.residual`, `pllm.final_hidden`) reach tensor methods as float32, and
+  `pllm.layer_logits` is float32; tensors inside model sites (`@pllm.custom_residual`, `@pllm.custom_attention`)
+  and state fields without an optimizer are in the model dtype (bfloat16 by default). Cast explicitly where
+  the dtype matters (`.float()`, `.to(x.dtype)`). [pitfalls.md](pitfalls.md#shape-dtype-and-row-conventions) lists the shape
+  and dtype of every input and the return shape of every effect.
 - Inputs are read-only borrowed views. Return new tensors; change state only through the effects below.
+- A setting that depends on the instance is a method of the workload passed by name (`beta=strength`), never a
+  dataclass field named in the class body, which passes the class default.
 
 ## Read a hidden state, the residual stream or per-layer logits
 
@@ -391,11 +399,49 @@ with pllm.make_llm(GPU_CONFIG, workload=Steering()) as llm:
     print(repr(llm.diagnostics().eager_reason))  # '': activation patches run inside CUDA graphs
 ```
 
-| Attention reads | |
-|---|---|
-| `@pllm.custom_attention(layers=...)` | Replace dense FA2 reads with `f(q, kv, ...markers)`, keeping projections and KV writes. Return q-shaped attention and optional `[rows, ...]` aux. TP=1; disable prefix caching. |
-| `pllm.model.PagedKV` | Read-only paged caches and metadata. `kv.attend(q, window=0, topk=None)` returns attention and FP32 LSE. Top-K logical positions `[rows, k]` or `[rows, heads, k]`, padded with -1, select reads without freeing storage. |
-| `pllm.attention(layer, "aux" / "lse")` | Same-token facts from an earlier layer inside attention; sampled rows in tensor methods. LSE describes the first `kv.attend` call. |
+## Replace an attention read or the KV layout
+
+| Name | Meaning |
+| --- | --- |
+| `@pllm.custom_attention(*, layers=None, keep="all", window=0, source=0, sink=False)` | Replace the attention read of `layers` with `f(self, q, kv, ...markers)`; vLLM's q/k/v projections and KV writes stay. `q` is `[rows, heads, head_dim]` after RoPE. Return attention with q's shape and dtype, optionally `(attention, aux)` with `aux` shaped `[rows, ...]`. One method per layer. |
+| `pllm.model.PagedKV` | The method's `kv`: read-only paged K/V already holding the current tokens. `kv.attend(q, *, window=0, topk=None)` returns attention `[rows, heads, head_dim]` and float32 LSE `[rows, heads]`: the native causal read without arguments, the last `window` positions (current included) with `window=`, and only the given logical positions with `topk=` (int `[rows, k]` or `[rows, heads, k]`, padded with -1, no repeats within a head). Also `positions()`, `requests()`, `sink_lens()`, `window_start()`. |
+| `pllm.attention(layer, fact)` | `fact="aux"`: the aux an earlier layer's custom attention returned for the same token; `"lse"`: the LSE of its first `kv.attend` call. Inside attention methods it reads strictly earlier layers; in tensor methods (e.g. an export) it reads sampled rows. |
+
+Layouts change what is stored, not only what is read: `keep="window", window=N` keeps the last N tokens of K/V
+(vLLM's sliding-window spec frees older blocks); adding `sink=True` keeps the whole prompt plus the window;
+`keep="none", source=k` allocates no KV at this layer and reads layer `layer - k`'s. Layouts limit every read,
+including `topk=`. Top-K selection saves reads, not memory; freeing memory by score is unsupported.
+`pllm.explain` prints a `KV layer` line per layer with the per-request bound. Methods may read
+`InstanceState` parameters or modules, `pllm.depth()` and earlier `pllm.attention(...)` facts, and call pure
+custom ops. Requirements: `tensor_parallel_size=1`, unquantized KV, plain RoPE attention, prefix caching off,
+dense Qwen2/Llama/Qwen3 or Qwen3-MoE; layouts also need `runner="mrv2"` and exclude `pllm.PositionState` and
+`@pllm.custom_forward`. Full reads use FlashAttention 2; stored windows use vLLM's FlashInfer plans on
+Ampere/Ada (they keep grouped-query decode, which FA2's window path drops); prompt-sink reads use vLLM's
+Triton path.
+
+```python
+@dataclass(frozen=True)
+class RecentWindow(pllm.Workload):
+    window: int = 64
+
+    def span(self) -> int:
+        return self.window
+
+    @pllm.custom_attention(layers=(0, 2, 4), keep="window", window=span)
+    def read(self, q: torch.Tensor, kv: pllm.model.PagedKV) -> torch.Tensor:
+        attention, _lse = kv.attend(q, window=self.window)
+        return attention
+
+
+LONG = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8, max_model_len=4096)
+report = pllm.explain(RecentWindow(), LONG)
+print(repr(report.eager_reason))  # '': custom attention runs inside the model's CUDA graphs
+for capacity in report.kv_capacity[:2]:
+    print(capacity.layout.layer, capacity.layout.description, capacity.bytes)  # 0 window 64 565248 / 1 all 2097152
+```
+
+The bound includes the tokens one step may schedule (`max_num_batched_tokens`), so a window saves memory only
+when `max_model_len` is well above `window + max_num_batched_tokens`.
 
 ## Rewrite a residual site
 
@@ -432,7 +478,7 @@ print(pllm.explain(ValueResidual(), CONFIG).eager_reason)
 | --- | --- |
 | `@pllm.custom_forward(*, tokens="all", over="token")` | Replace the forward of the selected tokens (`"prefill"`, `"decode"`, `"all"`) with the method `f(self, layers, ...) -> stream`, returning the residual stream the final norm reads. Inputs after `layers` may be `pllm.parameter` / `pllm.module` of an `InstanceState`; the body reads plain settings from `self`. |
 | `pllm.model.Layers` | The method's `layers` argument. `layers(start=0, stop=None, hidden=None, *, kv="commit", active=None)` runs layers `start..stop-1` and returns their outputs; `kv="peek"` attends without writing the KV cache; `active` (bool `[rows, 1]`, only with `tokens="decode"`) freezes the rows that are False (early exit). Also `embeddings`, `generated` (bool `[rows, 1]`), `load(name)` / `save(name, value)` for a `pllm.PositionState`, `apply_updates()` for `@pllm.train_in_forward`. |
-| `pllm.model.LayerOutputs` | What `layers(...)` returns: the post-layer residual streams, indexed by absolute layer (`out[-1]` is the last layer run). |
+| `pllm.model.LayerOutputs` | What `layers(...)` returns: the post-layer residual streams of the layers that slice ran, indexed by absolute model layer, negative from the model's end. `out[-1]` is the model's last layer, so it exists only when the slice runs to the end; `layers(stop=12)[11]` reads a partial slice (`layers(stop=12)[-1]` raises `index a tap inside the Layers slice that produced it`). |
 | `pllm.scan(step, *, carry, over, chunk, invariants=(), valid_rows=None)` | Run `step(carry, *slices, *invariants) -> (carry, readout)` over `over` in chunks of `chunk` rows, in order, returning the final carry and the readouts. |
 
 pllm schedules a custom forward's layer slices itself and captures its own CUDA graphs for them, so vLLM's
@@ -563,6 +609,58 @@ with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=8
 | `pllm.KVOffload(connector="OffloadingConnector", cpu_bytes=536870912, prompt_only=False)` | Offload complete KV pages to CPU memory (`ModelConfig(kv_offload=...)`). |
 | `pllm.Workload` | The base class. Subclass it (a frozen dataclass when it has settings); put declarations and tensor math in it, nothing else. |
 
+### The engine handle
+
+`pllm.make_llm` returns a handle; use it as a context manager. Its methods:
+
+| Method | Meaning |
+| --- | --- |
+| `generate(prompts, sampling_params, *, batch=None, sample_index=0, prompt_indices=None, routes=None, use_tqdm=False)` | vLLM's `generate` with the workload running: one `RequestOutput` per prompt holding its `n` samples. `batch` feeds `pllm.batch` training or a `pllm.io.StateImport`; `sample_index` numbers each prompt's first sample; `prompt_indices` labels prompts across calls (`identity.prompt_index` in exports); `routes` gives one value per prompt for `key_fields=("route",)` states. |
+| `generate_completions(prompts, sampling_params, *, group_id, ...)` | Like `generate`, returning a `pllm.host.CompletionInput`: every sample as a `Completion` plus its final hidden row. |
+| `generate_feedback(prompts, sampling_params, *, feedback, group_id, max_rounds, ...)` | The host loop of [Train on host batches](#train-on-host-batches-or-run-a-host-feedback-loop): generate, call `feedback`, retry. |
+| `diagnostics()` | Exact counters read from the workers (see below). |
+| `trace_snapshot()`, `select_trace(selection)` | Retained trace events (exports, timings) and opt-in extra snapshots or kernel profiling. |
+| `feed(name)` | The `pllm.io.Feed` of a fed state (in-process engines only). |
+| `hidden_size`, `vocab_size`, `device` | Model facts, for building host batches. |
+| `close()` | Shut the engine down and release its GPU memory and compile state; leaving `with` calls it. |
+
+`diagnostics()` fields: `eager_reason` (empty when the model runs in CUDA graphs), `update_count`,
+`trained_rows`, `loss_count` (training progress), `active_states` and `inference_pins` (live request states and
+the versions running steps hold), `state_usage` (pllm's state pages: `reserved_bytes`, `logical_live_bytes`,
+`admission_capacity_failures`, ...), `numeric_health` (norm, max-abs and non-finite count of each live
+published field), `hold_count` / `last_hold` (steps that held an external input, such as a state feed, instead of applying it),
+`kv_cache_blocks` and `kv_cache_max_concurrency` (vLLM's KV allocation and how many `max_model_len`
+requests fit, per TP rank).
+
+### ModelConfig fields
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `model`, `revision`, `trust_remote_code` | — | Hugging Face model id or path, as vLLM takes them. |
+| `dtype` | `"bfloat16"` | Model dtype (`"float16"`, `"float32"`). |
+| `max_model_len`, `max_num_seqs`, `max_num_batched_tokens` | `512`, `8`, `512` | vLLM's length, concurrency and per-step token limits; pllm sizes its state and taps from them. |
+| `gpu_memory_utilization` | `0.5` | Fraction of GPU memory vLLM takes for weights, activations and KV cache; pllm's state pages and workspaces use free memory outside it, so leave room. |
+| `seed` | `0` | Seeds sampling and `pllm.Computed` initializers. |
+| `enable_prefix_caching`, `enable_chunked_prefill` | `False`, `False` | vLLM features; see [rules.md](rules.md#engine-settings-that-interact-with-workloads). |
+| `generated_kv` | `"isolate"` | With prefix caching and a workload that treats prompt and generated tokens differently (patches, adapters, some custom forwards): `"isolate"` keys blocks of generated tokens apart from prompt blocks with the same tokens; `"reuse"` lets them match. |
+| `multiprocessing` | `False` | Run vLLM's EngineCore in its own process; the workload class must be importable. |
+| `runner` | `"mrv2"` | vLLM model runner; `"mrv1"` runs workloads eagerly and lacks several features. |
+| `execution` | `ExecutionOptions()` | pllm's policy (next table). |
+| `cuda_graphs` | `"auto"` | `"auto"`: graphs when the workload allows; `True`: require them; `False`: eager. |
+| `kv_offload` | `None` | `pllm.KVOffload(...)` to offload complete KV pages to CPU memory. |
+| `tensor_parallel_size` | `1` | Single-node tensor parallelism (vLLM 0.32.0, MRv2); `pipeline_parallel_size` and `data_parallel_size` must stay 1. |
+
+| `ExecutionOptions` field | Default | Meaning |
+| --- | --- | --- |
+| `publish_lag` | `1` | Steps hidden from readers: an update at step n is read from n + 1 + `publish_lag`. `0` stops training from overlapping the next forward. |
+| `state_page_budget_bytes` | `0` | Device bytes for state pages; 0 uses the observed free capacity. |
+| `execution_peak_budget_bytes` | `None` | Cap on pllm's execution peak (pages, task workspace, results, graph and anchor reservations); excludes weights and KV. |
+| `cuda_graph_pool_budget_bytes` | `None` | Budget of each task or model CUDA-graph pool; None traces tasks, model default 64 MiB. |
+| `max_host_training_rows` | `1` | Host-fed training rows per state per step. |
+| `guidance_capacity` | `4096` | Guide the highest K post-filter survivors per row (power of two, 32 to 4096); None is exact dense guidance. |
+| `allow_numerical_transforms` | `True` | Let pllm pick numerically equivalent implementations. |
+| `tuning` | `"heuristic"` | `"measured"` times alternative implementations where several exist. |
+
 ## Inspect the plan and check contracts
 
 | Name | Meaning |
@@ -576,6 +674,15 @@ with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=8
 | `pllm.testing.TokenDistance` | `prompt_index`, predicted `token_offset` in prompt + continuation (both zero-based), and `value`. |
 | `pllm.testing.CheckResult` | `passed` (names of verified properties) and `skipped` (each with `property` and `reason`); `str()` prints a table. |
 | `pllm.testing.ContractError` | An `AssertionError` whose `failures` lists every discrepancy, naming the method that mixed rows or the framework routing that differs. |
+
+
+`ExplainResult` fields, for programmatic checks: `eager_reason`; `members` (per method: `name`, `effect`,
+`tasks` with `anchor`, `lane`, `captured`, `reads`, and `training`); `states` (`name`, `scope`, `roots`,
+`bytes_per_root`, `reserved_bytes`, `fields`, `source`, `placement`, `host_bytes`, `transfer_bytes_per_row`);
+`exports` (`name`, `rows`, `source_rows`, `columns`, `bytes`, `events`, `overflow`); `peak_memory_bytes`;
+`budget_errors`; `preemption` (`"keep"` or `"reset"`) and `recompute_rejection`; `workload_host_syncs`;
+`escape_hatches` (the `timing` lines); `kv_capacity` and `attention` (custom attention layers); `custom_ops`;
+`workload_digest`; `flops_per_token_estimate`.
 
 ```python
 report = pllm.explain(ShallowDistiller(), CONFIG)
