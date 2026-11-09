@@ -802,6 +802,12 @@ class CustomAttention(Effect):
                     raise TypeError(
                         "@pllm.custom_attention reads instance parameters, modules, depth and earlier attention facts"
                     )
+                if isinstance(value, StateInput) and value.request:
+                    raise ValueError(
+                        f"{name} reads RequestState {value.resource!r}, but @pllm.custom_attention runs for every "
+                        "scheduled token with instance-wide inputs; read an InstanceState and select per request "
+                        "inside the math"
+                    )
             inputs.append((name, value))
         binding.attention.add(AttentionMethod(operation.name, layers, freeze(operation.function), tuple(inputs)))
         binding.attention.layouts += expand_layouts(self.layouts(), count)

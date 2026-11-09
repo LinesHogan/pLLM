@@ -133,10 +133,6 @@ class AttentionProgram:
                     raise ValueError(
                         f"{method.name}: pllm.attention({source.layer}, {source.fact!r}) needs a strictly earlier layer"
                     )
-                if isinstance(source, StateInput) and source.request:
-                    raise ValueError(
-                        "@pllm.custom_attention reads InstanceState; use stateless selection or instance parameters"
-                    )
             self.methods[layer] = method
 
     def port(self, binding: TensorDeclaration, source: AttentionFact) -> TensorPort:

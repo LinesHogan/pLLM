@@ -90,6 +90,7 @@ weights, so run it first.
 | `... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward` | A stateful sublayer needs exactly one visit per token. | Use two workloads, or carry the memory in `pllm.PositionState` inside the custom forward. |
 | `static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)` | A layout splits the KV cache into several groups; these features need one group. | Drop the layout (`keep=`/`window=`/`source=`) or the custom forward. |
 | `declare one @pllm.train_in_forward method per workload; ... already is one` | One method drives every projection hook of a workload. | Train all targets in one method (targets is a tuple). |
+| `... reads RequestState ..., but @pllm.custom_attention runs for every scheduled token with instance-wide inputs; ...` | Attention reads have no per-request state. | Read an `InstanceState` and select per request inside the math. |
 | `pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host` | `make_host` compiles without a model. | Use `make_llm`, or keep only `pllm.batch` training for `make_host`. |
 | `... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...` | A `@pllm.train_in_forward` method without an optimizer returns the correction added to the projection's output (`pllm.UpdateOutput(output, ...)`, or `(next_weight, output)` with `chunk=`). pllm runs every overlay method once at declaration on maximum-shape operands and checks the result there, not on every step. | Return `output` shaped `[rows, out_features]` of the target, in the input dtype or float32. |
 | `... must return changed (bool) and update_count and trained_rows (int64) as 0-d tensors on the input's device` | The counters stay on the device so no step synchronizes with the host. | Build them as 0-d device tensors (`x.new_ones((), dtype=torch.bool)`), or return `pllm.UpdateOutput.unchanged(output)`. |
@@ -328,6 +329,3 @@ Current framework behaviour that is wrong or unhelpful; each has a workaround.
   `@pllm.custom_attention` reject `enable_prefix_caching=True`. The cache key covers the workload's identity,
   not its state values, so a cached prompt prefix can carry K/V computed under another request's imported
   or trained state. Keep prefix caching off (the default) unless every request uses the same state.
-- **`@pllm.custom_attention` reading a `RequestState` says `reads InstanceState`.** The message reads
-  `@pllm.custom_attention reads InstanceState; use stateless selection or instance parameters`, but it is
-  raised for request state; instance parameters are allowed. Workaround: read an `InstanceState`.
