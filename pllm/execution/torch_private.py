@@ -22,6 +22,7 @@ from torch._higher_order_ops.triton_kernel_wrap import triton_kernel_wrapper_mut
 from torch._library.custom_ops import CustomOpDef as CustomOpDef, _maybe_get_opdef  # pyright: ignore[reportPrivateUsage]
 from torch._ops import OpOverload, OpOverloadPacket, _OpNamespace, _Ops  # pyright: ignore[reportPrivateUsage]
 from torch._subclasses.fake_tensor import DynamicOutputShapeException, FakeTensor, FakeTensorMode as FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode
 from torch.fx.graph import _PyTreeCodeGen  # pyright: ignore[reportPrivateUsage]
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.overrides import TorchFunctionMode
@@ -189,9 +190,15 @@ def dispatcher_namespace(value: object) -> str | None:
 
 @contextmanager
 def fixed_shapes() -> Generator[None]:
-    """Explain why data-dependent custom-op outputs cannot be planned or captured."""
+    """Explain why data-dependent control flow and custom-op outputs cannot be planned or captured."""
     try:
         yield
+    except GuardOnDataDependentSymNode as error:
+        raise ValueError(
+            "methods run inside CUDA graphs, so Python cannot branch on tensor values (if, while or break on a "
+            "tensor); run a fixed number of steps and select rows with torch.where, or in a custom_forward stop "
+            "rows with layers(..., active=mask)"
+        ) from error
     except (RuntimeError, DynamicOutputShapeException) as error:
         if isinstance(error, DynamicOutputShapeException) or "dynamic" in str(error).lower() or "get_ctx" in str(error):
             raise ValueError(

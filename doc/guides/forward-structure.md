@@ -322,7 +322,7 @@ True
 
 ### 控制流规范：有界循环、禁止张量分支、`pllm.scan`
 1. **有界 Python 循环自动展开**：基于负载字段的 Python `for` 循环（如 `for _ in range(self.loops):`）会在追踪期直接展开录入分段 CUDA graph。
-2. **禁止基于张量值的控制流**：方法体内部绝对**不能**出现 `if tensor.norm() > 1:`、`while` 或 `break`。前向图的拓扑结构必须确定，否则会在 meta 张量追踪时抛出 `Tensor.item() cannot be called on meta tensors` 异常。条件判断必须使用 `torch.where` 或 `active=` 掩码表达。
+2. **禁止基于张量值的控制流**：方法体内部绝对**不能**出现 `if tensor.norm() > 1:`、`while` 或 `break`。前向图的拓扑结构必须确定，否则追踪时报错 `methods run inside CUDA graphs, so Python cannot branch on tensor values (if, while or break on a tensor); ...`。循环固定次数，条件用 `torch.where` 或 `active=` 掩码表达（`active=` 需 `tokens="decode"`，见 [12 自适应深度](../examples/12_adaptive_depth.ipynb)）。
 3. **线性扫描（`pllm.scan`）**：若在自定义前向中需要实现长序列线性递推（形如 $S_t = A_t S_{t-1} + B_t$），应调用 `pllm.scan(step, carry=..., over=..., chunk=...)`。pllm 会识别仿射递推，在条件允许时改用 GPU 上的**并行前缀扫描**，比逐块串行的循环快得多（见[性能与显存](../explain/performance.md)）。详见 [04 改写 forward](../tutorials/04_custom_forward.ipynb)。
 
 ### 运行开销、限制与组合

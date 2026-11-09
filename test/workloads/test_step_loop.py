@@ -82,3 +82,11 @@ def test_ineligible_and_unsaved_tokens_fill_forward(save):
     decoder.begin = staged
     run_step(execution, VALUE, decoder)
     torch.testing.assert_close(decoder.position.tables[0], torch.tensor([[2.0] * 4, [2.0] * 4, [2.0 + save] * 4]))
+
+
+def test_tensor_branch_names_the_mask_construct():
+    def route(layers: Layers):
+        return layers.embeddings if layers.embeddings.sum() > 0 else -layers.embeddings
+
+    with pytest.raises(ValueError, match=r"active=mask"):
+        TokenProgram.trace(route, TokenTensor((1, 4), torch.float32, "cpu"), 3, ())

@@ -26,7 +26,8 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | 报错（原文） | 为什么 | 改法 |
 | --- | --- | --- |
 | PyTorch 的 "Tensor.item() cannot be called on meta tensors"，附注 `while shape tracing method ...; methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values` | 方法在构建时只按形状追踪，运行时在 CUDA graph 里重放 | 去掉 `.item()`、`print(tensor)`、按张量值的 `if`；用掩码和 `torch.where`，看数值用 `@pllm.export` |
-| `methods run inside CUDA graphs, so outputs need shapes fixed by the inputs; return a fixed-size tensor and a tensor mask instead of ...` | 输出形状随数据变化（如 `break`、按条件删行）无法录进 graph | 固定次数的循环加掩码 |
+| `methods run inside CUDA graphs, so outputs need shapes fixed by the inputs; return a fixed-size tensor and a tensor mask instead of ...` | 自定义算子的输出形状随数据变化（如按条件删行）无法录进 graph | 返回固定大小的张量加掩码 |
+| `methods run inside CUDA graphs, so Python cannot branch on tensor values (if, while or break on a tensor); ...` | 按张量值的 `if`、`while`、`break`（多见于 `@pllm.custom_forward` 的循环）让每步算的东西随数据变化，无法录进 graph | 循环固定次数，用 `torch.where` 选行；`custom_forward` 里用 `layers(..., active=mask)` 让已停下的行保持不变（需 `tokens="decode"`） |
 | `... cannot compile as one full graph: ...` | 方法里有不能整图编译的操作 | 用可追踪的张量操作；自写算子给出 fake 实现；或 `ExecutionOptions(allow_numerical_transforms=False)` |
 | `@pllm.train reads ..., which trains with ...; declare ... with optimizer=...` | 训练方式由方法读的输入决定，优化器写在状态上 | 给状态加报错里说的优化器 |
 | `training methods return one loss per row; pllm reduces the selected rows per state` | 只有 pllm 知道哪些行属于哪份状态 | 返回 `[rows]` 的 loss，不要 `.mean()` |
