@@ -7,13 +7,9 @@ from pllm import testing
 from pllm.authoring import StepResult
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from test import reference_huber as oracle
 
 
@@ -42,8 +38,8 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     facts = backend_facts(
         hidden,
         bindings,
-        model_timeline(device),
-        PageBundleProviderFacts("test.huber@1", 12, StateDeviceKind(device.type)),
+        device=device.type,
+        pages=12,
         # A step packs up to five rows of three requests; captured steps are sized by admitted lineages.
         max_lineages=5,
         memory_bytes=100000,

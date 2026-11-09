@@ -11,24 +11,17 @@ from torch.nn import functional as F
 
 from pllm.authoring import CausalTrainBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import (
-    AttachmentGraphMode,
-    ModelProbe,
-)
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import Projection, ProjectionShape
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
-from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.causal_batch import LMHead
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.step_input import StepInput
 from pllm.kernels.adamw import AdamWConfig
+from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 
@@ -65,21 +58,20 @@ class TinyCausalPort:
 
 def causal_facts(model, *, reserved=0, task_resources=()) -> BackendCompileFacts:
     """Single-device facts before workload template reservations."""
-    kind = StateDeviceKind(model.device.type)
-    timeline = model_timeline(model.device, ("optimizer/adamw@1", "transition/full_root@1"))
-    timeline = replace(timeline, reserved_bytes=(reserved,) * len(timeline.anchors), task_resources=task_resources)
-    probe = ModelProbe(
-        "c" * 64,
-        AttachmentGraphMode.EAGER,
-        kind,
-        model.tensor_dtype,
+    facts = backend_facts(
         model.targets[0].input_size,
-        8,
-        (),
-        (),
+        device=model.device.type,
+        pages=4,
+        memory_bytes=32768,
+        max_rows=8,
+        dtype=model.tensor_dtype.torch,
+        layer_count=1,
+        targets={shape.target: (shape.input_size, shape.output_size) for shape in model.targets},
     )
-    provider = PageBundleProviderFacts("test.tlm@1", 4, kind)
-    return BackendCompileFacts(replace(probe, targets=model.targets), timeline, (provider,), 2, 32768, 7, layer_count=1)
+    timeline = replace(
+        facts.timeline, reserved_bytes=(reserved,) * len(facts.timeline.anchors), task_resources=task_resources
+    )
+    return replace(facts, timeline=timeline)
 
 
 def _compile(model, config: TLMConfig):

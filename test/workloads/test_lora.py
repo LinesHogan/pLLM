@@ -11,26 +11,16 @@ import pllm
 from pllm import testing
 from pllm.authoring import WeightedCEBatch
 from pllm.config import ExecutionOptions
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 
 BINDING = testing.final_hidden_binding(1)
 
 
 def compile_lora(config, device=torch.device("cpu"), *, lineages=3, pages=3):
-    cuda = device.type == "cuda"
-    provider = PageBundleProviderFacts(
-        "cuda_dense_page@1" if cuda else "test.page@1",
-        pages,
-        StateDeviceKind.CUDA if cuda else StateDeviceKind.CPU,
-    )
     facts = backend_facts(
-        4, (BINDING,), model_timeline(device), provider, max_lineages=lineages, memory_bytes=32 * 1024**2
+        4, (BINDING,), device=device.type, pages=pages, max_lineages=lineages, memory_bytes=32 * 1024**2
     )
     workload = OutputLoRAWorkload(config)
     return workload.compile_backend(replace(facts, vocab_size=7), ExecutionOptions(max_host_training_rows=4)).execution

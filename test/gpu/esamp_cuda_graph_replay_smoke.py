@@ -21,11 +21,9 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, Pack
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
-from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, compile_page_bundle_plan
-from pllm.execution.runtime_facts import model_timeline
+from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_task import TensorTask
 from pllm.testing import backend_facts
@@ -60,10 +58,8 @@ def mean_capture(publish_lag: int = 0) -> None:
     device = torch.device("cuda", 0)
     stream = torch.cuda.current_stream(device)
     resource = PackedHiddenResourceBinding("0", HiddenLayerKind.INDEX, HiddenSite.BLOCK_OUTPUT, "model.layers[0]")
-    timeline = model_timeline(device)
     workload = MeanFit()
-    provider = PageBundleProviderFacts("test.mean@1", 6, StateDeviceKind.CUDA)
-    facts = backend_facts(4, (resource,), timeline, provider, max_lineages=3)
+    facts = backend_facts(4, (resource,), device="cuda", capabilities=(), pages=6, max_lineages=3)
     facts, declaration = workload.specialize(
         facts, pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2, publish_lag=publish_lag)
     )

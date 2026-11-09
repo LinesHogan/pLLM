@@ -21,13 +21,10 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.semantic_graph import AnchorSymbol, SchedulerTimeline, TimelineAnchor
-from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.page_borrow import receive_field
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
 from pllm.kernels.adamw import AdamWConfig, AdamWFields, apply_adamw
 from pllm.testing import backend_facts
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
@@ -47,8 +44,7 @@ def _plan():
         tuple(TimelineAnchor(AnchorSymbol(name), index) for index, name in enumerate(anchors)),
         ("compute/cuda@1", "state/dense_page_cuda@1"),
     )
-    provider = PageBundleProviderFacts("test.page_bundle@1", 6, StateDeviceKind.CUDA)
-    facts = backend_facts(4, bindings, timeline, provider)
+    facts = replace(backend_facts(4, bindings, device="cuda", pages=6), timeline=timeline)
     workload = ESampWorkload(ESampConfig(rank=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
 
@@ -302,8 +298,9 @@ def test_numeric_health_is_explicit_and_uses_bounded_device_scratch():
     stream = torch.cuda.current_stream(device)
     facts = backend_facts(
         4,
-        timeline=model_timeline(device, ("transition/full_root@1",)),
-        provider=PageBundleProviderFacts("test.health@1", 6, StateDeviceKind.CUDA),
+        device="cuda",
+        capabilities=("transition/full_root@1",),
+        pages=6,
         memory_bytes=512 << 20,
         layer_count=1,
     )

@@ -11,13 +11,8 @@ from pllm import testing
 from pllm.backends.vllm.architecture import hidden_binding
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.parameter_overlay import ProjectionShape
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, StateResource
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import model_timeline
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.state_producers import (
     TARGETS,
     DecodeFactorsWorkload,
@@ -38,13 +33,11 @@ def device(request):
 def deployment(workload, device=torch.device("cpu")):
     facts = backend_facts(
         4,
-        (),
-        model_timeline(device, ("transition/full_root@1", "optimizer/adamw@1")),
-        PageBundleProviderFacts("test.producers@1", 16, StateDeviceKind(device.type)),
+        device=device.type,
         memory_bytes=1 << 20,
         max_rows=8,
         layer_count=10,
-        targets=tuple(ProjectionShape(t, 4, o) for t, o in zip(TARGETS, (4, 2), strict=True)),
+        targets=dict(zip(TARGETS, ((4, 4), (4, 2)), strict=True)),
     )
     facts = replace(
         facts,
@@ -290,15 +283,7 @@ def test_initialized_reader_and_hidden_before_model_boundary():
             return (h,)
 
     with pytest.raises(ValueError, match="after model forward"):
-        Cycle().build(
-            backend_facts(
-                4,
-                (),
-                model_timeline(torch.device("cpu")),
-                None,
-                targets=tuple(ProjectionShape(target, 4, 4) for target in TARGETS),
-            )
-        )
+        Cycle().build(backend_facts(4, targets={target: (4, 4) for target in TARGETS}))
 
 
 def test_tasks_run_at_backend_points():

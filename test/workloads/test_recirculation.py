@@ -14,7 +14,6 @@ from pllm.contracts.backend_attachment import (
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import (
     AnchorId,
 )
@@ -27,6 +26,7 @@ from pllm.execution.custom_forward import (
 )
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
+from pllm.testing import RequestIdentity
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.recirculation import RecirculationWorkload
 

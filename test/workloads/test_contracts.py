@@ -13,7 +13,6 @@ from pllm import testing
 from pllm.backends.vllm import compat
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.execution.post_sample import PostSampleOverlap
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.trace import TraceEventKind, TraceSelection
@@ -491,9 +490,7 @@ def test_check_detects_imports_routed_by_sorted_request_id(workload, model_confi
 def test_import_shape_boundary_and_first_export(per_request):
     workload = ImportedRows(per_request)
     tap = testing.hidden_binding(0, layer_count=1)
-    facts = testing.backend_facts(
-        8, (tap,), model_timeline(torch.device("cpu"), ("transition/full_root@1",)), layer_count=1, memory_bytes=1 << 20
-    )
+    facts = testing.backend_facts(8, (tap,), layer_count=1, memory_bytes=1 << 20)
     declaration = workload.build(facts)
     values = torch.arange(16 if per_request else 8, dtype=torch.float32).reshape((2, 8) if per_request else (8,))
     for tensor, error in (
@@ -577,7 +574,7 @@ def test_host_batch_rejects_reduction_at_declaration(field) -> None:
             """Return a scalar loss owned by the batch method."""
             return values.sum() * w.sum()
 
-    facts = testing.backend_facts(4, (), model_timeline(torch.device("cpu")))
+    facts = testing.backend_facts(4)
     with pytest.raises(
         ValueError, match="host-batch training returns one scalar and owns its reduction; remove reduction="
     ):

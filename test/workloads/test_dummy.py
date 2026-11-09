@@ -18,12 +18,10 @@ from pllm import testing
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_task import TensorTask
 from pllm.execution.trace import ExecutionTrace, TraceEventKind, TraceSelection, TraceSnapshot
 from pllm.host import HostConfig
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from test.backend_facts import assert_finite_resources
 
@@ -81,8 +79,6 @@ def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
     facts = backend_facts(
         5,
         (BINDING,),
-        model_timeline(torch.device("cpu")),
-        None,
         max_lineages=1,
         memory_bytes=0,
         max_rows=3,

@@ -26,7 +26,6 @@ from pllm.contracts.backend_attachment import (
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, StateResource
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
@@ -47,7 +46,7 @@ from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
-from pllm.testing import backend_facts, step_input
+from pllm.testing import RequestIdentity, backend_facts, step_input
 from pllm.workloads.video import VideoWorkload, frame_features
 
 
@@ -102,7 +101,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         )
         if missing is not None:
             b.conditional_input(("features",), publication)
-        facts = backend_facts(2, (), timeline, PageBundleProviderFacts("video.binding@1", 3))
+        facts = backend_facts(2, pages=3)
         buffers = attachment_buffer_bytes(facts.probe, b.graph, b.layouts, b.effects)
         timeline = replace(timeline, reserved_bytes=(buffers,) * len(timeline.anchors))
     plan = compile_page_bundle_plan(
@@ -187,7 +186,7 @@ def _session(b, execution):
     from pllm.backends.vllm.session import VllmSession
 
     plan = execution.arena.plan
-    facts = backend_facts(2, (), plan.timeline, PageBundleProviderFacts("video.binding@1", 3))
+    facts = backend_facts(2, pages=3)
     deployment = BackendDeployment(execution, bind_backend_attachment(plan, facts.probe, b.effects))
     model = SimpleNamespace(model=SimpleNamespace(layers=()), lm_head=SimpleNamespace(weight=torch.zeros(2, 2)))
     from pllm.backends.vllm.prefix_cache import CachePolicy
@@ -370,8 +369,7 @@ def test_video_real_frame_math_and_signed_composition():
     values = frame_features(second, first, 2)
     stationary = frame_features(first, first, 2)
     assert torch.count_nonzero(stationary[1]) == torch.count_nonzero(stationary[2]) == 0
-    timeline = model_timeline(torch.device("cpu"), ("transition/full_root@1",))
-    facts = backend_facts(4, (), timeline, PageBundleProviderFacts("video.cpu@1", 3), layer_count=1)
+    facts = backend_facts(4, pages=3, layer_count=1)
     workload = VideoWorkload(grid_size=2)
     deployment = workload.compile_backend(facts, ExecutionOptions())
     execution, plan = deployment.execution, deployment.attachment.plan

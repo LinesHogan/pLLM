@@ -18,19 +18,13 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     Projection,
     ProjectionOperands,
-    ProjectionShape,
 )
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import TensorDType
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.overlay_task import ChunkUpdate
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.scan_analysis import analyze
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from test.dense_update import DenseUpdate, DenseUpdateConfig
 from test.workloads.test_inplace_ttt import projection_input
 
@@ -38,17 +32,14 @@ TARGET = Projection("down_proj", 0)
 
 
 def facts_for(device, dtype):
-    timeline = model_timeline(device, ("transition/full_root@1", "state/fenced_reclaim@1"))
-    provider = PageBundleProviderFacts("test.region.full_root@1", 4, StateDeviceKind(device.type))
     return backend_facts(
         7,
-        (),
-        timeline,
-        provider,
+        device=device.type,
+        pages=4,
         memory_bytes=65536,
         max_rows=8,
-        dtype=TensorDType(str(dtype).removeprefix("torch.")),
-        targets=(ProjectionShape(TARGET, 7, 5),),
+        dtype=dtype,
+        targets={TARGET: (7, 5)},
     )
 
 

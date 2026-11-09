@@ -17,15 +17,10 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     Projection,
     ProjectionOperands,
-    ProjectionShape,
 )
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.overlay_task import ChunkUpdate
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from test.backend_facts import assert_finite_resources
 from test.dense_update import DenseUpdate, DenseUpdateConfig
 
@@ -46,13 +41,11 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     workload = DenseUpdate(config, dtype=torch.float64)
     facts = backend_facts(
         3,
-        (),
-        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
-        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        pages=4,
         memory_bytes=4096,
         max_rows=8,
-        dtype=TensorDType.FLOAT64,
-        targets=tuple(ProjectionShape(target, 3, 2) for target in targets),
+        dtype=torch.float64,
+        targets={target: (3, 2) for target in targets},
     )
     execution = assert_finite_resources(workload, facts).execution
     visibility = next(
@@ -328,12 +321,10 @@ def _check_exact_projection_lifecycle():
     workload = GatedDeltaWorkload(GatedDeltaConfig(targets, head_width=1, chunk_size=2, alpha=1, beta=0.1))
     facts = backend_facts(
         1,
-        (),
-        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
-        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        pages=4,
         memory_bytes=4096,
         max_rows=16,
-        targets=tuple(ProjectionShape(target, 1, 1) for target in targets),
+        targets={target: (1, 1) for target in targets},
     )
     deployment = workload.compile_backend(facts, pllm.ExecutionOptions())
     execution = deployment.execution
@@ -473,12 +464,10 @@ def _check_exact_additive_projection():
     workload = DenseUpdate(DenseUpdateConfig(targets, chunk_size=2, learning_rate=0.01, visibility="exact"))
     facts = backend_facts(
         1,
-        (),
-        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
-        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        pages=4,
         memory_bytes=4096,
         max_rows=8,
-        targets=tuple(ProjectionShape(target, 1, 1) for target in targets),
+        targets={target: (1, 1) for target in targets},
     )
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
@@ -557,14 +546,12 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
     workload = PrefillAdaptersWorkload(chunk_size=3, rank=2, dtype=torch.float64)
     facts = backend_facts(
         3,
-        (),
-        model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
-        PageBundleProviderFacts("test.cpu.full_root@1", 4),
+        pages=4,
         memory_bytes=1 << 20,
         max_rows=32,
-        dtype=TensorDType.FLOAT64,
+        dtype=torch.float64,
         layer_count=10,
-        targets=tuple(ProjectionShape(target, 3, 2) for target in TARGETS),
+        targets={target: (3, 2) for target in TARGETS},
     )
     deployed = assert_finite_resources(workload, facts)
     execution = deployed.execution
@@ -643,10 +630,7 @@ def test_prompt_end_operand_stays_live_during_replay():
     math = workload.build(
         backend_facts(
             3,
-            (),
-            model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
-            None,
-            targets=tuple(ProjectionShape(target, 3, 2) for target in TARGETS),
+            targets={target: (3, 2) for target in TARGETS},
         )
     ).overlay_math
     x, base = torch.ones(1, 3, device="cuda"), torch.zeros(2, 3, device="cuda")
@@ -823,11 +807,10 @@ def test_paper_ttt_matches_fake_decoder_oracle(tmp_path, track, scale):
     facts = replace(
         backend_facts(
             3,
-            timeline=model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
             memory_bytes=1 << 20,
             max_rows=16,
             layer_count=2,
-            targets=tuple(ProjectionShape(t, 5, 3) for t in targets),
+            targets={t: (5, 3) for t in targets},
         ),
         checkpoint=str(tmp_path),
     )

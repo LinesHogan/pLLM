@@ -10,7 +10,6 @@ import torch
 import pllm
 from pllm import testing
 from pllm.contracts.backend_attachment import CausalModelDomain
-from pllm.contracts.parameter_overlay import ProjectionShape
 from pllm.execution.runtime_facts import model_timeline
 
 TARGET = pllm.model.Projection("down_proj", 1)
@@ -19,11 +18,11 @@ CAPABILITIES = ("model/custom_forward@1", "transition/full_root@1", "optimizer/a
 FACTS = testing.backend_facts(
     4,
     (BINDING,),
-    model_timeline(torch.device("cpu"), CAPABILITIES),
+    capabilities=CAPABILITIES,
     memory_bytes=1 << 20,
     layer_count=3,
     vocab_size=4,
-    targets=(ProjectionShape(TARGET, 4, 4),),
+    targets={TARGET: (4, 4)},
 )
 FACTS = replace(FACTS, probe=replace(FACTS.probe, causal_domain=CausalModelDomain(2, 3, 16), capabilities=CAPABILITIES))
 

@@ -431,10 +431,6 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
     """One graph follows the serial chunk recurrence while PTTS recycles private write slots."""
     from pllm.contracts.hidden_locator import HiddenPhase
     from pllm.contracts.request_identity import RequestIdentity
-    from pllm.contracts.state_representation import StateDeviceKind
-    from pllm.contracts.tensor_layout import TensorDType
-    from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-    from pllm.execution.runtime_facts import model_timeline
     from pllm.execution.site_memory import SiteMemorySchedule
     from pllm.testing import backend_facts, compile_execution, step_input
 
@@ -443,12 +439,13 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
     workload = FastWeightMemory(layer=0, chunk=chunk, shared=shared)
     facts = backend_facts(
         8,
-        timeline=model_timeline(device, ("transition/full_root@1",)),
-        provider=PageBundleProviderFacts("testing.cuda@1", 32, StateDeviceKind.CUDA),
+        device="cuda",
+        capabilities=("transition/full_root@1",),
+        pages=32,
         max_lineages=3,
         max_rows=16,
         memory_bytes=1 << 24,
-        dtype=TensorDType.BFLOAT16,
+        dtype=torch.bfloat16,
         layer_count=1,
     )
     execution = compile_execution(workload, facts, stream)

@@ -12,8 +12,6 @@ import pllm
 from pllm import testing
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
-from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
 
 pytest.importorskip("vllm")
@@ -118,8 +116,7 @@ def test_stateful_custom_residual_matches_serial_chunk_oracle(chunk: int) -> Non
     decoder = SimpleNamespace(model=model, norms=tuple(norm.forward for norm in sublayer_norms(model)))
     facts = testing.backend_facts(
         WIDTH,
-        timeline=model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
-        dtype=TensorDType.FLOAT64,
+        dtype=torch.float64,
         layer_count=LAYERS,
         memory_bytes=1 << 20,
     )

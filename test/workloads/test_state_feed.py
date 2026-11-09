@@ -10,8 +10,6 @@ import torch
 import pllm
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_feed import FeedOrder
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_feed import FeedEvent, FeedRecord, select_publications
 from pllm.testing import backend_facts
 
@@ -52,11 +50,7 @@ class FeedWorkload(pllm.Workload):
 
 
 def facts_for(device=torch.device("cpu")):
-    from pllm.contracts.state_representation import StateDeviceKind
-
-    timeline = model_timeline(device, ("transition/full_root@1",))
-    provider = PageBundleProviderFacts("test.feed@1", 3, StateDeviceKind(device.type))
-    return backend_facts(2, (), timeline, provider, layer_count=1, memory_bytes=65536)
+    return backend_facts(2, device=device.type, pages=3, layer_count=1, memory_bytes=65536)
 
 
 def test_feed_declaration_derives_ownership():

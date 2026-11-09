@@ -45,10 +45,11 @@ from pllm.contracts.packed_rows import (
     PackedSamplerRowBatch,
     PackedSamplerRowLink,
 )
-from pllm.contracts.parameter_overlay import ProjectionOperands
+from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
-from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline
+from pllm.contracts.semantic_graph import AnchorId
+from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.cuda_stream import CudaStreamReadiness
@@ -57,6 +58,7 @@ from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
 from pllm.testing_contracts import (
+    SIMULATED_CAPABILITIES,
     CheckResult as CheckResult,
     ContractError as ContractError,
     check as check,
@@ -76,37 +78,38 @@ if TYPE_CHECKING:
 DataT = TypeVar("DataT")
 ResultT = TypeVar("ResultT")
 
-_CPU_TIMELINE = model_timeline(torch.device("cpu"))
-_CPU_PAGES = PageBundleProviderFacts("testing.cpu@1", 16)
-
 
 def backend_facts(
     hidden_size: int,
     hidden: tuple[PackedHiddenResourceBinding, ...] = (),
-    timeline: SchedulerTimeline = _CPU_TIMELINE,
-    provider: PageBundleProviderFacts | None = _CPU_PAGES,
     *,
+    device: str = "cpu",
+    capabilities: tuple[str, ...] = SIMULATED_CAPABILITIES,
+    pages: int = 16,
     max_lineages: int = 2,
     memory_bytes: int = 10000,
     max_rows: int | None = None,
-    dtype: TensorDType = TensorDType.FLOAT32,
+    dtype: torch.dtype = torch.float32,
     vocab_size: int = 0,
     layer_count: int = 0,
-    targets: tuple[ProjectionShape, ...] = (),
+    targets: Mapping[Projection, tuple[int, int]] = {},
 ) -> BackendCompileFacts:
     """Facts for an eager in-process model, in place of what the vLLM runner probes.
 
-    `hidden` lists the taps the workload reads (see `hidden_binding`); `provider` holds state pages, None for
-    a workload without state. `max_lineages` bounds admitted requests, `memory_bytes` the state budget, and
-    `max_rows` the packed rows per step (twice `max_lineages` by default). `targets` declares parameter
-    shapes for overlays; `vocab_size` and `layer_count` are needed by workloads that read logits or layers.
+    `hidden` lists the taps the workload reads (see `hidden_binding`). `device` ("cpu" or "cuda") holds the
+    state pages, `pages` versions per state. `capabilities` are the backend features plans may use; the default
+    is everything a CPU simulation runs (overlays, AdamW, custom forwards, token capture). `max_lineages` bounds
+    admitted requests, `memory_bytes` the state budget, and `max_rows` the packed rows per step (twice
+    `max_lineages` by default). `targets` maps overlay targets to their (input, output) widths; `vocab_size`
+    and `layer_count` are needed by workloads that read logits or layers.
     """
+    kind = StateDeviceKind(torch.device(device).type)
     return BackendCompileFacts(
         ModelProbe(
             "c" * 64,
             AttachmentGraphMode.EAGER,
-            _CPU_PAGES.device_kind if provider is None else provider.device_kind,
-            dtype,
+            kind,
+            TensorDType(str(dtype).removeprefix("torch.")),
             hidden_size,
             max_lineages * 2 if max_rows is None else max_rows,
             tuple(
@@ -114,10 +117,10 @@ def backend_facts(
                 for binding in sorted(hidden, key=lambda item: item.locator_key)
             ),
             (),
-            targets=targets,
+            targets=tuple(ProjectionShape(target, *widths) for target, widths in targets.items()),
         ),
-        timeline,
-        () if provider is None else (provider,),
+        model_timeline(torch.device(device), capabilities),
+        (PageBundleProviderFacts(f"testing.{kind}@1", pages, kind),),
         max_lineages,
         memory_bytes,
         7,

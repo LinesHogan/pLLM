@@ -12,8 +12,8 @@ from importlib.util import find_spec
 import pytest
 import torch
 
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.host import Completion, CompletionBatch, CompletionInput, FinishReason, HostConfig, RetryAction, make_host
+from pllm.testing import RequestIdentity
 from pllm.workloads.fttt import FTTTConfig, FTTTFeedback, FTTTFeedbackQueue, FTTTJudge, FTTTJudgeResult
 
 

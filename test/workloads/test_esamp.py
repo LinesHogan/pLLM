@@ -18,21 +18,17 @@ from pllm import testing
 from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskSymbol
-from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.declaration import Dimensions
 from pllm.execution.module_state import initial_values
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorTask
-from pllm.testing import backend_facts
+from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
 BINDINGS = tuple(
@@ -42,9 +38,9 @@ BINDINGS = tuple(
 
 
 def facts_for(device, hidden_size, pages, lineages=2, memory_bytes=10000):
-    provider = PageBundleProviderFacts("test.esamp@1", pages, StateDeviceKind(device.type))
-    timeline = model_timeline(device)
-    return backend_facts(hidden_size, BINDINGS, timeline, provider, max_lineages=lineages, memory_bytes=memory_bytes)
+    return backend_facts(
+        hidden_size, BINDINGS, device=device.type, pages=pages, max_lineages=lineages, memory_bytes=memory_bytes
+    )
 
 
 def step_input(identities, source, target, step_id, order=None, stream=None):

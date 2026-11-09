@@ -10,44 +10,21 @@ import pllm
 from pllm.authoring import StateImport
 from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
-    AttachmentGraphMode,
     DecodeRefresh,
     DecodeWindow,
-    ModelProbe,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId
-from pllm.contracts.state_representation import StateDeviceKind
-from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.step_input import StepInput
+from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload, load_loreft_interventions
 
 
 def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     device = torch.device("cpu")
-    facts = BackendCompileFacts(
-        ModelProbe(
-            "c" * 64,
-            AttachmentGraphMode.EAGER,
-            StateDeviceKind.CPU,
-            TensorDType.FLOAT64,
-            4,
-            8,
-            (),
-            (),
-        ),
-        model_timeline(device, ("transition/full_root@1",)),
-        (PageBundleProviderFacts("test.page@1", 4),),
-        2,
-        65536,
-        0,
-    )
+    facts = backend_facts(4, pages=4, memory_bytes=65536, max_rows=8, dtype=torch.float64)
     workload = ReFTWorkload(ReFTConfig((0,), 2, first_tokens=1, last_tokens=1))
     deployment = workload.compile_backend(facts)
     execution = deployment.execution

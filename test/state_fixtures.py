@@ -12,15 +12,14 @@ from pllm import testing
 from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow
-from pllm.contracts.parameter_overlay import Projection, ProjectionShape
+from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import AnchorId, SemanticState, StateResource, StateScope
-from pllm.contracts.state_representation import StateDeviceKind, StateRepresentationRequest
+from pllm.contracts.state_representation import StateRepresentationRequest
 from pllm.contracts.tensor_layout import LayoutFieldId, StateTensorLayout, TensorLayoutRequest
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.scheduler import compile_state_schedule, intern_tensor_layouts
 from pllm.execution.state_execution import MathBinding
 from pllm.execution.tensor_program import FunctionMath
@@ -58,21 +57,17 @@ def paged_rows(positions=(4, 5, 4, 5)) -> tuple[PackedPhaseRow, ...]:
     )
 
 
-def inplace_plan(device: torch.device, provider: PageBundleProviderFacts, capabilities: tuple[str, ...]):
-    """The InPlaceTTT plan for one request-scoped dense resource on ``device``."""
+def inplace_plan(device: str):
+    """The InPlaceTTT plan for one request-scoped dense resource on ``device``, with six pages per state."""
     target = Projection("down_proj", 0)
-    timeline = model_timeline(device, capabilities)
-    facts = testing.backend_facts(
-        3, (), timeline, provider, memory_bytes=4096, max_rows=8, targets=(ProjectionShape(target, 3, 2),)
-    )
+    facts = testing.backend_facts(3, device=device, pages=6, memory_bytes=4096, max_rows=8, targets={target: (3, 2)})
     workload = DenseUpdate(DenseUpdateConfig((target,), chunk_size=2))
     return workload.plan_backend(*workload.specialize(facts, ExecutionOptions())).plan
 
 
 def page_arena(*, heterogeneous: bool = False) -> PageBundleArena:
     """A CPU arena for one request-scoped dense resource (plus an instance one)."""
-    provider = PageBundleProviderFacts("test.page_bundle@1", 6)
-    plan = inplace_plan(torch.device("cpu"), provider, ("transition/full_root@1",))
+    plan = inplace_plan("cpu")
     if heterogeneous:
         (dense,) = plan.tensor_layout_request.layouts
         layout = replace(
@@ -123,8 +118,7 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
 
 def cuda_arena(stream) -> PageBundleArena:
     """The same request plan, with pages and completion receipts on CUDA."""
-    provider = PageBundleProviderFacts("test.region.cuda@1", 6, StateDeviceKind.CUDA)
-    return PageBundleArena(inplace_plan(stream.device, provider, ("transition/full_root@1", "state/fenced_reclaim@1")))
+    return PageBundleArena(inplace_plan("cuda"))
 
 
 DENSE = StateResource("dense_fast_weights")

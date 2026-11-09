@@ -191,6 +191,14 @@ class _Run:
         return False
 
 
+# The backend features a CPU simulation of the vLLM runner executes.
+SIMULATED_CAPABILITIES = (
+    "execution/token_capture@1",
+    "model/custom_forward@1",
+    "optimizer/adamw@1",
+    "state/fenced_reclaim@1",
+    "transition/full_root@1",
+)
 _IDS = tuple(RequestIdentity(name, index, index) for index, name in enumerate(("r2", "r0", "r1")))
 _PROMPTS = (5, 1, 9)
 _LOGITS_CHANNEL = 90
@@ -779,10 +787,7 @@ def contract_facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape,
     return shape, replace(
         facts,
         probe=replace(facts.probe, device_kind=StateDeviceKind.CPU),
-        timeline=model_timeline(
-            torch.device("cpu"),
-            ("transition/full_root@1", "optimizer/adamw@1", "model/custom_forward@1", "execution/token_capture@1"),
-        ),
+        timeline=model_timeline(torch.device("cpu"), SIMULATED_CAPABILITIES),
         providers=tuple(
             replace(provider, provider_id="testing.cpu@1", device_kind=StateDeviceKind.CPU)
             for provider in facts.providers

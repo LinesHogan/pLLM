@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from pllm.authoring import FunctionMath, StepInput, WeightedRowBatch
-from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, HostServiceInputSource
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.state_execution import PartialCommitError
@@ -23,6 +22,7 @@ from pllm.host import (
     HostConfig,
     RetryAction,
 )
+from pllm.testing import RequestIdentity
 from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadWorkload, boxed_label, majority_vote
 
 

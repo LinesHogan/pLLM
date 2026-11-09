@@ -12,7 +12,6 @@ from torch import nn
 import pllm
 from pllm import testing
 from pllm.execution.freeze import fingerprint
-from pllm.execution.runtime_facts import model_timeline
 
 
 def fill_probe(fields, generator):
@@ -191,7 +190,6 @@ def test_pretrained_boundary_messages_and_import_first_export(tmp_path):
     imported = replace(workload, state=replace(state, init=pllm.Imported()))
     tap = testing.final_hidden_binding(1)
     facts = testing.backend_facts(4, (tap,), layer_count=1, memory_bytes=1 << 20)
-    facts = replace(facts, timeline=model_timeline(torch.device("cpu"), ("transition/full_root@1",)))
     with testing.compile_execution(imported, facts) as execution:
         ids = (testing.RequestIdentity("a", 0, 0),)
         execution.admit(ids)
@@ -207,7 +205,7 @@ def test_pretrained_boundary_messages_and_import_first_export(tmp_path):
 
 
 def test_pretrained_uses_model_side_initializer_paths(tmp_path):
-    from pllm.contracts.parameter_overlay import Projection, ProjectionShape
+    from pllm.contracts.parameter_overlay import Projection
     from test.dense_update import DenseUpdate, DenseUpdateConfig
     from test.workloads.test_model_sites import FastWeightMemory
 
@@ -231,10 +229,9 @@ def test_pretrained_uses_model_side_initializer_paths(tmp_path):
     target = Projection("down_proj", 0)
     facts = testing.backend_facts(
         3,
-        timeline=model_timeline(torch.device("cpu"), ("transition/full_root@1",)),
         memory_bytes=1 << 20,
         layer_count=2,
-        targets=(ProjectionShape(target, 3, 2),),
+        targets={target: (3, 2)},
     )
     for workload, key, shape in (
         (SavedDense(DenseUpdateConfig((target,), chunk_size=2), path=path), "delta", (2, 3)),

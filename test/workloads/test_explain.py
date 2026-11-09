@@ -311,7 +311,7 @@ class PrecisionRoles(pllm.Workload):
 @pytest.mark.parametrize("model_dtype", ("bfloat16", "float16"))
 def test_storage_precision_follows_declared_role(dtype, model_dtype, model_config):
     declaration = PrecisionRoles(dtype).build(
-        testing.backend_facts(8, (testing.hidden_binding(0, 10),), dtype=TensorDType(model_dtype), layer_count=10)
+        testing.backend_facts(8, (testing.hidden_binding(0, 10),), dtype=TensorDType(model_dtype).torch, layer_count=10)
     )
     expected = {
         ("values", "read"): model_dtype,
@@ -416,8 +416,10 @@ def test_tp_projection_shard_costs(model_config, kind, target):
             partitions if row else 1,
             1 if row else partitions,
         )
-        facts = testing.backend_facts(8, layer_count=10, memory_bytes=1 << 20, targets=(projection,))
-        binding = workload.build(replace(facts, probe=replace(facts.probe, tensor_parallel_size=tp)))
+        facts = testing.backend_facts(8, layer_count=10, memory_bytes=1 << 20)
+        binding = workload.build(
+            replace(facts, probe=replace(facts.probe, targets=(projection,), tensor_parallel_size=tp))
+        )
         for rank in range(tp):
             binding.tensor_parallel_rank = rank
             root = tuple(

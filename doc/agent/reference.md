@@ -951,7 +951,7 @@ pllm.testing.check_on_gpu(workload: 'Workload', config: 'ModelConfig', *, neutra
     Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
 pllm.testing.RequestIdentity(request_id: 'str', prompt_index: 'int', sample_index: 'int', route: 'str' = '')
 pllm.testing.SamplerFeedback(sampler_rows: 'PackedSamplerRowBatch', base_logits: 'torch.Tensor', sampled_tokens: 'torch.Tensor')
-pllm.testing.backend_facts(hidden_size: 'int', hidden: 'tuple[PackedHiddenResourceBinding, ...]' = (), timeline: 'SchedulerTimeline' = ..., provider: 'PageBundleProviderFacts | None' = ..., *, max_lineages: 'int' = 2, memory_bytes: 'int' = 10000, max_rows: 'int | None' = None, dtype: 'TensorDType' = <TensorDType.FLOAT32: 'float32'>, vocab_size: 'int' = 0, layer_count: 'int' = 0, targets: 'tuple[ProjectionShape, ...]' = ()) -> 'BackendCompileFacts'
+pllm.testing.backend_facts(hidden_size: 'int', hidden: 'tuple[PackedHiddenResourceBinding, ...]' = (), *, device: 'str' = 'cpu', capabilities: 'tuple[str, ...]' = ..., pages: 'int' = 16, max_lineages: 'int' = 2, memory_bytes: 'int' = 10000, max_rows: 'int | None' = None, dtype: 'torch.dtype' = torch.float32, vocab_size: 'int' = 0, layer_count: 'int' = 0, targets: 'Mapping[Projection, tuple[int, int]]' = {}) -> 'BackendCompileFacts'
     Facts for an eager in-process model, in place of what the vLLM runner probes.
 pllm.testing.compile_execution(workload: 'BackendWorkload[DataT, ResultT]', facts: 'BackendCompileFacts', stream: 'torch.cuda.Stream | None' = None) -> 'StateExecution[StepInput, DataT, ResultT]'
     Compile `workload` against `facts` and admit its instance state, as the vLLM runner does on install.
