@@ -504,7 +504,7 @@ class TensorDeclaration:
         overlay = OverlayBatch(math, limits.get(symbol) if capture else None)
         batched = replace(math, executor=overlay)
         return replace(
-            operation, body=partial(native_body, batched), trace_body=batched, capture_resident=overlay.resident
+            operation, body=partial(native_body, batched), trace_body=batched.trace, capture_resident=overlay.resident
         )
 
     def _tensor_operation(

@@ -173,6 +173,7 @@ def declare_parameter_overlay(
         ),
     )
     _bind_visibility(b, transition, source)
+    b.operations[transition.symbol] = replace(b.operations[transition.symbol], trace_body=math.trace)
     if visibility == "exact":
         b.operations[transition.symbol] = replace(
             b.operations[transition.symbol], version="private", select_fields=math.written_fields

@@ -376,13 +376,10 @@ def derive_resources(
             if state.resource == address.resource and state.immutable
             for tensor in root
         )
-        entries = len(data.entries)
         try:
             with fixed_shapes(), GatherTrace(tables) as gathers:
                 usage = operation.memory(data, batch)
                 gathers.check_outputs(tuple(batch.results.values()))
-            if binding.overlay_math is not None and symbol == binding.overlay_math.task:
-                binding.overlay_math.check(data.step.operands, data.entries[entries:])
             for resource, size in gathers.bytes.items():
                 binding.gather_bytes[symbol, resource] = size // (
                     facts.probe.max_packed_rows if symbol in binding.model_site_tasks else len(data.rows)

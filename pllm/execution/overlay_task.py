@@ -410,18 +410,23 @@ class OverlayTransition:
 
     def __call__(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         batch = batch.for_resource(self.resource)
+        return self._output(data, batch, self._updates(data, batch))
+
+    def trace(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
+        """Planning's run on maximum-shape meta operands; checks the author's results once, so steps trust them."""
+        batch = batch.for_resource(self.resource)
+        updates = self._updates(data, batch)
+        self.check(data.step.operands, updates)
+        return self._output(data, batch, updates)
+
+    def _updates(self, data: TensorFrame, batch: TensorBatch) -> dict[tuple[RequestIdentity, Projection], UpdateOutput]:
+        """Each visible request's update of each target."""
         operands = {
             (operand.identity, operand.target): operand
             for operand in data.step.operands
             if self.visibility.in_forward or operand.phase in self.phases
         }
-        if not operands:
-            return TaskOutput()
-        selected = dict.fromkeys(
-            (row.identity, index)
-            for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
-        )
-        indices = {identity: index for identity, index in selected}
+        indices = dict(zip((row.identity for row in batch.selection.rows), batch.selection.state_indices, strict=True))
         updates: dict[tuple[RequestIdentity, Projection], UpdateOutput] = {}
         with torch.no_grad():
             for target_index, target in enumerate(self.targets):
@@ -442,6 +447,21 @@ class OverlayTransition:
                     else:
                         results = self.executor.run(group, target_index, group_indices, batch)
                     updates.update(((o.identity, target), result) for o, result in zip(group, results, strict=True))
+        return updates
+
+    def _output(
+        self,
+        data: TensorFrame,
+        batch: TensorBatch,
+        updates: Mapping[tuple[RequestIdentity, Projection], UpdateOutput],
+    ) -> TaskOutput:
+        """Record one entry per updated request, and the residuals and counters of the step."""
+        if not updates:
+            return TaskOutput()
+        selected = dict.fromkeys(
+            (row.identity, index)
+            for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
+        )
         start = len(data.entries)
         changed: dict[int, torch.Tensor] = {}
         for identity, index in selected:
@@ -553,38 +573,46 @@ class OverlayTransition:
             return UpdateOutput.unchanged(self.apply(operand.hidden, values))
         return self.function(**self.inputs(operand, values))
 
-    def check(self, operands: Sequence[ProjectionOperands], entries: Sequence[OverlayEntry]) -> None:
+    def check(
+        self,
+        operands: Sequence[ProjectionOperands],
+        updates: Mapping[tuple[RequestIdentity, Projection], UpdateOutput],
+    ) -> None:
         """Check the author's results once, from declaration's run on maximum-shape meta operands.
 
-        Every update kind returns its residual and counters through these entries, so no step checks them again.
+        Every update kind returns its residual and counters here, so no step checks them again.
         """
         hidden = {(operand.identity, operand.target): operand.hidden for operand in operands}
-        for entry in entries:
-            for item in entry.targets:
-                result, rows = item.update, hidden[entry.identity, item.target]
-                size = self.projections[self.targets.index(item.target)].output_size
-                if (
-                    result.output.shape != (len(rows), size)
-                    or result.output.dtype not in (rows.dtype, torch.float32)
-                    or result.output.device != rows.device
-                ):
-                    raise ValueError(
-                        f"{self.task} must return the residual for {item.target} as [rows, {size}] in the input "
-                        f"dtype or float32 on the input's device; got {tuple(result.output.shape)} "
-                        f"{result.output.dtype} on {result.output.device}"
-                    )
-                if any(
-                    value.shape != () or value.device != rows.device or value.dtype != dtype
-                    for value, dtype in (
-                        (result.changed, torch.bool),
-                        (result.update_count, torch.int64),
-                        (result.trained_rows, torch.int64),
-                    )
-                ):
-                    raise ValueError(
-                        f"{self.task} must return changed (bool) and update_count and trained_rows (int64) "
-                        "as 0-d tensors on the input's device"
-                    )
+        for (identity, target), result in updates.items():
+            rows = hidden[identity, target]
+            size = self.projections[self.targets.index(target)].output_size
+            if type(result) is not UpdateOutput:
+                raise TypeError(
+                    f"{self.task} must return pllm.UpdateOutput(residual, changed, update_count, trained_rows); "
+                    f"got {type(result).__name__}"
+                )
+            if (
+                result.output.shape != (len(rows), size)
+                or result.output.dtype not in (rows.dtype, torch.float32)
+                or result.output.device != rows.device
+            ):
+                raise ValueError(
+                    f"{self.task} must return the residual for {target} as [rows, {size}] in the input "
+                    f"dtype or float32 on the input's device; got {tuple(result.output.shape)} "
+                    f"{result.output.dtype} on {result.output.device}"
+                )
+            if any(
+                value.shape != () or value.device != rows.device or value.dtype != dtype
+                for value, dtype in (
+                    (result.changed, torch.bool),
+                    (result.update_count, torch.int64),
+                    (result.trained_rows, torch.int64),
+                )
+            ):
+                raise ValueError(
+                    f"{self.task} must return changed (bool) and update_count and trained_rows (int64) "
+                    "as 0-d tensors on the input's device"
+                )
 
 
 class ProgramOperand(NamedTuple):
