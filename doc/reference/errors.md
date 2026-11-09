@@ -94,6 +94,7 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | --- | --- | --- |
 | `pllm runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...` | pllm 只对这两个版本做过对齐 | 安装 0.27.1 或 0.32.0 |
 | `pllm runs vLLM's own model classes, not subclasses of them` | 子类可能改变投影布局或 logits | 用列出的模型类，见[支持矩阵](support-matrix.md) |
+| `completions carry each sample's final hidden row, which only a workload collects; ...` | `generate_completions` 和 `generate_feedback` 要把每个样本最终位置的 hidden 交给宿主，只有装了负载的引擎才会采集 | 只做重试或打分、不训练时，给 `make_llm` 传 `workload=pllm.workloads.DummyWorkload()` |
 | `pllm.input_tokens needs runner="mrv2"` | token 历史来自 MRv2 runner | `runner="mrv2"` |
 | `...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | `cuda_graphs=True` 时负载里有需要 eager 的写法 | 去掉那个写法，或允许 eager |
 | `worker processes cannot send ... defined in __main__ or a notebook; move it into an importable .py module, ...` | 子进程按导入路径重建负载 | 把类放进 `.py` 模块，或 `multiprocessing=False` |

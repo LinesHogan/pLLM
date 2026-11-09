@@ -446,6 +446,11 @@ class VllmLlm(Generic[DataT, ResultT]):
 
     def _completion_device(self, requested: torch.device | None) -> torch.device:
         """Where completion hidden rows land: `requested`, else the model's device (CPU for an EngineCore engine)."""
+        if self.backend_attachment is None:
+            raise ValueError(
+                "completions carry each sample's final hidden row, which only a workload collects; pass "
+                "workload=pllm.workloads.DummyWorkload() to make_llm when nothing should train"
+            )
         return requested or (torch.device("cpu") if self._runner is None else self.device)
 
     def _generate(
