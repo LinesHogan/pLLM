@@ -19,7 +19,7 @@ from pllm.backends.vllm.compat import admit_parallel
 from pllm.backends.vllm.compile_facts import compile_facts
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
-from pllm.contracts.backend_attachment import AttachmentHiddenResource
+from pllm.contracts.backend_attachment import AttachmentHiddenResource, BackendAttachment
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
@@ -43,7 +43,7 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.checkpoint import checkpoint_directory
-from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.model_sites import StateInput
 from pllm.execution.preemption import preemption_policy
 from pllm.execution.runtime_facts import model_timeline
@@ -928,7 +928,6 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
     """
     passed: list[str] = []
     skipped: list[CheckSkip] = []
-    failures: list[str] = []
     requirements = workload.backend_requirements()
     admit_parallel(config, requirements)
     passed.append(f"tensor_parallel_size={config.tensor_parallel_size}: admission")
@@ -968,38 +967,15 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         )
     programs = tuple((declaration.custom_forward_programs or {}).values())
     if any(program.adaptive for program in programs):
-        from pllm.testing_depth import check_depth, check_never_exit
-
-        parameters = _initial_parameters(declaration, programs, config.seed)
-        for program in programs:
-            if not program.adaptive:
-                continue
-            if program.entries or declaration.overlay_targets or declaration.sites.rewrites:
-                skipped.append(CheckSkip("adaptive decoder", "PositionState and model-site composition need GPU"))
-                continue
-            try:
-                passed.extend(
-                    check_depth(
-                        program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch, parameters
-                    )
-                )
-                check_never_exit(
-                    program, shape.layer_count, shape.hidden_size, facts.probe.tensor_dtype.torch, parameters
-                )
-                passed.append("never exit bitwise")
-            except AssertionError as error:
-                raise ContractError((f"[adaptive depth] {error}",)) from error
-        if parameters:
-            passed.append("custom-forward instance reads / CPU decoder")
-        skipped.append(CheckSkip("model arithmetic", "CPU fake decoder; native kernels need GPU"))
+        _check_adaptive(declaration, programs, shape, facts, config.seed, passed, skipped)
     if (
         ops
         and requirements.custom_residual
         and not programs
         and all(rewrite.memory is None for rewrite in declaration.sites.rewrites)
     ):
-        failures.extend(
-            _variants(workload, facts, declaration, shape, frozenset(), skipped, device_equivalence=device_equivalence)
+        failures = _variants(
+            workload, facts, declaration, shape, frozenset(), skipped, device_equivalence=device_equivalence
         )
         if failures:
             raise ContractError(tuple(failures))
@@ -1026,6 +1002,65 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         )
     if programs:
         passed.append("custom-forward instance reads / CPU decoder")
+    if declaration.graph.trains_on_batch and not requirements.hidden_inputs and not requirements.sampler_stages:
+        return CheckResult(
+            tuple(passed), (CheckSkip("CPU schedules", "host-batch-only workload; no request computation"),)
+        )
+    exports = frozenset(
+        prefix
+        for task in declaration.tensor_tasks.values()
+        if task.export is not None
+        for prefix in (f"method {task.symbol}.", f"export {task.export.name}")
+    )
+    skipped.extend(_unchecked_effects(requirements, declaration, attachment, programs, exports))
+    failures = _variants(workload, facts, declaration, shape, exports, skipped, device_equivalence=device_equivalence)
+    passed.extend(_schedule_properties(declaration, skipped))
+    if failures:
+        raise ContractError(tuple(failures))
+    return CheckResult(tuple(passed), tuple(skipped))
+
+
+def _check_adaptive(
+    declaration: TensorDeclaration,
+    programs: tuple[TokenProgram, ...],
+    shape: ModelShape,
+    facts: BackendCompileFacts,
+    seed: int,
+    passed: list[str],
+    skipped: list[CheckSkip],
+) -> None:
+    """Check adaptive-depth programs against the CPU decoder oracle, bitwise when no request exits."""
+    from pllm.testing_depth import check_depth, check_never_exit
+
+    parameters = _initial_parameters(declaration, programs, seed)
+    dtype = facts.probe.tensor_dtype.torch
+    for program in programs:
+        if not program.adaptive:
+            continue
+        if program.entries or declaration.overlay_targets or declaration.sites.rewrites:
+            skipped.append(CheckSkip("adaptive decoder", "PositionState and model-site composition need GPU"))
+            continue
+        try:
+            passed.extend(check_depth(program, shape.layer_count, shape.hidden_size, dtype, parameters))
+            check_never_exit(program, shape.layer_count, shape.hidden_size, dtype, parameters)
+            passed.append("never exit bitwise")
+        except AssertionError as error:
+            raise ContractError((f"[adaptive depth] {error}",)) from error
+    if parameters:
+        passed.append("custom-forward instance reads / CPU decoder")
+    skipped.append(CheckSkip("model arithmetic", "CPU fake decoder; native kernels need GPU"))
+
+
+def _unchecked_effects(
+    requirements: BackendRequirements,
+    declaration: TensorDeclaration,
+    attachment: BackendAttachment,
+    programs: tuple[TokenProgram, ...],
+    exports: frozenset[str],
+) -> list[CheckSkip]:
+    """What CPU schedules leave to the GPU checks, or compare only partly."""
+    skipped: list[CheckSkip] = []
+    if programs:
         skipped.append(
             CheckSkip("model attention / KV", "CPU decoder checks token math and state reads; real attention needs GPU")
         )
@@ -1040,10 +1075,6 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         skipped.append(CheckSkip("activation application", "needs a loaded model; state producers are checked"))
     if declaration.graph.trains_on_batch:
         skipped.append(CheckSkip("host training", "no host batch in the request script; inference is checked"))
-        if not requirements.hidden_inputs and not requirements.sampler_stages:
-            return CheckResult(
-                tuple(passed), (CheckSkip("CPU schedules", "host-batch-only workload; no request computation"),)
-            )
     if requirements.custom_residual:
         skipped.append(
             CheckSkip("residual arithmetic", "CPU schedules check pre-forward results; residual hooks need GPU")
@@ -1055,12 +1086,6 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
                 "isolation after shared training", f"InstanceState {', '.join(sorted(shared))} learns from all requests"
             )
         )
-    exports = frozenset(
-        prefix
-        for task in declaration.tensor_tasks.values()
-        if task.export is not None
-        for prefix in (f"method {task.symbol}.", f"export {task.export.name}")
-    )
     if exports:
         skipped.append(
             CheckSkip(
@@ -1075,9 +1100,12 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
                 "publish_lag counts engine steps: mixed/preempted values reading different permitted versions are not compared; every version read is checked",
             )
         )
-    failures.extend(
-        _variants(workload, facts, declaration, shape, exports, skipped, device_equivalence=device_equivalence)
-    )
+    return skipped
+
+
+def _schedule_properties(declaration: TensorDeclaration, skipped: list[CheckSkip]) -> list[str]:
+    """The properties the schedule variants checked; adds a skip for each that does not apply."""
+    passed: list[str] = []
     if any(
         state.resource in declaration.imports and state.scope is StateScope.REQUEST
         for state in declaration.graph.states
@@ -1107,9 +1135,7 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         )
     if not any(skip.property == "preempted" for skip in skipped):
         passed.append("preempted")
-    if failures:
-        raise ContractError(tuple(failures))
-    return CheckResult(tuple(passed), tuple(skipped))
+    return passed
 
 
 def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:

@@ -400,45 +400,8 @@ fn plan_memory(
     for (position, task) in tasks.iter().enumerate() {
         positions[task.task_id as usize] = position;
     }
-    let mut workspace = vec![0; graph.tasks.len()];
-    for fact in &timeline.task_resources {
-        let task = graph
-            .tasks
-            .binary_search_by(|task| task.symbol.cmp(&fact.task))
-            .expect("workspace facts name declared tasks");
-        workspace[task] = fact.workspace_bytes;
-    }
-    let mut values = Vec::new();
-    for (producer, task) in graph.tasks.iter().enumerate() {
-        for output in &task.outputs {
-            let fact = timeline
-                .value_resources
-                .iter()
-                .find(|fact| fact.task == task.symbol && fact.output == output.name);
-            let mut users: BTreeSet<_> = graph.tasks.iter().enumerate().filter_map(|(user, task)|
-                task.inputs.iter().any(|input| matches!(&input.source,
-                    InputSource::Result { task, output: name } if task == &graph.tasks[producer].symbol && name == &output.name))
-                    .then_some(user)).collect();
-            // Autograd may save a consumer's inputs until its downstream gradient sink.
-            for &user in &index.order {
-                if graph.tasks[user].math.as_ref().is_some_and(|math| {
-                    graph.tasks[user].inputs.iter().any(|input| {
-                        math.input_gradients.contains(&input.name)
-                            && matches!(&input.source, InputSource::Result { task, .. }
-                            if users.iter().any(|&parent| &graph.tasks[parent].symbol == task))
-                    })
-                }) {
-                    users.insert(user);
-                }
-            }
-            values.push(ValueUse {
-                producer,
-                users,
-                bytes: fact.map_or(0, |fact| fact.bytes),
-                exported: output.kind != OutputKind::Temporary,
-            });
-        }
-    }
+    let workspace = task_workspace(graph, timeline);
+    let values = value_uses(graph, index, timeline);
     let mut planned = tasks.to_vec();
     for task in &mut planned {
         task.release_values.clear();
@@ -473,56 +436,12 @@ fn plan_memory(
         .map(|f| f.resident_bytes as u128)
         .sum::<u128>()
         + state.map_or(0, |s| s.reserved_bytes as u128);
-    let copies = if tasks.iter().any(|t| t.read_origin == ReadOrigin::Latest) {
-        values
-            .iter()
-            .filter(|v| {
-                tasks[positions[v.producer]].read_origin != ReadOrigin::Latest
-                    && (v.exported
-                        || v.users
-                            .iter()
-                            .any(|&u| tasks[positions[u]].read_origin == ReadOrigin::Latest))
-            })
-            .map(|v| v.bytes as u128)
-            .sum::<u128>()
-    } else {
-        0
-    };
-    let side_workspace = copies
-        + tasks
-            .iter()
-            .filter(|t| t.lane == Lane::Side)
-            .map(|t| workspace[t.task_id as usize] as u128 + live[positions[t.task_id as usize]])
-            .max()
-            .unwrap_or(0);
+    let side = side_workspace(tasks, &values, &positions, &workspace, &live);
     let mut peak = 0;
-    for (anchor, _) in timeline.anchors.iter().enumerate() {
+    for anchor in 0..timeline.anchors.len() {
         let reserved = timeline.reserved_bytes.get(anchor).copied().unwrap_or(0) as u128 + resident;
-        let at: Vec<_> = tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.anchor_id as usize == anchor)
-            .collect();
-        let bytes = if at.is_empty() {
-            // Values spanning an anchor still occupy storage when no task runs there.
-            values
-                .iter()
-                .filter(|v| {
-                    tasks[positions[v.producer]].anchor_id as usize <= anchor
-                        && (v.exported
-                            || v.users
-                                .iter()
-                                .any(|&u| tasks[positions[u]].anchor_id as usize >= anchor))
-                })
-                .map(|v| v.bytes as u128)
-                .sum()
-        } else {
-            at.iter()
-                .map(|(pos, t)| live[*pos] + workspace[t.task_id as usize] as u128)
-                .max()
-                .unwrap()
-        };
-        peak = peak.max(reserved + bytes + side_workspace);
+        let bytes = anchor_bytes(anchor, tasks, &values, &positions, &workspace, &live);
+        peak = peak.max(reserved + bytes + side);
     }
     peak = peak.max(resident + exported);
     let peak = u64::try_from(peak).map_err(|_| "placement memory envelope overflows u64")?;
@@ -540,6 +459,123 @@ fn plan_memory(
         tasks: planned,
         peak,
     })
+}
+
+/// Each task's workspace from the measured task facts, indexed like `graph.tasks`.
+fn task_workspace(graph: &SemanticGraph, timeline: &Timeline) -> Vec<u64> {
+    let mut workspace = vec![0; graph.tasks.len()];
+    for fact in &timeline.task_resources {
+        let task = graph
+            .tasks
+            .binary_search_by(|task| task.symbol.cmp(&fact.task))
+            .expect("workspace facts name declared tasks");
+        workspace[task] = fact.workspace_bytes;
+    }
+    workspace
+}
+
+/// Every task output with its measured size and the tasks that keep it alive.
+fn value_uses(graph: &SemanticGraph, index: &GraphIndex, timeline: &Timeline) -> Vec<ValueUse> {
+    let mut values = Vec::new();
+    for (producer, task) in graph.tasks.iter().enumerate() {
+        for output in &task.outputs {
+            let fact = timeline
+                .value_resources
+                .iter()
+                .find(|fact| fact.task == task.symbol && fact.output == output.name);
+            let mut users: BTreeSet<_> = graph.tasks.iter().enumerate().filter_map(|(user, task)|
+                task.inputs.iter().any(|input| matches!(&input.source,
+                    InputSource::Result { task, output: name } if task == &graph.tasks[producer].symbol && name == &output.name))
+                    .then_some(user)).collect();
+            // Autograd may save a consumer's inputs until its downstream gradient sink.
+            for &user in &index.order {
+                if graph.tasks[user].math.as_ref().is_some_and(|math| {
+                    graph.tasks[user].inputs.iter().any(|input| {
+                        math.input_gradients.contains(&input.name)
+                            && matches!(&input.source, InputSource::Result { task, .. }
+                            if users.iter().any(|&parent| &graph.tasks[parent].symbol == task))
+                    })
+                }) {
+                    users.insert(user);
+                }
+            }
+            values.push(ValueUse {
+                producer,
+                users,
+                bytes: fact.map_or(0, |fact| fact.bytes),
+                exported: output.kind != OutputKind::Temporary,
+            });
+        }
+    }
+    values
+}
+
+/// What the side lane holds at once: copies of the values it reads from the main lane, plus its largest
+/// task's live values and workspace.
+fn side_workspace(
+    tasks: &[PhysicalTask],
+    values: &[ValueUse],
+    positions: &[usize],
+    workspace: &[u64],
+    live: &[u128],
+) -> u128 {
+    let copies = if tasks.iter().any(|t| t.read_origin == ReadOrigin::Latest) {
+        values
+            .iter()
+            .filter(|v| {
+                tasks[positions[v.producer]].read_origin != ReadOrigin::Latest
+                    && (v.exported
+                        || v.users
+                            .iter()
+                            .any(|&u| tasks[positions[u]].read_origin == ReadOrigin::Latest))
+            })
+            .map(|v| v.bytes as u128)
+            .sum::<u128>()
+    } else {
+        0
+    };
+    copies
+        + tasks
+            .iter()
+            .filter(|t| t.lane == Lane::Side)
+            .map(|t| workspace[t.task_id as usize] as u128 + live[positions[t.task_id as usize]])
+            .max()
+            .unwrap_or(0)
+}
+
+/// The main lane's bytes at one anchor: its largest task's live values and workspace, or the values spanning
+/// the anchor when no task runs there.
+fn anchor_bytes(
+    anchor: usize,
+    tasks: &[PhysicalTask],
+    values: &[ValueUse],
+    positions: &[usize],
+    workspace: &[u64],
+    live: &[u128],
+) -> u128 {
+    let at: Vec<_> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.anchor_id as usize == anchor)
+        .collect();
+    if at.is_empty() {
+        // Values spanning an anchor still occupy storage when no task runs there.
+        return values
+            .iter()
+            .filter(|v| {
+                tasks[positions[v.producer]].anchor_id as usize <= anchor
+                    && (v.exported
+                        || v.users
+                            .iter()
+                            .any(|&u| tasks[positions[u]].anchor_id as usize >= anchor))
+            })
+            .map(|v| v.bytes as u128)
+            .sum();
+    }
+    at.iter()
+        .map(|(pos, t)| live[*pos] + workspace[t.task_id as usize] as u128)
+        .max()
+        .unwrap()
 }
 
 pub(super) fn compile(

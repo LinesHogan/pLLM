@@ -13,9 +13,11 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import CausalTrainBatch
 from pllm.contracts.kv_layout import KVCapacity
+from pllm.contracts.member import MemberDeclaration
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
     HostServiceInputSource,
+    SemanticTask,
     StateEffectKind,
     StateSelectionInputSource,
     TaskResourceFact,
@@ -465,6 +467,7 @@ def _states(plan: PlanBundle, binding: TensorDeclaration, rows: int) -> tuple[St
 def _settings(
     binding: TensorDeclaration, config: ModelConfig, plan: PlanBundle, facts: BackendCompileFacts
 ) -> tuple[EscapeHatch, ...]:
+    """The settings that shaped this plan: run-wide options, then each member's and task's choices."""
     lag = config.execution.publish_lag
     result = [
         EscapeHatch(
@@ -477,114 +480,132 @@ def _settings(
         )
     ]
     if any(task.sampler_beta for task in binding.tensor_tasks.values()):
-        capacity = facts.guidance_capacity
-        result.append(
-            EscapeHatch(
-                "",
-                "guidance_capacity",
-                str(config.execution.guidance_capacity),
-                config.execution.guidance_capacity == ExecutionOptions().guidance_capacity,
-                (
-                    "exact dense post-filter guidance: "
-                    + (
-                        "explicit guidance_capacity=None"
-                        if config.execution.guidance_capacity is None
-                        else str(facts.guidance_rejection)
-                    )
-                )
-                if capacity is None
-                else f"bounded fused guidance: guide the highest {capacity} survivors/row, tail unguided; "
-                "peaked full-vocabulary rows use the true one-token nucleus when top-1 probability >= top_p < 1; "
-                "choose capacities so the common case never takes the overflow path; "
-                "smaller K is slower because overflow rows need top-K selection; "
-                "MRv2, unquantized unscaled TP=1 LM head; FLOP/byte estimates are capacity upper bounds",
-            )
-        )
+        result.append(_guidance_setting(config, facts))
+    custom_forward = plan.semantic_graph.custom_forward_task is not None
     for name, member in binding.members.items():
-        if member.phase is not None:
-            result.append(EscapeHatch(name, "phase", member.phase, False, "overrides automatic task timing"))
-        if member.tokens is not None:
-            default_tokens = "prefill" if member.effect == "train_in_forward" else "all"
-            result.append(
-                EscapeHatch(
-                    name,
-                    "tokens",
-                    member.tokens,
-                    member.tokens == default_tokens,
-                    "selects the rows this method processes",
-                )
-            )
-        if member.visibility is not None:
-            result.append(
-                EscapeHatch(
-                    name,
-                    "visibility",
-                    member.visibility,
-                    member.visibility == "forward_pinned",
-                    "later chunks read earlier updates"
-                    if member.visibility == "exact"
-                    else "forward reads its entry state",
-                )
-            )
-        if member.effect == "custom_forward":
-            result.append(
-                EscapeHatch(
-                    name, member.effect, "enabled", False, "model wrapper runs eagerly; layer waves use CUDA graphs"
-                )
-            )
-        elif member.effect == "Adapter" and plan.semantic_graph.custom_forward_task is not None:
-            result.append(
-                EscapeHatch(
-                    name,
-                    "projection calls",
-                    "forward-pinned state",
-                    True,
-                    "apply the delta on every projection invocation, including repeated layer calls and replay; "
-                    "compacted rows and reordered waves select each request through device indices; "
-                    "native QKV propagation also uses the delta; 0 blocking host syncs per step",
-                )
-            )
-        elif member.effect == "custom_residual":
-            result.append(
-                EscapeHatch(
-                    name, member.effect, "enabled", False, "model graphs capture source operators, not inductor fusion"
-                )
-            )
+        result.extend(_member_settings(name, member, custom_forward=custom_forward))
     for task in plan.semantic_graph.tasks:
-        if task.custom_forward is not None and task.custom_forward.adaptive:
-            result.append(
-                EscapeHatch(
-                    task.symbol,
-                    "active",
-                    "CUDA conditional nodes",
-                    True,
-                    "stable compaction into power-of-two buckets plus exact all-active width; 0 blocking host syncs per step; "
-                    "first skipped commit propagates native norm/QKV/RoPE, later skips retain KV; recompute replays by token role; "
-                    "decode GEMMs save most when all rows exit; full-QKV propagation is about 7% of Qwen2.5 layer FLOPs (estimate)",
-                )
-            )
-        phases = tuple(
-            dict.fromkeys(
-                port.source.phase.value
-                for port in task.inputs
-                if isinstance(port.source, HiddenInputSource) and port.source.site is not HiddenSite.LAYER_LOGITS
-            )
-        )
-        if phases:
-            result.append(
-                EscapeHatch(
-                    task.symbol,
-                    "tokens",
-                    ",".join(phases),
-                    phases == ("decode",),
-                    "hidden taps select completed prompt endings, latest decode rows or every fresh token",
-                )
-            )
+        result.extend(_task_settings(task))
     if config.cuda_graphs is False:
         result.append(EscapeHatch("", "cuda_graphs", "False", False, "model forward runs eagerly"))
     if config.runner == "mrv1":
         result.append(EscapeHatch("", "runner", "mrv1", False, "workloads run without model CUDA graphs"))
     return tuple(result)
+
+
+def _guidance_setting(config: ModelConfig, facts: BackendCompileFacts) -> EscapeHatch:
+    """Whether sampler guidance is bounded to the top survivors or exact over the dense vocabulary, and why."""
+    capacity = facts.guidance_capacity
+    return EscapeHatch(
+        "",
+        "guidance_capacity",
+        str(config.execution.guidance_capacity),
+        config.execution.guidance_capacity == ExecutionOptions().guidance_capacity,
+        (
+            "exact dense post-filter guidance: "
+            + (
+                "explicit guidance_capacity=None"
+                if config.execution.guidance_capacity is None
+                else str(facts.guidance_rejection)
+            )
+        )
+        if capacity is None
+        else f"bounded fused guidance: guide the highest {capacity} survivors/row, tail unguided; "
+        "peaked full-vocabulary rows use the true one-token nucleus when top-1 probability >= top_p < 1; "
+        "choose capacities so the common case never takes the overflow path; "
+        "smaller K is slower because overflow rows need top-K selection; "
+        "MRv2, unquantized unscaled TP=1 LM head; FLOP/byte estimates are capacity upper bounds",
+    )
+
+
+def _member_settings(name: str, member: MemberDeclaration, *, custom_forward: bool) -> list[EscapeHatch]:
+    """A workload member's timing, token and visibility choices, and how its model effect runs."""
+    result: list[EscapeHatch] = []
+    if member.phase is not None:
+        result.append(EscapeHatch(name, "phase", member.phase, False, "overrides automatic task timing"))
+    if member.tokens is not None:
+        default_tokens = "prefill" if member.effect == "train_in_forward" else "all"
+        result.append(
+            EscapeHatch(
+                name,
+                "tokens",
+                member.tokens,
+                member.tokens == default_tokens,
+                "selects the rows this method processes",
+            )
+        )
+    if member.visibility is not None:
+        result.append(
+            EscapeHatch(
+                name,
+                "visibility",
+                member.visibility,
+                member.visibility == "forward_pinned",
+                "later chunks read earlier updates"
+                if member.visibility == "exact"
+                else "forward reads its entry state",
+            )
+        )
+    if member.effect == "custom_forward":
+        result.append(
+            EscapeHatch(
+                name, member.effect, "enabled", False, "model wrapper runs eagerly; layer waves use CUDA graphs"
+            )
+        )
+    elif member.effect == "Adapter" and custom_forward:
+        result.append(
+            EscapeHatch(
+                name,
+                "projection calls",
+                "forward-pinned state",
+                True,
+                "apply the delta on every projection invocation, including repeated layer calls and replay; "
+                "compacted rows and reordered waves select each request through device indices; "
+                "native QKV propagation also uses the delta; 0 blocking host syncs per step",
+            )
+        )
+    elif member.effect == "custom_residual":
+        result.append(
+            EscapeHatch(
+                name, member.effect, "enabled", False, "model graphs capture source operators, not inductor fusion"
+            )
+        )
+    return result
+
+
+def _task_settings(task: SemanticTask) -> list[EscapeHatch]:
+    """A task's adaptive-depth execution and the hidden-row phases it reads."""
+    result: list[EscapeHatch] = []
+    if task.custom_forward is not None and task.custom_forward.adaptive:
+        result.append(
+            EscapeHatch(
+                task.symbol,
+                "active",
+                "CUDA conditional nodes",
+                True,
+                "stable compaction into power-of-two buckets plus exact all-active width; 0 blocking host syncs per step; "
+                "first skipped commit propagates native norm/QKV/RoPE, later skips retain KV; recompute replays by token role; "
+                "decode GEMMs save most when all rows exit; full-QKV propagation is about 7% of Qwen2.5 layer FLOPs (estimate)",
+            )
+        )
+    phases = tuple(
+        dict.fromkeys(
+            port.source.phase.value
+            for port in task.inputs
+            if isinstance(port.source, HiddenInputSource) and port.source.site is not HiddenSite.LAYER_LOGITS
+        )
+    )
+    if phases:
+        result.append(
+            EscapeHatch(
+                task.symbol,
+                "tokens",
+                ",".join(phases),
+                phases == ("decode",),
+                "hidden taps select completed prompt endings, latest decode rows or every fresh token",
+            )
+        )
+    return result
 
 
 def _plans(
