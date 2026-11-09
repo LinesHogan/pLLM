@@ -8,6 +8,7 @@ import re
 from dataclasses import replace
 from hashlib import blake2b
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -100,31 +101,27 @@ def _automatic_retry_uses_original_control_and_quorum() -> None:
             self.calls = []
             self.votes = votes
 
-        def generate_completions(
-            self,
-            prompts,
-            sampling_params,
-            *,
-            use_tqdm,
-            group_id,
-            prompt_indices,
-            sample_index,
-            batch=None,
-            completion_device=None,
-            routes=None,
-        ):
+        def _completion_device(self, requested):
+            return requested
+
+        def _generate(self, texts, sampling_params, use_tqdm, batch, first_samples, prompt_indices, routes, device):
             assert routes is None
             self.calls.append(prompt_indices)
+            return SimpleNamespace(
+                completion_input=lambda group_id: self._completions(group_id, prompt_indices, first_samples)
+            )
+
+        def _completions(self, group_id, prompt_indices, first_samples):
             entries = tuple(
                 Completion(
-                    RequestIdentity(f"request-{sample_index}-{row}", index, sample_index),
+                    RequestIdentity(f"request-{sample}-{row}", index, sample),
                     0,
                     group_id,
                     (1,),
                     (r"\boxed{1}" if row < 2 else r"\boxed{2}") if self.votes else "4" if index == 7 else "3",
                     FinishReason.STOP,
                 )
-                for row, index in enumerate(prompt_indices)
+                for row, (index, sample) in enumerate(zip(prompt_indices, first_samples))
             )
             return CompletionInput(CompletionBatch(entries), torch.ones(len(entries), 4))
 

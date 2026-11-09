@@ -147,6 +147,25 @@ class _Generation:
     destination: torch.Tensor | None
     n: int
 
+    def completion_input(self, group_id: str) -> CompletionInput:
+        """Every sample as a Completion labelled `group_id`, in prompt-major order, with its final hidden row."""
+        assert self.destination is not None
+        completions: dict[RequestIdentity, Completion] = {}
+        for output in self.outputs:
+            identity = self.external[output.request_id]
+            (completion,) = output.outputs
+            completions[identity] = Completion(
+                identity,
+                completion.index,
+                group_id,
+                tuple(completion.token_ids),
+                completion.text,
+                FinishReason(completion.finish_reason),
+            )
+        return CompletionInput(
+            CompletionBatch(tuple(completions[identity] for identity in self.identities)), self.destination
+        )
+
 
 @dataclass(slots=True)
 class VllmLlm(Generic[DataT, ResultT]):
@@ -303,43 +322,39 @@ class VllmLlm(Generic[DataT, ResultT]):
         edit: Callable[[FeedbackT], StateImport[torch.Tensor] | None] | None = None,
         routes: tuple[str, ...] | None = None,
     ) -> Iterator[tuple[CompletionInput, FeedbackT]]:
-        """Generate completions labelled `group_id`, run `feedback` on them, then retry eligible prompts, at most
-        `max_rounds` rounds.
+        """Generate completions labelled `group_id`, run `feedback` on them, then regenerate the samples it marks
+        RETRY, at most `max_rounds` rounds. A retried sample runs alone (n=1) and keeps its place among its prompt's
+        samples: sample j has index k*n + j in round k.
 
         The callable runs locally after generate has released backend requests; it is
         never installed on a worker. Each yield is the original completion and result,
         with no retained history. Multi-request barriers are regenerated as a full
         vote group. Closing the iterator leaves no pending generation.
-        Optional edits return a StateImport for an activation-patch workload;
+        Optional edits return a StateImport, one row per retried sample, for an activation-patch workload;
         the feedback adapter returns original tensors, never a worker callback.
         A callback that returns None has nothing to feed back for its round: the round
         is not yielded (the callback already saw its completions) and nothing retries.
         """
-        if max_rounds < 1 or not prompts:
-            raise ValueError("generate_feedback needs at least one prompt and max_rounds >= 1")
-        # Round k samples indices k*n..(k+1)*n-1; fail before any round trains state.
-        if self._sample_limit is not None and max_rounds * sampling_params.n > self._sample_limit:
+        if max_rounds < 1 or not prompts or not group_id:
+            raise ValueError("generate_feedback needs at least one prompt, a non-empty group_id and max_rounds >= 1")
+        n = sampling_params.n
+        # Sample j of a prompt has index k*n + j in round k; fail before any round trains state.
+        if self._sample_limit is not None and max_rounds * n > self._sample_limit:
             raise ValueError(
-                f"{max_rounds} feedback rounds of n={sampling_params.n} samples exceed this workload's "
+                f"{max_rounds} feedback rounds of n={n} samples exceed this workload's "
                 f"pllm.sample_index(limit={self._sample_limit}); lower max_rounds to at most "
-                f"{self._sample_limit // sampling_params.n} or raise the workload's limit"
+                f"{self._sample_limit // n} or raise the workload's limit"
             )
         texts: list[str] = list(prompts)
         indices: tuple[int, ...] = self.resolve_prompt_indices(texts, prompt_indices)
-        route_values: list[str] | None = list(routes) if routes is not None else None
+        text_of = dict(zip(indices, texts, strict=True))
+        first_samples: tuple[int, ...] = (0,) * len(texts)
         edits: HostBatch[torch.Tensor] | None = None
+        device = self._completion_device(completion_device)
         for attempt in range(max_rounds):
-            batch = self.generate_completions(
-                texts,
-                sampling_params,
-                group_id=group_id,
-                use_tqdm=use_tqdm,
-                prompt_indices=indices,
-                sample_index=attempt * sampling_params.n,
-                batch=edits,
-                completion_device=completion_device,
-                routes=None if route_values is None else tuple(route_values),
-            )
+            batch = self._generate(
+                texts, sampling_params, use_tqdm, edits, first_samples, indices, routes, device
+            ).completion_input(group_id)
             result = feedback(batch)
             if result is None:
                 return
@@ -365,17 +380,19 @@ class VllmLlm(Generic[DataT, ResultT]):
                         retry.difference_update(members)
                     else:
                         retry.update(members)
-            selected: tuple[int, ...] = tuple(
-                index for index, entry in enumerate(entries) if entry.identity.request_id in retry
-            )
-            edits = edit(result) if edit is not None and selected and attempt + 1 < max_rounds else None
+            retried = [entry.identity for entry in entries if entry.identity.request_id in retry]
+            edits = edit(result) if edit is not None and retried and attempt + 1 < max_rounds else None
             yield batch, result
-            if not selected:
+            if not retried:
                 return
-            texts = [texts[index] for index in selected]
-            indices = tuple(indices[index] for index in selected)
-            if route_values is not None:
-                route_values = [route_values[index] for index in selected]
+            # Each retried sample is regenerated alone, as one prompt with n=1, under its next round's index.
+            texts = [text_of[identity.prompt_index] for identity in retried]
+            indices = tuple(identity.prompt_index for identity in retried)
+            first_samples = tuple(identity.sample_index + n for identity in retried)
+            if routes is not None:
+                routes = tuple(identity.route for identity in retried)
+            sampling_params = sampling_params.clone()
+            sampling_params.n = 1
 
     def generate(
         self,
@@ -397,7 +414,10 @@ class VllmLlm(Generic[DataT, ResultT]):
             if batch is not None or sample_index or prompt_indices is not None or routes is not None:
                 raise ValueError("batch, sample_index, prompt_indices and routes need workload= in make_llm")
             return self.require_llm().generate(prompts, sampling_params, use_tqdm=use_tqdm)
-        run = self._generate(prompts, sampling_params, use_tqdm, batch, sample_index, prompt_indices, routes, None)
+        texts = [prompts] if isinstance(prompts, str) else prompts
+        run = self._generate(
+            texts, sampling_params, use_tqdm, batch, (sample_index,) * len(texts), prompt_indices, routes, None
+        )
         return _per_prompt(run.outputs, run.n)
 
     def generate_completions(
@@ -417,47 +437,39 @@ class VllmLlm(Generic[DataT, ResultT]):
         final hidden row (on `completion_device`, by default the model's device), the input host feedback reads."""
         if not group_id:
             raise ValueError("generate_completions needs a non-empty group_id")
-        device = completion_device or (torch.device("cpu") if self._runner is None else self.device)
-        run = self._generate(prompts, sampling_params, use_tqdm, batch, sample_index, prompt_indices, routes, device)
-        assert run.destination is not None
-        completions: dict[RequestIdentity, Completion] = {}
-        for output in run.outputs:
-            identity = run.external[output.request_id]
-            (completion,) = output.outputs
-            completions[identity] = Completion(
-                identity,
-                completion.index,
-                group_id,
-                tuple(completion.token_ids),
-                completion.text,
-                FinishReason(completion.finish_reason),
-            )
-        return CompletionInput(
-            CompletionBatch(tuple(completions[identity] for identity in run.identities)), run.destination
+        texts = [prompts] if isinstance(prompts, str) else prompts
+        device = self._completion_device(completion_device)
+        run = self._generate(
+            texts, sampling_params, use_tqdm, batch, (sample_index,) * len(texts), prompt_indices, routes, device
         )
+        return run.completion_input(group_id)
+
+    def _completion_device(self, requested: torch.device | None) -> torch.device:
+        """Where completion hidden rows land: `requested`, else the model's device (CPU for an EngineCore engine)."""
+        return requested or (torch.device("cpu") if self._runner is None else self.device)
 
     def _generate(
         self,
-        prompts: str | list[str],
+        texts: list[str],
         sampling_params: SamplingParams,
         use_tqdm: bool,
         batch: HostBatch[torch.Tensor] | None,
-        sample_index: int,
+        first_samples: tuple[int, ...],
         prompt_indices: tuple[int, ...] | None,
         routes: tuple[str, ...] | None,
         completion_device: torch.device | None,
     ) -> _Generation:
-        """Run one generate call; with a `completion_device`, also collect each sample's final hidden row there."""
+        """Run one generate call; prompt p's samples get indices first_samples[p] + j. With a `completion_device`,
+        also collect each sample's final hidden row there."""
         self.require_llm()
-        texts = [prompts] if isinstance(prompts, str) else prompts
         if not texts or any(not prompt for prompt in texts):
             raise ValueError("provide non-empty prompts")
-        if sample_index < 0:
+        if min(first_samples) < 0:
             raise ValueError("use a nonnegative sample index")
         n = sampling_params.n
-        if self._sample_limit is not None and sample_index + n > self._sample_limit:
+        if self._sample_limit is not None and max(first_samples) + n > self._sample_limit:
             raise ValueError(
-                f"sample indices {sample_index}..{sample_index + n - 1}: this workload reads "
+                f"sample index {max(first_samples) + n - 1}: this workload reads "
                 f"pllm.sample_index(limit={self._sample_limit}); keep sample_index + n at most {self._sample_limit} or "
                 "raise the workload's limit"
             )
@@ -491,10 +503,14 @@ class VllmLlm(Generic[DataT, ResultT]):
             # Each of a prompt's n samples is its own request, with its own sample index and request state.
             request_ids = llm.enqueue(
                 [prompt for prompt in texts for _ in range(n)],
-                [self.cache_policy.sampling(sample) for _ in texts for sample in _one_per_sample(sampling_params)],
+                [
+                    self.cache_policy.sampling(sample)
+                    for first in first_samples
+                    for sample in _one_per_sample(sampling_params, first)
+                ],
                 use_tqdm=use_tqdm,
             )
-            identities = self._request_identities(request_ids, indices, sample_index, n, routes)
+            identities = self._request_identities(request_ids, indices, first_samples, n, routes)
             # Borrow vLLM's exact frontend mapping before completed entries are removed.
             external = {
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
@@ -545,14 +561,16 @@ class VllmLlm(Generic[DataT, ResultT]):
         self,
         request_ids: list[str],
         indices: tuple[int, ...],
-        sample_index: int,
+        first_samples: tuple[int, ...],
         n: int,
         routes: tuple[str, ...] | None,
     ) -> tuple[RequestIdentity, ...]:
-        """Sample j of each prompt gets sample index `sample_index + j`."""
+        """Sample j of prompt p gets sample index `first_samples[p] + j`."""
         samples = (
-            (index, sample_index + j, route)
-            for index, route in zip(indices, routes if routes is not None else ("",) * len(indices), strict=True)
+            (index, first + j, route)
+            for index, first, route in zip(
+                indices, first_samples, routes if routes is not None else ("",) * len(indices), strict=True
+            )
             for j in range(n)
         )
         return tuple(
@@ -602,14 +620,15 @@ class VllmLlm(Generic[DataT, ResultT]):
         return destination
 
 
-def _one_per_sample(params: SamplingParams) -> list[SamplingParams]:
-    """vLLM's own split of n samples into requests: n=1 each, and seed + j for sample j when a seed is set."""
+def _one_per_sample(params: SamplingParams, first_sample: int) -> list[SamplingParams]:
+    """vLLM's own split of n samples into requests: n=1 each, and with a seed, seed + i for sample index i (vLLM's
+    seed + j when the first sample index is 0), so distinct samples of one prompt never share a seed."""
     samples: list[SamplingParams] = []
     for j in range(params.n):
         sample = params.clone()
         sample.n = 1
         if params.seed is not None:
-            sample.seed = params.seed + j
+            sample.seed = params.seed + first_sample + j
         samples.append(sample)
     return samples
 

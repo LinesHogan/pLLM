@@ -575,8 +575,9 @@ A training method that reads `pllm.batch(...)` fields trains on a batch you pass
 | `pllm.host.RewardOutcome(completion, reward, is_correct, feedback_text, judge, label, skip_reason)` | A scored completion, for the callable's own result. |
 
 `llm.generate_feedback(prompts, sampling, *, feedback, group_id, max_rounds)` generates, calls
-`feedback(completion_input)`, and retries the prompts whose completions the result marks `RETRY`, for at
-most `max_rounds` rounds; it yields `(completion_input, result)` per round. The result is any object with
+`feedback(completion_input)`, and regenerates the completions the result marks `RETRY`, for at
+most `max_rounds` rounds. Each retried sample runs alone (`n=1`) and keeps its place among its prompt's `n`
+samples: sample j has sample index `k*n + j` in round k. It yields `(completion_input, result)` per round. The result is any object with
 `retry_controls`, `update_barriers` and `update_count`; returning `None` ends the loop. See
 `pllm/workloads/reward_head.py` and tutorial 05.
 
@@ -615,7 +616,7 @@ with pllm.host.make_host(pllm.host.HostConfig(torch.device("cpu"), hidden_size=8
 
 | Method | Meaning |
 | --- | --- |
-| `generate(prompts, sampling_params, *, batch=None, sample_index=0, prompt_indices=None, routes=None, use_tqdm=False)` | vLLM's `generate` with the workload running: one `RequestOutput` per prompt holding its `n` samples. `batch` feeds `pllm.batch` training or a `pllm.io.StateImport`; `sample_index` numbers each prompt's first sample; `prompt_indices` labels prompts across calls (`identity.prompt_index` in exports); `routes` gives one value per prompt for `key_fields=("route",)` states. |
+| `generate(prompts, sampling_params, *, batch=None, sample_index=0, prompt_indices=None, routes=None, use_tqdm=False)` | vLLM's `generate` with the workload running: one `RequestOutput` per prompt holding its `n` samples. `batch` feeds `pllm.batch` training or a `pllm.io.StateImport`; `sample_index` numbers each prompt's first sample (with a `seed`, sample index i samples with `seed + i`); `prompt_indices` labels prompts across calls (`identity.prompt_index` in exports); `routes` gives one value per prompt for `key_fields=("route",)` states. |
 | `generate_completions(prompts, sampling_params, *, group_id, ...)` | Like `generate`, returning a `pllm.host.CompletionInput`: every sample as a `Completion` plus its final hidden row. |
 | `generate_feedback(prompts, sampling_params, *, feedback, group_id, max_rounds, ...)` | The host loop of [Train on host batches](#train-on-host-batches-or-run-a-host-feedback-loop): generate, call `feedback`, retry. |
 | `diagnostics()` | Exact counters read from the workers (see below). |

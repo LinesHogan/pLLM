@@ -228,7 +228,7 @@ from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadFeedback, Rew
 
 gpu_config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8, gpu_memory_utilization=0.3)
 prompts = ["What is 2 + 3? Put the final answer in \\boxed{}.", "What is 7 * 6? Put the final answer in \\boxed{}."]
-sampling = SamplingParams(n=1, max_tokens=64, temperature=0.8, seed=0)  # 每个 prompt 一个样本，见下文
+sampling = SamplingParams(n=4, max_tokens=64, temperature=0.8, seed=0)  # 每个 prompt 4 个样本参与投票
 head_workload = RewardHeadWorkload(RewardHeadConfig(rank=16, learning_rate=1e-3))
 host_cfg = HostConfig(torch.device("cuda"), hidden_size=896)
 
@@ -247,7 +247,7 @@ with pllm.make_llm(gpu_config, workload=DummyWorkload()) as llm, make_host(host_
 
 - **输入参数**：
   - `prompts`：待评测的提示词列表。
-  - `sampling`：采样参数（`SamplingParams`）。目前要用每个 prompt 一个样本（`n=1`）：重试按 prompt 进行，`n>1` 时重试轮会出错；需要多票时，让投票跨轮次累积，或者用 `generate(batch=...)` 的写法。
+  - `sampling`：采样参数（`SamplingParams`），每个 prompt 采 `n` 个样本。重试按样本进行：被标为 `RETRY` 的样本下一轮单独重采（`n=1`），并保留它在本 prompt 样本中的位置——第 k 轮的第 j 个样本编号为 `k*n + j`。设了 `seed` 时，编号为 i 的样本用 `seed + i`，所以重试会抽到新的样本。
   - `feedback`：用户定义的回调函数，类型为 `Callable[[CompletionInput], FeedbackT | None]`。
   - `group_id`：本批请求所属的组标识符。
   - `max_rounds`：最大迭代轮数。

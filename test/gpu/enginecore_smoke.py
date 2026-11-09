@@ -340,24 +340,26 @@ def _output_lora_shared_input() -> None:
         rounds = list(
             handle.generate_feedback(
                 PROMPTS,
-                sampling,
+                SamplingParams(n=2, max_tokens=3, temperature=0.8, seed=7, ignore_eos=True),
                 feedback=processor,
                 group_id="retry",
                 max_rounds=3,
                 prompt_indices=(7, 9),
             )
         )
-        prompt_rounds = [
-            tuple(entry.identity.prompt_index for entry in batch.completions.entries) for batch, _ in rounds
+        sample_rounds = [
+            tuple((entry.identity.prompt_index, entry.identity.sample_index) for entry in batch.completions.entries)
+            for batch, _ in rounds
         ]
-        assert prompt_rounds == [(7, 9), (9,)]
+        # Only the wrong sample (9, 0) retries, alone, under its next round's index.
+        assert sample_rounds == [((7, 0), (7, 1), (9, 0), (9, 1)), ((9, 2),)]
         assert sum(result.update_count for _, result in rounds) == 1
         assert service.lifecycle("retry", 9).retries == 1 and service.lifecycle("retry", 9).stopped
         assert service.queued_feedback == 0
         assert all(batch.hidden.device.type == "cpu" for batch, _ in rounds)
         assert not torch.cuda.is_initialized()
         print(
-            "Output LoRA EngineCore: shared publication=1, real sampler changed; feedback retry: 2 prompts -> 1 retry"
+            "Output LoRA EngineCore: shared publication=1, real sampler changed; feedback retry: 4 samples -> 1 retry"
         )
     finally:
         handle.close()
