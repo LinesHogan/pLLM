@@ -882,8 +882,16 @@ def _component_independence(workload: Workload, config: ModelConfig) -> list[str
     return failures
 
 
+def affects_model(workload: Workload, config: ModelConfig) -> bool:
+    """Whether the workload changes anything; with every effect disabled (e.g. guidance with beta=0) it is the base
+    model, which is exactly neutral."""
+    return workload.build(contract_facts(workload, config)[1]).affects_model
+
+
 def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
     failures: list[str] = []
+    if not affects_model(neutral, config):
+        return failures
     neutral_shape, neutral_facts = contract_facts(neutral, config)
     neutral_facts, neutral_declaration = neutral.specialize(neutral_facts, config.execution)
     sampler = neutral.plan_backend(neutral_facts, neutral_declaration).spec.sampler

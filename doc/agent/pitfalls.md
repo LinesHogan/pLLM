@@ -316,10 +316,6 @@ inputs of a `@pllm.custom_residual` method are bfloat16.
 
 Current framework behaviour that is wrong or unhelpful; each has a workaround.
 
-- **A workload whose only effect is `@pllm.guide_sampling` cannot take `neutral=`.** With `beta=0` it
-  declares no effect at all, so the neutral run fails with `the workload has no effect on the model`.
-  Workaround: run `testing.check` without `neutral=` for such workloads (`beta=0` declares no sampler stage
-  by construction), and compare sampling with the plain model on the GPU.
 - **Prefix caching is not rejected for `ActivationPatch` and `Adapter`.** Only `@pllm.custom_residual` and
   `@pllm.custom_attention` reject `enable_prefix_caching=True`. The cache key covers the workload's identity,
   not its state values, so a cached prompt prefix can carry K/V computed under another request's imported

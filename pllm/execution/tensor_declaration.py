@@ -1023,9 +1023,15 @@ class TensorDeclaration:
         """Note states the model forward reads, so planning keeps their versions readable."""
         self.graph = replace(self.graph, model_reads=tuple(sorted({*self.graph.model_reads, *resources})))
 
+    @property
+    def affects_model(self) -> bool:
+        """Whether a declared effect reaches the model, its sampler, training or exports; guidance with beta=0 does
+        not, since it declares no sampler stage."""
+        return not self.effects.empty or bool(self.sites.rewrites) or bool(self.attention.methods)
+
     def finish(self) -> tuple[SemanticGraph, TensorLayoutRequest, BackendAttachmentSpec]:
         """Return the graph, layouts and backend effects of a workload that affects the model."""
-        if self.effects.empty and not self.sites.rewrites and not self.attention.methods:
+        if not self.affects_model:
             raise ValueError(
                 "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
                 "@pllm.export, @pllm.train_in_forward, @pllm.custom_residual, @pllm.custom_attention, a custom_forward or a "

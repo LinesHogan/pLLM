@@ -79,6 +79,20 @@ class Steering(pllm.Workload):
 
 
 @dataclass(frozen=True)
+class Guided(pllm.Workload):
+    """Guidance alone: at beta=0 it declares nothing, so it is exactly the base model."""
+
+    strength: float = 0.5
+
+    def beta(self) -> float:
+        return self.strength
+
+    @pllm.guide_sampling(beta=beta)
+    def push(self, h=pllm.final_hidden()):
+        return h
+
+
+@dataclass(frozen=True)
 class SelectedSteering(pllm.Workload):
     """Row masks may stay enabled when additive logits have zero strength."""
 
@@ -254,6 +268,7 @@ class PromptMask(pllm.Workload):
     ]
     + [
         (SelectedSteering(), SelectedSteering(0.0), ""),
+        (Guided(), Guided(0.0), ""),
         (SelectedSteering(), SelectedSteering(), r"\[neutral\].*sampler bias.*exactly zero"),
     ]
     + [

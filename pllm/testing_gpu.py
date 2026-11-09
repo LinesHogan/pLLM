@@ -39,7 +39,7 @@ from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import read_batch
 from pllm.explanation import explain, explain_facts
-from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, check_contracts
+from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, affects_model, check_contracts
 from pllm.workload import Workload
 
 _Allocation = ParamSpec("_Allocation")
@@ -378,6 +378,8 @@ def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[No
 
 
 def _neutral(workload: Workload, config: ModelConfig) -> None:
+    if not affects_model(workload, config):
+        return
     observed = _neutral_tokens(workload, config)
     with plain_model(workload, config) as vanilla:
         expected = tuple(
