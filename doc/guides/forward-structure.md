@@ -216,7 +216,7 @@ True
 ### 运行开销与限制
 - **开销**：
   - 静态布局能实质减少物理显存占用。在 Qwen2.5-0.5B（上下文 2048 token）实测中，单请求 KV 显存上限从全量的 **24.0 MiB** 降至偶数层窗口 256 的 **16.6 MiB**，跨层共享则降至 **12.0 MiB**，并发容量翻倍。
-  - 同一个示例在 RTX 4090 上测得：原样读取的 `NativeRead` 吞吐为原生 vLLM 的 **95%**；偶数层窗口 `LocalGlobal` 为 **76%**，跨层共享 `CrossLayerShared` 为 **93%**（窗口布局会让 vLLM 走不同的 attention 内核，见[性能与显存](../explain/performance.md)）。纯 PyTorch 实现的 Top-K 动态打分（如未写成专用内核的 Quest）吞吐仅为原生的 **7%**，生产环境加速需使用融合算子（详见[自写算子](custom-ops.md)与 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb)）。
+  - 同一个示例在 RTX 4090 上测得：原样读取的 `NativeRead` 吞吐为原生 vLLM 的 **98%**；偶数层窗口 `LocalGlobal` 为 **97%**，跨层共享 `CrossLayerShared` 为 **96%**（窗口层走 vLLM 的 FlashInfer 窗口内核，见[性能与显存](../explain/performance.md)）。纯 PyTorch 实现的 Top-K 动态打分（如未写成专用内核的 Quest）吞吐仅为原生的 **7%**，生产环境加速需使用融合算子（详见[自写算子](custom-ops.md)与 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb)）。
 - **限制与原因**：
   - `tensor_parallel_size=1`：自定义 FlashAttention 读法与分页 KV 布局尚未实现跨 TP rank 的注意力头切分与通信同步。
   - 仅限 FlashAttention 2 后端：底层依赖 FA2 暴露的低级接口与元数据。

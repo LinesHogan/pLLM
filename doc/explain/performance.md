@@ -547,8 +547,8 @@ class TopPages(pllm.Workload):
 | :--- | :--- | :--- |
 | **省 KV 显存容量吗？** | **真省容量**：直接映射为 vLLM 原生 `SlidingWindowSpec`、`SinkSpec` 和跨层共享组，滑出窗口的物理块会被真正回收给池子 | **不省容量**：所有历史 token 的 KV 仍必须保留在显存中供打分和挑选 |
 | **省读取带宽吗？** | **真省带宽**：直接调用原生 FA2 和 Triton `unified_attention` | **省逻辑读取字节**（`explain` 中示例 10 的 `QuestRead` 每 token 最多读 $458,752\text{ B}$，全量为 $1,048,576\text{ B}$），但打分和 gather 走 PyTorch 算子 |
-| **实测单请求 KV 显存上限**<br>（0.5B，示例 10：`max_model_len=2048`，256 token 分块 prefill） | 全量 **$24.0\text{ MiB}$** $\rightarrow$ 偶数层窗口 256 降至 **$16.6\text{ MiB}$**；共享一半层降至 **$12.0\text{ MiB}$**（可同时容纳的 2048-token 请求从 358.8 个增至 717.6 个）。`sink=True` 保留整个 prompt，上限仍为 $24.0\text{ MiB}$，实际节省取决于生成长度 | 仍为 **$24.0\text{ MiB}$** |
-| **实测吞吐**<br>（RTX 4090，0.5B，128 并发） | 原生读取（`NativeRead`）**97%**；偶数层窗口（`LocalGlobal`）**97%**；跨层共享（`CrossLayerShared`）**95%** | 示例 10 中 `QuestRead` 仅为原生的 **7%**（$2,727\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
+| **实测单请求 KV 显存上限**<br>（0.5B，示例 10：`max_model_len=2048`，256 token 分块 prefill） | 全量 **$24.0\text{ MiB}$** $\rightarrow$ 偶数层窗口 256 降至 **$16.6\text{ MiB}$**；共享一半层降至 **$12.0\text{ MiB}$**（可同时容纳的 2048-token 请求从 358.0 个增至 716.0 个）。`sink=True` 保留整个 prompt，上限仍为 $24.0\text{ MiB}$，实际节省取决于生成长度 | 仍为 **$24.0\text{ MiB}$** |
+| **实测吞吐**<br>（RTX 4090，0.5B，128 并发） | 原生读取（`NativeRead`）**98%**；偶数层窗口（`LocalGlobal`）**97%**；跨层共享（`CrossLayerShared`）**96%** | 示例 10 中 `QuestRead` 仅为原生的 **7%**（$2,827\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
 
 #### 窗口布局：先看 GQA 内核，再看少读了多少 KV
 

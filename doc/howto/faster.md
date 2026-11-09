@@ -299,9 +299,9 @@ attn_report = pllm.explain(LocalGlobalAttention(), config)
 ### 代价是什么
 
 在 RTX 4090（0.5B，`max_model_len=2048`，256 token 分块 prefill）测试中：
-* **单请求 KV 显存上限**：全量 24.0 MiB；偶数层窗口 256 降至 **16.6 MiB**；奇数层跨层共享降至 **12.0 MiB**（可容纳并发从 358.8 个翻倍至 717.6 个请求）。
-* **吞吐表现**：示例 10 那次运行中，原样读取为原生 vLLM 的 95%，偶数层窗口 76%，跨层共享 93%（设置见示例 10）。
-* **动态稀疏读取对比**：[自定义 attention 教程](../examples/10_custom_attention.ipynb) 中的 `QuestRead`（纯 PyTorch 实现）显存依然为 24.0 MiB，吞吐断崖式下跌至原生的 **7%**（2,727 tok/s），因为未融合的 PyTorch 打分与 gather 开销远超节省的读取量。
+* **单请求 KV 显存上限**：全量 24.0 MiB；偶数层窗口 256 降至 **16.6 MiB**；奇数层跨层共享降至 **12.0 MiB**（可容纳并发从 358.0 个翻倍至 716.0 个请求）。
+* **吞吐表现**：示例 10 那次运行中，原样读取为原生 vLLM 的 98%，偶数层窗口 97%，跨层共享 96%（设置见示例 10）。
+* **动态稀疏读取对比**：[自定义 attention 教程](../examples/10_custom_attention.ipynb) 中的 `QuestRead`（纯 PyTorch 实现）显存依然为 24.0 MiB，吞吐断崖式下跌至原生的 **7%**（2,827 tok/s），因为未融合的 PyTorch 打分与 gather 开销远超节省的读取量。
 
 ---
 
