@@ -1,83 +1,77 @@
-# 词汇表
+# 术语表
 
-一个术语一个含义；签名与执行边界使用的就是这些词。
+文档和 `pllm.explain` 输出里出现的词，一个词一个意思。每条后面的链接指向讲它的页面。
 
-## 创作
+## 写负载
 
-- **负载（Workload）** —— 带类型张量方法与声明效果的冻结类（`pllm.Workload`）。编译一次；永远不是运行时钩子。
-- **阶段 / 锚点窗口（Phase / anchor window）** —— 两个时间轴锚点
-  （`request.prepare`、`model.execute`、`state.publish`、`sampler.pre_draw`、
-  `token.commit`、`next.prepare`）之间的签名区间，操作在其中运行。
-  `Phase` 是 `When` 窗口的 DSL 拼写。
-- **来源标记（Source marker）** —— 写成方法参数默认值、命名输入来源的标记：`pllm.hidden`、
-  `pllm.residual`、`pllm.batch`、`pllm.parameter`、`pllm.index`、`pllm.version`、`pllm.result`、
-  `pllm.base_logits`、`pllm.sampled_tokens` 等（完整列表见 [agent 参考](../agent/reference.md)）。
-- **Hidden / BLOCK_OUTPUT** —— `pllm.hidden(L)` 读取第 L 个 decoder 层的 MLP 输出，
-  位于残差加法之前；它不是残差流（残差流见 `pllm.residual`）。每个请求读取最新 decode token 或 prompt 最后一个 token。
-- **残差流读取（pllm.residual）** —— 某层之后（或 attention 与 MLP 之间）的残差流：
-  下一个子层的 norm 读入的和。steering 向量、SAE 与 logit lens 读的是它；`pllm.hidden(L)`
-  只是第 L 层 MLP 在加入残差流之前的输出。
-- **层 logits（pllm.layer_logits）** —— 模型自己的最终 norm 与 LM head 作用于若干层之后的
-  残差流（logit lens），FP32 `[rows, layers, vocab]`，覆盖采样器抽取的每个 token。
-- **定制残差（@pllm.custom_residual）** —— 拥有某些层 attention/MLP 子层残差更新、value 行或最终流的
-  方法；原生分支照常运行，方法决定流如何更新。
-- **状态子层（state= / chunk=）** —— 带每请求携带量的定制残差：按 chunk 扫描，每行读其 chunk 开始时的
-  携带量，chunk 完成后更新。
-- **位置索引（pllm.depth）** —— 定制残差方法所在位置的 Python 整数：层号，`site="both"` 时为子层号。
-- **值行（pllm.value）** —— 定制残差方法内读取的、同一 token 在更早层计算出的 value 行。
-- **效果组合（Effect composition）** —— 一个负载里的效果各自声明位置与状态读写、
-  并排生效；只有真实冲突（同一位置的两个所有者、同一状态的两个写者等）被拒绝。
-- **因果批（Causal batch）** —— `pllm.host.CausalTrainBatch` 提供同形的
-  `input_ids`、`labels` 和可选 `attention_mask`，训练方法用 `pllm.batch(...)` 读取。
-- **因果模型端口（Causal model port）** —— `pllm.causal_model("adapter")` 注入
-  `pllm.model.CausalModel`；`model(...)` 应用命名 Adapter，`model.base(...)` 只用冻结基座；
-  `model.token_logprobs(ids, labels)` 按块跑 LM head，直接给出每个标签的对数概率，不物化整批 logits。
-- **设置函数（setting function）** —— 装饰器或标记的参数可以是负载的函数而不是值，绑定时调用一次：
-  通常是上方定义的方法，如 `@pllm.on(phase)` 配 `def phase(self) -> pllm.Phase`，TLM 据此决定在线/离线训练时机。
-- **训练步结果（TrainStep）** —— `pllm.host.HostTrainer.train(batch)` 的返回值：`loss`
-  与 `parameters`（更新后的状态字段，按名字）。训练方法返回的 `UpdateOutput.metrics` 保存
-  算法提供的设备张量，TLM 的 `selected_count` 是选中的句子数。
-- **携带标记（pllm.carry）** —— 包住训练方法输入默认值的标记
-  `pllm.carry(source, state=, field=)`：发布时，每个 lineage 的 carry 字段收到该输入
-  最后一个选中行的值。
-- **指纹（Fingerprint）** —— 所创作数学的冷结构签名（marshaled 字节码加
-  传递闭包的全局/自由变量），不求值注解、不执行代码。改动数学会重新签名；
-  装载从不重新执行。
-- **冻结（Freeze）** —— 对所创作负载做的 detach 深拷贝，函数值被递归冻结，
-  之后对创作环境的改动无法漂移已签名的行为。
+- **负载（workload）**：`pllm.Workload` 的子类，只放声明和张量数学。构建引擎时被读一次，之后由 pllm 安排执行；
+  它的方法不是运行时回调。见[负载的组成](../guides/workload-anatomy.md)。
+- **声明**：负载回答"读什么、存什么、结果去哪"的三种写法：参数默认值、状态属性、效果装饰器或模型改写属性。
+- **输入标记**：写在参数默认值里、说明数据从哪来的值，如 `pllm.hidden(0)`、`pllm.parameter("s", "w")`。
+  类型注解只说明方法体拿到什么。见[读取模型内部](../guides/reading.md)。
+- **效果**：说明方法的结果去哪的装饰器：`@pllm.export`、`@pllm.add_logits`、`@pllm.guide_sampling`、`@pllm.write`、
+  `@pllm.train` 等。见[结果去哪](../guides/results.md)。
+- **模型站点**：直接作用在模型 forward 里的声明：`pllm.model.ActivationPatch`、`pllm.model.Adapter`、
+  `@pllm.train_in_forward`、`@pllm.custom_residual`、`@pllm.custom_attention`。CPU 上的检查不执行它们。
+- **设置方法**：交给装饰器或输入标记、代替固定值的方法，如 `beta=strength` 配 `def strength(self) -> float`。
+  pllm 对每个负载实例调用一次。
+- **行（row）**：方法收到的张量第 0 维的一行：一个运行中的请求（或采样器要抽的一个 token、一步算出的一个 token）。
+  行的顺序由调度器决定。见[核心概念](../explain/core-concepts.md)。
+- **选择器（`rows=`）**：返回 `bool [rows]` 掩码的方法，交给效果的 `rows=`，只让选中的行生效。
+- **组件**：作为 dataclass 字段放进另一个负载的负载；名字带字段名前缀，状态互相独立。见[组合负载](../guides/composition.md)。
+- **自写算子**：用 `torch.library.custom_op` 包装、在方法里调用的 kernel。见[自写算子](../guides/custom-ops.md)。
 
 ## 状态
 
-- **状态（State）** —— 唯一可变的东西：声明布局下的具名、带版本张量字段。
-  三种生产方式、消费完全相同：优化器更新、超网络/外部导入、checkpoint 装载。
-  无优化器时状态是冻结的：准入时初始化、到处可读（观测也行）、永不更新。
-- **Lineage** —— 一个逻辑状态的版本链。实例作用域一条；请求作用域每个准入键
-  一条。执行从不合并或拆分 lineage。
-- **Carry 字段**（`carry=`）—— 跟随训练迁移但不参与优化器展开的每 lineage 普通字段
-  （无梯度/动量槽）。读的是输入版本：第 N+1 步看到第 N 步发布的值。
-  页在准入时零初始化。
-- **版本（Version）** —— lineage 的不可变根。读取 pin 住一个版本；写入产生
-  私有候选；发布使其原子可见。
-- **输入版本（Input version）** —— 步开始时 pin 住的版本；这一步里所有输入
-  版本读看到的都是它 —— 跨步 memory 语义因此零成本。
+- **状态**：负载里唯一可变的东西：一组有名字的张量字段，由 pllm 分配显存、按版本更新。见[状态](../guides/state.md)。
+- **请求状态 / 实例状态**：`pllm.RequestState` 每个请求（或每组请求）一份；`pllm.InstanceState` 整个引擎一份。
+- **`key_fields`**：决定哪些请求共用一份请求状态：每个请求、同一 prompt 的样本，或同一路由值（`routes=`）。
+  见[让一组请求共享训练成果](../howto/share-training-across-requests.md)。
+- **字段**：状态里的一个张量。`shape=` 声明一个叫 `"value"` 的字段；`pllm.Field` 给出按投影宽度算的形状或明确的精度。
+- **初值来源（`init=`）**：状态的起始值从哪来：`pllm.Zeros`、`pllm.Computed`、`pllm.Pretrained`、
+  `pllm.ModelCheckpoint`、`pllm.FromModule`、`pllm.Fed`、`pllm.Imported`。见[加载训练好的权重](../howto/load-trained-weights.md)。
+- **冻结状态**：没有优化器的状态：到处可读，只能由导入或写入改变。
+- **版本**：状态每次更新都发布一个新版本；读的一方读已发布的版本，在途的请求保留开始时的版本。
+  `pllm.version(state)` 是每行的状态已更新的次数。
+- **`publish_lag`**：第 n 步算出的更新从第 n + 1 + `publish_lag` 步起被读到；默认 1，换来训练和下一步 forward 的重叠。
+- **carry 字段**：`carry=` 声明、随训练更新一起发布但不被优化器更新的字段，由 `pllm.carry` 写入。
+- **位置状态（`pllm.PositionState`）**：每个 KV 块一个 hidden 宽的向量，只在 `@pllm.custom_forward` 里用
+  `layers.load` / `layers.save` 读写。
+- **放置（`placement=`）**：只读的大表放在显存（`"device"`）还是锁页主机内存（`"host"`）。
 
-## 执行
+## 训练
 
-- **语义图（Semantic graph）** —— 签名的任务/状态/效果声明；规划器的唯一输入。
-- **物理计划（Physical plan）** —— 图到锚点、页与缓冲的签名下沉。
-- **回退（Fallback）** —— 签名原语之外的执行。其计数永远断言为零。
-- **Adapter** —— 模型执行时从状态字段应用的签名参数效果（稠密或低秩），
-  与字段的生产方式无关。`Projection(layer=None, ...)` 表示所有层；
-  TLM 用一个 Adapter 让训练与推理读取同一组 q/v 因子。
-- **重放（Replay）** —— `custom_forward` 定义逐 token 的层调用与返回 residual；
-  `recirculation` 是使用该接口的负载。组合一个训练 overlay 时，
-  `layers.apply_updates()` 消费捕获并改变本 token 后续读取的私有字段。
-  执行使用 `tokenwise_region.py` 和 vLLM 的稳定 token CUDA graph；状态仍由原
-  transition 与 publication 拥有。
-- **参考调度（Reference schedule）** —— 按程序原始语句顺序排列的那份
-  schedule。它没有独立公开符号：构造在 Rust `region_dependence.rs::analyze`
-  内部（`reference`），是容量与合法性的基线，也是测量路径的对照组。
-- **Route lineage** —— 由用户计算的路由键匹配的请求共享的 lineage，可休眠
-  存续；会话关闭时显式退役。
-- **证据（Evidence）** —— 编号的、记入 manifest 的可观测契约，带一条能证明
-  它的命令。测试扩展现有证据；新 ID 需要真正新的可观测边界。
+- **请求行训练**：`@pllm.train` 方法读运行中请求的行、每行返回一个 loss，pllm 按状态归约、反向、更新。
+  见[在线训练](../guides/training.md)。
+- **归约（`reduction=`）**：同一份状态在一步里有多行时，loss 取平均（`"mean"`）还是求和（`"sum"`）。
+- **宿主批次**：宿主代码拼好、经 `generate(batch=...)` 送进来的训练批次：`WeightedRowBatch`、`CausalTrainBatch`、
+  `WeightedCEBatch`。见[宿主循环与批训练](../guides/host-loops.md)。
+- **因果模型（`pllm.causal_model`）**：训练方法里可调用的整模型，带上指定的 `Adapter`，梯度流向适配器的状态。
+- **`HostTrainer`**：`pllm.host.make_host` 返回的对象，在没有模型的情况下用宿主批次训练一个负载的状态。
+- **前向内训练（`@pllm.train_in_forward`）**：在 forward 运行时，用投影的输入输出训练一份请求状态，并把它的增量
+  加到投影上（TTT、In-Place TTT 一类）。见[改模型](../guides/model-edits.md)。
+
+## 改模型与 forward
+
+- **激活补丁（`ActivationPatch`）**：从状态读值，改某些层的输出（引导向量、ReFT）。
+- **Adapter**：把状态当作权重增量加到指定投影上（LoRA 一类），不管状态由谁写。
+- **定制残差（`@pllm.custom_residual`）**：接管某些层某个位置的残差更新、value 行或最终的流。
+  见[改 forward 结构](../guides/forward-structure.md)。
+- **状态子层**：带 `state=`、`chunk=` 的定制残差，每个请求一份按块更新的携带量（快权重记忆）。
+- **定制 attention（`@pllm.custom_attention`）**：替换某些层读 KV 的方式；可以同时声明静态 **KV 布局**
+  （滑动窗口、prompt 加窗口、跨层共享）。
+- **custom forward（`@pllm.custom_forward`）**：用 Python 编排每个 token 跑哪些层、跑几遍、何时停。
+
+## 执行与检查
+
+- **阶段（`pllm.Phase`）**：一步里的时间窗口：`BEFORE_FORWARD`、`IN_FORWARD`、`AFTER_FORWARD`、`BEFORE_SAMPLE`、
+  `AFTER_SAMPLE`，以及由 pllm 决定的 `AUTOMATIC`。每个效果有默认阶段，`@pllm.on(phase)` 可以改。
+- **锚点**：`pllm.explain` 打印的、一步里的位置名：`request.prepare`、`model.execute`、`state.publish`、
+  `sampler.pre_draw`、`token.commit` 等。
+- **主 stream / 旁路 stream（lane）**：`main` 与 forward 串行；`side` 与下一步 forward 重叠。
+- **eager 原因**：模型 forward 不在 CUDA graph 里的原因（`eager_reason`），空表示在。
+- **中性设置（`neutral=`）**：强度为零的同一个负载；`testing.check` 要求它不改变采样。
+- **契约检查**：`pllm.testing.check`（CPU）和 `check_on_gpu`（GPU）检查的性质：行的顺序、请求隔离、分块、抢占重算、
+  版本可见性、中性设置。见[检查正确性](../guides/checking.md)。
+- **预算**：`ExecutionOptions` 里限制 pllm 显存的三个值：`state_page_budget_bytes`、`execution_peak_budget_bytes`、
+  `cuda_graph_pool_budget_bytes`。见[配置项](config.md)。

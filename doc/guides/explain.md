@@ -4,7 +4,7 @@
 
 ## 为什么需要它
 
-以前要知道一个负载会不会退回 eager 模式、要占多少显存，只能真正启动引擎：加载权重、分配 KV cache、捕获 CUDA graph，然后看 `llm.diagnostics().eager_reason` 或者等报错。
+要知道一个负载会不会退回 eager 模式、要占多少显存，最直接的办法是真正启动引擎：加载权重、分配 KV cache、捕获 CUDA graph，然后看 `llm.diagnostics().eager_reason` 或者等报错。
 
 `pllm.explain` 用同一套声明、同一套准入规则和规划器，在 CPU 上把计划算出来给你看。它只读取模型配置（`config.json`）并在 CPU 上追踪张量形状，不加载模型权重，不初始化 CUDA，也不分配 GPU 显存。以教程 03 的 `MiniESamp` 为例，在 CPU 上首次调用耗时 2.9 s（包含读取配置），同一进程里第二次调用不到 0.1 s。
 
@@ -62,7 +62,7 @@ config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_model_len=512, max_n
 print(pllm.explain(MiniESamp(beta=0.5), config))
 ```
 
-输出如下（节选，省略了 `kernels`、`timing` 与 `note` 的大部分行）：
+输出如下（节选，省略了 `kernels`、`note` 行和几行 `timing` 细节）：
 
 ```text
 model    Qwen2ForCausalLM, hidden 896, 24 layers, vocab 151936, bfloat16 [exact, config.json]
@@ -71,14 +71,18 @@ forward  CUDA graphs: no effect needs eager
 base     987922432 FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]
 member  effect  anchor / lane / graph  state reads (origin, distance)
 loss  train  token.commit / side / captured  distiller (latest, 0); one AdamW step per state per engine step; prompt rows train once per prefill chunk
+  CUDA-graph pool reservation: 101384192 bytes [workload estimate or cuda_graph_pool_budget_bytes]
   estimate / step (128 rows): 4587520 matmul FLOP + 0 projection FLOP; state read/write 14680576/14680576 bytes, optimizer 29361152 bytes (included), sampler 0 bytes
 predict  guide_sampling  model.execute / main / captured  distiller (boundary, 1)
+  CUDA-graph pool reservation: 2138112 bytes [workload estimate or cuda_graph_pool_budget_bytes]
+  estimate / step (128 rows): 0 matmul FLOP + 0 projection FLOP; state read/write 0/0 bytes, optimizer 0 bytes (included), sampler 0 bytes
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
+  CUDA-graph pool reservation: 52146176 bytes [workload estimate or cuda_graph_pool_budget_bytes]
   estimate / step (128 rows): 1835008 matmul FLOP + 939524096 projection FLOP; state read/write 3670016/0 bytes, optimizer 0 bytes (included), sampler 1261406208 bytes
 tap      model.layers.0[0], decode: 460800 bytes shared by loss, predict
 tap      model.layers.23[0], decode: 460800 bytes shared by loss
 state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  514  114704  58957916  field 0: float32, ...
+distiller  request  514  114704  58957916  field 0: float32, field 1: float32, field 2: float32, field 3: float32, field 4: float32; source: module init; placement: device; host bytes: 0; logical transfer bytes/row: 0; decode bytes/step: 0
 memory   peak 964919904 bytes funded by pllm [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
          below 964919904 bytes tasks run inline; below 919036000 bytes planning fails
 preempt  state keep; replay rejection: not applicable to kept state
@@ -95,6 +99,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
   - `lane`（在哪条 CUDA stream）：`side` 是旁路 stream，和下一步 forward 重叠；`main` 是主 stream。
   - `graph`：`captured` 表示进 CUDA graph。
   - `state reads (origin, distance)`：读哪份状态、读到的版本离最新差几步。`loss` 读最新的（距离 0），`predict` 读的版本落后 1（这就是教程 03 里说的“第 N 步的更新在第 N+2 步被读到”带来的重叠）。所以对 `MiniESamp` 来说，`loss` 训练在旁路 stream、进 graph；`predict` 在主 stream、进 graph。
+  - `CUDA-graph pool reservation`：为这段计算捕获 CUDA graph 要预留的私有显存池；这部分显存要从 KV cache 那里分走，所以列出来。
   - `estimate / step`：这段计算每步（按 `max_num_seqs` 行算）的 FLOP、状态读写字节和采样器字节估计。`predict` 的 `projection FLOP` 与 `sampler` 字节来自用 LM head 投影预测并引导采样。
 - **`tap`**：从模型里取出的 hidden（第 0 层、第 23 层）和预留的缓冲大小（各 460800 字节）；第 0 层的那份由 `loss` 和 `predict` 共用。
 - **`state`**：`distiller` 是请求级状态，预留 514 份（`roots`），每份 114704 字节，共 58957916 字节（约 56 MiB）；`[exact]` 表示这是精确值。514 是为 128 个并发请求和在途的版本预留的份数——比并发数多，因为训练中的新版本和正在被读的旧版本要同时存在。
@@ -179,7 +184,7 @@ print(pllm.explain(MiniESamp(beta=0.5), small).budget_errors)
 
 ## 给程序/代理用
 
-如果你在写自动化脚本或让代理自动检查负载，不需要解析文本。`pllm.explain` 返回的对象可以用 `dataclasses.asdict(report)` 转成能够 `json.dumps` 的字典，包含 `eager_reason`、`members`（每个方法的任务）、`states`、`peak_memory_bytes`、`budget_errors`、`exports` 等字段；`workload_digest` 是负载声明、方法代码和取值的签名（相同即同一个负载），`flops_per_token_estimate` 是基座与各任务合计的每 token FLOP 估计：
+如果你在写自动化脚本或让代理自动检查负载，不需要解析文本。`pllm.explain` 返回的对象可以用 `dataclasses.asdict(report)` 转成能够 `json.dumps` 的字典，包含 `eager_reason`、`members`（每个方法的任务）、`states`、`peak_memory_bytes`、`budget_errors`、`exports` 等字段；`workload_digest` 是负载声明、方法代码和取值的摘要（相同即同一个负载），`flops_per_token_estimate` 是基座与各任务合计的每 token FLOP 估计：
 
 ```python
 import json

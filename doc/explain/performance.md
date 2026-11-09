@@ -44,7 +44,7 @@
 | **多卡 All-Reduce 被旁路任务撞上** | 4 张 A100 跑 7B（TP=4）时，若旁路训练每步与 vLLM 的 Custom All-Reduce 重叠约 **$193\text{–}205\ \mu\text{s}$**，吞吐只有原生的 **87.07%**（同设置单卡为 93.79%） | 旁路训练与 All-Reduce 争抢带宽和 SM，拖慢全卡同步 |
 
 围绕这三个瓶颈，`pllm` 在底层替你做了三件事：
-1. **保住时间线**：稳态 decode 每步 0 次主机同步，把前向改写和旁路训练录进 CUDA Graph，并把每步约 **$700\ \mu\text{s}$** 的 CPU 簿记藏进 GPU 执行阴影里。
+1. **保住时间线**：稳态 decode 每步 0 次主机同步，把前向改写和旁路训练录进 CUDA Graph，并把每步约 **$700\ \mu\text{s}$** 的 CPU 端准备工作藏进 GPU 执行阴影里。
 2. **省下显存容量**：用分页状态池、按角色自动选精度和 CPU 静态代码追踪，把显存留给 KV cache。
 3. **少搬字节、聪明重叠**：能合并读权重的绝不读两遍；必须搬运或训练的，只在 GPU 对应硬件资源空闲时塞进旁路 stream 重叠执行。
 
@@ -124,7 +124,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 怎么从输出里看性能与显存
 
-对照 [《写代码时就看到成本》](explain.md) 中的输出结构，重点盯住这五类行：
+对照 [《写代码时就看到成本》](../guides/explain.md) 中的输出结构，重点盯住这五类行：
 
 * **`forward`**：如果是 `CUDA graphs: no effect needs eager`，说明模型主干保住了图模式；如果出现 `eager: ...`，后面会直接点名是哪个声明导致了退回 eager。
 * **`member`**：看每个方法的 `anchor / lane / graph`：
@@ -139,7 +139,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 > **实用建议与边界**
 > * `pllm.explain` 不包含模型权重、vLLM 自身的激活和 KV cache 占用，也不包含与具体 GPU 相关的 BLAS 工作区大小（因此受影响的峰值是下界）。能不能装进 GPU 要到 `make_llm` 时才确定。
-> * 作用在模型层内部或注意力里的计算（`pllm.model.ActivationPatch`、`@pllm.custom_residual`、`@pllm.custom_attention`）以及自定义算子，在 CPU 上无法追踪同步，`host` 行显示为 `unverified syncs`，需要上 GPU 跑 [`pllm.testing.check_on_gpu`](validation.md) 验证。
+> * 作用在模型层内部或注意力里的计算（`pllm.model.ActivationPatch`、`@pllm.custom_residual`、`@pllm.custom_attention`）以及自定义算子，在 CPU 上无法追踪同步，`host` 行显示为 `unverified syncs`，需要上 GPU 跑 [`pllm.testing.check_on_gpu`](../guides/checking.md) 验证。
 
 ---
 
@@ -149,7 +149,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 3.1 零主机同步：为什么一行 `.item()` 会拖垮吞吐？
 
-在异步执行模型下，CPU 总是领先 GPU 一步准备元数据。`pllm` 每步的 CPU 簿记总计约 **$700\ \mu\text{s}$**，所需的槽位、掩码等元数据通过一张锁页 `int64` 表一次上传（H2D 约 **$6.24\ \mu\text{s}$**），完全藏在 $3.30\text{ ms}$ 的 GPU 前向阴影里，造成的步间 GPU 空闲仅约 **$4\text{–}6\ \mu\text{s}$**。
+在异步执行模型下，CPU 总是领先 GPU 一步准备元数据。`pllm` 每步在 CPU 上的准备工作总计约 **$700\ \mu\text{s}$**，所需的槽位、掩码等元数据通过一张锁页 `int64` 表一次上传（H2D 约 **$6.24\ \mu\text{s}$**），完全藏在 $3.30\text{ ms}$ 的 GPU 前向阴影里，造成的步间 GPU 空闲仅约 **$4\text{–}6\ \mu\text{s}$**。
 
 一旦在方法里写下 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)` 或 `if tensor.any():`，CPU 就必须停下来等 GPU 把前面的所有算子跑完，流水线被彻底排空；而方法又运行在 CUDA Graph 和旁路 stream 里，这样的代码根本无法录制。所以 `pllm` 不让它跑起来：规划时用 meta 张量追踪你的方法，遇到这类操作直接报错，`pllm.explain` 和 `make_llm` 都过不去。
 
@@ -190,7 +190,7 @@ class GoodBias(pllm.Workload):
 `pllm.explain(BadBias(), config)` 抛出 `RuntimeError: Tensor.item() cannot be called on meta tensors`，并附一条提示：`methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values`。`.cpu()`、`torch.nonzero` 等同样在这一步被拦下。`GoodBias` 则正常规划，`host` 行为 `0 syncs`。注意改写后的语义也更对：原写法用整个 batch 的范数做一次判断，会让一个请求的结果受同批其他请求影响；改写后每一行只看自己。
 
 **机制与验证**：
-* `pllm` 将“稳态 decode 每步 0 次阻塞式主机同步”作为硬契约。在 RTX 4090 的 128 并发剖析中，`pllm` 产生的 Event/Stream 主机等待为 **0**，decode 窗口内 `cudaDeviceSynchronize` 空闲时间为 **0**。
+* `pllm` 保证稳态 decode 每步 0 次阻塞式主机同步，`check_on_gpu` 会检查这一点。在 RTX 4090 的 128 并发剖析中，`pllm` 产生的 Event/Stream 主机等待为 **0**，decode 窗口内 `cudaDeviceSynchronize` 空闲时间为 **0**。
 * 遇到自适应深度分桶、计数 scan 完成判断等必须动态跳转的内部场景，`pllm` 使用 CUDA Graph 内的设备端条件节点（CUDA IF nodes，需 CUDA 12.4+ 驱动路径）直接在 GPU 上跳转，不把条件拷回 CPU。
 * `explain` 只能追踪普通方法里的数学。模型层内和注意力里的计算要用 `pllm.testing.check_on_gpu(workload, config)` 验证：它在 `torch.cuda.set_sync_debug_mode("error")` 下实跑至少 8 个稳态 decode 步，任何隐式同步都会立即报错。
 
@@ -200,7 +200,7 @@ CUDA Graph 会把一串 GPU kernel 的启动参数预先录制成一张图，之
 
 1. **任务与在线训练整包捕获（`StepCapture`）**：在线训练（如 `@pllm.train`）包含前向、loss、掩码归约、`backward()`、写状态和分页 `AdamW` 等几十个小 kernel。`pllm` 按最大行数和状态容量把它们录进同一张图；输入使用固定缓冲，未满 batch 的空行指向不会污染真实状态的哑槽位（sink state）。因此即便每步活跃请求集合在变，也**不需要重录图**：稳态下每个 decode 步只回放 1 次训练图，0 次重捕获。在一次 128 并发的对比测试中，训练进图让每步从 $6.73\text{ ms}$ 降到 $5.25\text{ ms}$，吞吐提高约 **25%**。
 2. **模型层内残差改写进图**：`@pllm.custom_residual` 会被编译为具名算子并直接录进 vLLM 的模型图里（详见 [5.4 节](#54-模型层内残差改写)）。
-3. **自定义算子进图**：用 `torch.library.custom_op` 注册并附上 `register_fake` 的 Triton 或 PyTorch 算子，只要直接调用该 op 对象（不要调 `torch.ops.<namespace>`），就能被捕进图与旁路流（见[教程 09](../tutorials/09_custom_kernels.ipynb)）。在 RTX 4090（128 并发）下，自定义 Triton 算子吞吐达原生 vLLM 的 **95%**（$37,518\text{ tok/s}$），PyTorch 自定义算子达 **96%**（$37,976\text{ tok/s}$）。
+3. **自定义算子进图**：用 `torch.library.custom_op` 注册并附上 `register_fake` 的 Triton 或 PyTorch 算子，只要直接调用该 op 对象（不要调 `torch.ops.<namespace>`），就能被捕进图与旁路流（见[示例 09](../examples/09_custom_kernels.ipynb)）。在 RTX 4090（128 并发）下，自定义 Triton 算子吞吐达原生 vLLM 的 **95%**（$37,518\text{ tok/s}$），PyTorch 自定义算子达 **96%**（$37,976\text{ tok/s}$）。
 
 **如何控制与检查图模式**：
 
@@ -274,15 +274,15 @@ print(pllm.explain(Distill(), strict_config))
 
 ### 4.1 分页状态池与版本槽位公式（`roots`）
 
-当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，`pllm` 用分页张量状态池（PTTS）管理显存。当状态更新时，框架执行**字段级写时复制（COW）**：只为被修改的字段分配新物理页，未修改字段直接与旧版本共享物理槽位。
+当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，`pllm` 用一个分页的状态池管理显存。当状态更新时，框架执行**字段级写时复制（COW）**：只为被修改的字段分配新物理页，未修改字段直接与旧版本共享物理槽位。
 
 为什么在 `pllm.explain` 里看到的 `roots`（预留槽位数）比 `max_num_seqs` 大得多？
-因为为了支持 `publish_lag` 跨步重叠，当旁路流正在写入新版本时，主干流还在读取旧版本，多个版本必须同时驻留在显存里。精确槽位公式如下（其中 `lineages` 为并发请求槽位数，即 `max_num_seqs`）：
+因为为了支持 `publish_lag` 跨步重叠，当旁路流正在写入新版本时，主干流还在读取旧版本，多个版本必须同时驻留在显存里。精确槽位公式如下（其中“副本数”为并发请求槽位数，即 `max_num_seqs`）：
 
-* **普通可写 `RequestState`**：$\text{roots} = (3 + \text{publish\_lag}) \times \text{lineages} + 2$
+* **普通可写 `RequestState`**：$\text{roots} = (3 + \text{publish\_lag}) \times \text{副本数} + 2$
   * 例如第 2 节的 `Distill`：`max_num_seqs=128`、默认 `publish_lag=1` 时，$\text{roots} = 4 \times 128 + 2 = \mathbf{514}$，每份 $129,104\text{ B}$，总预留 $66,359,516\text{ B} \approx \mathbf{63.3\text{ MiB}}$。改成 `publish_lag=0` 后为 $3 \times 128 + 2 = 386$ 份。
-* **前向内精确更新（`@pllm.train_in_forward(visibility="exact")` decode）**：$\text{roots} = 2 \times \text{lineages} + 2$
-* **`InstanceState`**：可写实例状态最多按单条 lineage 计算（默认 `publish_lag=1` 时 $\text{roots} = 6$）；只读（不可变）实例状态只需 **`1` 个 root**。
+* **前向内精确更新（`@pllm.train_in_forward(visibility="exact")` decode）**：$\text{roots} = 2 \times \text{副本数} + 2$
+* **`InstanceState`**：可写实例状态按一份副本计算（默认 `publish_lag=1` 时 $\text{roots} = 6$）；只读（不可变）实例状态只需 **`1` 个 root**。
 
 ### 4.2 自动精度选择：什么时候用 BF16，什么时候必须用 FP32？
 
@@ -328,7 +328,7 @@ class Probe(pllm.Workload):
 
 ```python
 exec_opts = pllm.ExecutionOptions(
-    state_page_budget_bytes=256 << 20,  # 状态池（PTTS）上限：256 MiB
+    state_page_budget_bytes=256 << 20,  # 状态池上限：256 MiB
     execution_peak_budget_bytes=1024 << 20,  # 执行峰值上限（含状态页、任务与捕获池）：1024 MiB
     cuda_graph_pool_budget_bytes=128 << 20,  # 每个任务/模型的 CUDA Graph 池预算：128 MiB
 )
@@ -336,7 +336,7 @@ config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=exec_opts)
 ```
 
 这四个旋钮的行为如下：
-1. **`execution_peak_budget_bytes`（两级优雅降级）**：包含 PTTS 状态页、任务工作区与存活结果、anchor 缓冲和捕获池预留；不含模型权重与 KV 池。旁路重叠（`side` lane）需要同时保留两步缓冲，因此峰值更高。以 128 并发的 `ESamp`（$\beta=0.5$）为例，旁路重叠计划峰值约为 **$1,041\text{ MiB}$**，内联（inline）下限约为 **$973\text{ MiB}$**。
+1. **`execution_peak_budget_bytes`（两级优雅降级）**：包含状态页、任务工作区与存活结果、anchor 缓冲和捕获池预留；不含模型权重与 KV 池。旁路重叠（`side` lane）需要同时保留两步缓冲，因此峰值更高。以 128 并发的 `ESamp`（$\beta=0.5$）为例，旁路重叠计划峰值约为 **$1,041\text{ MiB}$**，内联（inline）下限约为 **$973\text{ MiB}$**。
    * 如果你设置的 `execution_peak_budget_bytes` 介于两者之间，规划器**不会报错，而是自动把旁路任务退回主 stream 内联执行**（`explain` 里该任务的 lane 从 `side` 变为 `main`），用一点重叠吞吐换取显存装得下。
    * 如果低于内联下限，规划失败，`explain(...).budget_errors` 会写明峰值需要多少字节、预算只有多少，并建议调小 `max_num_batched_tokens`、调大 `execution_peak_budget_bytes`，或把只读大表声明为 `placement="host"`。
 2. **`state_page_budget_bytes`**：状态总预留（`roots × bytes/root`）超过该值时，`explain` 把缺口写进 `budget_errors`（建议调小 `max_num_seqs` 或调大预算），`make_llm` 在绑定阶段抛出 `ValueError`。默认 `0` 表示用后端实际可用的显存。
@@ -410,7 +410,7 @@ Dense 路径仍需额外的全词表 LM Head 投影和重加权：旧版 RTX 409
 旁路训练本身也很省：在 `beta=0` 时每步 $177.6\ \mu\text{s}$ 的旁路 GPU 时间里，分页 `AdamW` 只占 **$29.3\ \mu\text{s}$**——它直接从源物理槽位读取参数和一阶/二阶矩并写回目标槽位，省去了对 5 个优化器状态字段做写时复制的整页搬运。
 
 > **实用建议与限制**
-> * **优先用 `@pllm.guide_sampling`，慎用多层 `pllm.layer_logits`**：`pllm.layer_logits`（如 `DoLa` 读取多个中间层的词表分布）走独立的 GEMM，每多读一层就要多读一遍 $272\text{ MB}$ 的 LM Head 权重。在 0.5B 模型（32 请求 $\times n=4$）上，`DoLa` 的吞吐仅为原生的 **25%**（见[教程 06](../tutorials/06_reading_inside.ipynb)）。
+> * **优先用 `@pllm.guide_sampling`，慎用多层 `pllm.layer_logits`**：`pllm.layer_logits`（如 `DoLa` 读取多个中间层的词表分布）走独立的 GEMM，每多读一层就要多读一遍 $272\text{ MB}$ 的 LM Head 权重。在 0.5B 模型（32 请求 $\times n=4$）上，`DoLa` 的吞吐仅为原生的 **25%**（见[示例 06](../examples/06_reading_inside.ipynb)）。
 > * **模型越大，引导采样的相对代价越小**：在 0.5B 小模型上，词表投影和重加权占整步时间的 $\sim 10\%$；但在 7B 模型上，主干每步要读十几 GB 权重，同样的词表开销占比很小——在 RTX 4090 上跑 7B 模型时，`ESamp`（$\beta=0.5$）吞吐约为原生 vLLM 的 **94%**（$\beta=0$ 约 **97%**）。
 > * **逐行训练默认 `reduction="mean"`**：只平均本步每个状态选中的行；`reduction="sum"` 则求和。两者都不会跨状态归约。宿主批次自己归约，非默认 `reduction=` 会在声明期报错。
 
@@ -418,7 +418,7 @@ Dense 路径仍需额外的全词表 LM Head 投影和重加权：旧版 RTX 409
 
 ### 5.2 外部大表与词表级查表
 
-**它是什么、什么时候用**：算法需要根据历史输入 token（`pllm.input_tokens`）从一张巨大的预训练查找表（如几百 MiB 到几 GiB 的 n-gram 先验表或 Engram 式记忆表）中取出向量，经掩码和缩放后叠加到词表分布或残差流上（见[教程 11](../tutorials/11_lookup_memory.ipynb)）。
+**它是什么、什么时候用**：算法需要根据历史输入 token（`pllm.input_tokens`）从一张巨大的预训练查找表（如几百 MiB 到几 GiB 的 n-gram 先验表或 Engram 式记忆表）中取出向量，经掩码和缩放后叠加到词表分布或残差流上（见[示例 11](../examples/11_lookup_memory.ipynb)）。
 
 #### 代码示例：把大表放在显存（`device`）或主机内存（`host`）
 
@@ -488,7 +488,7 @@ class LookupPrior(pllm.Workload):
 
 ### 5.3 自定义注意力与 KV Cache 瘦身
 
-**它是什么、什么时候用**：使用 `@pllm.custom_attention` 改变某些层存储 KV 的物理布局（滑动窗口、保留整个 prompt 加最近窗口、跨层复用低层 KV），或者改变读取 KV 的方式（如 Quest 风格的按页打分 Top-K 稀疏读取，见[教程 10](../tutorials/10_custom_attention.ipynb)）。
+**它是什么、什么时候用**：使用 `@pllm.custom_attention` 改变某些层存储 KV 的物理布局（滑动窗口、保留整个 prompt 加最近窗口、跨层复用低层 KV），或者改变读取 KV 的方式（如 Quest 风格的按页打分 Top-K 稀疏读取，见[示例 10](../examples/10_custom_attention.ipynb)）。
 
 #### 代码示例：静态 KV 布局瘦身 vs 动态 Top-K 读取
 
@@ -537,7 +537,7 @@ class TopPages(pllm.Workload):
         return kv.attend(q, topk=tokens)[0]  # 每个头只读自己选中的位置
 ```
 
-方案 C 用的是简化打分；按 Quest 原文用每页 key 的最小/最大值求上界的完整写法见教程 10 的 `QuestRead`。
+方案 C 用的是简化打分；按 Quest 原文用每页 key 的最小/最大值求上界的完整写法见示例 10 的 `QuestRead`。
 
 #### 原理与代价：分清“真省显存容量”和“只省逻辑读取”
 
@@ -546,9 +546,9 @@ class TopPages(pllm.Workload):
 | 特性维度 | 静态几何布局（`keep="window"` / `sink=True` / `keep="none", source=k`） | 动态稀疏读取（`kv.attend(q, topk=...)`） |
 | :--- | :--- | :--- |
 | **省 KV 显存容量吗？** | **真省容量**：直接映射为 vLLM 原生 `SlidingWindowSpec`、`SinkSpec` 和跨层共享组，滑出窗口的物理块会被真正回收给池子 | **不省容量**：所有历史 token 的 KV 仍必须保留在显存中供打分和挑选 |
-| **省读取带宽吗？** | **真省带宽**：直接调用原生 FA2 和 Triton `unified_attention` | **省逻辑读取字节**（`explain` 中教程 10 的 `QuestRead` 每 token 最多读 $458,752\text{ B}$，全量为 $1,048,576\text{ B}$），但打分和 gather 走 PyTorch 算子 |
-| **实测单请求 KV 显存上限**<br>（0.5B，教程 10：`max_model_len=2048`，256 token 分块 prefill） | 全量 **$24.0\text{ MiB}$** $\rightarrow$ 偶数层窗口 256 降至 **$16.6\text{ MiB}$**；共享一半层降至 **$12.0\text{ MiB}$**（可同时容纳的 2048-token 请求从 358.8 个增至 717.6 个）。`sink=True` 保留整个 prompt，上限仍为 $24.0\text{ MiB}$，实际节省取决于生成长度 | 仍为 **$24.0\text{ MiB}$** |
-| **实测吞吐**<br>（RTX 4090，0.5B，128 并发） | 原生读取（`NativeRead`）**97%**；偶数层窗口（`LocalGlobal`）**97%**；跨层共享（`CrossLayerShared`）**95%** | 教程 10 中 `QuestRead` 仅为原生的 **7%**（$2,727\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
+| **省读取带宽吗？** | **真省带宽**：直接调用原生 FA2 和 Triton `unified_attention` | **省逻辑读取字节**（`explain` 中示例 10 的 `QuestRead` 每 token 最多读 $458,752\text{ B}$，全量为 $1,048,576\text{ B}$），但打分和 gather 走 PyTorch 算子 |
+| **实测单请求 KV 显存上限**<br>（0.5B，示例 10：`max_model_len=2048`，256 token 分块 prefill） | 全量 **$24.0\text{ MiB}$** $\rightarrow$ 偶数层窗口 256 降至 **$16.6\text{ MiB}$**；共享一半层降至 **$12.0\text{ MiB}$**（可同时容纳的 2048-token 请求从 358.8 个增至 717.6 个）。`sink=True` 保留整个 prompt，上限仍为 $24.0\text{ MiB}$，实际节省取决于生成长度 | 仍为 **$24.0\text{ MiB}$** |
+| **实测吞吐**<br>（RTX 4090，0.5B，128 并发） | 原生读取（`NativeRead`）**97%**；偶数层窗口（`LocalGlobal`）**97%**；跨层共享（`CrossLayerShared`）**95%** | 示例 10 中 `QuestRead` 仅为原生的 **7%**（$2,727\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
 
 #### 窗口布局：先看 GQA 内核，再看少读了多少 KV
 
@@ -569,7 +569,7 @@ FlashInfer 的 tensor-core decode 使用 16×128 的 Q/KV tile、4 个 warp，�
 FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2 转成自然对数；FP32 返回类型不代表与 FA2 位相同。窗口回收的独立参考计算中，输出相对 FP32 的最大绝对误差约 0.0079，LSE 约 0.0017。同一组 query 上，FlashInfer 与 FA2 对 FP64 输出的最大误差都是约 0.0076；LSE 与按该 BF16 分母计算的 FP64 参考差异不超过 0.00005。若算法对很小的 LSE 差异敏感，应把这个舍入量级纳入质量验证。
 
 > **实用建议与限制**
-> * **布局改的是模型数学**：未经相应训练的模型直接换成窗口或跨层共享布局，回答质量可能明显变差（教程 10 中 `LocalGlobal` 和 `CrossLayerShared` 都答错了长文检索问题，`PromptPlusWindow` 答对）。先在自己的任务上验证质量，再看吞吐。
+> * **布局改的是模型数学**：未经相应训练的模型直接换成窗口或跨层共享布局，回答质量可能明显变差（示例 10 中 `LocalGlobal` 和 `CrossLayerShared` 都答错了长文检索问题，`PromptPlusWindow` 答对）。先在自己的任务上验证质量，再看吞吐。
 > * **不支持按注意力分数动态淘汰物理 KV 块（如 SnapKV / H2O）**：vLLM 对每个请求只维护单一的 `num_computed_tokens` 计数，位置编码与物理槽位均由它线性推导，且块表（block table）只能追加、不能在中间挖洞。如果你的目标是省 KV 显存，请改用静态 `keep="window"`（可加 `sink=True`）或 `keep="none", source=...`；如果只想少读，用 `kv.attend(q, topk=...)`。
 > * **硬件与配置限制**：`@pllm.custom_attention` 要求 `tensor_parallel_size=1`、FlashAttention-2、非量化 KV 且关闭 prefix caching；静态布局还要求 MRv2 runner，且不能与 `pllm.PositionState` 或 `@pllm.custom_forward` 同时使用。
 > * **不要设极小的滑动窗口**：窗口极小（如只有 3 个 token）时，FA2 处理窗口的耗时（$91.5\ \mu\text{s}$）反而比直接算全量注意力（$16.6\ \mu\text{s}$）慢 5 倍以上。
@@ -579,7 +579,7 @@ FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2
 
 ### 5.4 模型层内残差改写
 
-**它是什么、什么时候用**：需要在 Transformer 的每一层或特定子层内部直接修改残差流、注意力 Value 或跨层连接（如 Value Residual、LAuReL、Hyper-Connections），同时不希望模型退回 eager 模式（见[教程 07](../tutorials/07_custom_residual.ipynb)）。
+**它是什么、什么时候用**：需要在 Transformer 的每一层或特定子层内部直接修改残差流、注意力 Value 或跨层连接（如 Value Residual、LAuReL、Hyper-Connections），同时不希望模型退回 eager 模式（见[示例 07](../examples/07_custom_residual.ipynb)）。
 
 #### 代码示例
 
@@ -619,11 +619,11 @@ class ScaleResidual(pllm.Workload):
 
 ### 5.5 前向内训练、线性扫描与自适应深度
 
-**它是什么、什么时候用**：需要在模型前向内部做快权重更新（`@pllm.train_in_forward`，见[教程 08](../tutorials/08_inplace_ttt.ipynb)）、用 `pllm.scan` 计算长序列线性递推（$S_t = A_t S_{t-1} + B_t$），或者用 `@pllm.custom_forward` 编排层循环与按 token 提前退出（`active=mask`，见[教程 12](../tutorials/12_adaptive_depth.ipynb)）。
+**它是什么、什么时候用**：需要在模型前向内部做快权重更新（`@pllm.train_in_forward`，见[示例 08](../examples/08_inplace_ttt.ipynb)）、用 `pllm.scan` 计算长序列线性递推（$S_t = A_t S_{t-1} + B_t$），或者用 `@pllm.custom_forward` 编排层循环与按 token 提前退出（`active=mask`，见[示例 12](../examples/12_adaptive_depth.ipynb)）。
 
 #### 1) 线性递推 `pllm.scan`：自动并行前缀扫描
 
-在 chunk 内做线性递推时，如果用 Python 循环串行步进，GPU 的 SM 根本填不满。用 `pllm.scan` 写递推后，`pllm` 的 Rust 规划器会自动识别形如 $S_t = A_t S_{t-1} + B_t$ 的仿射递推，在显存工作区预算允许且系数为 FP32 时，替换为**并行前缀扫描（Parallel Prefix Scan）**：
+在 chunk 内做线性递推时，如果用 Python 循环串行步进，GPU 的 SM 根本填不满。用 `pllm.scan` 写递推后，`pllm` 的规划器会自动识别形如 $S_t = A_t S_{t-1} + B_t$ 的仿射递推，在显存工作区预算允许且系数为 FP32 时，替换为**并行前缀扫描（Parallel Prefix Scan）**：
 * **微基准**：单头 $64 \times 64$ 状态扫描从串行的 $1.439\text{ ms}$ 降到 **$0.219\text{ ms}$（6.57 倍）**；14 头 $64 \times 64$ 为 **1.85 倍**；完整状态转移从 $5.879\text{ ms}$ 降到 **$1.759\text{ ms}$（3.34 倍）**。
 * **自动回退**：当状态维度很大（如 $d=896$）导致树形扫描不划算时，形状守卫会保留串行循环；CPU 上、部分扫描或需要求导的调用也保持串行。你也可以设 `ExecutionOptions(tuning="measured")` 让引擎在绑定时实测挑选最快实现，或用 `allow_numerical_transforms=False` 禁止并行重排。
 
