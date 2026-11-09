@@ -153,11 +153,8 @@ def test_j1_admission():
     for name in ("pipeline_parallel_size", "data_parallel_size"):
         with pytest.raises(ValueError, match=name + "=1"):
             pllm.make_llm(replace(config(), **{name: 2}), workload=DummyWorkload())
-    for workload, message, milestone in (
-        (TLMWorkload(TLMConfig()), "causal_model", "M5"),
-        (VideoWorkload(), "state feeds", "E1"),
-    ):
-        with pytest.raises(ValueError, match=message + ".*tensor_parallel_size=1.*" + milestone):
+    for workload, message in ((TLMWorkload(TLMConfig()), "causal_model"), (VideoWorkload(), "state feeds")):
+        with pytest.raises(ValueError, match=message + ".*tensor_parallel_size=1"):
             pllm.make_llm(config(), workload=workload)
     with pytest.raises(ValueError, match="not shard-local.*other ranks"):
         pllm.explain(PrefillAdaptersWorkload(), config())

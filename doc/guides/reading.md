@@ -259,7 +259,7 @@ tap      lm_head[0], prefill,decode: 29171840 bytes shared by top1
 | `pllm.residual(after=...): use "layer" or "attention"` | `pllm.residual` 的 `after=` 参数仅支持 `"layer"`（整层之后）或 `"attention"`（注意力之后）。 |
 | `pllm.input_tokens(history=) needs a nonnegative integer` | `history` 必须是非负整数（$\ge 0$）。 |
 | `pllm.input_tokens needs runner="mrv2"` | 使用 `pllm.input_tokens` 时，`ModelConfig` 的 `runner` 必须设为 `"mrv2"`（默认值）。 |
-| `pllm.attention needs a nonnegative layer and fact='aux' or 'lse'; DSA topk facts are deferred` | `pllm.attention` 的层号必须是非负整数，且 `fact` 只能为 `"aux"` 或 `"lse"`。 |
+| `pllm.attention needs a nonnegative layer and fact='aux' or 'lse'` | `pllm.attention` 的层号必须是非负整数，且 `fact` 只能为 `"aux"` 或 `"lse"`。 |
 | `pllm.layer_logits reads the model's LM head; compile this workload with make_llm` | `pllm.layer_logits` 依赖模型运行时的完整 LM head 权重，无法在脱离模型的宿主独立编译（`make_host`）中使用。 |
 
 ---

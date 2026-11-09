@@ -760,7 +760,9 @@ def finish_model_declaration(b: TensorDeclaration, facts: BackendCompileFacts) -
         for program in (b.custom_forward_programs or {}).values()
         for step in program.steps
     ):
-        raise ValueError("@pllm.custom_attention inside @pllm.custom_forward needs kv='commit'; kv='peek' is deferred")
+        raise ValueError(
+            "@pllm.custom_attention inside @pllm.custom_forward reads only layers called with kv='commit'; use kv='commit'"
+        )
     b.configure_scans(facts)
 
 

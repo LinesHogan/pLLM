@@ -45,11 +45,6 @@ def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> st
     """Reject unsupported engine settings and return the model forward eager reason."""
     if requirements.input_token_history >= 0 and config.runner != "mrv2":
         raise ValueError('pllm.input_tokens needs runner="mrv2"')
-    if requirements.input_token_history >= 0 and requirements.custom_residual and config.tensor_parallel_size != 1:
-        raise ValueError(
-            "pllm.input_tokens feeding @pllm.custom_residual needs tensor_parallel_size=1 "
-            "(custom_residual's TP support is deferred)"
-        )
     compat.admit_parallel(config, requirements)
     if model_hooks(requirements) and config.enable_prefix_caching:
         raise ValueError(

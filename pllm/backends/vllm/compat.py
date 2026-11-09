@@ -31,7 +31,8 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
     ):
         if type(size) is not int or size != 1:
             raise ValueError(
-                f"pllm needs {name}=1; pipeline/data parallelism is deferred to M6; only tensor parallelism is supported"
+                f"pllm needs {name}=1: it spreads a model over GPUs only by tensor parallelism; "
+                "set tensor_parallel_size instead"
             )
     if requirements.custom_attention and config.tensor_parallel_size != 1:
         raise ValueError("@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads")
@@ -39,13 +40,13 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
         return
     if VLLM_027 or config.runner != "mrv2":
         raise ValueError('multi-GPU needs vLLM 0.32.0 and runner="mrv2"; otherwise use tensor_parallel_size=1')
-    for used, feature, milestone in (
-        (requirements.causal_training, "causal_model training", "M5"),
-        (requirements.feeds, "state feeds", "E1"),
-        (requirements.custom_residual, "@pllm.custom_residual", "post-M2 model-site support"),
+    for used, feature in (
+        (requirements.causal_training, "causal_model training"),
+        (requirements.feeds, "state feeds"),
+        (requirements.custom_residual, "@pllm.custom_residual"),
     ):
         if used:
-            raise ValueError(f"{feature} needs tensor_parallel_size=1; TP support is deferred to {milestone}")
+            raise ValueError(f"{feature} runs on one GPU only; set tensor_parallel_size=1")
 
 
 if VLLM_027:

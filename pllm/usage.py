@@ -158,9 +158,7 @@ def final_hidden(*, tokens: Literal["decode", "prefill", "all"] = "decode") -> A
 def attention(layer: int, fact: Fact) -> Any:
     """Read sampled attention aux or the first kv.attend call's float32 LSE; inside attention, use earlier layers."""
     if type(layer) is not int or layer < 0 or fact not in ("aux", "lse"):
-        raise ValueError(
-            "pllm.attention needs a nonnegative layer and fact='aux' or 'lse'; DSA topk facts are deferred"
-        )
+        raise ValueError("pllm.attention needs a nonnegative layer and fact='aux' or 'lse'")
     return Attention(layer, fact)
 
 
