@@ -422,30 +422,30 @@ def community_t2(checkpoint: str) -> None:
     """
     from time import perf_counter
 
-    from pllm.execution.overlay_task import OverlayTransition
+    from pllm.execution.overlay_task import ChunkUpdate
     from pllm.workloads import InPlaceTTTConfig, InPlaceTTTWorkload
 
     options = InPlaceTTTConfig.from_checkpoint(checkpoint, track="T2")
     measurements = []
-    execute = OverlayTransition.serial_result
+    execute = ChunkUpdate.contiguous
 
-    def record(math, operand, values, row, plan):
-        arguments = math.inputs(operand, values)
+    def record(update, arguments, plan, offset):
         before = arguments["delta"].clone()
-        result = execute(math, operand, values, row, plan)
+        result = execute(update, arguments, plan, offset)
         if result.update_count.item():
-            source = operand.embedding
+            source = arguments["targets"]
             wanted = (
                 torch.nn.functional.conv1d(source.T.unsqueeze(0), arguments["conv"], padding=2, groups=source.shape[1])
                 .squeeze(0)
                 .T
                 @ arguments["proj"]
             )
-            raw_norm = (wanted.float().T @ operand.hidden.float()).norm().item()
+            raw_norm = (wanted.float().T @ arguments["inputs"].float()).norm().item()
             applied_norm = (arguments["delta"] - before).norm().item()
             assert raw_norm > 1e-5
             assert abs(applied_norm - options.learning_rate * 1e-5) < 1e-9
-            measurements.append({"layer": operand.target.layer, "raw_norm": raw_norm, "applied_norm": applied_norm})
+            layer = options.targets[len(measurements)].layer
+            measurements.append({"layer": layer, "raw_norm": raw_norm, "applied_norm": applied_norm})
         return result
 
     config = ModelConfig(
@@ -459,7 +459,7 @@ def community_t2(checkpoint: str) -> None:
     with (
         patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=512 << 20)),
         pllm.make_llm(config, workload=InPlaceTTTWorkload(options)) as handle,
-        patch.object(OverlayTransition, "serial_result", record),
+        patch.object(ChunkUpdate, "contiguous", record),
     ):
         started = perf_counter()
         outputs = handle.generate(

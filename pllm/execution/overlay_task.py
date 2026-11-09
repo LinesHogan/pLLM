@@ -180,6 +180,11 @@ def overlay_apply(effect: ProjectionDelta, hidden: torch.Tensor, values: Tensors
     return parameter_correction(hidden, tuple(values[name] for name in effect.applied_fields), effect.operator)
 
 
+def count_updates(results: Sequence[UpdateOutput]) -> torch.Tensor:
+    """The device [applied updates, trained rows] summed over results, in two kernels."""
+    return torch.stack((*(r.update_count for r in results), *(r.trained_rows for r in results))).view(2, -1).sum(1)
+
+
 Gradient = Callable[[Tensors, Tensors, Tensors, torch.Tensor], Tensors]
 
 
@@ -434,7 +439,6 @@ class OverlayTransition:
         )
         indices = {identity: index for identity, index in selected}
         updates: dict[tuple[RequestIdentity, Projection], UpdateOutput] = {}
-        counters: list[torch.Tensor] = []
         with torch.no_grad():
             for target_index, target in enumerate(self.targets):
                 for train in (False, True):
@@ -443,18 +447,17 @@ class OverlayTransition:
                         for (_, name), operand in operands.items()
                         if name == target and (operand.phase in self.phases) == train
                     )
-                    if group:
-                        if data.step.overlay_updates:
-                            results = tuple(data.step.overlay_updates[o.identity, target] for o in group)
-                            counts = torch.stack(
-                                tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)
-                            ).sum(0)
-                        else:
-                            results, counts = self.group(
-                                group, target_index, tuple(indices[o.identity] for o in group), batch
-                            )
-                        counters.append(counts)
-                        updates.update(((o.identity, target), result) for o, result in zip(group, results, strict=True))
+                    if not group:
+                        continue
+                    group_indices = tuple(indices[operand.identity] for operand in group)
+                    if data.step.overlay_updates:
+                        results = tuple(data.step.overlay_updates[o.identity, target] for o in group)
+                    elif self.executor is None:
+                        values = self.private_values(target_index, group_indices, batch)
+                        results = tuple(self.result(o, v) for o, v in zip(group, values, strict=True))
+                    else:
+                        results = self.executor.run(group, target_index, group_indices, batch)
+                    updates.update(((o.identity, target), result) for o, result in zip(group, results, strict=True))
         start = len(data.entries)
         changed: dict[int, torch.Tensor] = {}
         for identity, index in selected:
@@ -478,62 +481,24 @@ class OverlayTransition:
             },
             changed=tuple(changed),
             update_mask=torch.stack(tuple(changed.values())),
-            counters=torch.stack(counters).sum(0),
+            counters=count_updates(tuple(updates.values())),
         )
 
-    def group(
-        self,
-        operands: tuple[ProjectionOperands, ...],
-        target: int,
-        indices: tuple[int, ...],
-        batch: TensorBatch,
-    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
-        """Gather issued slots once per target/phase; writing results still belongs to the task."""
-        if self.chunk is not None:
-            # TensorDeclaration installs the batched executor for every chunked overlay (configure_scans for routes).
-            assert self.executor is not None
-            return self.executor.run(operands, target, indices, batch)
-        return self.serial(operands, target, indices, batch)
+    def private_values(self, target: int, indices: tuple[int, ...], batch: TensorBatch) -> tuple[Tensors, ...]:
+        """Borrow each request's private pages and the target's shared fields.
 
-    def serial(
-        self,
-        operands: tuple[ProjectionOperands, ...],
-        target: int,
-        indices: tuple[int, ...],
-        batch: TensorBatch,
-        *,
-        plan: PreparedScan | None = None,
-    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
-        """Keep unbatchable implementations on their selected numerical path."""
+        The task already owns these pages; borrowing their views avoids copying every dense carry twice.
+        """
         width = len(self.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
         invariants = self.invariant_values(target, batch)
-        rows = {row.identity: row for row in batch.selection.rows}
-        # The task already owns these private pages. Serial execution can borrow
-        # their views; gathering and scattering would copy every dense carry twice.
-        results = tuple(
-            self.serial_result(
-                operand,
-                {
-                    **{name: pool[slots[index]] for name, (pool, slots) in zip(self.buffers, fields, strict=True)},
-                    **invariants,
-                },
-                rows[operand.identity],
-                plan,
-            )
-            for operand, index in zip(operands, indices, strict=True)
+        return tuple(
+            {
+                **{name: pool[slots[index]] for name, (pool, slots) in zip(self.buffers, fields, strict=True)},
+                **invariants,
+            }
+            for index in indices
         )
-        return results, torch.stack(tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)).sum(0)
-
-    def serial_result(
-        self, operand: ProjectionOperands, values: Tensors, row: PackedPhaseRow, plan: PreparedScan | None
-    ) -> UpdateOutput:
-        """Use contiguous backend rows for ordinary exact chunk transitions."""
-        offset = self.chunk_offset(row, len(operand.hidden)) if row.phase is operand.phase else None
-        if offset is not None and plan is not None:
-            assert isinstance(self.chunk, ChunkUpdate)
-            return self.chunk.contiguous(self.inputs(operand, values), plan, offset)
-        return self.result(operand, values)
 
     def chunk_offset(self, row: PackedPhaseRow, count: int) -> int | None:
         """The contiguous training frontier, when the backend supplied complete row metadata."""

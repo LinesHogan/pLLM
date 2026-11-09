@@ -32,6 +32,18 @@ if TYPE_CHECKING:
     from pllm.execution.overlay_task import OverlayTransition
 
 
+def store_fields(
+    names: tuple[str, ...],
+    pools: tuple[torch.Tensor, ...],
+    values: Tensors,
+    sources: torch.Tensor,
+    destinations: torch.Tensor,
+) -> None:
+    """Copy each field's `sources` rows to its row of page `destinations`; a negative destination is skipped."""
+    for name, pool, destination in zip(names, pools, destinations, strict=True):
+        copy_pages(values[name], pool, sources, destination)
+
+
 class OverlayBatch:
     """At most eight captured shapes per target: four row capacities and two phases."""
 
@@ -60,19 +72,14 @@ class OverlayBatch:
         target: int,
         indices: tuple[int, ...],
         batch: TensorBatch,
-    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
+    ) -> tuple[UpdateOutput, ...]:
         """Bucket actual rows, then tile states; oversized rows stay eager at native size."""
         groups: dict[int, list[int]] = defaultdict(list)
         for i, operand in enumerate(operands):
             rows = len(operand.hidden)
             groups[next((size for size in self.capacities() if rows <= size), rows)].append(i)
         train = operands[0].phase in self.math.phases
-        keys = tuple((target, train, rows) for rows in groups)
-        tile = self.tiles.get(keys[0]) if len(keys) == 1 else None
-        if tile is not None and not tile.batchable:
-            return self.math.serial(operands, target, indices, batch, plan=tile.plan)
         results: dict[int, UpdateOutput] = {}
-        counters: list[torch.Tensor] = []
         width = len(self.math.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
         pools = tuple(pool for pool, _ in fields)
@@ -83,15 +90,36 @@ class OverlayBatch:
                 selected = members[start : start + self.states]
                 tile = self.tile(target, train, rows, pools, operands[selected[0]], len(selected), invariants)
                 items = tuple(operands[i] for i in selected)
-                if not tile.batchable:
-                    values, counts = self.math.serial(
-                        items, target, tuple(indices[i] for i in selected), batch, plan=tile.plan
-                    )
+                states = tuple(indices[i] for i in selected)
+                if tile.batchable:
+                    values = tile.run(items, slots[:, states], pools, batch.stream)
                 else:
-                    values, counts = tile.run(items, slots[:, [indices[i] for i in selected]], pools, batch.stream)
+                    values = self.serial(items, target, states, batch, tile.plan)
                 results.update(zip(selected, values, strict=True))
-                counters.append(counts)
-        return tuple(results[i] for i in range(len(operands))), torch.stack(counters).sum(0)
+        return tuple(results[i] for i in range(len(operands)))
+
+    def serial(
+        self,
+        operands: tuple[ProjectionOperands, ...],
+        target: int,
+        indices: tuple[int, ...],
+        batch: TensorBatch,
+        plan: PreparedScan | None,
+    ) -> tuple[UpdateOutput, ...]:
+        """Keep unbatchable implementations on their selected numerical path, one request at a time."""
+        math, chunk = self.math, self.math.chunk
+        rows = {row.identity: row for row in batch.selection.rows}
+        results: list[UpdateOutput] = []
+        for operand, values in zip(operands, math.private_values(target, indices, batch), strict=True):
+            row = rows[operand.identity]
+            offset = math.chunk_offset(row, len(operand.hidden)) if row.phase is operand.phase else None
+            if offset is None or plan is None:
+                results.append(math.result(operand, values))
+            else:
+                # Only a ChunkUpdate has a contiguous training frontier.
+                assert isinstance(chunk, ChunkUpdate)
+                results.append(chunk.contiguous(math.inputs(operand, values), plan, offset))
+        return tuple(results)
 
     def tile(
         self,
@@ -242,17 +270,9 @@ class OverlayTile:
             fields, output, changed, updates, trained = torch.vmap(self.one, in_dims=(0, 0, 0, 0, 0, None))(
                 values, self.hidden, self.desired, self.embedding, self.table[-1], base
             )
-        self.output = (
-            output,
-            changed,
-            updates,
-            trained,
-            fields["_pending_length"],
-            torch.stack((updates.sum(), trained.sum())),
-        )
+        self.output = output, changed, updates, trained, fields["_pending_length"]
         if self.train:
-            for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True)):
-                copy_pages(fields[name], pool, self.sources, self.table[width + i])
+            store_fields(self.math.buffers, self.pools, fields, self.sources, self.table[width : 2 * width])
 
     def run(
         self,
@@ -260,7 +280,7 @@ class OverlayTile:
         slots: np.ndarray[tuple[int, ...], np.dtype[np.int64]],
         pools: tuple[torch.Tensor, ...],
         stream: torch.cuda.Stream | None,
-    ) -> tuple[tuple[UpdateOutput, ...], torch.Tensor]:
+    ) -> tuple[UpdateOutput, ...]:
         """Fence staging through PinnedStaging and detach outputs before the next tile replay."""
         self.pools = pools
         base = operands[0].base_weight
@@ -298,7 +318,7 @@ class OverlayTile:
                 partial(self.staging.copy_to, self.table),
                 self.buffers,
             )
-        output, changed, updates, trained, lengths, counters = (value.clone() for value in self.output)
+        output, changed, updates, trained, lengths = (value.clone() for value in self.output)
         return tuple(
             UpdateOutput(
                 output[i, : len(o.hidden)],
@@ -308,7 +328,7 @@ class OverlayTile:
                 {"tail_rows": lengths[i]} if self.train else {},
             )
             for i, o in enumerate(operands)
-        ), counters
+        )
 
 
 class DecodeOverlay:
@@ -395,9 +415,13 @@ class DecodeOverlay:
 
     def store(self, index: int, values: Tensors, active: torch.Tensor) -> None:
         """Write only issued destinations, leaving padding and inactive carries untouched."""
-        slots = self.table[:-1, index]
-        for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True)):
-            copy_pages(values[name].unsqueeze(0), pool, self.source, slots[i : i + 1].masked_fill(~active, -1))
+        store_fields(
+            self.math.buffers,
+            self.pools,
+            {name: value.unsqueeze(0) for name, value in values.items()},
+            self.source,
+            self.table[:-1, index : index + 1].masked_fill(~active, -1),
+        )
 
     def run(
         self, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
