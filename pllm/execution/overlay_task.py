@@ -468,9 +468,7 @@ class OverlayTransition:
                     )
                     if group:
                         if data.step.overlay_updates:
-                            results = tuple(
-                                self.validate(data.step.overlay_updates[o.identity, target], o) for o in group
-                            )
+                            results = tuple(data.step.overlay_updates[o.identity, target] for o in group)
                             counts = torch.stack(
                                 tuple(torch.stack((r.update_count, r.trained_rows)) for r in results)
                             ).sum(0)
@@ -558,7 +556,7 @@ class OverlayTransition:
         if offset is not None and plan is not None:
             assert isinstance(self.chunk, ChunkUpdate)
             if plan.analysis is None or offset % self.chunk.chunk + len(operand.hidden) < self.chunk.chunk:
-                return self.validate(self.chunk.contiguous(self.inputs(operand, values), offset), operand)
+                return self.chunk.contiguous(self.inputs(operand, values), offset)
         return self.result(operand, values)
 
     def chunk_offset(self, row: PackedPhaseRow, count: int) -> int | None:
@@ -595,43 +593,70 @@ class OverlayTransition:
             writes.append(fields if complete else tails)
         return tuple(writes)
 
-    def inputs(self, operand: ProjectionOperands, values: Tensors) -> Tensors:
+    def bind(
+        self,
+        values: Tensors,
+        hidden: torch.Tensor,
+        desired: torch.Tensor,
+        embedding: torch.Tensor,
+        weight: torch.Tensor,
+        prompt_end: torch.Tensor,
+    ) -> Tensors:
         """Bind state, shared fields and projection operands to the author's parameter names."""
         inputs = {
             **values,
-            "input": operand.hidden,
-            "target": operand.desired,
-            "embedding": operand.embedding,
-            "weight": operand.base_weight,
-            "prompt_end": operand.prompt_end,
+            "input": hidden,
+            "target": desired,
+            "embedding": embedding,
+            "weight": weight,
+            "prompt_end": prompt_end,
         }
         return {key: inputs[source] for key, source in self.arguments.items()}
 
+    def inputs(self, operand: ProjectionOperands, values: Tensors) -> Tensors:
+        """Bind one request's projection operands."""
+        return self.bind(
+            values, operand.hidden, operand.desired, operand.embedding, operand.base_weight, operand.prompt_end
+        )
+
     def result(self, operand: ProjectionOperands, values: Tensors) -> UpdateOutput:
-        """Validate the author's result at its tensor boundary without observing CUDA values."""
+        """Run one request eagerly."""
         if operand.phase not in self.phases:
             return UpdateOutput.unchanged(self.apply(operand.hidden, values))
-        return self.validate(self.function(**self.inputs(operand, values)), operand)
+        return self.function(**self.inputs(operand, values))
 
-    def validate(self, result: UpdateOutput, operand: ProjectionOperands) -> UpdateOutput:
-        """Check authored results at the same boundary for eager and batched execution."""
-        projection = self.projections[self.targets.index(operand.target)]
-        if (
-            result.output.shape != (len(operand.hidden), projection.output_size)
-            or result.output.dtype not in (operand.hidden.dtype, torch.float32)
-            or result.output.device != operand.hidden.device
-        ):
-            raise ValueError("overlay output differs from its target shape, dtype or device")
-        if any(
-            value.shape != () or value.device != operand.hidden.device or value.dtype != dtype
-            for value, dtype in (
-                (result.changed, torch.bool),
-                (result.update_count, torch.int64),
-                (result.trained_rows, torch.int64),
-            )
-        ):
-            raise ValueError("overlay counters need a bool changed flag and int64 counts on the operand device")
-        return result
+    def check(self, operands: Sequence[ProjectionOperands], entries: Sequence[OverlayEntry]) -> None:
+        """Check the author's results once, from declaration's run on maximum-shape meta operands.
+
+        Every update kind returns its residual and counters through these entries, so no step checks them again.
+        """
+        hidden = {(operand.identity, operand.target): operand.hidden for operand in operands}
+        for entry in entries:
+            for item in entry.targets:
+                result, rows = item.update, hidden[entry.identity, item.target]
+                size = self.projections[self.targets.index(item.target)].output_size
+                if (
+                    result.output.shape != (len(rows), size)
+                    or result.output.dtype not in (rows.dtype, torch.float32)
+                    or result.output.device != rows.device
+                ):
+                    raise ValueError(
+                        f"{self.task} must return the residual for {item.target} as [rows, {size}] in the input "
+                        f"dtype or float32 on the input's device; got {tuple(result.output.shape)} "
+                        f"{result.output.dtype} on {result.output.device}"
+                    )
+                if any(
+                    value.shape != () or value.device != rows.device or value.dtype != dtype
+                    for value, dtype in (
+                        (result.changed, torch.bool),
+                        (result.update_count, torch.int64),
+                        (result.trained_rows, torch.int64),
+                    )
+                ):
+                    raise ValueError(
+                        f"{self.task} must return changed (bool) and update_count and trained_rows (int64) "
+                        "as 0-d tensors on the input's device"
+                    )
 
 
 class ProgramOperand(NamedTuple):

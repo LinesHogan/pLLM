@@ -212,11 +212,13 @@ def example(
     # A step packs at most max_packed_rows prompt tokens across all rows. The first row takes the remainder,
     # so both one longest prompt and every row's fixed cost are traced.
     lengths = (max(1, facts.probe.max_packed_rows - len(rows) + 1), *(1,) * (len(rows) - 1))
+    # Operands of a phase the overlay trains on, so every update kind runs (and is funded and checked) here.
+    phase = HiddenPhase.PREFILL if binding.overlay_math is None else binding.overlay_math.phases[0]
     operands = tuple(
         ProjectionOperands(
             row.identity,
             target.target,
-            HiddenPhase.PREFILL,
+            phase,
             meta(length, target.input_size, dtype=dtype),
             meta(length, target.target_size, dtype=dtype),
             meta(target.output_size, target.input_size, dtype=dtype),
@@ -374,10 +376,13 @@ def derive_resources(
             if state.resource == address.resource and state.immutable
             for tensor in root
         )
+        entries = len(data.entries)
         try:
             with fixed_shapes(), GatherTrace(tables) as gathers:
                 usage = operation.memory(data, batch)
                 gathers.check_outputs(tuple(batch.results.values()))
+            if binding.overlay_math is not None and symbol == binding.overlay_math.task:
+                binding.overlay_math.check(data.step.operands, data.entries[entries:])
             for resource, size in gathers.bytes.items():
                 binding.gather_bytes[symbol, resource] = size // (
                     facts.probe.max_packed_rows if symbol in binding.model_site_tasks else len(data.rows)

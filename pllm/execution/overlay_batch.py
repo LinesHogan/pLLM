@@ -156,15 +156,7 @@ class OverlayTile:
         chunk = math.chunk
         assert chunk is not None
         values = dict(zip(math.buffers, (pool[0] for pool in pools), strict=True))
-        self.plan = (
-            chunk.prepare(
-                self.arguments(
-                    values, operand.hidden, operand.desired, operand.embedding, operand.base_weight, operand.prompt_end
-                )
-            )
-            if train
-            else None
-        )
+        self.plan = chunk.prepare(math.inputs(operand, {**values, **invariants})) if train else None
         # Serial execution retains its prepared plan without padded tensor capacity.
         if not self.batchable:
             states = rows = 0
@@ -199,26 +191,6 @@ class OverlayTile:
     def buffer_bytes(self) -> int:
         return sum(value.untyped_storage().nbytes() for value in (self.table, *self.buffers))
 
-    def arguments(
-        self,
-        values: Tensors,
-        hidden: torch.Tensor,
-        desired: torch.Tensor,
-        embedding: torch.Tensor,
-        base: torch.Tensor,
-        prompt_end: torch.Tensor,
-    ) -> Tensors:
-        inputs = {
-            **values,
-            **self.invariants,
-            "input": hidden,
-            "target": desired,
-            "embedding": embedding,
-            "weight": base,
-            "prompt_end": prompt_end,
-        }
-        return {key: inputs[source] for key, source in self.math.arguments.items()}
-
     def one(
         self,
         values: Tensors,
@@ -233,7 +205,9 @@ class OverlayTile:
         if self.train:
             assert isinstance(chunk, ChunkUpdate) and self.plan is not None
             result = chunk.counted(
-                self.plan, count, self.arguments(values, hidden, desired, embedding, base, self.prompt_end)
+                self.plan,
+                count,
+                self.math.bind({**values, **self.invariants}, hidden, desired, embedding, base, self.prompt_end),
             )
         else:
             result = UpdateOutput.unchanged(self.math.apply(hidden, values))
@@ -253,7 +227,9 @@ class OverlayTile:
             result = chunk.counted(
                 None,
                 self.table[-1],
-                self.arguments(values, self.hidden, self.desired, self.embedding, base, self.prompt_end),
+                self.math.bind(
+                    {**values, **self.invariants}, self.hidden, self.desired, self.embedding, base, self.prompt_end
+                ),
             )
             fields, output, changed, updates, trained = (
                 values,
@@ -324,15 +300,12 @@ class OverlayTile:
             )
         output, changed, updates, trained, lengths, counters = (value.clone() for value in self.output)
         return tuple(
-            self.math.validate(
-                UpdateOutput(
-                    output[i, : len(o.hidden)],
-                    changed[i],
-                    updates[i],
-                    trained[i],
-                    {"tail_rows": lengths[i]} if self.train else {},
-                ),
-                o,
+            UpdateOutput(
+                output[i, : len(o.hidden)],
+                changed[i],
+                updates[i],
+                trained[i],
+                {"tail_rows": lengths[i]} if self.train else {},
             )
             for i, o in enumerate(operands)
         ), counters
@@ -362,6 +335,7 @@ class DecodeOverlay:
         self.plan: PreparedScan | None = None
         self.read_full: Callable[..., torch.Tensor] | None = None
         self.read_row: Callable[..., torch.Tensor] | None = None
+        self.prompt_end = self.table.new_zeros((), dtype=torch.bool)
 
     @property
     def buffers(self) -> list[torch.Tensor]:
@@ -399,17 +373,8 @@ class DecodeOverlay:
     def arguments(
         self, values: Tensors, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
     ) -> Tensors:
-        """Bind the same state and model operands for counted chunks and decode completion."""
-        inputs = {
-            **values,
-            **self.invariants,
-            "input": hidden,
-            "target": desired,
-            "embedding": embedding,
-            "weight": base,
-            "prompt_end": hidden.new_zeros((), dtype=torch.bool),
-        }
-        return {key: inputs[source] for key, source in self.math.arguments.items()}
+        """Decode rows never end a prompt."""
+        return self.math.bind({**values, **self.invariants}, hidden, desired, embedding, base, self.prompt_end)
 
     def prepare_scan(self, arguments: Tensors) -> None:
         """Cut readouts and prepare the ordinary scan before any capacity graph is captured."""
