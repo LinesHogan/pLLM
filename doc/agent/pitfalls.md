@@ -101,7 +101,7 @@ weights, so run it first.
 
 | Message | Why | Fix |
 | --- | --- | --- |
-| `disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV would not match` | A cached prefix holds K/V computed by another request's rewrite. | Keep `enable_prefix_caching=False` (the default). |
+| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | vLLM keys cached K/V by tokens, not by state, so a cached prefix would hold K/V computed under another request's state. | Keep `enable_prefix_caching=False` (the default). |
 | `...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | `cuda_graphs=True` demands vLLM's whole-model graphs, and the named feature runs the forward without them. | Use `cuda_graphs="auto"` (the default); `diagnostics().eager_reason` then names the cause. |
 | `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | Your read function sees all heads at once. | Use `tensor_parallel_size=1`. |
 | `multi-GPU needs vLLM 0.32.0 and runner="mrv2"; otherwise use tensor_parallel_size=1` | Tensor parallelism exists only on the MRv2 runner of vLLM 0.32.0. | Use the 0.32.0 environment with the default `runner="mrv2"`, or one GPU. |
@@ -314,9 +314,5 @@ inputs of a `@pllm.custom_residual` method are bfloat16.
 
 ## Known issues
 
-Current framework behaviour that is wrong or unhelpful; each has a workaround.
+Current framework behaviour that is wrong or unhelpful; each has a workaround. None is open at the moment.
 
-- **Prefix caching is not rejected for `ActivationPatch` and `Adapter`.** Only `@pllm.custom_residual` and
-  `@pllm.custom_attention` reject `enable_prefix_caching=True`. The cache key covers the workload's identity,
-  not its state values, so a cached prompt prefix can carry K/V computed under another request's imported
-  or trained state. Keep prefix caching off (the default) unless every request uses the same state.

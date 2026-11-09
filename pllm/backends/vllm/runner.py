@@ -95,8 +95,6 @@ class Runner:
         cache_policy: CachePolicy,
     ) -> None:
         spec = deployment.attachment.spec
-        if self.cache_config.enable_prefix_caching and (spec.activation_bindings or spec.overlay_bindings):
-            raise ValueError("disable prefix caching when using parameter overlays or activation patches")
         if deployment.attachment.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
         adapter = self._sampler_guidance if spec.sampler else None

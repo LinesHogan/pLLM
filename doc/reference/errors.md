@@ -84,7 +84,7 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `kv.attend topk needs integer positions [rows, k] or [rows, heads, k], padded with -1` | top-K 是逻辑位置 | 按形状给整数位置，不足的用 -1 补 |
 | `...: return attention with q's shape and model dtype` | 输出要接回原生的输出投影 | 返回与 `q` 同形同 dtype 的张量 |
 | `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | 定制读法要看到完整的头 | 单卡 |
-| `disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV would not match` | 缓存的 KV 是在别的改写下算出的 | 关闭前缀缓存 |
+| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | 缓存的 KV 是在别的改写下算出的 | 关闭前缀缓存 |
 | `refresh= and on_missing= apply to decode tokens; set decode=True` | 这两个设置只管 decode token | 加 `decode=True` 或去掉它们 |
 | `pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host` | 宿主训练没有模型 | 用 `pllm.make_llm` |
 

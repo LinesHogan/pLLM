@@ -51,10 +51,11 @@ def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> st
             "(custom_residual's TP support is deferred)"
         )
     compat.admit_parallel(config, requirements)
-    if (requirements.custom_residual or requirements.custom_attention) and config.enable_prefix_caching:
+    if model_hooks(requirements) and config.enable_prefix_caching:
         raise ValueError(
-            "disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV "
-            "would not match"
+            "disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, "
+            "@pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: vLLM keys cached K/V by tokens, "
+            "not by state, so a cached prefix would carry K/V computed under another request's state"
         )
     if requirements.position_states and config.runner == "mrv1":
         raise ValueError('PositionState and @pllm.custom_forward need runner="mrv2"')

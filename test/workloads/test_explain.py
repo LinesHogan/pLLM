@@ -124,6 +124,9 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
             assert report.kv_capacity[0].bytes < full
         elif isinstance(workload, SharedAttention):
             assert sum(row.bytes for row in report.kv_capacity) == 5 * full
+    if isinstance(
+        workload, (WindowAttention, SinkAttention, SharedAttention, Residual, ReFTWorkload, PromptFactorsWorkload)
+    ):
         with pytest.raises(ValueError, match="disable prefix caching"):
             pllm.explain(workload, replace(model_config, enable_prefix_caching=True))
     if isinstance(workload, (Residual, Forward)):

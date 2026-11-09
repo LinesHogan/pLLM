@@ -350,7 +350,7 @@ True
 | --- | --- | --- |
 | `...: take the site tensors ... first, without defaults, then markers` | `@pllm.custom_residual` 方法没有把位置张量（如 `x, y`）写在最前面，或为其赋予了默认值 | 将位置张量作为前两个位置参数（不赋默认值），标记参数（如 `pllm.parameter`）写在后面 |
 | `... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward` | 将带有 `state=` 的状态化残差记忆子层与 `@pllm.custom_forward` 放在了同一个负载中 | 将两者解耦：状态子层按单 token 线性步进，与层循环/跳层互斥 |
-| `disable prefix caching (enable_prefix_caching=False) when a workload rewrites model sites; cached KV would not match` | 在开启前缀缓存（`enable_prefix_caching=True`）的同时使用了改写模型站点的装饰器 | 设置 `ModelConfig(enable_prefix_caching=False)` |
+| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | 在开启前缀缓存（`enable_prefix_caching=True`）的同时使用了改写模型站点的装饰器 | 设置 `ModelConfig(enable_prefix_caching=False)` |
 | `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | 在多卡张量并行（`tensor_parallel_size > 1`）下启用了 `@pllm.custom_attention` | 将张量并行大小设为 `1` |
 | `@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2` | 注意力后端未配置为 FlashAttention 2 | 保持默认或配置环境变量 `VLLM_ATTENTION_BACKEND=FLASH_ATTN` |
 | `@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto` | 在量化 KV 缓存（如 FP8、INT4）的环境下使用了自定义 attention | 将 `kv_cache_dtype` 保持为默认的 `"auto"`（非量化） |
