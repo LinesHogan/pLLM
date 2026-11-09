@@ -162,6 +162,11 @@ class ResidualRewrite:
         return self.read(stream, **{name: source.value(values, depth) for name, source in self.read_inputs})
 
     @property
+    def patch(self) -> bool:
+        """Whether this is a pllm.model.ActivationPatch, which reads nothing but its state's edit."""
+        return any(isinstance(source, PatchInput) for _, source in self.inputs)
+
+    @property
     def results(self) -> tuple[ResultInput, ...]:
         """The pre-forward values the write or read method consumes."""
         return tuple(source for _, source in (*self.inputs, *self.read_inputs) if isinstance(source, ResultInput))

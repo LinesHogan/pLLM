@@ -317,7 +317,7 @@ def test_schedule_contracts(workload, neutral, error, model_config):
             "dola.contrast",
             "steer.bias",
         }
-    if isinstance(workload, (ESampWorkload, PrefillTrainer, InPlaceTTTWorkload, PrefillAdaptersWorkload)):
+    if isinstance(workload, (ESampWorkload, PrefillTrainer, InPlaceTTTWorkload, PrefillAdaptersWorkload, ReFTWorkload)):
         assert "preempted" in result.passed
     if isinstance(workload, (InPlaceTTTWorkload, PrefillAdaptersWorkload)):
         assert "visibility=exact (chunking / replay)" in result.passed

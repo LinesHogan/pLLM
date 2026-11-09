@@ -248,8 +248,8 @@ pllm chooses one of two policies per workload; `pllm.explain` prints it as the `
 
 | Policy | Workloads | What happens on preemption |
 | --- | --- | --- |
-| `keep` | Effects that do not change the model's computation: hidden reads, exports, `@pllm.write`, `@pllm.train`, `@pllm.add_logits`, `@pllm.guide_sampling`, custom forwards without `active=`. | Request state is kept; the recomputed KV is the model's own, so it matches. |
-| `reset` | Effects that change K/V or the residual stream from state: `pllm.model.Adapter`, `pllm.model.ActivationPatch`, `@pllm.custom_residual`, `@pllm.custom_attention`, `@pllm.custom_forward` with `active=`, `@pllm.train_in_forward`. | pllm retires the request's state and replays the request from admission. This is only correct when replay rebuilds the same state, so pllm checks eligibility when it plans. |
+| `keep` | Effects that do not change the model's computation: hidden reads, exports, `@pllm.write`, `@pllm.train`, `@pllm.add_logits`, `@pllm.guide_sampling`, custom forwards without `active=`. Also `pllm.model.Adapter` and `pllm.model.ActivationPatch` on state no method writes or trains (frozen, or `init=pllm.Imported()`). | Request state is kept; the recompute reads the state version the request was admitted with, so its KV matches. |
+| `reset` | Effects that change K/V or the residual stream from state that changes while requests run: `pllm.model.Adapter` and `pllm.model.ActivationPatch` on written or trained state, `@pllm.custom_residual`, `@pllm.custom_attention`, `@pllm.custom_forward` with `active=`, `@pllm.train_in_forward`. | pllm retires the request's state and replays the request from admission. This is only correct when replay rebuilds the same state, so pllm checks eligibility when it plans. |
 
 A `reset` workload is replay-eligible when all of these hold; otherwise explain prints the first violated
 rule as `replay rejection`, `testing.check` SKIPs `preempted` with that reason, and a real preemption raises
@@ -264,10 +264,10 @@ rule as `replay rejection`, `testing.check` SKIPs `preempted` with that reason, 
 | use over="token" in @pllm.custom_forward instead of over="span" | Span programs depend on how the prompt was chunked. |
 | use visibility="exact" with zero publish lag and no cross-step dependencies | Lagged reads depend on step timing, which replay does not reproduce. |
 
-Practical consequence: a steering workload whose vector is `init=pllm.Imported()` (tutorial 00) is not
-replay-eligible. Size the engine so preemption does not happen (raise `gpu_memory_utilization`, lower
+Size the engine so a rejected workload is not preempted (raise `gpu_memory_utilization`, lower
 `max_num_seqs` or `max_model_len`), and say so to the user. `diagnostics().kv_cache_max_concurrency` tells
-how many full-length requests fit.
+how many full-length requests fit. A steering workload whose vector is `init=pllm.Imported()` (tutorial 00)
+is `keep` and survives preemption.
 
 ## Shape, dtype and row conventions
 
@@ -315,4 +315,3 @@ inputs of a `@pllm.custom_residual` method are bfloat16.
 ## Known issues
 
 Current framework behaviour that is wrong or unhelpful; each has a workaround. None is open at the moment.
-
