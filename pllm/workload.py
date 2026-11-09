@@ -4,7 +4,7 @@ a TensorDeclaration. Used by pllm (make_llm, explain), pllm.host and pllm.testin
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from functools import partial
 from graphlib import CycleError, TopologicalSorter
@@ -319,8 +319,9 @@ def _read_operation(
     if phase is None and marked is None:
         return
     effect = marked or Effect()
-    texts = (*vars(effect).values(), *vars(gradient or Gradient((), False)).values(), rows)
-    seeds.extend(candidates[text] for text in texts if type(text) is str and text in candidates)
+    seeds.extend(
+        _named_methods((*vars(effect).values(), *vars(gradient or Gradient((), False)).values(), rows), candidates)
+    )
     if (trained := _typed(effect, TrainInForward)) is not None:
         context.in_forward_states.add(trained.state)
     if (residual := _typed(effect, CustomResidual)) is not None and residual.state:
@@ -360,10 +361,17 @@ def _declare_result_helpers(
                 and all(isinstance(arg, (InputTokens, Parameter)) for arg in arguments)
                 else phase
             )
-            context.operations.append(Operation(context, source.operation, helper_phase, Effect(), None, ""))
+            gradient = _typed(vars(helper).get("__pllm_gradient__"), Gradient)
+            context.operations.append(Operation(context, source.operation, helper_phase, Effect(), gradient, ""))
             declared.add(source.operation)
             seeds.append(candidates[source.operation])
+            seeds.extend(_named_methods(vars(gradient or Gradient((), False)).values(), candidates))
             pending.append((helper, phase))
+
+
+def _named_methods(values: Iterable[object], candidates: dict[str, FunctionType]) -> list[FunctionType]:
+    """The methods a decorator names by string (rows=, input_rows=, ...), which must be frozen with the workload."""
+    return [candidates[value] for value in values if type(value) is str and value in candidates]
 
 
 def _reject_result_cycles(context: WorkloadContext) -> None:

@@ -235,7 +235,6 @@ def _chained_heads(facts) -> None:
         ) -> torch.Tensor:
             return hidden @ weight
 
-        @pllm.on(pllm.Phase.AFTER_SAMPLE)
         @pllm.differentiate(inputs=("features",))
         def frozen(
             self,
