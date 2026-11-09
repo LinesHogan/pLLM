@@ -183,11 +183,7 @@ def _check_cancelled_projection(handle):
     from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 
     execution = handle.runner.require_session().deployment.execution
-    from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay
-
     overlay = handle.runner.require_session().parameter_overlay
-    if isinstance(overlay, HybridParameterOverlay):
-        overlay = overlay.pinned
     reader = overlay.readers[0]
     identity = RequestIdentity("cancelled-projection", 41, 0)
     stream = torch.cuda.current_stream()
@@ -195,7 +191,7 @@ def _check_cancelled_projection(handle):
     rows = PackedPhaseRowBatch.from_rows(0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity),))
     invocation = execution.begin(rows.rows, stream)
     overlay.reserve()
-    overlay.prepare(rows, invocation, execution.directory)
+    overlay.prepare_pinned(rows, invocation, execution.directory, None)
     features = reader.captured.shape[1] if reader.mlp is None else reader.width
     hidden = reader.captured.new_ones((1, features))
     _projection_output(reader, hidden)
@@ -228,10 +224,10 @@ def _check_cancelled_projection(handle):
 
 def _check_graph(handle):
     """Pinned graph operands reach training as row counts and request order change."""
-    from pllm.backends.vllm.parameter_overlay import PinnedParameterOverlay, ProjectionReader
+    from pllm.backends.vllm.parameter_overlay import ProjectionReader
 
     overlay = handle.runner.require_session().parameter_overlay
-    assert isinstance(overlay, PinnedParameterOverlay)
+    assert overlay.pinned and not overlay.exact
     reader = overlay.readers[0]
     arena = handle.runner.require_session().deployment.execution.arena
     assert all(
@@ -256,11 +252,10 @@ def _check_hybrid(handle):
     """Prefill selects source execution; decode replays the bound projection kernels."""
     from vllm.config import CUDAGraphMode
 
-    from pllm.backends.vllm.parameter_overlay import HybridParameterOverlay, ProjectionReader
-    from pllm.contracts.hidden_locator import HiddenPhase
+    from pllm.backends.vllm.parameter_overlay import ProjectionReader
 
     overlay = handle.runner.require_session().parameter_overlay
-    assert isinstance(overlay, HybridParameterOverlay)
+    assert overlay.pinned and overlay.exact
     manager = handle.runner.cudagraph_manager
     dispatch = manager.dispatch
     modes = []
@@ -281,7 +276,7 @@ def _check_hybrid(handle):
     assert all(mode is CUDAGraphMode.NONE if training else mode is CUDAGraphMode.FULL for training, mode in modes)
     assert any(training for training, _ in modes)
     assert any(not training for training, _ in modes)
-    if HiddenPhase.DECODE not in overlay.phases:
+    if overlay.readers[0].decode is None:
         _check_cancelled_projection(handle)
     diagnostics = handle.diagnostics()
     assert diagnostics.update_count > 0 and diagnostics.active_states == diagnostics.pending_state_releases == 0

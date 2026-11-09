@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, NamedTuple, Protocol, TypeVar
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 
 import torch
 
@@ -312,22 +312,6 @@ class GradientUpdate:
             else output.index_select(0, positions)
         )
         return UpdateOutput(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
-
-
-class ProjectionTransition(Protocol):
-    """The output boundary consumed by a model projection."""
-
-    def prepare(self, math: OverlayTransition) -> TensorBatch: ...
-
-    def complete(
-        self,
-        operands: tuple[ProjectionOperands, ...],
-        updates: Mapping[tuple[RequestIdentity, Projection], UpdateOutput],
-    ) -> None: ...
-
-    def run(
-        self, operands: tuple[ProjectionOperands, ...], *, complete: bool = True
-    ) -> Mapping[tuple[RequestIdentity, Projection], torch.Tensor]: ...
 
 
 class ProjectionTask(Generic[DataT, ResultT]):

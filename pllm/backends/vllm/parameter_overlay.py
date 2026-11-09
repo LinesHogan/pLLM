@@ -1,5 +1,8 @@
-"""Parameter overlays: projection geometry checks at probing, the eager Exact projection-task driver,
-the pinned reader (the custom op that reads PTTS pools inside captured graphs) and the hybrid of both.
+"""Parameter overlays at vLLM projections, installed once by VllmSession and VllmCustomForward.
+
+Each target projection gets one ProjectionReader hook. Training steps without CUDA graphs run the overlay task
+eagerly inside the forward (exact segments); otherwise the hook reads PTTS pools through one custom op that vLLM
+can capture. ParameterOverlay owns the readers' per-invocation lifecycle.
 """
 
 from __future__ import annotations
@@ -7,29 +10,28 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
+from typing import Any
 
 import numpy as np
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.model_executor.layers.linear import LinearBase, QKVParallelLinear, RowParallelLinear
 
-from pllm.backends.vllm.architecture import Decoder, LinearOutput, Mlp, frozen_weight
+from pllm.backends.vllm.architecture import Decoder, LinearOutput, frozen_weight
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     ParameterOverlayFieldBinding,
-    ParameterOverlayOperator,
     Projection,
     ProjectionOperands,
     ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateResource
-from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.overlay_batch import DecodeOverlay
-from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay, ProjectionTransition
+from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay, ProjectionTask
 from pllm.execution.parameter_projection import (
     ROWS_PER_BLOCK,
     prepare_projection_read,
@@ -127,9 +129,6 @@ class ProjectionHook:
             self.module.quant_method.apply = self.apply
 
 
-Slice = tuple[ParameterOverlayFieldBinding, int, int]
-
-
 def base_weight(module: LinearBase, reading: bool, device: torch.device) -> torch.Tensor:
     """Borrow or dequantize operand("weight") for this read, only when its function uses it."""
     if reading:
@@ -144,17 +143,6 @@ def base_weight(module: LinearBase, reading: bool, device: torch.device) -> torc
         finally:
             method.apply = apply
     return torch.empty((0, module.input_size_per_partition), dtype=module.params_dtype, device=device)
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedRows:
-    source: PackedPhaseRow
-    ref: StateRef
-    rows: torch.Tensor
-    binding: ParameterOverlayFieldBinding
-    offset: int
-    size: int
-    prompt_end: torch.Tensor
 
 
 class _EmbeddingRows:
@@ -175,243 +163,6 @@ class _EmbeddingRows:
         """Remove the model hook when the overlay closes."""
         if self.hook is not None:
             self.hook.remove()
-
-
-class _ExactProjection:
-    def __init__(
-        self, module: LinearBase, mlp: Mlp | None, slices: tuple[Slice, ...], embedding: _EmbeddingRows
-    ) -> None:
-        self.embedding = embedding
-        self.module, self.mlp = module, mlp
-        self.bindings = slices
-        self.hook = ProjectionHook(module)
-        self.original_forward = self.hook.base
-        self.original_mlp_forward = None if mlp is None else mlp.forward
-        self.prepared: tuple[_PreparedRows, ...] = ()
-        self.operand_count = 0
-        self.mlp_input: torch.Tensor | None = None
-        self.total_rows = 0
-        self.apply_count = self.updated_apply_count = 0
-        self.transition: ProjectionTransition | None = None
-        self.row_overlays: tuple[ProgramOverlay, ...] = ()
-
-    def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
-        assert self.original_mlp_forward is not None
-        self.mlp_input = value.detach()
-        try:
-            return self.original_mlp_forward(value)
-        finally:
-            self.mlp_input = None
-
-    def forward(self, hidden: torch.Tensor) -> LinearOutput:
-        base = self.original_forward(hidden)
-        if not self.prepared:
-            return base
-        assert hidden.shape[0] == self.total_rows and not self.operand_count
-        # The GEMM owns this fresh partial output, not an input or state page.
-        match base:
-            case (output, *_):
-                pass
-            case output:
-                pass
-        # A replay span can contain both phases of one request. Finish its prompt
-        # transition (including prompt-end flush) before reading its decode state.
-        phases = tuple(
-            phase
-            for phase in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
-            if any(item.source.phase is phase for item in self.prepared)
-        )
-        weight = base_weight(self.module, any(binding.reads_weight for binding, _, _ in self.bindings), hidden.device)
-        for phase in phases:
-            prepared = tuple(item for item in self.prepared if item.source.phase is phase)
-            self.forward_segment(hidden, output, prepared, weight, complete=phase is phases[-1])
-        return base
-
-    def forward_segment(
-        self,
-        hidden: torch.Tensor,
-        output: torch.Tensor,
-        prepared: tuple[_PreparedRows, ...],
-        weight: torch.Tensor,
-        *,
-        complete: bool,
-    ) -> None:
-        inputs = tuple(hidden.index_select(0, item.rows) for item in prepared)
-        operands = tuple(
-            self.operands_of(item, selected, weight) for item, selected in zip(prepared, inputs, strict=True)
-        )
-        if self.row_overlays:
-            residuals = {
-                key: value
-                for row_overlay in self.row_overlays
-                for key, value in row_overlay.run(
-                    tuple(
-                        operand
-                        for operand in operands
-                        if operand.identity == row_overlay.data.step.rows.identity(row_overlay.row)
-                    )
-                ).items()
-            }
-        else:
-            assert self.transition is not None
-            residuals = self.transition.run(operands, complete=complete)
-        for item, selected in zip(prepared, inputs, strict=True):
-            delta = residuals[item.source.identity, item.binding.target] * item.binding.scale
-            columns = output[:, item.offset : item.offset + item.size]
-            columns.index_copy_(0, item.rows, (columns.index_select(0, item.rows) + delta).to(output.dtype))
-            self.apply_count += selected.shape[0]
-            if item.ref.version_id > 0:
-                self.updated_apply_count += selected.shape[0]
-        if not self.row_overlays:
-            self.operand_count += len(operands)
-
-    def operands_of(self, item: _PreparedRows, selected: torch.Tensor, weight: torch.Tensor) -> ProjectionOperands:
-        if self.mlp is None or item.binding.operator is ParameterOverlayOperator.HEAD_ADD:
-            desired = selected
-        else:
-            assert self.mlp_input is not None and self.mlp_input.shape[0] == self.total_rows
-            desired = self.mlp_input.index_select(0, item.rows)
-        return ProjectionOperands(
-            item.source.identity,
-            item.binding.target,
-            item.source.phase,
-            selected.detach(),
-            desired.detach(),
-            weight[item.offset : item.offset + item.size] if item.binding.reads_weight else weight[:0],
-            item.prompt_end,
-            self.embedding.values.index_select(0, item.rows)
-            if item.binding.reads_embedding
-            else selected.new_empty((0, 0)),
-        )
-
-    def clear(self) -> None:
-        self.prepared, self.operand_count = (), 0
-        self.mlp_input = None
-        self.total_rows = 0
-        self.transition = None
-        self.row_overlays = ()
-
-
-class ExactParameterOverlay:
-    """Eager Exact projection-task driver; pinned reads use the shared tensor op."""
-
-    def __init__(
-        self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...], device: torch.device, rows: int
-    ) -> None:
-        self.embedding = _EmbeddingRows(
-            decoder, rows, device, enabled=any(binding.reads_embedding for binding in bindings)
-        )
-        modules: dict[int, tuple[LinearBase, Mlp | None, list[Slice]]] = {}
-        for binding in bindings:
-            module, offset, size, mlp = decoder.projection(binding.target)
-            modules.setdefault(id(module), (module, mlp, []))[2].append((binding, offset, size))
-        self._modules = tuple(
-            _ExactProjection(module, mlp, tuple(slices), self.embedding) for module, mlp, slices in modules.values()
-        )
-        self.device = device
-        self.operand_staging = PinnedStaging()
-        for handle in self._modules:
-            handle.hook.install(handle.forward)
-            if handle.mlp is not None:
-                handle.mlp.forward = handle.forward_mlp
-
-    @property
-    def apply_count(self) -> int:
-        return sum(handle.apply_count for handle in self._modules)
-
-    @property
-    def updated_apply_count(self) -> int:
-        return sum(handle.updated_apply_count for handle in self._modules)
-
-    def reserve(self) -> None:
-        """Exact reads stage nothing ahead of the invocation."""
-
-    def prepare(
-        self,
-        rows: PackedPhaseRowBatch,
-        context: StateTaskContext[DataT],
-        directory: RequestStateDirectory,
-        transition: ProjectionTransition | None = None,
-    ) -> None:
-        assert transition is not None
-        grouped: dict[tuple[RequestIdentity, HiddenPhase], list[PackedPhaseRow]] = {}
-        for row in rows.rows:
-            grouped.setdefault((row.identity, row.phase), []).append(row)
-        table = torch.empty((rows.total_rows + len(grouped),), dtype=torch.long, device=self.device)
-        host = self.operand_staging.take(table.numel())
-        host[: rows.total_rows] = [row.packed_row_index for source in grouped.values() for row in source]
-        host[rows.total_rows :] = [
-            source[-1].token_offset == source[-1].prompt_length - 1 for source in grouped.values()
-        ]
-        self.operand_staging.copy_to(table)
-        indices = torch.split(table[: rows.total_rows], [len(source) for source in grouped.values()])
-        prompt_ends = table[rows.total_rows :].bool().unbind()
-        requests = tuple(
-            (source[0], index, prompt_end)
-            for (_, source), index, prompt_end in zip(grouped.items(), indices, prompt_ends, strict=True)
-        )
-        for handle in self._modules:
-            handle.transition = transition
-            handle.prepared = tuple(
-                _PreparedRows(
-                    source,
-                    context.selection.ref_for(source.identity, StateResource(binding.resource)),
-                    index,
-                    binding,
-                    offset,
-                    size,
-                    prompt_end,
-                )
-                for source, index, prompt_end in requests
-                for binding, offset, size in handle.bindings
-            )
-            handle.total_rows = rows.total_rows
-
-    def prepare_wave(
-        self,
-        rows: Sequence[PackedPhaseRow],
-        row_overlays: tuple[ProgramOverlay, ...],
-        indices: tuple[torch.Tensor, ...],
-    ) -> None:
-        """Use one projection call across the wave and request-local update operands."""
-        for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True):
-            row_overlay.prompt_end.fill_(row.token_offset + index.numel() == row.prompt_length)
-        for handle in self._modules:
-            handle.row_overlays = row_overlays
-            handle.prepared = tuple(
-                _PreparedRows(
-                    row,
-                    row_overlay.batch.after_refs[int(row_overlay.batch.selection.state_indices[row_overlay.row])],
-                    index,
-                    binding,
-                    offset,
-                    size,
-                    row_overlay.prompt_end,
-                )
-                for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True)
-                for binding, offset, size in handle.bindings
-            )
-            handle.operand_count, handle.total_rows = 0, sum(index.numel() for index in indices)
-
-    def take_operands(self) -> tuple[ProjectionOperands, ...]:
-        for handle in self._modules:
-            if handle.row_overlays:
-                continue
-            assert handle.operand_count == len(handle.prepared)
-            handle.operand_count = 0
-        return ()
-
-    def clear(self) -> None:
-        for handle in self._modules:
-            handle.clear()
-
-    def close(self) -> None:
-        self.clear()
-        self.embedding.close()
-        for handle in self._modules:
-            handle.hook.close()
-            if handle.mlp is not None and handle.original_mlp_forward is not None:
-                handle.mlp.forward = handle.original_mlp_forward
 
 
 def capacities(maximum: int) -> tuple[int, ...]:
@@ -456,51 +207,78 @@ def _projection_meta(
 pinned_projection.register_fake(_projection_meta)  # pyright: ignore[reportUnknownMemberType]
 
 
+@dataclass(frozen=True, slots=True)
+class _Segment:
+    """One request's packed rows of one phase in this invocation."""
+
+    source: PackedPhaseRow
+    rows: torch.Tensor
+    prompt_end: torch.Tensor
+    updated: bool
+
+
 class ProjectionReader:
-    """A target's stable tensor ports; the invocation supplies all pin-authorized indices."""
+    """One target's hook: exact segments run the overlay task in the forward, otherwise the pinned custom op reads.
+
+    Only a pinned reader owns stable tensor ports; the invocation supplies all pin-authorized indices.
+    """
 
     def __init__(
         self,
         decoder: Decoder,
         binding: ParameterOverlayFieldBinding,
         arena: PageBundleArena,
+        embedding: torch.Tensor,
         rows: int,
         requests: int,
         budget: int,
         *,
-        math: OverlayTransition | None = None,
-        in_program: bool = False,
+        pinned: bool,
+        math: OverlayTransition | None,
+        in_program: bool,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
         self.hook = ProjectionHook(self.module)
         self.forward_base = self.hook.base
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
-        self.in_program = in_program
+        self.pinned, self.in_program, self.embedding = pinned, in_program, embedding
+        self.mlp_input: torch.Tensor | None = None
+        self.apply_count = self.updated_apply_count = 0
+        # This invocation's exact segments and their consumer: the step's task, or a custom forward's lanes.
+        self.segments: tuple[_Segment, ...] = ()
+        self.task: ProjectionTask[Any, Any] | None = None
+        self.row_overlays: tuple[ProgramOverlay, ...] = ()
         self.call_rows: torch.Tensor | None = None
-        self.enabled = True
+        self.decode: DecodeOverlay | None = None
+        self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
+        ports = (requests if math is not None else rows) if pinned else 0
         self.pools = [view.read(arena.field_pool(binding.resource, view.field), pooled=True) for view in binding.fields]
         self.table = torch.zeros(
-            projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows,
-            device=self.pools[0].device,
+            projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows if pinned else 0,
+            device=embedding.device,
             dtype=torch.long,
         )
         self.table[-rows:].fill_(-1)
         inputs = self.module.input_size_per_partition
-        ports = requests if math is not None else rows
-        self.captured = self.pools[0].new_zeros((ports, inputs), dtype=self.module.params_dtype)
+        self.captured = embedding.new_zeros((ports, inputs), dtype=self.module.params_dtype)
         self.desired = self.captured.new_empty((ports, self.width) if self.mlp is not None else (0, 0))
-        self.mlp_input: torch.Tensor | None = None
-        self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
+        self.staging = PinnedStaging(capacity=self.table.numel(), slots=2 if pinned else 0)
         self.host = np.empty(0, dtype=np.int64)
-        self.decode: DecodeOverlay | None = None
-        self.embedding = self.captured.new_empty((0, 0))
-        self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
+        if pinned:
+            self.prepare_programs(budget, math)
+            _READERS[self.table.data_ptr()] = self
+        self.hook.install(self.forward)
+        if self.mlp is not None:
+            self.mlp.forward = self.forward_mlp
+
+    def prepare_programs(self, budget: int, math: OverlayTransition | None) -> None:
+        """Fund and warm every row bucket against the actual readonly pools before graph capture."""
         blas_bytes = blas_workspace_bytes()
         counts = (
             ()
             if math is not None and HiddenPhase.DECODE in math.phases
-            else capacities(requests if math is not None else rows)
+            else capacities(self.requests if math is not None else self.rows)
         )
         for count in counts:
             with torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
@@ -510,17 +288,15 @@ class ProjectionReader:
                     *self.pools,
                 )
             self.programs[count] = prepare_projection_read(
-                examples, binding.operator, budget, blas_workspace_bytes=blas_bytes
+                examples, self.binding.operator, budget, blas_workspace_bytes=blas_bytes
             )
-            # Warm every row bucket against the actual readonly pools before graph capture.
             self.read(self.captured[:count], self.pools, self.table, count)
-        _READERS[self.table.data_ptr()] = self
-        self.hook.install(self.forward)
-        if self.mlp is not None:
-            self.mlp.forward = self.forward_mlp
 
     def reserve(self) -> None:
-        self.host = self.staging.take(self.table.numel())
+        if self.decode is None:
+            self.host = self.staging.take(self.table.numel())
+        else:
+            self.decode.reserve()
 
     def ports(self, table: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         blocks = projection_blocks(count, min(count, self.requests))
@@ -534,6 +310,32 @@ class ProjectionReader:
             table[-self.rows :][:count],
         )
 
+    def weight(self, device: torch.device) -> torch.Tensor:
+        """This target's rows of operand("weight"), borrowed only when the function reads it."""
+        return base_weight(self.module, self.binding.reads_weight, device)[self.offset : self.offset + self.width]
+
+    def operands(
+        self,
+        row: PackedPhaseRow,
+        select: Callable[[torch.Tensor], torch.Tensor],
+        hidden: torch.Tensor,
+        desired: torch.Tensor | None,
+        weight: torch.Tensor,
+        prompt_end: torch.Tensor,
+    ) -> ProjectionOperands:
+        """One request's operands, selected by `select` from this call's input, MLP input and embedding rows."""
+        selected = select(hidden)
+        return ProjectionOperands(
+            row.identity,
+            self.binding.target,
+            row.phase,
+            selected,
+            selected if desired is None else select(desired),
+            weight,
+            prompt_end,
+            select(self.embedding) if self.binding.reads_embedding else selected.new_empty((0, 0)),
+        )
+
     def forward_mlp(self, value: torch.Tensor) -> torch.Tensor:
         assert self.mlp_base is not None
         self.mlp_input = value
@@ -545,12 +347,60 @@ class ProjectionReader:
     def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
         base = self.forward_base(hidden)
         assert isinstance(base, tuple)
-        if self.enabled:
-            buffers = self.pools if self.decode is None else self.decode.buffers
+        if self.segments:
+            self.run_segments(hidden.detach(), base[0])
+        elif self.pinned:
             desired = hidden if self.mlp is None else self.mlp_input
             assert desired is not None
+            buffers = self.pools if self.decode is None else self.decode.buffers
             pinned_projection(hidden, desired, buffers, self.table, base[0], self.captured, self.desired)
         return base
+
+    def run_segments(self, hidden: torch.Tensor, output: torch.Tensor) -> None:
+        """Run the overlay on this call's rows and add the residuals into the GEMM's fresh output."""
+        weight = self.weight(hidden.device)
+        desired = None if self.mlp_input is None else self.mlp_input.detach()
+        # A replay span can contain both phases of one request. Finish its prompt
+        # transition (including prompt-end flush) before reading its decode state.
+        phases = tuple(
+            phase
+            for phase in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+            if any(segment.source.phase is phase for segment in self.segments)
+        )
+        columns = output[:, self.offset : self.offset + self.width]
+        for phase in phases:
+            segments = tuple(segment for segment in self.segments if segment.source.phase is phase)
+            operands = tuple(
+                self.operands(
+                    segment.source,
+                    partial(torch.index_select, dim=0, index=segment.rows),
+                    hidden,
+                    desired,
+                    weight,
+                    segment.prompt_end,
+                )
+                for segment in segments
+            )
+            if self.row_overlays:
+                residuals = {
+                    key: value
+                    for row_overlay in self.row_overlays
+                    for key, value in row_overlay.run(
+                        tuple(
+                            operand
+                            for operand in operands
+                            if operand.identity == row_overlay.data.step.rows.identity(row_overlay.row)
+                        )
+                    ).items()
+                }
+            else:
+                assert self.task is not None
+                residuals = self.task.run(operands, complete=phase is phases[-1])
+            for segment in segments:
+                delta = residuals[segment.source.identity, self.binding.target] * self.binding.scale
+                columns.index_copy_(0, segment.rows, (columns.index_select(0, segment.rows) + delta).to(output.dtype))
+                self.apply_count += len(segment.rows)
+                self.updated_apply_count += len(segment.rows) if segment.updated else 0
 
     def emit(
         self,
@@ -566,12 +416,11 @@ class ProjectionReader:
         if self.mlp is not None:
             desired_capture[: len(hidden)].copy_(desired)
         if self.decode is not None:
-            weight = base_weight(self.module, self.binding.reads_weight, hidden.device)
             result = self.decode.run(
                 hidden,
                 captured[: len(hidden)] if self.mlp is None else desired_capture[: len(hidden)],
                 self.embedding,
-                weight[self.offset : self.offset + self.width],
+                self.weight(hidden.device),
             )
             columns = output[:, self.offset : self.offset + self.width]
             columns.copy_((columns + result * self.binding.scale).to(output.dtype))
@@ -635,15 +484,25 @@ class ProjectionReader:
         owners[:total] = block_rows * width + offsets % width
         self.staging.copy_to(self.table)
 
+    def clear(self) -> None:
+        self.segments, self.task, self.row_overlays = (), None, ()
+
     def close(self) -> None:
         self.hook.close()
         if self.mlp is not None and self.mlp_base is not None:
             self.mlp.forward = self.mlp_base
-        _READERS.pop(self.table.data_ptr())
+        if self.pinned:
+            _READERS.pop(self.table.data_ptr())
 
 
-class PinnedParameterOverlay:
-    """The sole pinned reader and capture path, for eager, replay and graph placement."""
+class ParameterOverlay:
+    """All target readers of one workload's overlay and their per-invocation lifecycle.
+
+    In-forward training without CUDA graphs, and every custom-forward program step, runs exact segments. With
+    graphs, in-forward training runs exact segments on prefill and mixed steps and replays the pinned reads on
+    uniform decode steps (training decode rows inside the graph when the overlay trains on decode). Any other
+    overlay reads pinned on every step and hands forward_pinned training operands to the task after the forward.
+    """
 
     def __init__(
         self,
@@ -653,97 +512,186 @@ class PinnedParameterOverlay:
         rows: int,
         requests: int,
         budget: int,
-        *,
         phases: tuple[HiddenPhase, ...],
-        math: OverlayTransition | None = None,
+        *,
+        in_forward: bool,
+        graphs: bool,
         in_program: bool = False,
+        math: OverlayTransition | None = None,
     ) -> None:
+        """Install each projection wrapper once, before compiling or capturing the model."""
+        program = in_program and math is not None
+        self.pinned = not program and uses_pinned_projection(in_forward=in_forward, graphs=graphs)
+        self.exact = program or in_forward
+        self.math = math if in_forward else None
+        # forward_pinned training reads its operands back from the pinned ports after the forward.
+        self.phases = () if in_forward else phases
+        self.embedding = _EmbeddingRows(
+            decoder, rows, arena.device, enabled=any(binding.reads_embedding for binding in bindings)
+        )
         self.readers = tuple(
-            ProjectionReader(decoder, binding, arena, rows, requests, budget, math=math, in_program=in_program)
+            ProjectionReader(
+                decoder,
+                binding,
+                arena,
+                self.embedding.values,
+                rows,
+                requests,
+                budget,
+                pinned=self.pinned,
+                math=self.math,
+                in_program=in_program,
+            )
             for binding in bindings
         )
-        self.phases = phases
-        self.embedding = _EmbeddingRows(
-            decoder,
-            rows,
-            arena.device,
-            enabled=bool(phases or math) and any(binding.reads_embedding for binding in bindings),
-        )
-        self.math = math
-        self.requests = requests
-        self.transition: ProjectionTransition | None = None
-        if math is not None and HiddenPhase.DECODE in math.phases:
-            width = len(math.buffers)
-            for reader in self.readers:
-                target = math.targets.index(reader.binding.target)
-                pools = tuple(
-                    arena.field_pool(str(math.resource), LayoutFieldId(target * width + i)) for i in range(width)
-                )
-                invariants = {
-                    name: views[target].read(arena.field_pool(resource, views[target].field), pooled=True)[0].clone()
-                    for name, (resource, views) in math.invariants.items()
-                }
-                reader.decode = DecodeOverlay(
-                    math,
-                    target,
-                    pools,
-                    invariants,
-                    requests,
-                    arena.plan.timeline.tensor_policy,
-                    next(
-                        state.key_fields
-                        for state in arena.plan.semantic_graph.states
-                        if state.resource == math.resource
-                    ),
-                )
-                reader.embedding = self.embedding.values
+        if self.pinned and self.math is not None and HiddenPhase.DECODE in self.math.phases:
+            self.install_decode(arena, self.math, requests)
+        self.requests, self.device = requests, arena.device
+        self.operand_staging = PinnedStaging()
+        self.task: ProjectionTask[Any, Any] | None = None
         self.sources: Sequence[PackedPhaseRow] = ()
         self.starts: Slots = np.empty(0, dtype=np.int64)
         self.total_rows = 0
         self.stream: torch.cuda.Stream | None = None
         self.readiness: CudaStreamReadiness | None = None
-        self.apply_count = self.updated_apply_count = 0
+
+    def install_decode(self, arena: PageBundleArena, math: OverlayTransition, requests: int) -> None:
+        """Give each reader its device-counted decode transition over the task's private slots."""
+        width = len(math.buffers)
+        key_fields = next(
+            state.key_fields for state in arena.plan.semantic_graph.states if state.resource == math.resource
+        )
+        for reader in self.readers:
+            target = math.targets.index(reader.binding.target)
+            pools = tuple(arena.field_pool(str(math.resource), LayoutFieldId(target * width + i)) for i in range(width))
+            invariants = {
+                name: views[target].read(arena.field_pool(resource, views[target].field), pooled=True)[0].clone()
+                for name, (resource, views) in math.invariants.items()
+            }
+            reader.decode = DecodeOverlay(
+                math, target, pools, invariants, requests, arena.plan.timeline.tensor_policy, key_fields
+            )
+
+    @property
+    def apply_count(self) -> int:
+        return sum(reader.apply_count for reader in self.readers)
+
+    @property
+    def updated_apply_count(self) -> int:
+        return sum(reader.updated_apply_count for reader in self.readers)
 
     def reserve(self) -> None:
         """Acquire every host table before the invocation issues any GPU work."""
-        for reader in self.readers:
-            if reader.decode is None:
+        if self.pinned:
+            for reader in self.readers:
                 reader.reserve()
-            else:
-                reader.decode.reserve()
-
-    def prepare_decode(self, rows: PackedPhaseRowBatch, transition: ProjectionTransition) -> None:
-        """Open private pages and stage every decode target before replay starts."""
-        assert self.math is not None
-        self.transition = transition
-        self.apply_count += rows.total_rows * len(self.readers)
-        batch = transition.prepare(self.math).for_resource(self.math.resource)
-        identities = tuple(dict.fromkeys(rows.identities))
-        self.sources = rows.inspect(np.arange(len(identities), dtype=np.int64))
-        self.total_rows = rows.total_rows
-        self.updated_apply_count += int(
-            (batch.selection.refs.versions[list(batch.selection.state_indices)] > 0).sum()
-        ) * len(self.readers)
-        for reader in self.readers:
-            assert reader.decode is not None
-            reader.decode.prepare(batch, identities)
 
     def prepare(
         self,
         rows: PackedPhaseRowBatch,
         context: StateTaskContext[DataT],
         directory: RequestStateDirectory,
-        transition: ProjectionTransition | None = None,
+        task: ProjectionTask[Any, Any] | None = None,
     ) -> None:
+        """Select exact segments or pinned reads from the labelled row facts, as vLLM's graph dispatch does."""
+        if self.exact and not (
+            self.pinned
+            and uniform_decode(
+                bool((rows.phases == 1).any()),
+                tuple(np.unique(rows.identity_indices, return_counts=True)[1].tolist()),
+            )
+        ):
+            assert task is not None
+            self.prepare_segments(rows, context, task)
+        else:
+            self.prepare_pinned(rows, context, directory, task)
+
+    def prepare_pinned(
+        self,
+        rows: PackedPhaseRowBatch,
+        context: StateTaskContext[DataT],
+        directory: RequestStateDirectory,
+        task: ProjectionTask[Any, Any] | None,
+    ) -> None:
+        """Stage the pinned ports, or the in-graph decode transition, after the previous invocation's reads."""
         self.stream = context.pin.stream
         assert self.stream is not None
         if self.readiness is not None:
             self.readiness.order_on(self.stream)
-        if self.math is not None and HiddenPhase.DECODE in self.math.phases:
-            assert transition is not None
-            self.prepare_decode(rows, transition)
-            return
-        assert transition is None
+        if self.readers[0].decode is None:
+            self.prepare_reads(rows, context, directory)
+        else:
+            assert task is not None
+            self.prepare_decode(rows, task)
+
+    def prepare_segments(
+        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], task: ProjectionTask[Any, Any]
+    ) -> None:
+        """Upload each request's packed rows per phase and its prompt-end flag for the eager forward."""
+        grouped: dict[tuple[RequestIdentity, HiddenPhase], list[PackedPhaseRow]] = {}
+        for row in rows.rows:
+            grouped.setdefault((row.identity, row.phase), []).append(row)
+        table = torch.empty((rows.total_rows + len(grouped),), dtype=torch.long, device=self.device)
+        with self.operand_staging.fill(table) as host:
+            host[: rows.total_rows] = [row.packed_row_index for source in grouped.values() for row in source]
+            host[rows.total_rows :] = [
+                source[-1].token_offset == source[-1].prompt_length - 1 for source in grouped.values()
+            ]
+        indices = torch.split(table[: rows.total_rows], [len(source) for source in grouped.values()])
+        prompt_ends = table[rows.total_rows :].bool().unbind()
+        for reader in self.readers:
+            resource = StateResource(reader.binding.resource)
+            reader.task = task
+            reader.segments = tuple(
+                _Segment(source[0], index, prompt_end, context.selection.ref_for(identity, resource).version_id > 0)
+                for ((identity, _), source), index, prompt_end in zip(
+                    grouped.items(), indices, prompt_ends, strict=True
+                )
+            )
+
+    def prepare_wave(
+        self,
+        rows: Sequence[PackedPhaseRow],
+        row_overlays: tuple[ProgramOverlay, ...],
+        indices: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Use one projection call across the wave and request-local update operands."""
+        for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True):
+            row_overlay.prompt_end.fill_(row.token_offset + index.numel() == row.prompt_length)
+        for reader in self.readers:
+            reader.row_overlays = row_overlays
+            reader.segments = tuple(
+                _Segment(
+                    row,
+                    index,
+                    row_overlay.prompt_end,
+                    row_overlay.batch.after_refs[
+                        int(row_overlay.batch.selection.state_indices[row_overlay.row])
+                    ].version_id
+                    > 0,
+                )
+                for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True)
+            )
+
+    def prepare_decode(self, rows: PackedPhaseRowBatch, task: ProjectionTask[Any, Any]) -> None:
+        """Open private pages and stage every decode target before replay starts."""
+        assert self.math is not None
+        self.task = task
+        batch = task.prepare(self.math).for_resource(self.math.resource)
+        identities = tuple(dict.fromkeys(rows.identities))
+        self.sources = rows.inspect(np.arange(len(identities), dtype=np.int64))
+        updated = int((batch.selection.refs.versions[list(batch.selection.state_indices)] > 0).sum())
+        for reader in self.readers:
+            assert reader.decode is not None
+            reader.apply_count += rows.total_rows
+            reader.updated_apply_count += updated
+            reader.decode.prepare(batch, identities)
+
+    def prepare_reads(
+        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
+    ) -> None:
+        """Pin each request's readable version and upload the readers' block tables."""
+        assert self.stream is not None
         ordinals = rows.request_ordinals
         self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
         self.sources = rows.inspect(self.starts)
@@ -755,46 +703,18 @@ class PinnedParameterOverlay:
             pins = tuple(pin for pin, _ in versions)
             refs = StateRefs.of(tuple(ref for _, ref in versions))
             _, slots = context.arena.slots(pins, np.arange(len(pins), dtype=np.int64), refs)
-            self.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
+            reader.apply_count += rows.total_rows
+            reader.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):
                 value.record_stream(self.stream)
             reader.prepare(slots, self.starts, rows.total_rows)
         self.embedding.values.record_stream(self.stream)
-        self.apply_count += rows.total_rows * len(self.readers)
-
-    def complete_decode(self) -> None:
-        """Settle replay's stable results through the ordinary projection task."""
-        assert self.transition is not None
-        operands: list[ProjectionOperands] = []
-        updates: dict[tuple[RequestIdentity, Projection], UpdateOutput] = {}
-        for reader in self.readers:
-            assert reader.decode is not None
-            count = self.requests
-            for index, row in enumerate(self.sources):
-                result = reader.decode.outputs[count][index]
-                updates[row.identity, reader.binding.target] = result
-                hidden = reader.captured[index : index + 1]
-                operands.append(
-                    ProjectionOperands(
-                        row.identity,
-                        reader.binding.target,
-                        row.phase,
-                        hidden,
-                        hidden if reader.mlp is None else reader.desired[index : index + 1],
-                        base_weight(reader.module, reader.binding.reads_weight, hidden.device)[
-                            reader.offset : reader.offset + reader.width
-                        ],
-                        hidden.new_zeros((), dtype=torch.bool),
-                        reader.embedding[index : index + 1]
-                        if reader.binding.reads_embedding
-                        else hidden.new_empty((0, 0)),
-                    )
-                )
-        self.transition.complete(tuple(operands), updates)
 
     def take_operands(self) -> tuple[ProjectionOperands, ...]:
-        if self.transition is not None:
-            self.complete_decode()
+        """Settle in-graph decode results, or return forward_pinned training operands for the task."""
+        assert all(reader.task is None or not reader.task.pending for reader in self.readers)
+        if self.task is not None:
+            self.complete_decode(self.task)
             return ()
         if not self.sources or not self.phases:
             return ()
@@ -807,120 +727,55 @@ class PinnedParameterOverlay:
         )
         results: list[ProjectionOperands] = []
         for reader in self.readers if spans else ():
-            weight = base_weight(reader.module, reader.binding.reads_weight, reader.captured.device)
+            weight = reader.weight(reader.captured.device)
             for row, first, last in spans:
-                hidden = reader.captured[first:last].clone()
                 results.append(
-                    ProjectionOperands(
-                        row.identity,
-                        reader.binding.target,
-                        row.phase,
-                        hidden,
-                        hidden if reader.mlp is None else reader.desired[first:last].clone(),
-                        weight[reader.offset : reader.offset + reader.width],
-                        hidden.new_full((), row.token_offset + last - first == row.prompt_length, dtype=torch.bool),
-                        self.embedding.values[first:last].clone()
-                        if reader.binding.reads_embedding
-                        else hidden.new_empty((0, 0)),
+                    reader.operands(
+                        row,
+                        lambda value: value[first:last].clone(),
+                        reader.captured,
+                        None if reader.mlp is None else reader.desired,
+                        weight,
+                        reader.captured.new_full(
+                            (), row.token_offset + last - first == row.prompt_length, dtype=torch.bool
+                        ),
                     )
                 )
         return tuple(results)
 
+    def complete_decode(self, task: ProjectionTask[Any, Any]) -> None:
+        """Settle replay's stable results through the ordinary projection task."""
+        operands: list[ProjectionOperands] = []
+        updates: dict[tuple[RequestIdentity, Projection], UpdateOutput] = {}
+        for reader in self.readers:
+            assert reader.decode is not None
+            weight = reader.weight(reader.captured.device)
+            prompt_end = reader.captured.new_zeros((), dtype=torch.bool)
+            for index, row in enumerate(self.sources):
+                updates[row.identity, reader.binding.target] = reader.decode.outputs[self.requests][index]
+                operands.append(
+                    reader.operands(
+                        row,
+                        lambda value: value[index : index + 1],
+                        reader.captured,
+                        None if reader.mlp is None else reader.desired,
+                        weight,
+                        prompt_end,
+                    )
+                )
+        task.complete(tuple(operands), updates)
+
     def clear(self) -> None:
-        self.transition = None
+        for reader in self.readers:
+            reader.clear()
+        self.task = None
         if self.sources and self.stream is not None:
             self.readiness = CudaStreamReadiness(self.stream)
         self.sources = ()
 
     def close(self) -> None:
+        """Unwind the wrappers in reverse installation order."""
+        self.clear()
         self.embedding.close()
         for reader in reversed(self.readers):
             reader.close()
-
-
-class HybridParameterOverlay:
-    """Eager prefill and device-counted decode share one exact projection-task lifecycle."""
-
-    def __init__(
-        self, pinned: PinnedParameterOverlay, exact: ExactParameterOverlay, phases: tuple[HiddenPhase, ...]
-    ) -> None:
-        self.pinned, self.exact, self.phases = pinned, exact, phases
-
-    @property
-    def apply_count(self) -> int:
-        return self.pinned.apply_count + self.exact.apply_count
-
-    @property
-    def updated_apply_count(self) -> int:
-        return self.pinned.updated_apply_count + self.exact.updated_apply_count
-
-    def reserve(self) -> None:
-        """Reserve bounded staging before the invocation issues GPU work."""
-        self.pinned.reserve()
-
-    def prepare(
-        self,
-        rows: PackedPhaseRowBatch,
-        context: StateTaskContext[DataT],
-        directory: RequestStateDirectory,
-        transition: ProjectionTransition | None = None,
-    ) -> None:
-        """Select the same eligibility used by dispatch from the labelled row facts."""
-        training = not uniform_decode(
-            bool((rows.phases == 1).any()),
-            tuple(np.unique(rows.identity_indices, return_counts=True)[1].tolist()),
-        )
-        for reader in self.pinned.readers:
-            reader.enabled = not training
-        if training:
-            self.exact.prepare(rows, context, directory, transition)
-        else:
-            self.pinned.prepare(rows, context, directory, transition if HiddenPhase.DECODE in self.phases else None)
-
-    def take_operands(self) -> tuple[ProjectionOperands, ...]:
-        """Exact consumed training operands in forward; inactive reads produce no task operands."""
-        self.pinned.take_operands()
-        return self.exact.take_operands()
-
-    def clear(self) -> None:
-        """Release invocation views through their existing owners."""
-        self.exact.clear()
-        self.pinned.clear()
-
-    def close(self) -> None:
-        """Unwind the stable wrappers in reverse installation order."""
-        self.exact.close()
-        self.pinned.close()
-
-
-def parameter_overlay(
-    decoder: Decoder,
-    bindings: tuple[ParameterOverlayFieldBinding, ...],
-    arena: PageBundleArena,
-    rows: int,
-    requests: int,
-    budget: int,
-    phases: tuple[HiddenPhase, ...],
-    *,
-    in_forward: bool,
-    graphs: bool,
-    in_program: bool = False,
-    math: OverlayTransition | None = None,
-) -> PinnedParameterOverlay | ExactParameterOverlay | HybridParameterOverlay:
-    """Install each projection wrapper once, before compiling or capturing the model."""
-    if (in_program and math is not None) or not uses_pinned_projection(in_forward=in_forward, graphs=graphs):
-        return ExactParameterOverlay(decoder, bindings, arena.device, rows)
-    pinned = PinnedParameterOverlay(
-        decoder,
-        bindings,
-        arena,
-        rows,
-        requests,
-        budget,
-        phases=() if in_forward else phases,
-        math=math if in_forward else None,
-        in_program=in_program,
-    )
-    if not in_forward:
-        return pinned
-    return HybridParameterOverlay(pinned, ExactParameterOverlay(decoder, bindings, arena.device, rows), phases)

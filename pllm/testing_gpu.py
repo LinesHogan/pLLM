@@ -31,7 +31,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskId
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.cuda_stream import CudaStreamReadiness
-from pllm.execution.overlay_task import ProjectionTransition
+from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
@@ -173,12 +173,12 @@ class SynchronizationCheck:
         rows: PackedPhaseRowBatch,
         context: StateTaskContext[TensorFrame],
         directory: RequestStateDirectory,
-        transition: ProjectionTransition | None = None,
+        task: ProjectionTask[TensorFrame, TensorOutput] | None = None,
     ) -> None:
         """Include graph port and private-page staging in steady decode sync checks."""
         assert self.prepare_overlay is not None
         with self.scope(context):
-            self.prepare_overlay(rows, context, directory, transition)
+            self.prepare_overlay(rows, context, directory, task)
 
     def anchor(self, context: StateTaskContext[TensorFrame], anchor: AnchorId) -> None:
         with self.scope(context):

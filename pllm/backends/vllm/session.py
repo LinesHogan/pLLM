@@ -20,7 +20,7 @@ from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_taps import HiddenTaps
 from pllm.backends.vllm.layer_logits import LayerLogits
 from pllm.backends.vllm.model_sites import ModelSites
-from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, PinnedParameterOverlay, parameter_overlay
+from pllm.backends.vllm.parameter_overlay import ParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.sampler import (
@@ -115,14 +115,14 @@ class VllmSession(Generic[DataT, ResultT]):
         custom_forward_task = plan.semantic_graph.custom_forward_task
         program_overlay = attachment.spec.in_forward is not None and custom_forward_task is not None
         self.parameter_overlay = (
-            parameter_overlay(
+            ParameterOverlay(
                 decoder,
                 overlay_bindings,
                 deployment.execution.arena,
                 probe.max_packed_rows,
                 max_sampler_rows,
                 buffers,
-                phases=attachment.spec.overlay_phases,
+                attachment.spec.overlay_phases,
                 in_forward=plan.semantic_graph.updates_in_forward,
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
                 in_program=custom_forward_task is not None,
@@ -196,10 +196,7 @@ class VllmSession(Generic[DataT, ResultT]):
                 sites=self.model_sites,
                 position_layers=position_layers,
                 allocation_block_size=allocation_block_size,
-                overlay=self.parameter_overlay
-                if isinstance(self.parameter_overlay, ExactParameterOverlay) and program_overlay
-                else None,
-                adapter=self.parameter_overlay if isinstance(self.parameter_overlay, PinnedParameterOverlay) else None,
+                projections=self.parameter_overlay,
             )
         self._sampler = sampler
         self.request_identities: dict[str, RequestIdentity] = {}

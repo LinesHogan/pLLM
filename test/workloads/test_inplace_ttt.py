@@ -686,15 +686,11 @@ def test_prompt_end_operand_stays_live_during_replay():
     torch.testing.assert_close(values["b"], torch.full_like(values["b"], 0.003))
 
 
-class CpuOperandStaging:
-    """CPU transport replacing CUDA's pinned index transfer in the fake backend."""
+class PaperLinear(torch.nn.Linear):
+    """Return (output, bias) like vLLM's linear layers."""
 
-    def take(self, size):
-        self.host = torch.zeros(size, dtype=torch.int64)
-        return self.host.numpy()
-
-    def copy_to(self, target):
-        target.copy_(self.host)
+    def forward(self, input):
+        return super().forward(input), None
 
 
 class PaperMlp(torch.nn.Module):
@@ -703,12 +699,12 @@ class PaperMlp(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.gate, self.up = torch.nn.Linear(3, 5, bias=False), torch.nn.Linear(3, 5, bias=False)
-        self.down_proj = torch.nn.Linear(5, 3, bias=False)
+        self.down_proj = PaperLinear(5, 3, bias=False)
         self.down_proj.params_dtype = torch.float32
         self.down_proj.input_size_per_partition = 5
 
     def forward(self, x):
-        return self.down_proj(torch.nn.functional.silu(self.gate(x)) * self.up(x))
+        return self.down_proj(torch.nn.functional.silu(self.gate(x)) * self.up(x))[0]
 
 
 class PaperDecoder(torch.nn.Module):
@@ -807,7 +803,7 @@ def test_paper_ttt_matches_fake_decoder_oracle(tmp_path, track, scale):
 
     from safetensors.torch import save_file
 
-    from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay
+    from pllm.backends.vllm.parameter_overlay import ParameterOverlay
     from pllm.workloads import InPlaceTTTConfig, InPlaceTTTWorkload
 
     torch.manual_seed(19)
@@ -842,8 +838,8 @@ def test_paper_ttt_matches_fake_decoder_oracle(tmp_path, track, scale):
     prompts = (torch.randn(9, 3), torch.randn(9, 3))
     expected = tuple(paper_oracle(body, x, convs, projs, track, 3.0) for x in prompts)
     decoder = SimpleNamespace(model=SimpleNamespace(model=body), projection=body.projection)
-    overlay = ExactParameterOverlay(decoder, deployed.attachment.spec.overlay_bindings, torch.device("cpu"), 16)
-    overlay.operand_staging = CpuOperandStaging()
+    bindings = deployed.attachment.spec.overlay_bindings
+    overlay = ParameterOverlay(decoder, bindings, execution.arena, 16, 2, 0, (), in_forward=True, graphs=False)
     try:
         # A partial prefill chunk completes in decode; the completing token reads old state.
         with (

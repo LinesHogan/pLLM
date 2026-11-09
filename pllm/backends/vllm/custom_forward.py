@@ -25,7 +25,7 @@ from pllm.backends.vllm.custom_forward_attention import (
     validate_attention_resources,
 )
 from pllm.backends.vllm.model_sites import ModelSites
-from pllm.backends.vllm.parameter_overlay import ExactParameterOverlay, PinnedParameterOverlay
+from pllm.backends.vllm.parameter_overlay import ParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer, PositionCacheProvider
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.semantic_graph import AnchorId, SemanticTask, TokenProgramEffect
@@ -187,15 +187,13 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         *,
         activation: VllmActivationPatch | None = None,
         sites: ModelSites | None = None,
-        overlay: ExactParameterOverlay | None = None,
-        adapter: PinnedParameterOverlay | None = None,
+        projections: ParameterOverlay | None = None,
         position_layers: tuple[PositionCacheLayer, ...] = (),
         allocation_block_size: int = 16,
     ) -> None:
         assert task.custom_forward is not None
         self.model, self.effect = model.model, task.custom_forward
-        self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, overlay
-        self.adapter = adapter
+        self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, projections
         self.sites = sites
         implementation = execution.arena.plan.scheduled(task.symbol)
         binding = CustomForwardTask[DataT].from_implementation(
@@ -234,7 +232,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         Compacted waves retain their parent's homogeneous patch presence; device indices
         still gather each selected request's fields. Return the hooks' completed stream.
         """
-        readers = () if self.adapter is None else self.adapter.readers
+        readers = () if self.projections is None else self.projections.readers
         previous_rows = tuple(reader.call_rows for reader in readers)
         for reader in readers:
             reader.call_rows = packed
