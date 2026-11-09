@@ -345,14 +345,21 @@ def test_component_boundaries_and_base_collisions() -> None:
     class Lag(pllm.Workload):
         serial: Serial = field(default_factory=Serial)
 
+    class WriteTwice(Write, Export):
+        @pllm.write(state="written", fields=("v",))
+        def write_again(self, v=pllm.parameter("written", "v")):
+            return (v + 2,)
+
     for workload, message in (
         (type("Collision", (ESampWorkload, collision), {})(), "ESampWorkload and MyTrainer both declare 'loss'"),
+        (WriteTwice(), r"write_(again|value)\.write and write_(again|value)\.write both write state"),
         (TwoGuides(), "first.guide and second.guide"),
         (CrossRead(), "components are independent"),
         (Lag(), "serial requires publish_lag=0.*engine uses publish_lag=1"),
     ):
         with pytest.raises(ValueError, match=message):
-            workload.specialize(FACTS, pllm.ExecutionOptions())
+            facts, declaration = workload.specialize(FACTS, pllm.ExecutionOptions())
+            workload.plan_backend(facts, declaration)
     facts, declaration = Lag().specialize(FACTS, pllm.ExecutionOptions(publish_lag=0))
     Lag().plan_backend(facts, declaration)
 

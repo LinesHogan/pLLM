@@ -157,7 +157,7 @@ class Write(Effect):
         context.writes[self.state] = (
             update,
             context.binding.publish(
-                update, state, when=operation.transition_window.publication, name=f"{self.state}.publish"
+                update, state, when=operation.transition_window.publication, name=f"{update.symbol}.publish"
             ),
         )
 

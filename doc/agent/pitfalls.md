@@ -71,7 +71,7 @@ weights, so run it first.
 | `host-batch training returns one scalar and owns its reduction; remove reduction=` | A host batch's loss is already one number. | Remove `reduction=`; reduce inside the method (`(weights * error).sum() / weights.sum().clamp_min(1)`). |
 | `training on WeightedRowBatch or CausalTrainBatch fields takes one AdamW step over the whole batch: remove rows=, update_rows=, steps=, reset=, @pllm.differentiate and pllm.carry` | These batches always train as one whole batch. | Remove the listed settings. |
 | `steps= and reset= apply to training on WeightedCEBatch fields (pllm.batch); remove them to train on request rows` | Repeated SGD steps from a reset point exist only for `WeightedCEBatch`. | Remove `steps=` and `reset=`. |
-| `... and ... both write state ... from the same version; let one method write it` | Two writers of one state in one step would each overwrite the other's version. | One writer per state: either `@pllm.train` or `@pllm.write`, not both. Two `@pllm.write` methods on one state fail with the [known issue](#known-issues) message `duplicate operation ...`. |
+| `... and ... both write state ... from the same version; let one method write it` | Two writers of one state in one step would each overwrite the other's version. | One writer per state: one `@pllm.write` method (writing all its fields) or one `@pllm.train`, not both. |
 | `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | Gradients of `b @ a` vanish when both factors are zero. | Initialize A randomly and B at zero with `init=pllm.Computed(function)` (see reference.md, Train inside the forward). |
 | `placement="host" needs a read-only InstanceState of gathered fields; use placement="device" for mutable state` | Host tables are read in bounded gathers that overlap the forward; they cannot be written. | Use `placement="host"` only for frozen pretrained tables of an `InstanceState`. |
 | `...: gather host rows in a helper and read pllm.result in the model site; or use placement="device"` | A model site runs in the middle of a layer, where a PCIe read would stall the forward. | Gather in an undecorated helper that reads only `pllm.input_tokens` and the table; the model site reads `pllm.result("helper")`. |
@@ -319,8 +319,6 @@ Current framework behaviour that is wrong or unhelpful; each has a workaround.
   is not supported, but declaration stops earlier with `ValueError: zip() argument 2 is longer than
   argument 1` instead of pllm's explanation. Workaround: train the adapter's state in the
   `@pllm.train_in_forward` method itself, or use two workloads.
-- **Two `@pllm.write` methods on one state report `duplicate operation <state>.publish`.** The message names
-  no fix. Workaround: write all fields of a state from one method.
 - **A workload whose only effect is `@pllm.guide_sampling` cannot take `neutral=`.** With `beta=0` it
   declares no effect at all, so the neutral run fails with `the workload has no effect on the model`.
   Workaround: run `testing.check` without `neutral=` for such workloads (`beta=0` declares no sampler stage
