@@ -219,7 +219,7 @@ True
   - 同一个示例在 RTX 4090 上测得：原样读取的 `NativeRead` 吞吐为原生 vLLM 的 **98%**；偶数层窗口 `LocalGlobal` 为 **97%**，跨层共享 `CrossLayerShared` 为 **96%**（窗口层走 vLLM 的 FlashInfer 窗口内核，见[性能与显存](../explain/performance.md)）。纯 PyTorch 实现的 Top-K 动态打分（如未写成专用内核的 Quest）吞吐仅为原生的 **7%**，生产环境加速需使用融合算子（详见[自写算子](custom-ops.md)与 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb)）。
 - **限制与原因**：
   - `tensor_parallel_size=1`：自定义 FlashAttention 读法与分页 KV 布局尚未实现跨 TP rank 的注意力头切分与通信同步。
-  - 仅限 FlashAttention 2 后端：底层依赖 FA2 暴露的低级接口与元数据。
+  - 引擎需使用 FlashAttention 2 后端：pLLM 从 FA2 的元数据里取页表和序列长度来组织每一种读法；其中普通的窗口读取再交给 vLLM 自带的 FlashInfer 内核执行，因为 FA2 的窗口路径会关掉 GQA 打包（见[性能与显存](../explain/performance.md)）。
   - 未量化 KV（`kv_cache_dtype="auto"`）：FP8 等量化格式打包了存储字节，在稀疏读取 gather 时需要专用的反量化内核。
   - 普通 RoPE 注意力：不支持带有 ALiBi、Logit Soft-capping 或硬件特定 Sink Token 的注意力模型。
   - 关闭前缀缓存：滑动窗口与跨层共享会改变每个请求实际留存的 KV 结构，破坏前缀缓存的全局哈希树假设。
