@@ -396,14 +396,19 @@ def derive_resources(
                 "use tensor operations such as torch.where, not .item() or Python branches on tensor values"
             )
             raise
-        if task is not None and task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD:
+        if task is not None and task.sampler_stage is not None:
             result = batch.results[symbol, task.outputs[0]]
-            expected = (len(data.rows), facts.vocab_size)
+            additive = task.sampler_stage is SamplerStage.PACKED_PRE_FILTER_ADD
+            expected = (len(data.rows), facts.vocab_size if additive else facts.probe.hidden_size)
             if result.shape != expected:
                 raise ValueError(
                     f"@pllm.add_logits method `{symbol}` must return [rows, vocab_size] = {expected}; "
                     f"got {tuple(result.shape)}. Read logits=pllm.layer_logits((-1,)) and return logits[:, -1], "
                     "or project hidden states to the model's vocabulary."
+                    if additive
+                    else f"@pllm.guide_sampling method `{symbol}` must return a hidden-state prediction "
+                    f"[rows, hidden_size] = {expected}; got {tuple(result.shape)}. pllm projects it with the model's "
+                    "LM head; to add logits directly, use @pllm.add_logits."
                 )
         # Model overlays capture bounded tiles, not their whole maximum-shape operation.
         required = operation.resident(usage.capture) if task is not None else 0

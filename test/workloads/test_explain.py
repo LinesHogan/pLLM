@@ -161,6 +161,17 @@ def test_train_in_forward_beside_an_adapter_names_the_conflict(model_config):
         pllm.explain(_AdaptedPrefillAdapters(chunk_size=4, rank=2), model_config)
 
 
+class _NarrowGuide(pllm.Workload):
+    @pllm.guide_sampling(beta=0.5)
+    def guide(self, h: torch.Tensor = pllm.hidden(0)) -> torch.Tensor:
+        return h[:, :2]
+
+
+def test_guidance_width_is_checked_at_build(model_config):
+    with pytest.raises(ValueError, match=r"must return a hidden-state prediction \[rows, hidden_size\]"):
+        pllm.explain(_NarrowGuide(), model_config)
+
+
 def test_esamp_attribution_and_budget_fallback(model_config):
     workload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
     report = pllm.explain(workload, model_config)

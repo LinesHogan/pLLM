@@ -96,6 +96,7 @@ weights, so run it first.
 | `... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...` | A `@pllm.train_in_forward` method without an optimizer returns the correction added to the projection's output (`pllm.UpdateOutput(output, ...)`, or `(next_weight, output)` with `chunk=`). pllm runs every overlay method once at declaration on maximum-shape operands and checks the result there, not on every step. | Return `output` shaped `[rows, out_features]` of the target, in the input dtype or float32. |
 | `... must return changed (bool) and update_count and trained_rows (int64) as 0-d tensors on the input's device` | The counters stay on the device so no step synchronizes with the host. | Build them as 0-d device tensors (`x.new_ones((), dtype=torch.bool)`), or return `pllm.UpdateOutput.unchanged(output)`. |
 | `@pllm.add_logits method ... must return [rows, vocab_size] = ...; got ...` | The result is added to the full-vocabulary logits. | Return `[rows, vocab]`: read `pllm.layer_logits((-1,))` and return `logits[:, -1]`-shaped tensors, or project hidden states to the vocabulary. |
+| `@pllm.guide_sampling method ... must return a hidden-state prediction [rows, hidden_size] = ...; got ...` | pllm projects the prediction with the model's LM head and pushes sampling away from it. | Return `[rows, hidden_size]` (e.g. a prediction of `pllm.final_hidden()`); to add logits directly, use `@pllm.add_logits`. |
 
 ### Engine settings and models
 
