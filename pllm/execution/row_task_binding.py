@@ -418,6 +418,7 @@ def state_metadata(state: State, *, version: bool) -> TensorPort:
 def declare_tensor(
     b: TensorDeclaration,
     name: str,
+    function: TensorMath,
     *,
     inputs: Mapping[str, TensorPort],
     when: When = When.BEFORE_SAMPLE,
@@ -433,40 +434,109 @@ def declare_tensor(
     export: TensorExport | None = None,
     sampler_stage: SamplerStage | None = None,
     sampler_beta: float = 0.0,
-) -> Callable[[TensorMath], Call]:
+) -> Call:
     """Declare a tensor task with its final inputs, effects and output adapter."""
-    sources = {key: value.source for key, value in inputs.items()}
-
-    def phases(source: SemanticInputSource) -> set[HiddenPhase]:
-        if isinstance(source, HiddenInputSource):
-            # Layer logits cover every row the sampler draws, of either phase.
-            return set() if source.phase is HiddenPhase.NONE else {source.phase}
-        return set[HiddenPhase]().union(
-            *(
-                phases(port.source)
-                for task in b.graph.tasks
-                if isinstance(source, TaskResultInputSource) and task.symbol == source.task
-                for port in task.inputs
+    phase = _input_phase(b, name, inputs, when, export)
+    sources = _task_sources(inputs, phase, update, carries)
+    policy = MathContract() if math is None else math
+    if policy.parameter_gradient_rows and any(
+        not port.rowwise
+        for port in inputs.values()
+        if isinstance(port.source, StateSelectionInputSource) and port.source.resource in policy.parameter_gradients
+    ):
+        raise ValueError("parameter gradient rows require Parameter(..., per_row=True) for shared parameters")
+    symbol = TaskSymbol(name)
+    b.tensor_tasks[symbol] = TensorTask(
+        symbol,
+        function,
+        inputs,
+        sources,
+        policy,
+        outputs,
+        carries,
+        phase,
+        update.declaration.resource
+        if update is not None
+        else next(
+            (source.resource for source in sources.values() if isinstance(source, StateSelectionInputSource)),
+            StateResource(""),
+        ),
+        tuple_output=tuple_output,
+        export=export,
+        sampler_stage=sampler_stage,
+        sampler_beta=sampler_beta,
+        training=update,
+    )
+    return b.compute(
+        name,
+        inputs=sources,
+        extra_inputs=_sampler_inputs(b, sources) if output_kind is SemanticOutputKind.SAMPLER else (),
+        outputs=outputs,
+        output_kind=output_kind,
+        changes=update,
+        effect=effect,
+        math=math,
+        result_schema="tensor_training_result@1" if update is not None else result_schema,
+        when=When.HOST if b.host else when,
+        reads=tuple(
+            SemanticEffect(resource, StateEffectKind.READ)
+            for resource in dict.fromkeys(
+                source.resource
+                for source in sources.values()
+                if isinstance(source, StateSelectionInputSource)
+                and (update is None or source.resource != update.declaration.resource)
             )
-        )
+        ),
+        implementations=(native(identity or f"{b.graph.workload_id}:{name}@1"),),
+    )
 
-    domains = set[HiddenPhase]().union(*(phases(source) for source in sources.values()))
+
+def _phases(b: TensorDeclaration, source: SemanticInputSource) -> set[HiddenPhase]:
+    """The hidden phases an input reads, directly or through the methods whose results it reads."""
+    if isinstance(source, HiddenInputSource):
+        # Layer logits cover every row the sampler draws, of either phase.
+        return set() if source.phase is HiddenPhase.NONE else {source.phase}
+    return set[HiddenPhase]().union(
+        *(
+            _phases(b, port.source)
+            for task in b.graph.tasks
+            if isinstance(source, TaskResultInputSource) and task.symbol == source.task
+            for port in task.inputs
+        )
+    )
+
+
+def _input_phase(
+    b: TensorDeclaration, name: str, inputs: Mapping[str, TensorPort], when: When, export: TensorExport | None
+) -> HiddenPhase | None:
+    """The one row phase a method's inputs read, None for a method without hidden inputs."""
+    domains = set[HiddenPhase]().union(*(_phases(b, port.source) for port in inputs.values()))
     if len(domains) > 1 or domains and when is When.BEFORE_FORWARD:
         raise ValueError("tensor inputs need one phase; hidden inputs become available after model forward")
     phase = next(iter(domains), None)
     if phase is HiddenPhase.ALL and (
-        export is None or any(isinstance(source, TaskResultInputSource) for source in sources.values())
+        export is None or any(isinstance(port.source, TaskResultInputSource) for port in inputs.values())
     ):
         # Other methods run on one row per request and are funded and captured for that many rows.
         raise ValueError(
             f'`{name}` reads tokens="all" rows; only @pllm.export methods read them, and without pllm.result inputs. '
             'Export the rows, or read tokens="prefill" or "decode"'
         )
+    return phase
+
+
+def _task_sources(
+    inputs: Mapping[str, TensorPort],
+    phase: HiddenPhase | None,
+    update: State | None,
+    carries: Mapping[str, LayoutFieldId],
+) -> dict[str, SemanticInputSource]:
+    """The task's semantic inputs: state reads at its phase, plus the trained state's selection."""
     sources = {
-        key: replace(source, phase=phase or HiddenPhase.DECODE)
-        if isinstance(source, StateSelectionInputSource)
-        else source
-        for key, source in sources.items()
+        key: replace(port.source, phase=phase or HiddenPhase.DECODE)
+        if isinstance(port.source, StateSelectionInputSource)
+        else port.source
+        for key, port in inputs.items()
     }
     if carries and update is None:
         raise ValueError("pllm.carry needs the method to train its own state")
@@ -479,75 +549,14 @@ def declare_tensor(
         if "__update_state" in sources:
             raise ValueError("__update_state is reserved for the optimizer's state selection")
         sources["__update_state"] = update.read()
-    policy = MathContract() if math is None else math
-    reads = tuple(
-        SemanticEffect(resource, StateEffectKind.READ)
-        for resource in dict.fromkeys(
-            source.resource
-            for source in sources.values()
-            if isinstance(source, StateSelectionInputSource)
-            and (update is None or source.resource != update.declaration.resource)
-        )
-    )
-    sampler_inputs = (
-        (
-            SemanticInput("packed_rows", b.rows()),
-            *(
-                (SemanticInput("__sampler_rows", b.sampler_rows()),)
-                if not any(isinstance(source, PackedSamplerRowsInputSource) for source in sources.values())
-                else ()
-            ),
-        )
-        if output_kind is SemanticOutputKind.SAMPLER
-        else ()
-    )
+    return sources
 
-    def decorate(function: TensorMath) -> Call:
-        symbol = TaskSymbol(name)
-        if policy.parameter_gradient_rows and any(
-            not port.rowwise
-            for port in inputs.values()
-            if isinstance(port.source, StateSelectionInputSource) and port.source.resource in policy.parameter_gradients
-        ):
-            raise ValueError("parameter gradient rows require Parameter(..., per_row=True) for shared parameters")
-        task = TensorTask(
-            symbol,
-            function,
-            inputs,
-            sources,
-            policy,
-            outputs,
-            carries,
-            phase,
-            update.declaration.resource
-            if update is not None
-            else next(
-                (source.resource for source in sources.values() if isinstance(source, StateSelectionInputSource)),
-                StateResource(""),
-            ),
-            tuple_output=tuple_output,
-            export=export,
-            sampler_stage=sampler_stage,
-            sampler_beta=sampler_beta,
-            training=update,
-        )
-        b.tensor_tasks[symbol] = task
-        return b.compute(
-            name,
-            inputs=sources,
-            extra_inputs=sampler_inputs,
-            outputs=outputs,
-            output_kind=output_kind,
-            changes=update,
-            effect=effect,
-            math=math,
-            result_schema="tensor_training_result@1" if update is not None else result_schema,
-            when=When.HOST if b.host else when,
-            reads=reads,
-            implementations=(native(identity or f"{b.graph.workload_id}:{name}@1"),),
-        )
 
-    return decorate
+def _sampler_inputs(b: TensorDeclaration, sources: Mapping[str, SemanticInputSource]) -> tuple[SemanticInput, ...]:
+    """The packed rows a sampler-stage task reads, and the sampler rows unless it already reads them."""
+    if any(isinstance(source, PackedSamplerRowsInputSource) for source in sources.values()):
+        return (SemanticInput("packed_rows", b.rows()),)
+    return SemanticInput("packed_rows", b.rows()), SemanticInput("__sampler_rows", b.sampler_rows())
 
 
 def validate_gradients(b: TensorDeclaration, trainers: tuple[Call, ...]) -> None:

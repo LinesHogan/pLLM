@@ -157,6 +157,7 @@ class Operation:
         return declare_tensor(
             context.binding,
             self.name,
+            freeze(self.function),
             inputs=inputs,
             when=self.phase if when is None else when,
             identity=self.identity,
@@ -171,7 +172,7 @@ class Operation:
             export=export,
             sampler_stage=sampler_stage,
             sampler_beta=sampler_beta,
-        )(freeze(self.function))
+        )
 
     @property
     def domains(self) -> dict[str, str]:
@@ -213,13 +214,14 @@ class Operation:
                 selectors[method] = declare_tensor(
                     self.context.binding,
                     self.context.selector_name(self.name, method),
+                    freeze(selector),
                     when=self.phase,
                     identity=f"python:{identity}:{self.name}:{method}",
                     inputs={
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
                         for key, source in sources[self.context.selector_name(self.name, method)].items()
                     },
-                )(freeze(selector))
+                )
             key = f"__{domain}"
             inputs[key] = result_port(TaskResultInputSource(selectors[method].symbol, "value"))
             math = replace(math, **{domain: key})

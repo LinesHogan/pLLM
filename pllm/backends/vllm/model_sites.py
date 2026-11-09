@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+from vllm.model_executor.layers.linear import LinearBase
 
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, hidden_binding, sublayer_norms
@@ -71,6 +72,45 @@ def _model_site_meta(
 model_site.register_fake(_model_site_meta)  # pyright: ignore[reportUnknownMemberType]
 
 
+def _state_inputs(
+    rewrites: tuple[ResidualRewrite, ...], attention_program: AttentionProgram | None
+) -> tuple[StateInput, ...]:
+    """The states the hooks and attention methods read, excluding request memories' own carries."""
+    carries = {rewrite.memory.carry for rewrite in rewrites if rewrite.memory is not None}
+    sources = [
+        source
+        for rewrite in rewrites
+        for _, source in (*rewrite.inputs, *rewrite.read_inputs)
+        if isinstance(source, StateInput) and source not in carries
+    ]
+    if attention_program is not None:
+        sources.extend(
+            source
+            for method in attention_program.methods.values()
+            for _, source in method.inputs
+            if isinstance(source, StateInput)
+        )
+    return tuple(dict.fromkeys(sources))
+
+
+def _prefetch_events(sources: tuple[ResultInput, ...], arena: PageBundleArena) -> dict[ResultInput, torch.cuda.Event]:
+    """A readiness event per task result a side-lane task produces from an earlier version."""
+    events = {
+        source: torch.cuda.Event(external=True)
+        for source in sources
+        if any(
+            task.lane == "side"
+            and task.read_origin != "latest"
+            and arena.plan.semantic_graph.tasks[task.task_id].symbol == source.task
+            for task in arena.plan.schedule.tasks
+        )
+    }
+    # An uncreated event makes wait_event a no-op, so create it before model graph capture.
+    for ready in events.values():
+        ready.record()
+    return events
+
+
 class ModelSites:
     """One session's installed rewrites, the step's copies of the states they read and the earlier values of the
     forward they read. Every copy lives in a stable buffer, so custom-forward graph replays see the step's values."""
@@ -88,8 +128,7 @@ class ModelSites:
         graphs: bool = False,
         attention_program: AttentionProgram | None = None,
     ) -> None:
-        body = decoder.model.model
-        count, weight = len(body.layers), body.norm.weight
+        weight = decoder.model.model.norm.weight
         owners = {place: rewrite for rewrite in rewrites for place in rewrite.places}
         earlier = {source for rewrite in rewrites for source in rewrite.earlier}
         self.streams, self.hidden = max((rewrite.streams for rewrite in rewrites), default=1), weight.shape[0]
@@ -101,29 +140,7 @@ class ModelSites:
         self._activation = activation
         self.count = 0  # rows of the current hook call (vLLM may pad the step's rows)
         self._requests_of = torch.zeros(rows, dtype=torch.long, device=weight.device)
-        carries = {rewrite.memory.carry for rewrite in rewrites if rewrite.memory is not None}
-        self.state_inputs = tuple(
-            dict.fromkeys(
-                source
-                for rewrite in rewrites
-                for _, source in (*rewrite.inputs, *rewrite.read_inputs)
-                if isinstance(source, StateInput) and source not in carries
-            )
-        )
-        if attention_program is not None:
-            self.state_inputs = tuple(
-                dict.fromkeys(
-                    (
-                        *self.state_inputs,
-                        *(
-                            source
-                            for method in attention_program.methods.values()
-                            for _, source in method.inputs
-                            if isinstance(source, StateInput)
-                        ),
-                    )
-                )
-            )
+        self.state_inputs = _state_inputs(rewrites, attention_program)
         self._memories = {
             rewrite.name: SiteMemorySchedule(rewrite, arena, requests, rows)
             for rewrite in rewrites
@@ -134,19 +151,7 @@ class ModelSites:
             source: torch.zeros((rows, *source.shape), device=weight.device, dtype=source.dtype)
             for source in self._result_sources
         }
-        self._prefetch = {
-            source: torch.cuda.Event(external=True)
-            for source in self._result_sources
-            if any(
-                task.lane == "side"
-                and task.read_origin != "latest"
-                and arena.plan.semantic_graph.tasks[task.task_id].symbol == source.task
-                for task in arena.plan.schedule.tasks
-            )
-        }
-        # An uncreated event makes wait_event a no-op, so create it before model graph capture.
-        for ready in self._prefetch.values():
-            ready.record()
+        self._prefetch = _prefetch_events(self._result_sources, arena)
         self.state_values: dict[StateInput, Tensor] = {}
         for source in self.state_inputs:
             field = source.view.read(arena.field_pool(source.resource, source.view.field), pooled=True)[0]
@@ -180,6 +185,28 @@ class ModelSites:
             if numerics and rewrite.memory is None
             for read in ((False, True) if rewrite.read is not None else (False,))
         }
+        self._install_boundaries(decoder, owners, earlier, methods, graphs=graphs)
+        for layer, value_rows in values.items():
+            self._install_value(layer, value_rows, owners, earlier, methods, weight, graphs=graphs)
+        if numerics:
+            sample = weight.new_zeros((1, self.hidden))
+            for rewrite in rewrites:
+                if rewrite.memory is not None:
+                    self.remember(rewrite, sample, sample)
+        if graphs:
+            _SITES[self._requests_of.data_ptr()] = self
+
+    def _install_boundaries(
+        self,
+        decoder: Decoder,
+        owners: dict[Place, ResidualRewrite],
+        earlier: set[EarlierInput],
+        methods: dict[tuple[str, bool], Callable[..., None]],
+        *,
+        graphs: bool,
+    ) -> None:
+        """Hook each norm between sublayers that completes, reads, keeps or taps something."""
+        count, weight = len(decoder.model.model.layers), decoder.model.model.norm.weight
         for index, (norm, kernel) in enumerate(zip(sublayer_norms(decoder.model), decoder.norms, strict=True)):
             layer, attention = divmod(index, 2)
             before: Place | None = ("attention", layer) if attention else ("mlp", layer - 1) if layer else None
@@ -203,7 +230,7 @@ class ModelSites:
                     for source in earlier
                     if source.kind != "value" and before is not None and source.position == position(before)
                 ),
-                (None, None) if taps is None else (taps.taps.get((path, 0)), taps.taps.get((path, 1))),
+                (None, None) if self.taps is None else (self.taps.taps.get((path, 0)), self.taps.taps.get((path, 1))),
             )
             boundary.bind(weight, methods)
             if before is not None and before[0] == "mlp":
@@ -219,31 +246,37 @@ class ModelSites:
                 boundary.index = len(self.hooks)
                 self._install(norm, boundary.graph_forward if graphs else boundary)
                 self.hooks.append(boundary)
-        for layer, (module, start, width, head_dim) in values.items():
-            keeps = EarlierInput("value", layer)
-            hook = ValueProjection(
-                self,
-                module.forward,
-                layer,
-                owners.get(("value", layer)),
-                keeps if keeps in earlier else None,
-                start,
-                width,
-                head_dim,
-            )
-            hook.bind(weight, methods)
-            if hook.owner is None and hook.keeps is None:
-                continue
-            hook.index = len(self.hooks)
-            self._install(module, hook.graph_forward if graphs else hook)
-            self.hooks.append(hook)
-        if numerics:
-            sample = weight.new_zeros((1, self.hidden))
-            for rewrite in rewrites:
-                if rewrite.memory is not None:
-                    self.remember(rewrite, sample, sample)
-        if graphs:
-            _SITES[self._requests_of.data_ptr()] = self
+
+    def _install_value(
+        self,
+        layer: int,
+        value_rows: tuple[LinearBase, int, int, int],
+        owners: dict[Place, ResidualRewrite],
+        earlier: set[EarlierInput],
+        methods: dict[tuple[str, bool], Callable[..., None]],
+        weight: Tensor,
+        *,
+        graphs: bool,
+    ) -> None:
+        """Hook a layer's value projection when a method writes or keeps its V rows."""
+        module, start, width, head_dim = value_rows
+        keeps = EarlierInput("value", layer)
+        hook = ValueProjection(
+            self,
+            module.forward,
+            layer,
+            owners.get(("value", layer)),
+            keeps if keeps in earlier else None,
+            start,
+            width,
+            head_dim,
+        )
+        hook.bind(weight, methods)
+        if hook.owner is None and hook.keeps is None:
+            return
+        hook.index = len(self.hooks)
+        self._install(module, hook.graph_forward if graphs else hook)
+        self.hooks.append(hook)
 
     @property
     def needs_step(self) -> bool:

@@ -150,9 +150,10 @@ class AttentionProgram:
             declare_tensor(
                 binding,
                 str(symbol),
+                identity,
                 inputs={"value": TensorPort(PackedSamplerRowsInputSource(), partial(self.read, source))},
                 when=When.AFTER_FORWARD,
-            )(identity)
+            )
         return result_port(TaskResultInputSource(symbol, "value"))
 
     def read(self, source: AttentionFact, data: TensorFrame, batch: TensorBatch) -> torch.Tensor:

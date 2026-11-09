@@ -59,8 +59,12 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         tuple(LayoutField(name, (2,)) for name in ("qp", "residual", "mv", "segmentation")),
         optimizer=None,
     )
-    encoded = declare_tensor(b, "encode", inputs=ports, when=When.BEFORE_FORWARD)(
-        lambda **values: values["qp"] if alias else sum(values.values())
+    encoded = declare_tensor(
+        b,
+        "encode",
+        lambda **values: values["qp"] if alias else sum(values.values()),
+        inputs=ports,
+        when=When.BEFORE_FORWARD,
     )
     inject = b.state("inject", (LayoutField("delta", (2,)),))
 
