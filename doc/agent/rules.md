@@ -39,7 +39,7 @@ change satisfies it. The messages pllm raises when a rule is broken, and their f
 | `@pllm.train` with `rows=` / `update_rows=` next to `@pllm.guide_sampling`, or with no model effect | Such training updates every running request. | Put `rows=` on the guidance method. |
 | `@pllm.custom_forward` and methods reading `pllm.hidden` / `pllm.final_hidden` | A custom forward may run a layer several times or skip it, so its MLP output has no single value. | Read `pllm.residual(layer)` or `pllm.layer_logits(...)`: they read each layer's last visited stream. |
 | `active=` in a custom forward with `tokens="prefill"` or `"all"` | Skipped prompt tokens would leave approximate K/V that every later token reads. | `tokens="decode"`. |
-| `@pllm.train_in_forward` and `pllm.model.Adapter` | Both drive the same projection hooks. | Train the adapter's state in the `@pllm.train_in_forward` method, or use two workloads (today this fails with an unrelated message, see [Known issues](pitfalls.md#known-issues)). |
+| `@pllm.train_in_forward` and `pllm.model.Adapter` | Both drive the same projection hooks. | Train the adapter's state in the `@pllm.train_in_forward` method, or use two workloads. |
 | Two `@pllm.custom_residual` methods on the same sublayer | One method owns a sublayer's residual update. | Merge them. |
 | A stateful sublayer (`@pllm.custom_residual(state=..., chunk=...)`) and `@pllm.custom_forward` | The memory advances once per token, but a custom forward visits a layer a variable number of times. | Two workloads, or `pllm.PositionState` inside the custom forward. |
 | Static KV layouts (`keep="window"` / `"none"`) and `pllm.PositionState` or `@pllm.custom_forward` | A layout splits the KV cache into several groups; these need one. | Drop one of them. |

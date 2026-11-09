@@ -39,24 +39,25 @@ OperationMode = Literal["read", "transition", "update", "gradient"]
 
 @dataclass(frozen=True, slots=True)
 class Dimensions:
-    """Global model widths for workload declarations, with input/output partitions for each target."""
+    """Global model widths for workload declarations, and the probed shape of every projection the workload's
+    adapters and @pllm.train_in_forward target."""
 
     hidden_size: int
     vocab_size: int
-    target_shapes: tuple[tuple[int, int], ...] = ()
+    targets: tuple[ProjectionShape, ...] = ()
     dtype: TensorDType = TensorDType.FLOAT32
     layer_count: int = 0
     tensor_parallel_size: int = 1
-    target_partitions: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def target_shapes(self) -> tuple[tuple[int, int], ...]:
+        """(in_features, out_features) of every targeted projection, before tensor-parallel partitioning."""
+        return tuple(target.global_shape for target in self.targets)
 
     def projections(self, targets: tuple[Projection, ...]) -> tuple[ProjectionShape, ...]:
-        """Resolve rank-local widths."""
-        return tuple(
-            ProjectionShape(target, inputs // input_parts, outputs // output_parts, input_parts, output_parts)
-            for target, (inputs, outputs), (input_parts, output_parts) in zip(
-                targets, self.target_shapes, self.target_partitions, strict=True
-            )
-        )
+        """The rank-local shapes of `targets`, one projection-delta declaration's subset of all targets."""
+        shapes = {shape.target: shape for shape in self.targets}
+        return tuple(shapes[target] for target in targets)
 
 
 Shape = tuple[int, ...] | Callable[[Dimensions], tuple[int, ...]]

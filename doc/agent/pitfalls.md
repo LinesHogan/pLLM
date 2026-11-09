@@ -90,6 +90,7 @@ weights, so run it first.
 | `... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward` | A stateful sublayer needs exactly one visit per token. | Use two workloads, or carry the memory in `pllm.PositionState` inside the custom forward. |
 | `static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)` | A layout splits the KV cache into several groups; these features need one group. | Drop the layout (`keep=`/`window=`/`source=`) or the custom forward. |
 | `declare one @pllm.train_in_forward method per workload; ... already is one` | One method drives every projection hook of a workload. | Train all targets in one method (targets is a tuple). |
+| `a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet combine with a pllm.model.Adapter; ...` | The training method owns the projection hooks the adapter would also use. | Train the adapter's state in the `@pllm.train_in_forward` method itself, or use two workloads. |
 | `... reads RequestState ..., but @pllm.custom_attention runs for every scheduled token with instance-wide inputs; ...` | Attention reads have no per-request state. | Read an `InstanceState` and select per request inside the math. |
 | `pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host` | `make_host` compiles without a model. | Use `make_llm`, or keep only `pllm.batch` training for `make_host`. |
 | `... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...` | A `@pllm.train_in_forward` method without an optimizer returns the correction added to the projection's output (`pllm.UpdateOutput(output, ...)`, or `(next_weight, output)` with `chunk=`). pllm runs every overlay method once at declaration on maximum-shape operands and checks the result there, not on every step. | Return `output` shaped `[rows, out_features]` of the target, in the input dtype or float32. |
@@ -315,10 +316,6 @@ inputs of a `@pllm.custom_residual` method are bfloat16.
 
 Current framework behaviour that is wrong or unhelpful; each has a workaround.
 
-- **`@pllm.train_in_forward` next to a `pllm.model.Adapter` fails with an unrelated message.** The combination
-  is not supported, but declaration stops earlier with `ValueError: zip() argument 2 is longer than
-  argument 1` instead of pllm's explanation. Workaround: train the adapter's state in the
-  `@pllm.train_in_forward` method itself, or use two workloads.
 - **A workload whose only effect is `@pllm.guide_sampling` cannot take `neutral=`.** With `beta=0` it
   declares no effect at all, so the neutral run fails with `the workload has no effect on the model`.
   Workaround: run `testing.check` without `neutral=` for such workloads (`beta=0` declares no sampler stage

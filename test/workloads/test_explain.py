@@ -141,6 +141,23 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
             pllm.explain(workload, replace(model_config, cuda_graphs=True))
 
 
+class _AdaptedPrefillAdapters(PrefillAdaptersWorkload):
+    """A pllm.model.Adapter beside @pllm.train_in_forward, on a projection the training does not target."""
+
+    @property
+    def extra(self) -> pllm.RequestState:
+        return pllm.RequestState({"w": pllm.Field(lambda inputs, outputs: (outputs, inputs))})
+
+    @property
+    def apply(self) -> pllm.model.Adapter:
+        return pllm.model.Adapter("extra", (pllm.model.Projection("q_proj", 1),), weight="w")
+
+
+def test_train_in_forward_beside_an_adapter_names_the_conflict(model_config):
+    with pytest.raises(ValueError, match="does not yet combine with a pllm.model.Adapter"):
+        pllm.explain(_AdaptedPrefillAdapters(chunk_size=4, rank=2), model_config)
+
+
 def test_esamp_attribution_and_budget_fallback(model_config):
     workload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
     report = pllm.explain(workload, model_config)
