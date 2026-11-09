@@ -188,7 +188,7 @@ with pllm.make_llm(slice_config, workload=ObserveResidual()) as llm:
 | 你看到的报错 | 原因与应对方式 |
 | --- | --- |
 | `choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads` | 传入了未在准入名单中的模型架构。pllm 需要与具体的 vLLM 架构对齐内部残差流与子层归一化位置，目前请选择列表中的模型架构。 |
-| `choose a native vLLM model class; workload admission does not accept model subclasses` | 传入了原生类的派生子类。派生子类可能改变投影布局或 logits 计算，pllm 拒绝子类准入；请使用原生模型类。 |
+| `pllm runs vLLM's own model classes, not subclasses of them` | 传入了原生类的派生子类。派生子类可能改变投影布局或 logits 计算，pllm 拒绝子类准入；请使用原生模型类。 |
 | `... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model` | 试图在只读模型（如 DeepSeek V2/V3 或 gpt-oss）上运行 LoRA 权重改写、整模型因果训练或 forward 重放。这些模型采用压缩的潜在 KV（MLA）或多专家稀疏路由，缺乏单一稠密投影矩阵；请将负载限制在只读观测、ESamp、激活补丁或采样引导阶段。 |
 | `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model` | 在 Qwen3.5 混合模型上使用了 `@pllm.custom_forward` 或 `@pllm.custom_attention`。Gated DeltaNet 层的循环隐藏状态独立于分页 KV 缓存，无法从 KV 中重算历史状态；重放 forward 或自定义 attention 请使用全注意力稠密模型或 Qwen3-MoE。 |
 | `layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead` | 试图在 MoE 模型的专家层上挂载 LoRA 改写。每个 token 被动态路由到不同专家，不存在单一稠密的 MLP 矩阵；请将参数改写挂载到注意力的 query 或 value 投影上。 |
