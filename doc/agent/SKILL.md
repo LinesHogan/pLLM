@@ -87,7 +87,7 @@ CONFIG = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8)
 
 Everything else is your tensor math on row tensors: dimension 0 holds one row per request (or per sampled
 token), packed in an order you do not control, so compute along `dim=-1`. Inputs are read-only. A kernel of
-your own enters that math as a `torch.library.custom_op` with a `register_fake` (tutorial 09); call the op
+your own enters that math as a `torch.library.custom_op` with a `register_fake` (example 09); call the op
 object, not `torch.ops.<namespace>`. Method code may use only `torch`, `math`, `pllm`, `triton`, `typing`,
 `collections.abc`, builtins and your own module-level classes and functions ([rules.md](rules.md) says why).
 
