@@ -27,7 +27,6 @@ from pllm.contracts.semantic_graph import (
     SemanticOutputKind,
     SemanticTask,
     StateEffectKind,
-    StateScope,
     StateSelectionInputSource,
     StepIdInputSource,
     TaskResourceFact,
@@ -244,15 +243,6 @@ def _check_training(attachment: BackendAttachment) -> None:
     if not graph.trains_on_batch and not attachment.probe.hidden_resources:
         raise ValueError("train and sampler operations need a hidden input, e.g. `h: torch.Tensor = pllm.hidden(0)`")
     adds_logits = any(sampler.stage is SamplerStage.PACKED_PRE_FILTER_ADD for sampler in spec.sampler)
-    scopes = {state.resource: state.scope for state in graph.states}
-    tasks = {task.symbol: task for task in graph.tasks}
-    for symbol in spec.training:
-        trained = next(effect.resource for effect in tasks[symbol].effects if effect.kind is not StateEffectKind.READ)
-        if not graph.trains_on_batch and scopes[trained] is not StateScope.REQUEST and not adds_logits:
-            raise ValueError(
-                f"declare the trained state {trained!r} as pllm.RequestState; only workloads with "
-                "@pllm.add_logits train an InstanceState"
-            )
     # Planning already places every feedback reader after the draw; what remains is who may read it.
     remaining = set(spec.training)
     for scheduled in attachment.plan.schedule.tasks:

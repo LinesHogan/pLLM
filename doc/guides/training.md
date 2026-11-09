@@ -108,7 +108,7 @@ head = pllm.RequestState(
 
 - **原因**：优化器的一阶动量、二阶动量以及步数计时器在生命周期上严格隶属于状态本身。对于 `pllm.RequestState`，当请求结束退出时，其参数与优化器内部的动量槽位会一同被显存池释放回收；对于跨请求共享的 `pllm.InstanceState`，优化器动量则在引擎整个生命周期内全局保持。
 - **匹配规则**：在运行中的请求行上训练时（不包含宿主批次字段），状态必须声明 `optimizer=pllm.AdamW(lr)`。若未声明优化器或声明类型不匹配，在负载构建期就会报错提示。
-- **训练哪种状态**：请求行训练通常训练 `pllm.RequestState`（每个请求一份）。要在请求行上训练所有请求共享的 `pllm.InstanceState`（像 `pllm.workloads.OverRIDEWorkload` 那样），负载里需要有一个 `@pllm.add_logits`，否则构建时报错要求改成 `RequestState`。
+- **训练哪种状态**：请求行训练通常训练 `pllm.RequestState`（每个请求一份）。也可以在请求行上训练所有请求共享的 `pllm.InstanceState`（像 `pllm.workloads.OverRIDEWorkload` 那样）：每步所有请求的行一起给这一份状态做一次更新，所以一个请求的结果会受同批其他请求影响。
 
 ### 引擎步进与分块依赖
 
