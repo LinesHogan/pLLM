@@ -262,7 +262,7 @@ rule as `replay rejection`, `testing.check` SKIPs `preempted` with that reason, 
 | use request-owned keys containing request_id and remove mutable instance state | Shared or mutable state may have moved on since the request started. |
 | remove external feeds, imports and host inputs from the request state computation | Imported values and host batches are not stored for replay. |
 | remove sampler feedback dependencies | Replay does not redraw tokens. |
-| remove reads of step ids and PTTS versions or slot indices | Step ids, `pllm.version` and `pllm.index` differ between the first run and the replay. |
+| remove reads of pllm.version and pllm.index | A state's version and pool slot differ between the first run and the replay. |
 | use over="token" in @pllm.custom_forward instead of over="span" | Span programs depend on how the prompt was chunked. |
 | use visibility="exact" with zero publish lag and no cross-step dependencies | Lagged reads depend on step timing, which replay does not reproduce. |
 

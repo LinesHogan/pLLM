@@ -690,7 +690,7 @@ fn recompute_rejection(graph: &SemanticGraph, planned: &[PhysicalTask]) -> Optio
                     return Some("remove sampler feedback dependencies")
                 }
                 InputSource::StepId | InputSource::StateSelection { metadata: true, .. } => {
-                    return Some("remove reads of step ids and PTTS versions or slot indices");
+                    return Some("remove reads of pllm.version and pllm.index");
                 }
                 _ => {}
             }
