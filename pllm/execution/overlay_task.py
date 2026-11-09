@@ -140,57 +140,38 @@ class ChunkUpdate:
         )
         return chunk_readout(self.step, tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples))
 
-    def contiguous(self, values: Tensors, offset: int) -> UpdateOutput:
+    def contiguous(self, values: Tensors, plan: PreparedScan, offset: int) -> UpdateOutput:
         """Use the scheduler's contiguous token frontier without reading a device counter.
 
-        Incomplete chunks evaluate only their readout. Full chunks retain the
-        authored operation order, including GEMM shapes and rounding.
+        Complete chunks run the authored step in order, keeping its GEMM shapes and rounding. The incomplete
+        tail only evaluates its readout, so a carry that no chunk completes is never written.
         """
         carry, *columns = self.arguments
-        rows = tuple(values[name] for name in columns)
-        tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
-        length = values["_pending_length"]
         pending = offset % self.chunk
-        total = pending + len(rows[0])
-        invariants = tuple(values[name] for name in self.invariants)
+        total = pending + len(values[columns[0]])
+        full = total // self.chunk * self.chunk
         readout = self.readout(values)
-        if readout is None:
+        # A selected (non-serial) scan is specialized for a device-counted capacity shape.
+        if readout is None or (full and plan.analysis is not None):
             return self(**values)
-        trained = total // self.chunk * self.chunk
-        state = values[carry]
+        tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
+        rows = tuple(
+            torch.cat((tail[:pending], values[name])) if pending else values[name]
+            for tail, name in zip(tails, columns, strict=True)
+        )
+        invariants = tuple(values[name] for name in self.invariants)
         outputs: list[torch.Tensor] = []
-        start = 0
-        while start < len(rows[0]):
-            count = min(self.chunk - pending, len(rows[0]) - start)
-            complete = pending + count == self.chunk
-            if pending == 0 and complete:
-                operands = tuple(value[start : start + count].contiguous() for value in rows)
-            else:
-                for tail, row in zip(tails, rows, strict=True):
-                    tail[pending : pending + count].copy_(row[start : start + count])
-                operands = tails
-            if complete:
-                state, output = self.step(state, *operands, *invariants)
-            else:
-                output = readout(state, *operands, *invariants)
-            output = output[pending : pending + count]
-            outputs.append(output.clone() if operands is tails and complete else output)
-            if operands is tails and complete:
-                for tail in tails:
-                    tail.zero_()
-            pending = (pending + count) % self.chunk
-            start += count
-        if trained:
-            values[carry].copy_(state)
-        trained_rows = length.new_full((), trained)
-        remaining = length.new_full((), pending)
-        length.copy_(remaining)
+        if full:
+            updated, scanned = execute_scan(plan, values[carry], tuple(row[:full] for row in rows), invariants, None)
+            values[carry].copy_(updated)
+            outputs.extend(scanned)
+        length = values["_pending_length"]
+        trained = length.new_full((), full)
+        remaining = save_tail(tails, rows, length, length.new_full((), total), trained)
+        if total > full:
+            outputs.append(readout(values[carry], *tails, *invariants)[: total - full])
         return UpdateOutput(
-            torch.cat(outputs),
-            length.new_full((), trained > 0, dtype=torch.bool),
-            length.new_full((), trained // self.chunk),
-            trained_rows,
-            {"tail_rows": remaining},
+            torch.cat(outputs)[pending:], trained > 0, trained // self.chunk, trained, {"tail_rows": remaining}
         )
 
 
@@ -251,10 +232,6 @@ class GradientUpdate:
 
     def prepare(self, values: Tensors) -> None:
         """Autograd has no scan selection."""
-
-    def counted(self, plan: None, count: torch.Tensor, values: Tensors) -> UpdateOutput:
-        """Execute the already mapped derivative over a tile."""
-        return self.advance(values, count, batched=True)
 
     def rows(
         self, values: Tensors, count: torch.Tensor, offset: torch.Tensor, start: int
@@ -555,8 +532,7 @@ class OverlayTransition:
         offset = self.chunk_offset(row, len(operand.hidden)) if row.phase is operand.phase else None
         if offset is not None and plan is not None:
             assert isinstance(self.chunk, ChunkUpdate)
-            if plan.analysis is None or offset % self.chunk.chunk + len(operand.hidden) < self.chunk.chunk:
-                return self.chunk.contiguous(self.inputs(operand, values), offset)
+            return self.chunk.contiguous(self.inputs(operand, values), plan, offset)
         return self.result(operand, values)
 
     def chunk_offset(self, row: PackedPhaseRow, count: int) -> int | None:

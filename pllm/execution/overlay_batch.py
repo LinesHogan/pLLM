@@ -224,12 +224,12 @@ class OverlayTile:
             values["_pending_length"].masked_fill_(self.table[width] < 0, 0)
         chunk = self.math.chunk
         if self.train and isinstance(chunk, GradientUpdate):
-            result = chunk.counted(
-                None,
-                self.table[-1],
+            result = chunk.advance(
                 self.math.bind(
                     {**values, **self.invariants}, self.hidden, self.desired, self.embedding, base, self.prompt_end
                 ),
+                self.table[-1],
+                batched=True,
             )
             fields, output, changed, updates, trained = (
                 values,
