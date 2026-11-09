@@ -238,6 +238,9 @@ inside a method body reads `self.beta` normally.
   inductor-fused ones; compare against a matching vanilla engine (`check_on_gpu` builds one).
 - **`pllm.Field` shapes receive projection widths only for Adapter states.** For other states the callable
   gets `(hidden_size, hidden_size)`; `lambda width, _: (width,)` is the usual hidden-width vector.
+- **`pllm.ModelCheckpoint` takes its tensors away from the model.** vLLM skips every listed tensor when it
+  loads the weights, so the model runs without them and nothing reports it. List only tensors the model
+  does not use itself; never list one it needs, such as `model.embed_tokens.weight` or a layer's weights.
 - **Instance state read by an Adapter makes the forward eager.** `diagnostics().eager_reason` reports
   `CUDA-graph overlays do not support adapters backed by shared InstanceState`; per-request adapter state
   stays in CUDA graphs.

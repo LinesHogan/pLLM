@@ -164,7 +164,7 @@ from the same values):
 | `pllm.Zeros()` | Every field at zero (the default). |
 | `pllm.Computed(function)` | `function(fields, generator)` fills the named field tensors in place, once, with a seeded generator. |
 | `pllm.Pretrained(path, placement="device")` | Tensors named like the fields from a safetensors file; the file's hash joins the workload's identity. `placement="host"` keeps a read-only table that methods only gather rows from in pinned host memory; `"device"` never falls back to host. |
-| `pllm.ModelCheckpoint({field: tensor_name})` | The served model's checkpoint tensors (with `layers=(...)` the names may contain `{layer}`); `InstanceState` without optimizer, read-only. |
+| `pllm.ModelCheckpoint({field: tensor_name})` | The served model's checkpoint tensors (with `layers=(...)` the names may contain `{layer}`); `InstanceState` without optimizer, read-only. vLLM skips the listed tensors when it loads the model, so list only tensors the model class does not use (e.g. In-Place TTT's `ttt_conv` and `ttt_proj`), never one it needs such as `model.embed_tokens.weight`. |
 | `pllm.FromModule(factory, pretrained="")` | The parameters of `factory(dimensions)`, an `nn.Module`, as the state's one field, initialized as the module does or from a state_dict file. |
 | `pllm.Fed("ordered" or "latest")` | Published by a producer process through `llm.feed(state)`; one per workload. |
 | `pllm.Imported()` | Passed to `generate(batch=pllm.io.StateImport(...))`. |
@@ -228,7 +228,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
 | `@pllm.train(*, state, reduction="mean", rows="", update_rows="", steps=1, reset="")` | Minimize the returned loss with the optimizer declared on `state`; the framework masks padding, reduces, backpropagates, applies the optimizer and publishes the new version. Request-row training returns a `[rows]` loss. The default `reduction="mean"` averages each state's selected rows in this step; `"sum"` sums them. Host-batch training returns one scalar and owns its reduction; remove non-default `reduction=`. |
 | `pllm.AdamW(lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0)` | The optimizer for training on request rows and on `WeightedRowBatch` / `CausalTrainBatch` host batches. Declared on the state: `optimizer=pllm.AdamW(1e-3)`. |
 | `pllm.SGD(lr)` | The optimizer for `WeightedCEBatch` training (`steps=`, `reset=`) and for `@pllm.train_in_forward`. |
-| `@pllm.differentiate(*, inputs=(), parameters=False, input_rows="", parameter_rows="")` | Keep gradient edges through a non-loss method: `inputs` names its arguments whose gradients flow, `parameters=True` lets its parameters train too. A training method reads its result with `pllm.result(name)`. |
+| `@pllm.differentiate(*, inputs=(), parameters=False, input_rows="", parameter_rows="")` | Keep gradient edges through a non-loss method: `inputs` names its arguments whose gradients flow, `parameters=True` lets its parameters train too. A training method reads its result with `pllm.result(name)` and keeps the edge with its own `@pllm.differentiate(inputs=(...))`; without `@pllm.on` the method runs in the phase of the method that reads it. |
 | `pllm.result(operation)` | The value another method of this workload returned in the same step. |
 | `pllm.UpdateOutput(output, changed, update_count, trained_rows, metrics={})` | An optional richer return of a training method: the loss plus 0-d device counters (no host sync). |
 | `pllm.carry(source, *, state, field)` | Wrap an input marker of a training method: when the update publishes, the input's value is also written to `state`'s `carry=` field (per request the last selected row wins). |
@@ -721,7 +721,7 @@ For unit tests of your own math without a model, compile against stand-in facts 
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.testing.backend_facts(hidden_size, hidden=(), ..., *, max_lineages=2, memory_bytes=10000, max_rows=None, dtype=..., vocab_size=0, layer_count=0, targets=())` | Facts of an eager in-process model in place of what the vLLM runner probes. |
+| `pllm.testing.backend_facts(hidden_size, hidden=(), *, device="cpu", capabilities=..., pages=16, max_lineages=2, memory_bytes=10000, max_rows=None, dtype=torch.float32, vocab_size=0, layer_count=0, targets={})` | Facts of an eager in-process model in place of what the vLLM runner probes. `hidden` lists the taps the workload reads (`hidden_binding`); `device` holds the state pages, `pages` versions per state; `capabilities` defaults to everything a CPU simulation runs; `max_rows` defaults to `2 * max_lineages`; `targets` maps each `pllm.model.Projection` an overlay targets to its `(in_features, out_features)`; `vocab_size` and `layer_count` are needed by workloads that read logits or layers. |
 | `pllm.testing.hidden_binding(layer, layer_count)` | The tap `pllm.hidden(layer)` reads, for `backend_facts(hidden=...)` and `step_input(hidden=...)`. |
 | `pllm.testing.final_hidden_binding(layer_count)` | The tap `pllm.final_hidden()` reads. |
 | `pllm.testing.compile_execution(workload, facts, stream=None)` | Compile `workload` and admit its instance state; admit requests with `execution.admit(identities)`. |
