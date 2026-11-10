@@ -6,7 +6,7 @@
 
 要知道一个负载会不会退回 eager 模式、要占多少显存，最直接的办法是真正启动引擎：加载权重、分配 KV cache、捕获 CUDA graph，然后看 `llm.diagnostics().eager_reason` 或者等报错。
 
-`pllm.explain` 用同一套声明、同一套准入规则和规划器，在 CPU 上把计划算出来给你看。它只读取模型配置（`config.json`）并在 CPU 上追踪张量形状，不加载模型权重，不初始化 CUDA，也不分配 GPU 显存。以教程 03 的 `MiniESamp` 为例，在 CPU 上首次调用耗时 2.9 s（包含读取配置），同一进程里第二次调用不到 0.1 s。
+`pllm.explain` 用同一套声明、同一套准入规则和规划器，在 CPU 上把计划算出来给你看。它只读取模型配置（`config.json`）并在 CPU 上追踪张量形状，不加载模型权重，不初始化 CUDA，也不分配 GPU 显存。以教程 03 的 `MiniESamp` 和 7B 的配置为例，在本机 CPU 上首次调用约 0.2 s（包含读取配置，不含 `import pllm`），同一进程里第二次调用约 0.1 s。
 
 ## 一个能进 CUDA graph 的负载：教程 03 的 MiniESamp
 
@@ -57,7 +57,7 @@ class MiniESamp(pllm.Workload):
     def predict(self, shallow: torch.Tensor = pllm.hidden(0), f: Distiller = pllm.module("distiller")) -> torch.Tensor:
         return f(shallow)
 
-config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_model_len=512, max_num_seqs=128,
+config = pllm.ModelConfig("Qwen/Qwen2.5-7B-Instruct", max_model_len=512, max_num_seqs=128,
                           max_num_batched_tokens=8192)
 print(pllm.explain(MiniESamp(beta=0.5), config))
 ```
@@ -65,26 +65,26 @@ print(pllm.explain(MiniESamp(beta=0.5), config))
 输出如下（节选，省略了 `kernels`、`note` 行和几行 `timing` 细节）：
 
 ```text
-model    Qwen2ForCausalLM, hidden 896, 24 layers, vocab 151936, bfloat16 [exact, config.json]
+model    Qwen2ForCausalLM, hidden 3584, 28 layers, vocab 152064, bfloat16 [exact, config.json]
 parallel tensor_parallel_size=1; reservations are per rank
 forward  CUDA graphs: no effect needs eager
-base     987922432 FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]
+base     14140571648 FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]
 member  effect  anchor / lane / graph  state reads (origin, distance)
 loss  train  token.commit / side / captured  distiller (latest, 0); one AdamW step per state per engine step; prompt rows train once per prefill chunk
-  CUDA-graph pool reservation: 101384192 bytes [workload estimate or cuda_graph_pool_budget_bytes]
-  estimate / step (128 rows): 4587520 matmul FLOP + 0 projection FLOP; state read/write 14680576/14680576 bytes, optimizer 29361152 bytes (included), sampler 0 bytes
+  CUDA-graph pool reservation: 240746496 bytes [workload estimate or cuda_graph_pool_budget_bytes]
+  estimate / step (128 rows): 18350080 matmul FLOP + 0 projection FLOP; state read/write 58720768/58720768 bytes, optimizer 117441536 bytes (included), sampler 0 bytes
 predict  guide_sampling  model.execute / main / captured  distiller (boundary, 1)
   CUDA-graph pool reservation: 2138112 bytes [workload estimate or cuda_graph_pool_budget_bytes]
   estimate / step (128 rows): 0 matmul FLOP + 0 projection FLOP; state read/write 0/0 bytes, optimizer 0 bytes (included), sampler 0 bytes
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
-  CUDA-graph pool reservation: 52146176 bytes [workload estimate or cuda_graph_pool_budget_bytes]
-  estimate / step (128 rows): 1835008 matmul FLOP + 939524096 projection FLOP; state read/write 3670016/0 bytes, optimizer 0 bytes (included), sampler 1261406208 bytes
-tap      model.layers.0[0], decode: 460800 bytes shared by loss, predict
-tap      model.layers.23[0], decode: 460800 bytes shared by loss
+  CUDA-graph pool reservation: 98889728 bytes [workload estimate or cuda_graph_pool_budget_bytes]
+  estimate / step (128 rows): 7340032 matmul FLOP + 3758096384 projection FLOP; state read/write 14680064/0 bytes, optimizer 0 bytes (included), sampler 4080928768 bytes
+tap      model.layers.0[0], decode: 1837056 bytes shared by loss, predict
+tap      model.layers.27[0], decode: 1837056 bytes shared by loss
 state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  514  114704  58957916  field 0: float32, field 1: float32, field 2: float32, field 3: float32, field 4: float32; source: module init; placement: device; host bytes: 0; logical transfer bytes/row: 0; decode bytes/step: 0
-memory   peak 964919904 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
-         below 964919904 bytes tasks run inline; below 919036000 bytes planning fails
+distiller  request  514  458768  235806812  field 0: float32, field 1: float32, field 2: float32, field 3: float32, field 4: float32; source: module init; placement: device; host bytes: 0; logical transfer bytes/row: 0; decode bytes/step: 0
+memory   peak 1463980640 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
+         below 1463980640 bytes tasks run inline; below 1301602400 bytes planning fails
 preempt  state keep; replay rejection: not applicable to kept state
 host     0 syncs in traced workload math
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
@@ -101,9 +101,9 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
   - `state reads (origin, distance)`：读哪份状态、读到的版本离最新差几步。`loss` 读最新的（距离 0），`predict` 读的版本落后 1（这就是教程 03 里说的“第 N 步的更新在第 N+2 步被读到”带来的重叠）。所以对 `MiniESamp` 来说，`loss` 训练在旁路 stream、进 graph；`predict` 在主 stream、进 graph。
   - `CUDA-graph pool reservation`：为这段计算捕获 CUDA graph 要预留的私有显存池；这部分显存要从 KV cache 那里分走，所以列出来。
   - `estimate / step`：这段计算每步（按 `max_num_seqs` 行算）的 FLOP、状态读写字节和采样器字节估计。`predict` 的 `projection FLOP` 与 `sampler` 字节来自用 LM head 投影预测并引导采样。
-- **`tap`**：从模型里取出的 hidden（第 0 层、第 23 层）和预留的缓冲大小（各 460800 字节）；第 0 层的那份由 `loss` 和 `predict` 共用。
-- **`state`**：`distiller` 是请求级状态，预留 514 份（`roots`），每份 114704 字节，共 58957916 字节（约 56 MiB）；`[exact]` 表示这是精确值。514 是为 128 个并发请求和在途的版本预留的份数——比并发数多，因为训练中的新版本和正在被读的旧版本要同时存在。
-- **`memory`**：由 `execution_peak_budget_bytes` 约束的 pLLM 执行峰值（含状态页、任务工作区与结果、图池和 anchor 预留），为 964919904 字节（约 920 MiB）。第二行说明：预算低于 964919904 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 919036000 字节时规划失败。
+- **`tap`**：从模型里取出的 hidden（第 0 层、第 27 层）和预留的缓冲大小（各 1837056 字节）；第 0 层的那份由 `loss` 和 `predict` 共用。
+- **`state`**：`distiller` 是请求级状态，预留 514 份（`roots`），每份 458768 字节，共 235806812 字节（约 225 MiB）；`[exact]` 表示这是精确值。514 是为 128 个并发请求和在途的版本预留的份数——比并发数多，因为训练中的新版本和正在被读的旧版本要同时存在。
+- **`memory`**：由 `execution_peak_budget_bytes` 约束的 pLLM 执行峰值（含状态页、任务工作区与结果、图池和 anchor 预留），为 1463980640 字节（约 1396 MiB）。第二行说明：预算低于 1463980640 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 1301602400 字节时规划失败。
 - **`host`**：负载的张量数学里没有 GPU 到 CPU 的同步（`0 syncs`）。
 - **`timing`**：时机设置及其后果；`(default)` 表示你没改过默认值。
 - **`note`**：这份报告不知道的事（见下文的限制说明）。
@@ -126,16 +126,16 @@ print(pllm.explain(SharedLoRA(), config))
 输出的前几行如下（`timing` 与 `note` 行与上面相同）：
 
 ```text
-model    Qwen2ForCausalLM, hidden 896, 24 layers, vocab 151936, bfloat16 [exact, config.json]
+model    Qwen2ForCausalLM, hidden 3584, 28 layers, vocab 152064, bfloat16 [exact, config.json]
 parallel tensor_parallel_size=1; reservations are per rank
 forward  eager: CUDA-graph overlays do not support adapters backed by shared InstanceState
-base     987922432 FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]
+base     14140571648 FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]
 member  effect  anchor / lane / graph  state reads (origin, distance)
 apply  Adapter  model site or inactive method
   forward eager because apply: CUDA-graph overlays do not support adapters backed by shared InstanceState
 state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-lora  instance  6  22528  135224  field 0: bfloat16, ...
-preempt  state reset; replay rejection: use request-owned keys containing request_id and remove mutable instance state
+lora  instance  6  90112  540728  field 0: bfloat16, ...
+preempt  state keep; replay rejection: not applicable to kept state
 host     0 syncs in traced workload math
 ```
 
@@ -158,7 +158,7 @@ host     0 syncs in traced workload math
 如果你给负载设了显存预算，想知道当前配置能不能装下、装不下该调哪个参数，可以直接查看报告的 `budget_errors`：
 
 ```python
-small = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_model_len=512, max_num_seqs=128,
+small = pllm.ModelConfig("Qwen/Qwen2.5-7B-Instruct", max_model_len=512, max_num_seqs=128,
                          max_num_batched_tokens=8192,
                          execution=pllm.ExecutionOptions(execution_peak_budget_bytes=64 << 20))
 print(pllm.explain(MiniESamp(beta=0.5), small).budget_errors)
@@ -167,7 +167,7 @@ print(pllm.explain(MiniESamp(beta=0.5), small).budget_errors)
 输出如下：
 
 ```text
-('pLLM execution needs 919036000 bytes at its peak but only 67108864 fit; lower max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; reduce device tables or explicitly declare placement="host" for read-only lookup tables',)
+('pLLM execution needs 1301602400 bytes at its peak but only 67108864 fit; lower max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; reduce device tables or explicitly declare placement="host" for read-only lookup tables',)
 ```
 
 `budget_errors` 为空表示声明的预算装得下；不为空时，报告仍会给出不带这个限制的计划，并附上和 `make_llm` 相同的报错信息。如果是其他准入错误（例如不支持的组合），`pllm.explain` 会直接抛出异常，报错信息与创建引擎时相同。
@@ -195,4 +195,4 @@ print(report.eager_reason == "", [state.reserved_bytes for state in report.state
 print(len(json.dumps(asdict(report))) > 0)
 ```
 
-输出为 `True [58957916]` 和 `True`。
+输出为 `True [235806812]` 和 `True`。

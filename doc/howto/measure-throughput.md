@@ -202,7 +202,13 @@ python -m tools.benchmark_esamp --batch 8 --tokens 256 --rounds 3
 
 # 运行 Output LoRA 基准，测试每请求私有状态
 python -m tools.benchmark_lora --batch 8 --tokens 256 --rounds 3 --scope request
+
+# 在 24 GiB 的卡上测 7B：显存比例和两个预算都要调大，默认值是按 0.5B 定的
+python -m tools.benchmark_esamp --model Qwen/Qwen2.5-7B-Instruct --gpu-memory-utilization 0.85 \
+    --cuda-graph-pool-budget-mib 512 --state-page-budget-mib 1024
 ```
+
+默认的 256 MiB 捕获池和状态页预算放不下 7B 上的 ESamp（128 并发时训练图约需 306 MiB，状态页约 394 MiB）；不够时脚本会报错并给出需要的字节数。
 
 ### 公共命令行参数一览
 

@@ -123,14 +123,14 @@ print(repr(pllm.explain(FastWeightMemory(), CONFIG).eager_reason))
 如果某次调度步中某请求剩下的 token 未凑满 16 行，未完成的行由框架暂存，待后续步骤凑满整块后再触发状态更新。这样设计的原因在于：vLLM 的连续批处理调度器可能会将长 prompt 任意切块（Chunked Prefill），通过将更新严格锚定在固定块长边界上，保证了**生成结果完全不依赖调度器如何分步切分 prompt**。
 
 ### 运行开销与限制
-- **开销**：改写逻辑直接录入 CUDA graph，避免了逐步 Python 同步开销。吞吐下降仅来自于算法多出的张量算术。在 RTX 4090 上对 Qwen2.5-0.5B 实测（详见 [07 改写残差连接](../examples/07_custom_residual.ipynb)）：
-  - Value Residual（改写 23 层 value）：吞吐为原生 CUDA graph 的 **92%**。
-  - 超连接（$n=4$，改写 48 个子层）：吞吐为原生 CUDA graph 的 **74%**。
-  - 带状态记忆子层（每 token 读写 `[hidden, hidden]` 矩阵）：吞吐为原生 CUDA graph 的 **60%**。
+- **开销**：改写逻辑直接录入 CUDA graph，避免了逐步 Python 同步开销。吞吐下降仅来自于算法多出的张量算术。在 RTX 4090 上对 Qwen2.5-7B 实测（vLLM 0.32.0，256 token，预热 1 轮后 3 轮中位数；详见 [07 改写残差连接](../examples/07_custom_residual.ipynb)）：
+  - Value Residual（改写 27 层 value，32 个并发请求）：吞吐为原生 CUDA graph 的 **99%**。
+  - 超连接（$n=4$，改写 56 个子层，32 个并发请求）：吞吐为原生 CUDA graph 的 **93%**。
+  - 带状态记忆子层（每 token 读写 `[hidden, hidden]` 的 FP32 矩阵，7B 上每个请求约 49 MiB，所以只开 8 个并发请求）：吞吐为同样 8 个并发请求的原生 CUDA graph 的 **75%**。
 - **限制与原因**：
   - `tensor_parallel_size=1`：残差改写算子在单卡层前向图内执行，暂不支持跨多卡的残差张量与状态同步。
   - 关闭前缀缓存（`enable_prefix_caching=False`）：前缀缓存假定 prompt 前缀的 KV 恒定不变；残差改写或带状态更新会导致同一前缀产生不同的激活或跨 token 状态积累，使前缀缓存失效。
-  - 带状态记忆子层需要调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`：为每个请求分配的私有状态显存与 chunk 历史缓冲会超出默认 64 MiB 的图捕获预算，建议配置为 `1 << 30`（1 GiB）；若预算不足，引擎启动时会明确报错并给出所需字节数。
+  - 带状态记忆子层需要调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`：为每个请求分配的私有状态显存与 chunk 历史缓冲会超出默认 64 MiB 的图捕获预算，7B、8 个并发请求时约需 1.9 GiB；若预算不足，引擎启动时会明确报错并给出所需字节数。
   - 带状态记忆子层**不能**与 `@pllm.custom_forward` 组合：状态子层的记忆按 token 严格推进，而自定义前向可能在同一 token 内多次循环或跳过某层，导致步进时机未定义。
 
 ---
@@ -215,8 +215,8 @@ True
 
 ### 运行开销与限制
 - **开销**：
-  - 静态布局能实质减少物理显存占用。在 Qwen2.5-0.5B（上下文 2048 token）实测中，单请求 KV 显存上限从全量的 **24.0 MiB** 降至偶数层窗口 256 的 **16.6 MiB**，跨层共享则降至 **12.0 MiB**，并发容量翻倍。
-  - 同一个示例在 RTX 4090 上测得：原样读取的 `NativeRead` 吞吐为原生 vLLM 的 **98%**；偶数层窗口 `LocalGlobal` 为 **97%**，跨层共享 `CrossLayerShared` 为 **96%**（窗口层走 vLLM 的 FlashInfer 窗口内核，见[性能与显存](../explain/performance.md)）。纯 PyTorch 实现的 Top-K 动态打分（如未写成专用内核的 Quest）吞吐仅为原生的 **7%**，生产环境加速需使用融合算子（详见[自写算子](custom-ops.md)与 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb)）。
+  - 静态布局能实质减少物理显存占用。在 Qwen2.5-7B（上下文 2048 token）上，`explain` 算出的单请求 KV 显存上限从全量的 **112.0 MiB** 降至偶数层窗口 256 的 **70.4 MiB**，跨层共享则降至 **56.0 MiB**，并发容量翻倍。
+  - 同一个示例在 RTX 4090、7B、128 并发下测得：原样读取的 `NativeRead` 吞吐为原生 vLLM 的 **99%**；偶数层窗口 `LocalGlobal` 为 **100%**，跨层共享 `CrossLayerShared` 为 **98%**（窗口层走 vLLM 的 FlashInfer 窗口内核，见[性能与显存](../explain/performance.md)）。纯 PyTorch 实现的 Top-K 动态打分（如未写成专用内核的 Quest）吞吐仅为原生的 **14%**，生产环境加速需使用融合算子（详见[自写算子](custom-ops.md)与 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb)）。
 - **限制与原因**：
   - `tensor_parallel_size=1`：自定义 FlashAttention 读法与分页 KV 布局尚未实现跨 TP rank 的注意力头切分与通信同步。
   - 引擎需使用 FlashAttention 2 后端：pLLM 从 FA2 的元数据里取页表和序列长度来组织每一种读法；其中普通的窗口读取再交给 vLLM 自带的 FlashInfer 内核执行，因为 FA2 的窗口路径会关掉 GQA 打包（见[性能与显存](../explain/performance.md)）。
@@ -328,9 +328,9 @@ True
 ### 运行开销、限制与组合
 - **运行开销**：
   使用 `@pllm.custom_forward` 时，vLLM 原生的大模型整图不再生效，`eager_reason` 会明确标明 `@pllm.custom_forward`。**但这绝不意味着模型退回了逐算子 eager 运行**：pLLM 为每次调用的层分段分别捕获了独立的分段 CUDA graph。
-  在 [12 自适应深度](../examples/12_adaptive_depth.ipynb) 实测中，一个无跳层、分段调用的 `custom_forward` 吞吐达到了原生 vLLM CUDA graph 的 **93%**（远高于原生 eager 模式的 41%）。
+  在 [12 自适应深度](../examples/12_adaptive_depth.ipynb) 的实测中（RTX 4090，Qwen2.5-7B，32 个并发请求，256 token，vLLM 0.32.0），一个无跳层、分段调用的 `custom_forward` 吞吐为原生 vLLM CUDA graph 的 **99%**。这个设置下原生 eager 也有 99%（7B 一步约 19 ms，发射开销藏得住）；步长只有几毫秒的小模型上，分段图和 eager 的差别才明显。
 - **显存与硬件限制**：
-  - 分段图捕获需要更大的池空间，建议在配置中指定较大的捕获预算（例如 `ExecutionOptions(cuda_graph_pool_budget_bytes=4 << 30)` 即 4 GiB）；若预算不足，生成时会直接报错并指明所需的精确字节数。
+  - 分段图捕获需要自己的池空间，可能超过默认的 64 MiB 模型图预算（示例 12 的负载在 7B、32 个并发请求下要 143 MiB 左右），需要时在配置中调大捕获预算（例如 `ExecutionOptions(cuda_graph_pool_budget_bytes=128 << 20)`；这份预算会计入 `explain` 报的 pLLM 显存峰值，所以按报错给出的字节数留一点余量即可，不必给到几 GiB）；若预算不足，生成时会直接报错并指明所需的精确字节数。
   - 多卡张量并行要求使用 vLLM 0.32.0 与 `runner="mrv2"`。
 - **与状态读取器（`pllm.hidden`）互斥**：
   在同一个负载中，挂了 `@pllm.custom_forward` 后**不能**再声明读取 `pllm.hidden(layer)` 或 `pllm.final_hidden()`。

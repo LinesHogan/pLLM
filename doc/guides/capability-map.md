@@ -29,9 +29,9 @@
 |---|---|---|---|
 | 注意力统计 / 监控（落在最近位置上的注意力占比） | `@pllm.custom_attention` 返回 aux，`pllm.attention(layer, "aux")` 导出；输出与原生 vLLM 逐位相同 | 能写 | [10](../examples/10_custom_attention.ipynb) |
 | Lookback Lens 式（落在 prompt 上的注意力占比） | 需要知道每行的 prompt 长度；`PagedKV` 只在 `sink=True` 的布局下提供它（`kv.sink_lens`） | 部分 | — |
-| 训练无关的稀疏读取（Quest 按页挑选、retrieval heads 一类的固定模式） | `kv.attend(q, topk=...)`，每层、每个头可以有不同预算；省读不省显存；用 PyTorch 打分时吞吐很低（示例 10 实测 7%），提速要自定义 kernel | 能写 | [10](../examples/10_custom_attention.ipynb)、[09](../examples/09_custom_kernels.ipynb) |
+| 训练无关的稀疏读取（Quest 按页挑选、retrieval heads 一类的固定模式） | `kv.attend(q, topk=...)`，每层、每个头可以有不同预算；省读不省显存；用 PyTorch 打分时吞吐很低（示例 10 在 7B 上实测为原生的 14%），提速要自定义 kernel | 能写 | [10](../examples/10_custom_attention.ipynb)、[09](../examples/09_custom_kernels.ipynb) |
 | 按分数驱逐 KV（H2O、SnapKV、PyramidKV） | 只读选择可以（按分数挑位置读，每层/每头预算）；按分数真正释放显存不支持，原因见[设计取舍](../explain/design-tradeoffs.md) | 部分 | [10](../examples/10_custom_attention.ipynb) |
-| 滑动窗口、局部/全局层交替 | `keep="window", window=N`，旧块由 vLLM 的滑动窗口机制释放；示例 10 实测偶数层窗口 256 时每个 2048-token 请求的 KV 上限从 24.0 MiB 降到 16.6 MiB | 能写 | [10](../examples/10_custom_attention.ipynb) |
+| 滑动窗口、局部/全局层交替 | `keep="window", window=N`，旧块由 vLLM 的滑动窗口机制释放；示例 10 中偶数层窗口 256 让 7B 每个 2048-token 请求的 KV 上限从 112.0 MiB 降到 70.4 MiB | 能写 | [10](../examples/10_custom_attention.ipynb) |
 | 保留 prompt 加最近窗口（R-SWA） | `sink=True`：保留整个 prompt 加最近 N 个生成的 token；按最坏情况算的上限不变，省的是长生成时的部分 | 能写 | [10](../examples/10_custom_attention.ipynb) |
 | StreamingLLM（开头几个 sink token + 最近窗口） | 读法可以用 `topk` 写成“只读前几个位置和最近窗口”；但显存只能按 R-SWA（整个 prompt + 窗口）释放，不能只留开头几个 token | 部分 | — |
 | 跨层共享 KV（CLA、YOCO 一类，以更低的层为源） | `keep="none", source=k`：这一层不分配 KV，读下面第 k 层的；示例 10 实测奇数层共享时 KV 上限减半；这些模型需要按共享结构训练过 | 能写（执行） | [10](../examples/10_custom_attention.ipynb) |

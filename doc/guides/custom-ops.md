@@ -146,15 +146,15 @@ Greatest relative difference: 5536.0 at index (8, 688) (up to 0.016 allowed)
 
 写自定义算子前需要明确：**自定义核函数并不保证端到端推理提速**。
 
-在 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb) 示例中，我们在第 12 层 MLP 输出后插入了一个相对引导算子（计算残差流范数并按比例加入方向向量）。在 RTX 4090、vLLM 0.27.1 下对 128 个并发请求进行吞吐测试，测得数据如下：
+在 [09 自写 Triton 算子](../examples/09_custom_kernels.ipynb) 示例中，我们在第 12 层 MLP 输出后插入了一个相对引导算子（计算残差流范数并按比例加入方向向量）。在 RTX 4090、vLLM 0.32.0、Qwen2.5-7B-Instruct（bf16，CUDA graph）下对 128 个并发请求（8 个 prompt × 16 个样本，各 256 token，预热 1 轮后 3 轮取中位数）进行吞吐测试，测得数据如下：
 
 ```text
-原生 vLLM   :  39516 token/s，为原生 vLLM 的 100%
-Triton 算子 :  37797 token/s，为原生 vLLM 的 96%
-PyTorch 算子:  37745 token/s，为原生 vLLM 的 96%
+原生 vLLM   :   5872 token/s，为原生 vLLM 的 100%
+Triton 算子 :   5760 token/s，为原生 vLLM 的 98%
+PyTorch 算子:   5755 token/s，为原生 vLLM 的 98%
 ```
 
-可以看到，手写的 Triton 核函数与纯 PyTorch 算子的吞吐几乎一致（均为原生 vLLM 的 96%）。这是因为单层残差向量加法本身耗时极短，根本不是整网推理的计算瓶颈。
+可以看到，手写的 Triton 核函数与纯 PyTorch 算子的吞吐几乎一致（均为原生 vLLM 的 98%）。这是因为单层残差向量加法本身耗时极短，根本不是整网推理的计算瓶颈。
 
 编写自定义核函数的正确动机，是算法中确实包含了 PyTorch 难以高效表达的操作（如特殊的哈希碰撞处理、按 token 历史的细粒度掩码扫描等），而非盲目为了提速重写基本线性代数运算。
 
