@@ -53,7 +53,7 @@ print(pllm.explain(DummyWorkload(), config).eager_reason == "")
 | `max_host_training_rows` | `1` | 宿主批训练每步每份状态最多接受的行（序列）数 | 宿主批次更大时调大；pLLM 按它预留训练显存。不限制 decode 时的请求行 |
 | `state_page_budget_bytes` | `0` | 状态的显存页预算；`0` 用后端观测到的空闲容量 | 想让计划可复现，或限制状态占用时给定值 |
 | `execution_peak_budget_bytes` | `None` | pLLM 执行峰值的上限：状态页、任务工作区与存活结果、CUDA graph 池和锚点预留；不含模型权重和 KV。`None` 不限 | 低于 `explain` 打印的重叠阈值时，旁路任务改成主 stream 内联（不再重叠）；低于失败阈值时规划报错 |
-| `cuda_graph_pool_budget_bytes` | `None` | 每个任务和模型的 CUDA graph 私有内存池预算（不是总和）；`None` 时任务按追踪结果预留，模型默认 64 MiB | 报错说“需要多少字节”时按报错调大，常见于带状态的子层和 `custom_forward` |
+| `cuda_graph_pool_budget_bytes` | `None` | 每个任务和模型的 CUDA graph 私有内存池预算（不是总和）；`None` 时任务按追踪结果预留，模型图由 vLLM 自动管理 | 报错说“需要多少字节”时按报错调大，常见于带状态的子层和 `custom_forward` |
 | `guidance_capacity` | `4096` | `@pllm.guide_sampling` 每行只引导 top-k / top-p 之后 logits 最高的这么多 token，尾部不引导；必须是 32 到 4096 之间的 2 的幂，`None` 表示对整个词表精确引导 | 采样集合通常比它大时调大；越小越慢，因为超出容量的行要走 top-K 选择 |
 | `allow_numerical_transforms` | `True` | 允许 pLLM 为了速度改写数值路径（融合、并行扫描），浮点舍入可能变化，发生时有一次警告 | 需要与参考实现逐位对齐时设 `False` |
 | `tuning` | `"heuristic"` | `"heuristic"` 用确定的规则选实现；`"measured"` 在启动时实测并选更快的实现 | 想用实测选择换启动时间时 |
@@ -93,7 +93,7 @@ print(pllm.explain(DummyWorkload(), config).eager_reason == "")
 | `sampling_n` | `16` | 每个 prompt 的样本数 |
 | `gpu_memory_utilization` | `0.25` | 每个引擎的显存比例 |
 | `cuda_graphs` | `True` | 两边都用 CUDA graph |
-| `cuda_graph_pool_budget_bytes`、`state_page_budget_bytes` | 各 256 MiB | 固定预算，让计划可复现 |
+| `cuda_graph_pool_budget_bytes`、`state_page_budget_bytes` | 捕获池 None，状态页 0 | 默认自动定容；需要限制资源时显式设置上限 |
 | `execution_peak_budget_bytes` | `None` | 执行峰值上限 |
 | `guidance_capacity` | `4096` | 同 `ExecutionOptions.guidance_capacity` |
 | `profile` | `None` | 给一个目录时，计时结束后另跑一遍做性能剖析 |

@@ -205,7 +205,7 @@ service_plan = pllm.explain(StreamMonitor(), service_config)
 - **`max_num_batched_tokens`**（默认 512）：单步内并发请求累计的最大 token 数量（包含 prefill 与 decode）。
 - **`state_page_budget_bytes`**（默认 0）：限制请求状态分配的设备页面显存上限；设为 0 表示使用框架观测到的空闲容量。
 - **`execution_peak_budget_bytes`**（默认 None）：限制状态页、任务工作区与中间输出的总峰值显存。
-- **`cuda_graph_pool_budget_bytes`**（默认 None）：任务与模型的 CUDA Graph 私有内存池上限（默认模型池为 64 MiB）。
+- **`cuda_graph_pool_budget_bytes`**（默认 None）：任务与模型的 CUDA Graph 私有内存池上限。None 自动定容：张量任务按追踪需求预留，模型图由 vLLM 管理；显式上限仍会检查。
 - **`max_host_training_rows`**（默认 1）：每步每个状态由主机投喂训练的最大行数（请求解码行训练单独统计）。
 
 所有执行选项的详细参数见[配置项](../reference/config.md)。在上线前，务必使用 `pllm.explain`（详见[看成本：pllm.explain](../guides/explain.md)）在 CPU 上核对显存预留峰值。

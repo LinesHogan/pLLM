@@ -203,12 +203,11 @@ python -m tools.benchmark_esamp --batch 8 --tokens 256 --rounds 3
 # 运行 Output LoRA 基准，测试每请求私有状态
 python -m tools.benchmark_lora --batch 8 --tokens 256 --rounds 3 --scope request
 
-# 在 24 GiB 的卡上测 7B：显存比例和两个预算都要调大，默认值是按 0.5B 定的
-python -m tools.benchmark_esamp --model Qwen/Qwen2.5-7B-Instruct --gpu-memory-utilization 0.85 \
-    --cuda-graph-pool-budget-mib 512 --state-page-budget-mib 1024
+# 在 24 GiB 的卡上测 7B：显式选择基座模型的显存比例；捕获与状态页自动定容
+python -m tools.benchmark_esamp --model Qwen/Qwen2.5-7B-Instruct --gpu-memory-utilization 0.80
 ```
 
-默认的 256 MiB 捕获池和状态页预算放不下 7B 上的 ESamp（128 并发时训练图约需 306 MiB，状态页约 394 MiB）；不够时脚本会报错并给出需要的字节数。
+默认按规划得到的需求为张量任务捕获池定容，状态页使用后端可用容量；原生模型图的池由 vLLM 管理。预算参数只在需要显式限制资源时设置，过小的上限会报错。explain 仍报告任务的捕获预留，排除 vLLM 的模型图与激活池。
 
 ### 公共命令行参数一览
 
@@ -224,8 +223,8 @@ python -m tools.benchmark_esamp --model Qwen/Qwen2.5-7B-Instruct --gpu-memory-ut
 | `--sampling-n` | `int`，默认 `16` | 每个 Prompt 生成的独立候选序列数。总并发序列数为 `batch × sampling_n`（默认 128）。 |
 | `--gpu-memory-utilization` | `float`，默认 `0.25` | vLLM 显存分配比例上限。留出充足显存供算法状态与工作区使用。 |
 | `--eager` | `bool` 标志 | 强制所有算法臂与原生基线关闭 CUDA Graph，以 eager 模式运行。 |
-| `--cuda-graph-pool-budget-mib` | `int`，默认 `256` | 每个张量任务及模型捕获池的显存上限（MiB）。不足时会明确报错拒绝。 |
-| `--state-page-budget-mib` | `int`，默认 `256` | 设备端状态页的容量上限（MiB）。使计时与重放环境可复现。 |
+| `--cuda-graph-pool-budget-mib` | `int`，可选，默认自动定容 | 每个张量任务及模型捕获池的显存上限（MiB）。不足时会明确报错拒绝。 |
+| `--state-page-budget-mib` | `int`，默认 `0`（后端可用容量） | 设备端状态页的容量上限（MiB）。使计时与重放环境可复现。 |
 | `--execution-peak-budget-mib` | `int`，可选 | 限制规划期的执行峰值显存（含状态、工作区与临时张量，不含模型/KV）。 |
 | `--guidance-capacity` | `int` 或 `None`，默认 `4096` | 采样引导仅针对前 K 个保留词；设为 None 则执行全词表稠密引导。 |
 | `--profile` | `Path`，可选 | 导出 Chrome trace（`.json`）的目录。详见第 6 节。 |
