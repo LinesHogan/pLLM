@@ -1,33 +1,74 @@
 # 行模型：在连续批处理里找回“每个请求”
 
-在单卡上写 PyTorch，batch 是一件平常事：把 B 条序列补齐成一样长，堆成 `[B, S, hidden]`，`x[i]` 就是第 i 条样本。像一排编了号的抽屉，谁的东西在哪个抽屉，一目了然。
+如果你只在单卡上写过 PyTorch 研究代码，你眼里的 batch 大概像一排整整齐齐的储物柜：张量的形状是 `[B, S, hidden]`，`x[0]` 永远属于第一个请求，`x[1]` 永远属于第二个请求。谁的东西锁在哪个柜子里，一目了然。
 
-vLLM 这样的 serving 引擎没有这排抽屉。它用**连续批处理**（continuous batching）：请求随时来、随时走；每一步，调度器为每个活跃请求决定这一步算几个 token——正在生成的请求通常算 1 个（decode），刚来的请求可能一次算完整段 prompt（prefill），开了分块预填充（chunked prefill）的话只算其中一块——然后把这些 token **首尾相接，拼成一张扁平的** `[num_tokens, hidden]` 送进模型。第 0 行可能是某个长 prompt 的一块，第 37 行可能是另一个请求刚生成的 token；为了凑上录好的 CUDA graph 尺寸，末尾还可能补几行没有意义的 padding。行序由调度器决定，每一步都在变。
+但在 vLLM 这样的生产级推理引擎里，当你满怀信心地在模型的第 0 层挂上一个 forward hook，打印出拿到的 `hidden` 形状时，那排储物柜不见了。你手里只有一个光秃秃的二维张量：`[64, 3584]`。
 
-如果只是用模型生成文字，这些都不用管。可只要你想在生成的同时做点有状态的事——给每个请求在线训练一个小网络、给每个请求维护一份记忆——就得先回答一个问题：**这一行是谁的？**
+```text
+你以为的 Batch（整齐的储物柜）：        vLLM 塞给 Hook 的张量（拍扁的传送带）：
+┌───────────────────────────┐          ┌───────────────────────────┐
+│ Req 0_0 (decode): [tok]   │          │ Row 0:     [ ??? ]        │
+├───────────────────────────┤          │ Row 1:     [ ??? ]        │
+│ Req 1_0 (decode): [tok]   │   ───►   │ Row 2:     [ ??? ]        │
+├───────────────────────────┤          │ Row 3..60: [ ??? ]        │
+│ Req 2 (prefill):  [t0..58]│          │ Row 61..63:[ 幽灵 Padding ]│
+└───────────────────────────┘          └───────────────────────────┘
+```
 
-这篇讲我们怎样回答它。答案最后落在每个请求的三个整数上，简单得有点不好意思；但在走到那里之前，我们在 vLLM 的源码里绕了很久。先讲绕路的故事，再拿一个真实的 batch，把这三个数能推出的东西一行一行算出来。
+这 64 行里，哪一行是刚刚进来、正在做分块预填充（chunked prefill）的长文档？哪一行是已经聊了十轮、正在吐第 11 个字的请求？末尾甚至还藏着几行为了凑齐 CUDA graph 录制尺寸而塞进来的幽灵 padding。更要命的是，等千分之几秒后下一步再进来时，调度器洗了一次牌，所有人的行号全变了。
 
-## 在 vLLM 源码里找“第几行是谁”
+这是因为现代服务引擎用的是**连续批处理（continuous batching）**。请求随时到达、随时离开；每一步，调度器为每个活跃请求决定这一步算几个 token——正在生成的请求通常算 1 个（decode），刚来的请求可能一次算完整段 prompt（prefill），开了分块预填充的话只算其中一截——然后把所有人的 token 首尾相接，拍扁成一张 `[num_tokens, hidden]` 的长条送进模型。
 
-2025 年做 ESamp 的时候，需求很具体：每个 decode 步，拿到第 0 层和最后一层的 hidden，还要知道每一行属于哪个请求，才能用那个请求自己的 distiller 去训练。forward hook 拿到的只是一张光秃秃的 `[num_tokens, hidden]`。
+如果你只是拿模型生成文字，这些细节都被引擎藏得好好的，你根本不用管。可只要你想在推理的同时干点有状态的事——比如像 ESamp 那样给每个请求在线训练一个轻量级蒸馏器（distiller），或者给每个请求维护一份外部记忆——你在写下第一行算子之前，就必须先回答一个灵魂问题：**我手里的这一行，到底是谁的？**
 
-当时开源项目里能拿到拆包信息——哪一行属于哪个请求——的做法，都要等到 logits processor 那一步。可 logits processor 是在整个前向、连同最后的 LM head 都算完之后才被调用的。等到那时才知道谁是谁就太晚了：训练、读 hidden 这些额外的工作，没法和主计算重叠，只能排在后面干等。
+这篇文章讲的就是我们怎样回答这个问题。最终的答案落在了每个请求的三个整数上，简单得甚至让人有点不好意思；但在走到那一步之前，我们曾在 vLLM 的 C++ 内核与动态结构体构成的地下城里迷路了很久。我们先回到当年的案发现场看看那段弯路，然后再拿一个真实的 batch，把那三个整数能推演出的整个世界一行一行算出来。
 
-我们不能等那么晚，只好往前追。attention 一定知道每个请求的 token 在哪里——否则它没法让每个请求只看自己的 KV——于是我们追进 runner，看 attention 是怎么拆包的。结果撞上一堵墙：vLLM 的 attention 是它自己的 C++/CUDA kernel，拆包的细节都在 kernel 里，Python 层看不见。我们注意到，attention 的输入里可能装着这份信息的只有一个结构：**attention metadata**。解包的信息一定是从这里来的。
+> **实验与测量环境说明**：除特别注明外，本文引用的性能数据均在单张 NVIDIA RTX 4090（24 GiB）、vLLM 0.32.0（开启 CUDA graph 与 FlashInfer 采样器）下测得，基座模型为 `Qwen/Qwen2.5-7B-Instruct`（BF16，隐藏维 3584），标准负载为 8 个并发 prompt × `n=16` 展开 = 128 个并行解码行，每请求生成 256 个 token（原生基线吞吐 5,894 tok/s，单步耗时 21.7 ms）。文中仅在对比固定宿主开销与展示底层探针时使用同配置的 `Qwen2.5-0.5B-Instruct`（单步耗时 3.0 ms，原生基线 42,355 tok/s）。
 
-这个结构的格式相当复杂，当时网上也没有任何解读。更麻烦的是它是动态的，光读代码很难确定：prefill 和 decode 混在一起时，哪些段是 prefill、哪些是 decode？有 padding 时，哪些字段把 padding 算进去了？多卡时又会怎么变？我们打了许多断点，一步一步地看，最后才弄明白。（今天在 vLLM 0.27.1 和 0.32 上重新实测的字段含义，整理在[文末附录](#附vllm-attention-metadata-字段笔记)里，给后来的人省点时间。）
+---
 
-弄懂格式之后，又冒出一个问题。attention metadata 是一个装着 GPU 张量引用的结构体，要是把它拷回 CPU 解析，算出“第 3 行是请求 A”，再把行号送回 GPU 去挑行，这一来一回就是几次同步和等待，而 decode 一步只有几毫秒。所以当时的方案只能和 GPU 缓冲区、CUDA graph 一起设计：不等 metadata 构造完，从构造它时用到的信息就开始解析；CPU 和 GPU 上都有解析，不把所有工作堆在 CPU 上；ESamp 当时的实现是一个**图内的轮询缓冲区**——CPU 定期、异步地把解析所需的信息放进固定的 GPU 缓冲区，GPU 在录好的图里完成解包。
+## 一场没有地图的地下城探险
 
-在后来公开的旧 tLLM 代码里还看得到这套设计的样子。`prepare_decode_localization` 从 `input_batch` 取 `req_ids`、`num_prompt_tokens`、`num_computed_tokens_cpu`，用 `num_computed_tokens >= num_prompt_tokens` 判断一个请求是否真的在 decode，用 attention metadata 的 `num_actual_tokens` 排除 padding 行，再把选出的行号写进几块固定的 GPU 暂存区（`decode_row_idx`、`decode_valid_mask`）。超出容量时的报错是“Increase graph_scratch_rows”——那几块缓冲区就是给图里的 kernel 读的。
+我们刚在早期原型系统（当时叫 tLLM）里做 ESamp 时，需求非常具体：在每一个 decode 步，我们需要从第 0 层和最后一层把隐藏状态（hidden states）捞出来，并且必须知道每一行对应哪个请求，才能拿那个请求专属的 distiller 权重去算梯度、更新参数。
 
-### 怎样确认自己真的读懂了
+当时开源社区里倒是有别的项目能分清“哪一行是谁”，但无一例外，它们走的都是 `LogitsProcessor` 接口。
 
-逆向一个大系统，最危险的是“以为自己懂了”。当时我们写过一个验证脚本，它的 docstring 就是一份实验协议（旧 tLLM 的 `verify_v1_decode_rows_runtime.py`）：
+为什么我们不能走那条路？看一眼时间线就明白了：`LogitsProcessor` 要等整座 Transformer 大山全部跑完、连最后那层庞大的 LM head 词表投影都乘完了，才会被引擎调用。如果我们等到那时候才拿到“拆包（unpack）”信息，黄花菜都凉了——本来可以放在旁路 CUDA stream 上、跟模型前向计算并行重叠（overlap）的在线训练和状态读取，只能傻乎乎地排在采样器前头干瞪眼。
+
+我们等不起那么晚，只能顺着调用栈往前追。
+
+我们的直觉是：模型内部一定有人知道每一行是谁——至少 Attention 层知道！否则它怎么做到不让张三的 token 偷看李四的 KV cache？
+
+顺着这个念头，我们一路摸进了 vLLM 的模型 runner，想看看注意力层是怎么把那张扁平张量拆开的。结果迎头撞上了第一堵墙：vLLM 的注意力计算全部封装在它自己的 C++/CUDA 内核里，拆包的细节藏在编译好的二进制文件里，在 Python 层完全隐形。
+
+我们把注意力层的 Python 调用入口翻了个底朝天，发现传进内核的参数里，唯一可能装着这本“户口本”的，是一个叫 **`attn_metadata`（attention metadata）** 的结构体。拆包的信息，一定就藏在它里面。
+
+但当我们扒开 `attn_metadata` 时，才发现自己跳进了一个没有地图的地下城。这个结构体的格式极其复杂，当时网上找不到哪怕一篇解析它的文章。更让人头疼的是，它完全是动态变化的，光靠静态读代码根本猜不出它在运行态的真实长相：
+* 当一个 batch 里同时混着 prefill 和 decode 请求时，里面哪几段是 prefill、哪几段是 decode？
+* 当 CUDA graph 为了对齐尺寸在末尾补了 padding 时，哪些计数把幽灵行算进去了，哪些没算？
+* 当开启多卡并行时，这些字段又会怎么变？
+
+那段时间我们几乎是在靠打断点度日。我们在 runner 里设下埋伏，构造各种刁钻的混排请求，一步一步单步调试、打印张量，硬生生靠肉眼把各个字段的脾气摸清楚了（为了不让后来的人再吃一遍这份苦，我把今天在 vLLM 0.27.1 和 0.32.0 上重新实测核对的字段解剖笔记完整放在了[文末附录](#附vllm-attention-metadata-字段解剖笔记)里）。
+
+然而，好不容易读懂了 `attn_metadata`，第二堵墙紧跟着就立在了面前。
+
+`attn_metadata` 是一个塞满了 GPU 张量引用的结构体。如果我们在前向传播途中把它里面的张量拷回 CPU，在 Python 里解析出“第 3 行属于请求 A”，再把挑出来的行号传回 GPU 去切分 `hidden`——这一来一回就是好几次主机与设备间的同步（Host-Device Synchronization）。在 GPU 上，一次同步等待动辄几十到上百微秒，而小模型一步 decode 总共也就 3 毫秒，再这么折腾几下，吞吐直接就废了。
+
+被逼无奈，当时的方案只能和 GPU 缓冲区、CUDA graph 绑在一起做协同设计：
+1. **抢在构造完成前动手**：不等 `attn_metadata` 完全造好，直接从构造它时用到的源头信息开始解析；
+2. **CPU 与 GPU 分工解析**：绝不把所有解析逻辑都堆在 CPU 上，避免把 GPU 张量往回拉；
+3. **图内轮询缓冲区（in-graph polling buffer）**：在 ESamp 当时的实现里，我们在显存里划出几块地址死死固定的暂存区（`decode_row_idx`、`decode_valid_mask`）。CPU 定期、异步地把解析出来的必要行号填进这块缓冲区；而在录好的 CUDA graph 内部，GPU 内核每一步直接去固定地址轮询读取，在设备端自己完成拆包。
+
+在后来公开的旧版 tLLM 代码库里，还能看到当年这套精密又沉重的机关：如果活跃行数超过了预留缓冲区的大小，系统就会抛出一句老用户很眼熟的报错——`"Increase graph_scratch_rows"`。
+
+### 怎么确认自己不是“以为懂了”？
+
+逆向工程别人家的庞大系统，最可怕的不是看不懂，而是**“自以为看懂了”**。万一在某个奇葩的分块或混排边界上，我们挑行的算术偏了一行，拿李四的 hidden 训练了张三的 distiller，代码不会崩溃，甚至 loss 还会看似正常地下降，但算法逻辑已经彻底烂掉了。
+
+为了睡个安稳觉，我们专门写了一个运行时验证脚本 `verify_v1_decode_rows_runtime.py`。它开头的几行注释，就是我们用来拷问自己的实验协议：
 
 ```python
-# check-docs: skip: excerpt from the 2025 tLLM verify_v1_decode_rows_runtime.py
+# check-docs: skip: excerpt from tllm/legacy/verify_v1_decode_rows_runtime.py in the old tLLM repository
 """Verify vLLM v1 decode-row localization using first-layer hidden MSE.
 
 Gold standard:
@@ -43,14 +84,21 @@ Pass condition:
 """
 ```
 
-金标准是一个 prompt 一个 prompt 单独跑，这时候“第 0 行是谁”毫无歧义；候选是同样的 prompt 一起成批跑，用我们以为正确的方式挑行；任何一个 prompt、任何一个 decode 步的第一层 hidden 对不上，就说明我们还没懂。我们很喜欢这个协议：它不依赖对 vLLM 内部的任何理解，只依赖“单独跑时没有歧义”这一个事实。想验证你对别人系统的理解，这几乎是一个通用的配方。
+这个协议的逻辑极其朴素：
+* **金标准（Gold standard）**：把一批 prompt **一个接一个单独喂给引擎**（采用 greedy 贪心解码保证确定性）。当引擎里只有一个请求时，根本不存在混排，“第 0 行是谁”毫无歧义。我们把每个请求在每个 decode 步的第 0 层输出抓下来存好。
+* **候选方案（Candidate）**：把同一批 prompt **同时扔进引擎并行跑**，让连续批处理调度器随便洗牌，然后用我们写的拆包逻辑去第 0 层挑出每个请求对应的行。
+* **生死线**：逐个请求、逐个 decode 步比对两边的隐藏状态均方误差（MSE）。哪怕有一个请求在某一步对不上，就说明我们还没真正搞懂 vLLM 的行布局。
 
-### 留下的伤疤
+我一直很喜欢这个小协议。它不依赖你对宿主系统内部的任何假设，只依赖“单请求运行时没有歧义”这一个铁打的事实。每当你要在一个复杂的黑盒系统里验证自己的定位逻辑时，这几乎是一张百试百灵的试纸。
 
-旧 tLLM 的生产入口包在 `GPUModelRunner._prepare_inputs` 的返回值上。这是个私有函数，返回元组的长度在不同 vLLM 版本里不一样，于是有了三个适配器（`<0.10`、`0.10`、`0.11+`），基类里按长度去猜：
+### 寄生在私有接口上的伤疤
+
+靠着断点调试和金标准验证，ESamp 跑起来了。但“手工追内部结构体”很快让我们尝到了苦头。
+
+旧版 tLLM 的生产入口，是挂在 `GPUModelRunner._prepare_inputs` 这个私有函数的返回值上的。糟糕的是，这个函数返回一个长长的 Python 元组，而随着 vLLM 在 `<0.10`、`0.10`、`0.11+` 一路演进，这个元组里的元素个数一直在变！于是我们的代码里被迫长出了三个版本适配器，基类里甚至出现了这样一段靠数元组长度来猜字段的凄凉代码：
 
 ```python
-# check-docs: skip: excerpt from the 2025 tLLM adapters/base.py
+# check-docs: skip: excerpt from tllm/runtime/vllm_patch/adapters/base.py in the old tLLM repository
 if len(out) >= 6:
     return PrepareInputsView(
         attn_metadata=out[0],
@@ -65,75 +113,118 @@ if len(out) >= 2:
     spec_decode_common = None
 ```
 
-这就是“手工追结构体”的代价：理解是对的，代码却寄生在一个随时会变的私有接口上。
+看到 `if len(out) >= 6:` 了吗？这就是深入敌后、扒内部结构体留下的伤疤。我们对机制的理解是对的，但代码却脆弱地寄生在一个随时会变形的私有元组上。
 
-## 一个真实的 batch
+在做 pLLM 的重构时，看着这段代码，我们心里只有一个念头：一定有更干净的办法。我们到底需要从 vLLM 里拿什么？
 
-把绕路的故事放一放，看看我们到底要从一个 batch 里认出什么。下面是附录里实测的一步（vLLM 0.32，Qwen2.5-0.5B，`max_num_batched_tokens=64`）。这一步里有四个请求：请求 0 要两个样本（n=2），vLLM 把它拆成两个子请求 `0_0` 和 `1_0`，各自的 prompt 都是 5 个 token；请求 1 的 prompt 是 2 个 token；请求 2 是一个 150 token 的长 prompt，因为每步最多 64 个 token，只能分块算。这一步 vLLM 拼出来的扁平张量有 64 行：
+---
 
-```text
-行 0      请求 0_0  （1 个 token）
-行 1      请求 1_0  （1 个 token）
-行 2      请求 1    （1 个 token）
-行 3..63  请求 2    （61 个 token）
-```
+## 顿悟：发货单在装车前就印好了
 
-这四段各是什么？请求 0_0 是 prompt 的一部分还是生成的？请求 2 的 61 个 token 里，有没有哪一行该拿去采样？光看这张表是答不出来的。
+让我们把历史包袱先放一放，拿显微镜看一个真实的 batch。
 
-再加上现实里的几件事，问题会更难。为了命中录好的 CUDA graph 尺寸，batch 可能被补齐，多出来的行是垃圾。一个请求可能被抢占：KV cache 不够时，vLLM 把它赶出去，过一会儿把它的 prompt 和已经生成的 token **从头重算**一遍，于是同样的内容会再一次以“prefill”的身份经过模型——对有状态的算法来说，这些重算的 token 不能再被当成新数据，否则同一段内容会被训练两遍。还有 CUDA graph 本身：行标签必须在前向开始之前算好、写进地址固定的缓冲区，前向中途不能回头问 CPU（见[《Python 只在录制时活着》](03-whole-algorithm-in-cuda-graphs.md)）。
+下面这个场景取自我们在 vLLM 0.32 上的实测探针（设 `max_num_batched_tokens=64` 以触发分块预填充）。系统里同时跑着三个用户发来的请求：
+* **请求 0**：prompt 长 5 个 token，但用户要求并行采样两个回答（`n=2`），于是 vLLM 在内部把它裂变成了两个独立的子请求 `0_0` 和 `1_0`；
+* **请求 1**：一段只有 2 个 token 的短 prompt；
+* **请求 2**：一段长达 150 个 token 的长文档。因为每步最多只能算 64 个 token，它必须被切成好几块，分好几步算完。
 
-## 三个数
+在运行的**第 2 步**，前三个短请求都已经算完了各自的 prompt，正在一步吐 1 个字地做 decode；而请求 2 在第 1 步刚算完前 52 个 token，这一步正接着算接下来的 61 个 token。
 
-答案是：对这一步被调度的每个请求，只需要三个整数。
-
-- `scheduled`：本步为它算几个 token；
-- `prompt`：它的 prompt 有多长；
-- `computed`：此前已经为它算过几个 token。
-
-这三个数在调度器决定这一步的时候就已经在 CPU 上了。把它们填到上面那个 batch 里：
+此时，vLLM 拼出来送进模型的扁平张量一共 64 行：
 
 ```text
-请求   scheduled  prompt  computed
-0_0        1         5        5
-1_0        1         5        5
-1          1         2        2
-2         61       150       52
+行 0       请求 0_0  （1 个 token）
+行 1       请求 1_0  （1 个 token）
+行 2       请求 1    （1 个 token）
+行 3..63   请求 2    （61 个 token）
 ```
 
-现在可以一行一行地算。请求在本步的第 i 个 token，在请求里的位置是 `offset = computed + i`。请求 0_0 只有一个 token，offset 是 5；5 ≥ prompt（5），所以它是**生成的 token**——更具体地说，是这个请求最新的 decode 行（它是本段的最后一个）。请求 1_0、请求 1 同理，都是 decode 行。请求 2 的 61 个 token，offset 从 52 到 112，全都小于 150，**都是 prompt**；其中有没有“prompt 的最后一个 token”，也就是采样第一个生成 token 的那一行？条件是 `offset == prompt - 1`，即 149，这一步还没到。
+面对这张 64 行的表，如果我们要支撑起一个通用扩展层，我们需要回答四个问题：
+1. **谁是谁？** 每一行对应哪个请求身份？
+2. **什么阶段？** 请求 `0_0` 的这 1 个 token，究竟是 prompt 的一部分，还是已经进入生成阶段的 decode token？
+3. **谁该去采样？** 请求 2 在这一步足足占了 61 行（行 3 到行 63），它的最后一行（行 63）该不该拿去给采样器抽第一个生成词？
+4. **是不是炒冷饭？** 在真实服务里，如果显存 KV cache 突然不够用了，vLLM 会把某个请求临时**抢占（preempt）**踢出显存；等过一会儿腾出地方了，再把它的 prompt 连同之前已经生成的 token **从头到尾重新当成 prefill 算一遍**。对无状态的纯推理来说，重算一遍毫无影响；但对有状态的在线学习来说，如果不把这些重算的 token 揪出来屏蔽掉，同一段文本就会被你的训练器喂两遍！
 
-下一步，请求 2 再算 37 个（offset 113 到 149），最后一个 token 的 offset 正好是 149：prompt 结束行在这一步出现，而且只出现这一次。分块预填充不需要任何额外的跟踪，算术自己保证了这一点。
+当年我们为了搞清这四件事，一头扎进了 `attn_metadata` 的张量迷宫里。但某一天当我退后一步，看着调度器在发车前刚刚填好的那几列普通 CPU 数组时，我突然愣住了。
 
-还剩抢占。为每个请求再记一个整数 `frontier`——它见过的最大位置。假如请求 2 在第 100 个 token 之后被抢占，重新调度回来时 `computed` 从 0 开始，可 offset 小于 frontier 的那些 token 我们都见过了：标成“重算”，不再交给训练。
+要回答上面所有问题，我们根本不需要碰 `attn_metadata` 里的任何一个 GPU 张量。对于这一步被调度的每一个请求，我们只需要**三个已经在 CPU 上的整数**：
 
-一个比喻：快递车里的包裹被随便堆在一起，但每个包裹上贴着“哪家、第几件”。我们之前做的，是跳上车去拆包裹看里面是什么；而这三个数是发车前就打印好的发货单。分拣根本不需要拆包。
+* `scheduled`：本步调度器决定为它算几个 token；
+* `prompt`：它的原始 prompt 总共有多长；
+* `computed`：在今天这一步开始**之前**，历史上已经为它算过几个 token。
 
-事后看，这简单得让人不好意思。我们花了很多时间去理解 attention metadata，最后用上的只是构造它之前就已经存在的三个数。
+让我们把这三个数字填进刚才那个第 2 步的 batch 里，看看会发生什么奇迹：
 
-## 今天的做法
+```text
+请求     scheduled    prompt    computed
+0_0          1           5          5
+1_0          1           5          5
+1            1           2          2
+2           61         150         52
+```
 
-### 入口：选签名最稳定的那个调用点
+现在，拿出一支笔，跟我们一起做小学加减法。
 
-MRv2 runner（vLLM 新版的模型 runner）每步在构建好 `InputBatch` 之后调用 `prepare_attn`，之后才去构建 attention metadata。pLLM 覆盖的就是它（`pllm/backends/vllm/runner.py`）：
+对于某个请求在本步被调度的第 `i` 个 token（`0 <= i < scheduled`），它在整条序列生命周期里的绝对逻辑位置（也就是 RoPE 位置编码的下标）是：
+
+$$\text{offset} = \text{computed} + i$$
+
+有了 `offset`，所有的谜底像多米诺骨牌一样哗啦啦全倒了：
+
+* **看请求 `0_0`**：它本步只算 1 个 token（`i = 0`），所以 `offset = 5 + 0 = 5`。拿它和 `prompt`（5）比一下：`5 >= 5`！这意味着前 5 个 prompt token（下标 `0..4`）早就翻篇了，这一行如假包换，是**生成阶段的 decode 行**。请求 `1_0`（`5 >= 5`）和请求 `1`（`2 >= 2`）完全同理。
+* **看请求 `2`**：它本步算 61 个 token（`i` 从 `0` 到 `60`），所以它们的 `offset` 从 `52` 一路排到 `112`。拿去和它的 `prompt`（150）比一下：全都小于 150！所以这 61 行**统统都是 prompt**。
+* **那么请求 `2` 在这一步有“prompt 结束行”（用来触发第一次采样的那一行）吗？** 所谓 prompt 刚刚结束，充要条件只有一个：`offset == prompt - 1`（即 `149`）。这一步算到头才到 `112`，根本没到 `149`！哪怕 vLLM 的内部采样索引把第 63 行塞了进去，我们的算术也一眼就能看穿：这只是分块预填充的半山腰，绝不能触发采样或导出。
+* **到了下一步（第 3 步）**：请求 `2` 的 `computed` 变成了 `113`，调度器把剩下的 `scheduled = 37` 个 prompt token 排了上来。这 37 个 token 的 `offset` 从 `113` 走到 `149`。当 `i = 36` 时，`offset` 稳稳当当地撞上了 `149 == 150 - 1`！Prompt 结束行在这一步、且只在这一步唯一地诞生了一次。分块预填充根本不需要任何复杂的跨步状态机，初等算术自己就保证了它的唯一性。
+
+那最后一个难题——**抢占重算（Preemption Replay）**呢？
+
+只需要给每个请求再加一个整数：**`frontier`（前沿水位线）**，用来记录这个请求自打进入引擎以来，我们的有状态逻辑**曾经见过的最大位置**。
+
+```text
+请求 2 的生命周期游标（prompt = 150）：
+
+正常推进到 113：
+  0                52                   113                150
+  ├─────────────────┼────────────────────┤                  │
+  │   Step 1 算完   │     Step 2 算完    ▲                  │
+  └─────────────────┴────────────────────┴──────────────────┘
+                                     frontier = 113
+
+遭遇 KV 抢占！Step k 从 0 开始重算前 64 个 token (computed=0, scheduled=64)：
+  0                         64          113                150
+  ├──────────────────────────┼───────────┤                  │
+  │ offset 0..63 < frontier! │           ▲                  │
+  │  ──► 全部标为 RECOMPUTED │       frontier = 113         │
+  └──────────────────────────┴──────────────────────────────┘
+```
+
+看上面的时间轴：正常跑完前两步后，请求 2 的 `frontier` 推到了 `113`。假设此时显存告急，请求 2 被无情踢走；几步之后它被重新捞回来从头重算，`computed` 瞬间归零，本步 `scheduled = 64`。当我们遍历这 64 个 token 时，算出来的 `offset` 是 `0..63`——它们全都严格小于 `frontier`（`113`）！
+
+看到 `offset < frontier`，标签器立刻明白：“这几行是旧账重算，不是新知识。”于是给它们盖上 `RECOMPUTED` 的戳，把它们从训练和导出的名单里直接剔除，直到重算的游标重新跨过 `113` 那条水位线为止。
+
+打个比方：连续批处理就像一辆快递货车，不同人家的包裹被胡乱塞进车厢里。当年我们干的事，是跳上已经开动的货车，挨个去扒包裹的包装纸（解析 GPU 上的 `attn_metadata`），想看清里面装的是什么；而今天我们恍然大悟——**在包裹被装上车之前，调度室的桌子上本来就放着一张印好的纸质发货单（`scheduled`、`prompt`、`computed`）。**
+
+照着发货单贴好标签再装车，分拣连一个包裹都不用拆。事后回头看，这个道理简单得让人想拍大腿；可如果没有当年在 `attn_metadata` 里打断点的那段日子，我们大概也没法一眼认出：原来这三个数字，就已经是全部了。
+
+---
+
+## 今天的做法：找最稳的接缝，写最响的断言
+
+一旦想通了“三个数加一个水位线决定一切”，代码的实现就从一场跟 C++ 内核斗智斗勇的泥潭战，变成了一件清爽愉快的工程活。
+
+### 1. 选最不容易变的那个调用点
+
+还记得旧版 tLLM 挂在 `_prepare_inputs` 上、被返回值元组长度折磨得死去活来的惨状吗？在给 vLLM 的新版 model runner（MRv2）写 pLLM 的子类（`pllm/backends/vllm/runner.py`）时，我们立下一条规矩：**绝不去钩信息最多、但签名飘忽不定的内部函数；我们要找那个签名最简单、在所有支持的 vLLM 版本上都纹丝不动的接缝。**
+
+在 MRv2 runner 里，每一步当 `prepare_inputs` 刚刚把 `InputBatch` 填好、但**还没有**开始构造复杂的 `attn_metadata` 之前，vLLM 都会调用一次 `prepare_attn(self, input_batch: InputBatch)`。在 pLLM 支持的每一个 vLLM 版本（无论是 0.27.1 还是 0.32.0）上，它的签名都长得一模一样。我们就守在这里：
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/runner.py
 def prepare_attn(self, input_batch: InputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Publish the step's rows to the session.
-
-    vLLM calls this once per real step, right after prepare_inputs built the InputBatch; unlike
-    prepare_inputs its signature is the same on every supported vLLM release.
-    """
+    # ……
     session = self.workload_session
     if session is not None:
-        if session.input_tokens is not None:
-            session.prepare_tokens(
-                self.req_states.all_token_ids.gpu,
-                tuple(int(index) for index in input_batch.idx_mapping_np),
-                input_batch.query_start_loc,
-                input_batch.positions,
-                input_batch.num_tokens,
-            )
+        # ……
         session.prepare_input(
             encode_mrv2_rows(
                 input_batch,
@@ -146,13 +237,13 @@ def prepare_attn(self, input_batch: InputBatch) -> tuple[tuple[torch.Tensor, ...
     return super().prepare_attn(input_batch)
 ```
 
-docstring 里写着选它的理由：它的签名在 pLLM 支持的每个 vLLM 版本（0.27.1 和 0.32.0）上都一样。2026 年 10 月支持 vLLM 0.32 的那次提交说明里也写着：“rows are published from prepare_attn, whose signature is the same on both releases”。信息最多的调用点不一定最好；**最不容易变的那个**才是。（旧的 MRv1 runner 走 `pllm/backends/vllm/mrv1.py`，最后调用的是同一个标签器。）
+注意这个时机有多妙：此时模型的前向计算还没开始，CUDA graph 还没发射，`attn_metadata` 甚至还没生出来。我们直接从 `input_batch` 和 `req_states` 的 NumPy 数组里借出那三个整数，当场把本步所有行的标签算好、发布给会话（`session.prepare_input`），然后深藏功与名，调用 `super().prepare_attn(input_batch)` 让 vLLM 干它自己的活去。（对于旧版的 MRv1 runner，我们在 `pllm/backends/vllm/mrv1.py` 里做了薄薄一层适配，底层调的是完全相同的原生标签器。）
 
-这也应验了当年那条经验：从“构造 metadata 时的信息”开始解析。今天走得更远——pLLM 根本不读 attention metadata，三个数都来自 `InputBatch` 和请求状态的 CPU 列。
+### 2. 把脆弱的假设变成响亮的 `assert`
 
-### 把假设写成断言
+既然我们不再靠猜元组长度过日子，那万一将来某天 vLLM 升级了调度协议，我们怎么保证自己不会悄无声息地挑错行？
 
-`encode_mrv2_rows`（`pllm/backends/vllm/packed_rows.py`）把这几列借过来交给标签器：
+答案写在 `pllm/backends/vllm/packed_rows.py` 的 `encode_mrv2_rows` 里——把我们对宿主引擎的所有假设，全都写成毫不留情的运行时断言：
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/packed_rows.py
@@ -182,13 +273,18 @@ def encode_mrv2_rows(
     )
 ```
 
-那几条 `assert` 是这段代码里最有价值的部分。它们把标签器依赖的假设写了出来：没有投机解码的草稿 token；`cu_num_logits` 是 `0..count`，也就是每个请求恰好一个采样行；`logits_indices` 在 GPU 上。vLLM 哪天改了调度协议，我们会在第一步就知道，而不是默默地挑错行。
+在很多代码库里，`assert` 只是防御性的点缀；但在这段代码里，那五条 `assert` 是最有价值的契约文档：
+* `num_draft_tokens == 0`：明确宣告我们假设没有投机解码（speculative decoding）的草稿 token；
+* `np.array_equal(input_batch.cu_num_logits_np, np.arange(count + 1))`：要求累积采样行数严格是 `0, 1, 2, ..., count`，即**每个请求在这一步恰好对应一个采样位**；
+* `input_batch.num_tokens_after_padding >= input_batch.num_tokens`：明确区分真实 token 数和为了凑齐 CUDA graph 补出来的幽灵 padding 行，而传给 `labeler.prepare` 的 `num_scheduled_tokens` 只包含真实请求，天然把尾部的 padding 拒之门外。
 
-请求的身份（请求 ID、第几个 prompt、第几个样本、路由键）在准入时编成整数，绑到 vLLM 的持久槽位上；每步只传槽号数组，不传字符串。
+至于请求的身份（`RequestIdentity`，包含请求字符串 ID、第几个 prompt、第几个采样样本、路由键），我们在请求刚获准进入引擎（`admit`）时，就把它编码成一串紧凑的 `int64` 整数，并在 `add_requests` 时绑定到 vLLM 的持久请求槽位（`labeler.slots`）上。这样到了每一步的高频循环里，我们只传递纯数字的槽号数组 `labeler.slots[input_batch.idx_mapping_np]`，连一个 Python 字符串都不碰。
 
-### 标签器：上一节那几行算术的直译
+### 3. Rust 里的 30 行算术：一次遍历，两处复用
 
-真正的标签在 Rust 里（`rust/pllm_core/src/packed_rows.rs`）。标签矩阵有七列：
+顺着 `labeler.prepare` 往下走，真正的贴标签工作落在了 `rust/pllm_core/src/packed_rows.rs` 里。
+
+对于本步全部的真实 token，Rust 标签器会生成一张 7 列的 `int64` 标签矩阵：
 
 ```rust
 // Rows of the label matrix; PackedPhaseRowBatch names them in Python.
@@ -202,7 +298,7 @@ const RECOMPUTED: usize = 6;
 const COLUMNS: usize = 7;
 ```
 
-核心的循环，和我们刚才在那个 batch 上手算的过程一模一样：
+而生成这张矩阵的核心循环，几乎就是我们上一节在草稿纸上手算过程的逐字翻译：
 
 ```rust
         for (request, (((&count, &length), &done), &id)) in scheduled
@@ -237,97 +333,155 @@ const COLUMNS: usize = 7;
         }
 ```
 
-`offset`、`replay`、`offset == length - 1`、`offset >= length && token == count - 1`——每一行都能在上一节找到对应的那句话。一次遍历得到四种选择：最新 decode 行、prompt 结束行、两者之并、本步所有新算的 token；`links` 记下每个请求的最后一行，也就是它的采样行。frontier 只在 `keep` 策略下推进，被标成重算的 token 不会进入任何一种选择。（一个小细节：Python 调这个函数时，Rust 用 `py.allow_threads` 释放了 GIL——它只碰 NumPy 列，不碰张量，也不碰 CUDA。）
+停下来欣赏一下这短短几十行代码。前面我们在纸上推导的每一条规则，在这里都有一行分毫不差的对映：
+* `let offset = i64::from(done) + i64::from(token);` —— 算出当前 token 在请求生命周期里的绝对位置；
+* `let replay = keep && offset < frontier;` —— 在保留状态的抢占策略（`keep`）下，一眼揪出回放重算的旧 token；
+* `if !replay && offset == i64::from(length) - 1` —— 挑出唯一的那一行“prompt 结束行”塞进 `prefill`；
+* `if !replay && offset >= i64::from(length) && token == count - 1` —— 挑出每个请求本步最新的生成行塞进 `decode`；
+* `links.push(start as i64 - 1)` —— 记下每个请求本步的最后一行，作为采样器行与打包行之间的桥梁。
 
-这个标签器还有第二个用户：CPU 上的契约检查（[《在 serving 引擎里信任一段用户程序》](02-trusting-user-programs.md)）。检查用的调度表就是一串 `(请求, scheduled, computed)`，喂给同一个 Rust 标签器。测试和生产走同一份实现，而不是另写一个“模拟 vLLM”的东西。
+由于这段逻辑只读取只读的 NumPy 切片，完全不碰 PyTorch 张量或 CUDA 上下文，我们在进入 `self.label(...)` 时直接用 `py.allow_threads(...)` 释放了 Python 的 GIL。一次线性扫描，同时吐出 7 列完整标签、4 组预筛选好的活跃行集合（`decode`、`prefill`、两者之并 `both`、以及所有非重算的新算行 `fresh`），外加每一组行对应的“打包行号 → 槽内名次（rank）”映射表。
 
-### 行流向哪里
+更妙的是，这个 Rust 标签器不仅服务于线上的 vLLM runner，它还有第二个每天都在高频调用它的用户：**CPU 契约检查器 `pllm.testing.check`**（见本系列第 12 篇《在 serving 引擎里信任一段用户程序》）。当我们在 CPU 上验证用户的代码是否满足“分块不变性”或“抢占重算不变性”时，测试框架并不是去另写一套拙劣的“vLLM 模拟器”，而是直接把一串 `(请求, scheduled, computed)` 喂给同一个 `RowLabeler`。生产环境跑什么算术，离线验证就跑什么算术。
 
-有了标签，“行”就成了 pLLM 所有用户 API 的第 0 维。用户方法收到的每个张量，第 0 维都是行，只是不同的输入来源，“一行”的含义不同：默认的 `tokens="decode"` 是每个 decode 请求的最新 token；`tokens="prefill"` 是本步刚完成 prompt 的请求的最后一个 prompt token（分块时只出现一次）；`@pllm.add_logits`、`@pllm.guide_sampling` 是本步每个要采样的 token；`tokens="all"`（仅 `@pllm.export`）是本步新算的每个 token，抢占重算的只导出一次。这些全由同一个标签器派生：hidden tap 用名次映射把选中的行写进固定的槽（[《图内挂载点》](05-in-graph-attach-points.md)）；状态选择用行的身份找到它的版本（[《PTTS》](01-ptts.md)）；采样器用采样行（[《采样尾声融合》](07-sampler-epilogue.md)）。
+---
 
-行的身份分清楚，有时候直接就是性能。旧 tLLM 时代有一次大跳跃（优化记录第 20 步；7B，8 个 prompt × n=16，256 token，β=0，min_p 0.05，历史测量）：吞吐比从约 79% 提到约 95.4%（原生约 5,048 tok/s，开训练后约 4,817 tok/s）。改动的原话是：“对 V1 `n>1` prompt expansion，不再训练每个 expanded sample，而是每个 prompt/slot 训练一行”，同时修了 graph capture。今天对应的写法是 `key_fields=("prompt_index",)`：同一个 prompt 的样本共享一份状态。128 行变成 8 行，训练量少了一个数量级。
+## 当“行”成为所有 API 的第一维
 
-多卡时，每个 rank 拿到同样的调度结果，标签在每个 rank 上独立、确定地算出来，不需要任何通信（附录里有 TP=2 的实测）。
+一旦底层的标签器把账算清，“行（Row）”就顺理成章地升格成了 pLLM 编程模型里的一等公民。
 
-## 在哪里更差
+在 pLLM 中，无论你写的是读取隐藏状态、修改残差流、在线训练参数，还是干预采样器，你收到的每一个按请求组织的张量，其**第 0 维永远是行（`[rows, ...]`）**。你再也不需要关心 continuous batching 怎么拼张量，也不用关心 CUDA graph 在尾巴上塞了多少行幽灵 padding——pLLM 已经在幕后用刚才算出的名次映射和身份索引，把属于每一行的激活值与属于同一个请求的状态版本（见第 3 篇《PTTS》）严丝合缝地对齐了。
 
-行模型仍然依赖 vLLM 的内部类。入口换成了签名稳定的 `prepare_attn`，读的却还是 `vllm.v1.worker.gpu.input_batch.InputBatch`（MRv1 是 `gpu_input_batch.InputBatch`）的列；vLLM 改调度协议，这里就得改。最现实的例子是投机解码：一个请求一步可能有多个草稿 token、多个采样行，“每个请求恰好一个采样行”的假设就不成立了。今天遇到这样的 batch 会直接断言失败——pLLM 不支持投机解码。
+```text
+InputBatch (CPU)               RowLabeler (Rust)                用户代码收到的第 0 维 [rows, ...]
+┌──────────────┐              ┌──────────────────┐             ┌────────────────────────────────┐
+│ scheduled    │              │ 7 列标签矩阵      │  decode ──► │ pllm.hidden (tokens="decode")  │
+│ prompt_len   ├──prepare()──►│ + 4 组选中行索引  ├──prefill──► │ pllm.hidden (tokens="prefill") │
+│ computed     │              │ + 槽内名次映射表  ├──fresh───►  │ @pllm.export (tokens="all")    │
+│ idx_mapping  │              │ + 采样行 links    ├──links───►  │ @pllm.add_logits / guide_...   │
+└──────────────┘              └──────────────────┘             └────────────────────────────────┘
+```
 
-每步在 CPU 上算标签、准备 hidden tap 也要时间。在 0.5B、β=0 的宿主 profile 里（RTX 4090，vLLM 0.27.1），每次调用的中位数是：`encode_mrv2_rows` 约 122 µs，`prepare_input` 约 174 µs，`HiddenTaps.prepare` 约 110 µs。0.5B 一步约 3 ms，这几百微秒大多藏在 GPU 的阴影里，但在 profile 里看得见；7B 一步约 21.7 ms，就不重要了。
+根据你在声明时选择的入口不同，“一行”会自动映射为那四组集合里的对应切片：
+* **默认激活读取（`tokens="decode"`）**：每个处于生成阶段的请求各占 1 行（即刚才挑出的 `decode` 集合）；
+* **预填充完成（`tokens="prefill"`）**：本步刚刚走完整个 prompt 的请求各占 1 行（即 `prefill` 集合，哪怕长文档被切成了十块，也只在最后一块完成的那一步出现唯一一次）；
+* **采样器干预（`@pllm.add_logits`、`@pllm.guide_sampling`）**：本步需要抽样的每个请求各占 1 行；
+* **全量导出（`@pllm.export` 设 `tokens="all"`）**：本步所有新算出来的 token 各占 1 行（即 `fresh` 集合，抢占重算的旧 token 会被 `frontier` 自动拦在门外，绝不重复导出）。
 
-vLLM 的 prefix caching 假设“相同的 token 前缀产生相同的 KV”。用户一旦改写前向——改残差、改权重、改注意力——这个假设就破了，所以改写前向和 prefix caching 互斥（[设计取舍](../design-tradeoffs.md)）。
+### 把身份分清楚，有时候直接就是性能
 
-最后是写法上的限制：行是不同请求的，用户代码不能沿第 0 维归约。`h - h.mean(0)`、BatchNorm、行间 softmax，都会让一个请求的输出依赖于“这一步恰好和谁拼在一起”。
+你可能会觉得，给行贴标签、绑身份只是一件为了“语义正确”而做的苦力活。但在真实的推理系统里，**对“行身份”的精确建模，有时候本身就能换来惊人的性能跃升。**
 
-## 可以带走的东西
+回到我们当年优化 ESamp 的历史现场。在我们的标准基准测试里，有 8 个并发 prompt，每个 prompt 要求并行采样 `n=16` 条输出序列（共 `8 × 16 = 128` 行）。早期版本的实现非常老实：既然 vLLM 把 `n=16` 拆成了 128 个子请求，那我们就每一步对这 128 行全部跑一遍训练。当时在 7B 模型上（8 个 prompt × `n=16`，256 token，`β=0`，`min_p=0.05`，历史测量），开启在线训练后的吞吐只有原生 vLLM 的约 **79%**。
 
-这个故事的转折点不在于终于读懂了 attention metadata，而在于发现**不需要读它**：我们要的信息，在那个结构被构造之前就已经以三个整数的形式存在了。往别人的系统里接东西时，最诱人的往往是信息最多的那个结构，可它也最复杂、最容易变；更好的接缝通常在更上游，那里的信息更少、更干净，接口也更稳定。
+后来我们突然反应过来：同一个 prompt 裂变出来的 16 条采样轨迹，共享的是完全相同的上下文起点！如果我们不是按子请求、而是按原始 prompt 来绑定状态，每个 prompt 只抽 1 行代表去更新 distiller，会怎么样？
 
-当然，如果没有那段打断点的日子，我们大概也认不出这三个数就是全部。读懂别人的系统和找到最小的依赖，并不矛盾——前者常常是后者的前提。
+那次改动（配合修复 graph capture，以及把可捕获的优化器换成 SGD）直接让 7B 上的吞吐比从约 **79% 飙升到了 95.4%**（原生约 5,048 tok/s，开启训练后达 4,817 tok/s）。在今天的 pLLM 里，这不再需要你去改底层引擎，只需要在声明状态时写下一行配置：
 
-## 附：vLLM attention metadata 字段笔记
+```python
+key_fields=("prompt_index",)
+```
 
-ESamp 时代我们靠打断点摸清了 attention metadata。今天的 pLLM 已经不读它，但它仍然是理解 vLLM 怎么拼 batch 的最好窗口。下面是在 vLLM 0.27.1 和 0.32.0 上重新实测的结果，给后来想在 vLLM 里“找行”的人。
+短短一行声明，就把同一个 prompt 下的 16 个子请求路由到了同一份状态上，要维护和更新的状态从 128 份缩减到了 8 份。
 
-### 怎么测的
+再比如在多卡张量并行（Tensor Parallelism，如 TP=2 或 TP=4）下，由于 vLLM 的所有 TP rank 在每一步都会收到完全相同的调度指令，我们的 Rust 标签器可以在每张卡的 worker 进程上**各自独立、确定性地算出完全一致的行标签**，连一比特的跨卡通信都不需要（文末附录展示了我们在两张 A100 上实测 TP=2 的逐字段比对）。
 
-用一个 30 行的探针包住 MRv2 runner 里构建 metadata 的 `model_state.prepare_attn`，每个真实步打印 `InputBatch` 和第一层的 attention metadata。设置：`VLLM_USE_V2_MODEL_RUNNER=1`，Qwen2.5-0.5B-Instruct，`max_num_seqs=8`，`max_num_batched_tokens=64`（逼出分块 prefill），prefix caching 关，CUDA graph 开。三个请求同时提交：
+---
 
-- 请求 0：`"Hello, my name is"`（5 个 token），n=2，生成 5 个 token；vLLM 把它拆成两个子请求，ID 形如 `0_0-…`、`1_0-…`；
-- 请求 1：`"Paris is"`（2 个 token），生成 5 个 token；
-- 请求 2：一个 150 token 的长 prompt，生成 2 个 token。
+## 天下没有免费的午餐：账单与边界
 
-单卡在 RTX 4090 上测（两个 vLLM 版本 × FlashAttention、FlashInfer 两个后端）；TP=2 在两张 A100-SXM4-80GB 上测。
+当然，把行模型立在 `prepare_attn` 和 `InputBatch` 之上，并不是没有代价的。作为系统设计者，我们得把账单摊开来算清楚。
 
-### 一步一步看
+**第一笔账是每一步的 CPU 准备耗时。**
+虽然我们彻底告别了把 GPU 张量拷回 CPU 的同步噩梦，但每一步在 CPU 上借用 NumPy 列、跑一遍 Rust 标签器、再把算好的行索引和名次映射填进即将拷往 GPU 的固定表里，仍然需要花掉几百微秒的主机时间。在 RTX 4090 的宿主侧 profile 中（0.5B 模型，`β=0`），每次调用的中位数耗时大约是：`encode_mrv2_rows` 占 **122 µs**，会话 `prepare_input` 占 **174 µs**，准备隐藏层抓取槽位 `HiddenTaps.prepare` 占 **110 µs**。
+这点时间贵不贵？这取决于你的模型有多大。这段 CPU 工作量只跟批次里的行数有关，跟模型大小无关。在 0.5B 这样的小模型上，GPU 跑完一步前向总共只要 **3.0 ms**，这四百多微秒的 CPU 准备工作虽然大部分能藏在 GPU 执行的阴影里，但在 profiler 的时间线上依然清晰可见；而当你换到 **7B 模型**时，一步 decode 长达 **21.7 ms**，这几百微秒的固定开销就彻底淹没在浩瀚的矩阵乘法背后，连一丝涟漪都看不见了。
 
-下面是 vLLM 0.32.0、FlashAttention 后端的五个真实步（0.27.1 除了 `idx_mapping` 的数值和 dtype 外完全相同）。`computed` 是 `num_computed_tokens`；`prefilling` 是 `is_prefilling`。
+**第二道边界是对宿主调度协议的依赖。**
+尽管我们挑了签名最稳定的 `prepare_attn`，但 `encode_mrv2_rows` 读取的依然是 vLLM 内部 `InputBatch` 的属性列。只要 vLLM 的调度假设发生结构性改变，我们的断言就会立刻拉响警报。最典型的例子就是**投机解码（Speculative Decoding）**：一旦开启投机解码，一个处于生成阶段的请求在同一步里会同时塞进多个草稿（draft）token，也会产生多个采样位置，“每个请求在本步最多一个最新 decode 行、恰好一个采样行”的算术前提当场破裂。因此，今天的 pLLM 遇到投机解码会直接报错，请你关掉它；`assert input_batch.num_draft_tokens == 0` 是最后一道保险。
+
+**第三道边界来自前缀缓存（Prefix Caching）与跨行操作。**
+vLLM 的前缀缓存默认一条铁律：“只要两个请求的 token 前缀一模一样，它们算出来的 KV cache 就一定一模一样。”当你的程序只是旁路读取隐藏状态或训练自己的小网络时，这条铁律安然无恙；但只要你在模型内部挂载了会因请求而异地改写残差流、权重或注意力的逻辑，相同的 token 前缀在不同请求手里就会算出不同的 KV，前缀缓存的假设便不复存在——此时 pLLM 会强制要求关闭或隔离前缀缓存。
+同样地，因为张量的第 0 维现在代表“恰好在这一步被拼在一起的不同租户”，你在写模型方法时必须守住一条铁律：**永远只沿着特征维（`dim=-1`）做归约，绝不能跨行（`dim=0`）归约。** 一句随手写下的 `h - h.mean(dim=0)` 或 `BatchNorm`，就会把张三和李四的命运死死绑在一起（至于我们怎么在你不小心写出这种代码时自动抓住你，那是第 12 篇的故事了）。
+
+---
+
+回顾从当年初探 ESamp 到今天 pLLM 的行模型，最让我感慨的转折点，并不是我们终于靠打断点破译了 `attn_metadata` 的全部密码，而是我们最终意识到**根本不需要去读它**。
+
+当你试图往一个庞大、高速演进的底层系统里挂载扩展时，最容易犯的错误，就是被那个“看起来信息最全、离计算最近”的复杂结构体吸引过去。但它往往也是耦合最深、变化最剧烈的泥潭。更好的接缝通常藏在更上游的地方——在那里，数据还没有被打包成面向特定硬件内核的复杂形态，信息更少、更朴素，接口反而稳如磐石。
+
+用三个在装车前就印好的整数，替代对一整车包裹的拆解——这是我们在 vLLM 里交过学费后，学到的最划算的一课。
+
+---
+
+## 附：vLLM attention metadata 字段解剖笔记
+
+当年做 ESamp 时，我们曾因为找不到任何关于 vLLM v1 `attn_metadata` 的开源文档而吃尽苦头，只能靠打断点一点点摸索。虽然今天的 pLLM 已经完全不再读取 `attn_metadata`，但对于任何想要深入理解 vLLM 是如何拼装连续批处理、如何管理分页 KV 以及如何配合 CUDA graph 的系统开发者来说，它依然是最好的观察窗口。
+
+我用一段几十行的探针脚本包住了 MRv2 runner 里构建元数据的 `model_state.prepare_attn`，在 **vLLM 0.27.1 和 0.32.0** 两个版本上重新实测了各个字段的运行态长相，整理成这份速查笔记，希望能帮后来在 vLLM 源码里探险的朋友省下几个通宵。
+
+### 1. 探针实验设置
+
+开启新版 runner（`VLLM_USE_V2_MODEL_RUNNER=1`），加载 `Qwen2.5-0.5B-Instruct`，设 `max_num_seqs=8`、`max_num_batched_tokens=64`（故意设小以逼出分块 prefill），关闭 prefix caching，开启 CUDA graph。同时向引擎提交三个请求：
+* **请求 0**：`"Hello, my name is"`（5 个 token），设并行采样 `n=2`，各生成 5 个 token；vLLM 内部将它裂变为两个子请求，ID 形如 `0_0-…` 和 `1_0-…`；
+* **请求 1**：`"Paris is"`（2 个 token），生成 5 个 token；
+* **请求 2**：一段 150 个 token 的长 prompt，生成 2 个 token。
+
+单卡实验在 RTX 4090 上完成（覆盖 0.27.1 / 0.32.0 两个版本 × FlashAttention / FlashInfer 两个注意力后端）；多卡张量并行（TP=2）在两张 A100-SXM4-80GB 上完成。
+
+### 2. 五个真实步的逐帧解剖
+
+下面是 vLLM 0.32.0 在 FlashAttention 后端下跑出的前五个真实步（0.27.1 除 `idx_mapping` 的具体槽号数值和整数位宽外完全一致）。表中 `computed` 即 `num_computed_tokens`，`prefilling` 即 `is_prefilling`：
 
 | 步 | 图模式 | 行序（请求） | scheduled | computed | query_start_loc | seq_lens | logits_indices | prefilling |
 |---|---|---|---|---|---|---|---|---|
-| 1 | eager | 1, 0_0, 1_0, 2 | 2, 5, 5, 52 | 0, 0, 0, 0 | 0, 2, 7, 12, 64 | 2, 5, 5, 52 | 1, 6, 11, 63 | T, T, T, T |
-| 2 | eager | 0_0, 1_0, 1, 2 | 1, 1, 1, 61 | 5, 5, 2, 52 | 0, 1, 2, 3, 64 | 6, 6, 3, 113 | 0, 1, 2, 63 | F, F, F, T |
-| 3 | eager | 0_0, 1_0, 1, 2 | 1, 1, 1, 37 | 6, 6, 3, 113 | 0, 1, 2, 3, 40 | 7, 7, 4, 150 | 0, 1, 2, 39 | F, F, F, T |
-| 4 | FULL | 0_0, 1_0, 1, 2 | 1, 1, 1, 1 | 7, 7, 4, 150 | 0, 1, 2, 3, 4 | 8, 8, 5, 151 | 0, 1, 2, 3 | F, F, F, F |
-| 5 | FULL | 0_0, 1_0, 1, (pad) | 1, 1, 1 | 8, 8, 5 | 0, 1, 2, 3, 3 | 9, 9, 6, 0 | 0, 1, 2 | F, F, F |
+| 1 | NONE (eager) | `1, 0_0, 1_0, 2` | `2, 5, 5, 52` | `0, 0, 0, 0` | `0, 2, 7, 12, 64` | `2, 5, 5, 52` | `1, 6, 11, 63` | `T, T, T, T` |
+| 2 | NONE (eager) | `0_0, 1_0, 1, 2` | `1, 1, 1, 61` | `5, 5, 2, 52` | `0, 1, 2, 3, 64` | `6, 6, 3, 113` | `0, 1, 2, 63` | `F, F, F, T` |
+| 3 | NONE (eager) | `0_0, 1_0, 1, 2` | `1, 1, 1, 37` | `6, 6, 3, 113` | `0, 1, 2, 3, 40` | `7, 7, 4, 150` | `0, 1, 2, 39` | `F, F, F, T` |
+| 4 | FULL (graph) | `0_0, 1_0, 1, 2` | `1, 1, 1, 1` | `7, 7, 4, 150` | `0, 1, 2, 3, 4` | `8, 8, 5, 151` | `0, 1, 2, 3` | `F, F, F, F` |
+| 5 | FULL (graph) | `0_0, 1_0, 1, (pad)` | `1, 1, 1` | `8, 8, 5` | `0, 1, 2, 3, 3` | `9, 9, 6, 0` | `0, 1, 2` | `F, F, F` |
 
-几件从表里直接能看到、光读代码不容易确定的事：
+盯着这张表看五分钟，你能直接看穿六件光靠静态读代码极难察觉的真相：
 
-1. **行序是排过的。** 第 1 步四个请求都在 prefill，按 token 数从小到大排（2、5、5、52）；第 2 步起 decode 请求排在最前。这是 MRv2 的 `sort_batch_req_ids`：先放本步 token 数等于 decode 长度（1）的请求，其余按 token 数升序。FlashInfer 一类后端依赖“decode 在前”来切分 batch。
-2. **`logits_indices` 包含还没算完 prompt 的请求。** 第 1、2 步里，请求 2 的 prompt 还没算完（52/150、113/150），可它的最后一行（63）仍在 `logits_indices` 里：vLLM 照样为它算 logits、采样，然后丢掉结果。所以“`logits_indices` 里的行”不等于“有意义的采样行”。第 3 步的 39 才是请求 2 真正的 prompt 结束行（offset 149 = 150 − 1）。这正是 pLLM 用 `offset == prompt - 1` 而不是 `logits_indices` 来判断 prompt 结束的原因。
-3. **`seq_lens` 是“算完本步之后”的长度**（`computed + scheduled`），也就是本步 attention 要看的 KV 长度，不是 prompt 长度。
-4. **哪些是 prefill、哪些是 decode，有两种不同的说法。** `is_prefilling` 按阶段判断（`num_computed_tokens < num_prompt_tokens`），和旧 tLLM 的 `num_computed_tokens >= num_prompt_tokens` 判 decode 是同一回事。FlashInfer 的 `num_decodes / num_prefills` 却是按**本步的 query 长度**判断：长度不超过 `reorder_batch_threshold`（这里是 1）的都算 decode。第 2 步 FlashInfer 报告 `num_decodes=3, num_decode_tokens=3, num_prefills=1, num_prefill_tokens=61`，和 `is_prefilling` 一致；但一个只剩 1 个 token 没算的 prompt 块，在 FlashInfer 眼里是 “decode”，在 `is_prefilling` 眼里仍是 prefill（vLLM 源码里把这叫 short extend，默认按 decode 处理）。要知道“真正的阶段”，看 `is_prefilling` 或自己用三个数算。
-5. **padding 在 FULL 图模式下会进入 metadata。** 第 5 步只有 3 个真实请求、3 个 token，被补到 4：`InputBatch.num_reqs=3, num_reqs_after_padding=4, num_tokens=3, num_tokens_after_padding=4`；metadata 里 `query_start_loc` 末尾重复（`0,1,2,3,3`，padding 请求的 query 长度为 0），`seq_lens` 补 0，`slot_mapping` 的 padding 位置是 −1（不写 KV），而 **`num_actual_tokens` 是 4——包含 padding**。vLLM 源码里那个字段旁边就有一句 TODO：“rename to num_tokens since it may be padded and this is misleading”。旧 tLLM 时代（MRv1）用 `num_actual_tokens` 排除 padding 是对的；在 MRv2 的 FULL 图模式下要用 `InputBatch.num_tokens`。eager 和 piecewise 模式用的是未补齐的大小。
-6. **`slot_mapping` 是每个 token 写 KV 的物理位置**（块号 × 块大小 + 块内偏移）。第 1 步请求 1 的两个 token 写到 48、49，请求 0 的两个子请求各自写一份（16–20、32–36）——prefix caching 关着时，n=2 的两个样本各自算一遍同一个 prompt。
+1. **行序是被悄悄重排过的。**
+   看第 1 步：四个请求全在做 prefill，它们在扁平张量里的顺序并不是按提交顺序排的，而是按本步调度的 token 数**从小到大升序排列**（`2, 5, 5, 52`）。到了第 2 步，进入 decode 的三个请求（`0_0, 1_0, 1`）被整齐地排在了最前面，还在做分块 prefill 的请求 `2` 被扔在最后。这是 MRv2 里 `sort_batch_req_ids` 干的活：先把本步 token 数等于 decode 长度（1）的请求排在最前，其余按 token 数升序排列。源码注释写得明白：后端切分 decode 与 prefill 的 `split_decodes_and_prefills` 依赖“decode 类请求排在最前”的布局。
+2. **`logits_indices` 里混着“假采样行”！**
+   看第 1 步和第 2 步：请求 `2` 的 150 个 prompt token 才算到第 52 个和第 113 个，离算完差得远呢，但它的最后一行（行 63）依然赫然出现在 `logits_indices`（`[1, 6, 11, 63]` 和 `[0, 1, 2, 63]`）里！换句话说，vLLM 照样把第 63 行送进 LM head 算出了词表 logits、甚至跑了采样，最后再把结果丢掉。直到第 3 步，请求 `2` 算完了最后的 37 个 token（总进度达到 150），此时的 `logits_indices` 里的 `39`（对应 `offset = 149`）才真正是有意义的 prompt 结束采样行。**千万不要以为出现在 `logits_indices` 里的行就代表 prompt 已经算完了**——这正是 pLLM 坚持用 `offset == prompt - 1` 判定预填充结束的根本原因。
+3. **`seq_lens` 代表“算完本步之后”的序列总长。**
+   在每一行里，`seq_lens` 严格等于 `computed + scheduled`，也就是本步注意力内核需要扫描的 KV 有效总长度，而不是原始 prompt 长度。
+4. **到底谁算 prefill、谁算 decode？内部有两种截然不同的口径。**
+   `CommonAttentionMetadata.is_prefilling` 是按**真实生命周期阶段**判定的（即 `num_computed_tokens < num_prompt_tokens`），这与旧版 tLLM 以及今天 pLLM 的口径完全一致。但如果你切到 FlashInfer 后端去看 `FlashInferMetadata` 里的 `num_decodes` 和 `num_prefills`，你会发现它是按**本步的 query 长度**判定的：凡是本步调度长度不超过 `reorder_batch_threshold`（此处为 1）的请求，统统被归入 decode！在第 2 步里，两边恰好一致（`num_decodes=3, num_prefills=1`）；但如果某个分块 prefill 的长请求在最后一步恰好只剩 1 个 prompt token 没算，FlashInfer 会把它当成 decode 处理（源码里称为 short extend），而 `is_prefilling` 依然是 `True`。想判断算法的真实阶段，永远看 `is_prefilling` 或自己用三个数算。
+5. **在 `FULL` CUDA graph 模式下，`num_actual_tokens` 居然包含幽灵 padding！**
+   看第 5 步：请求 `2` 已经生成完 2 个 token 退役了，场上只剩 3 个活跃请求、共 3 个真实 token。但为了命中尺寸为 4 的 `FULL` CUDA graph，batch 被补齐到了 4：`InputBatch.num_reqs=3, num_reqs_after_padding=4, num_tokens=3, num_tokens_after_padding=4`。此时看 `attn_metadata`：`query_start_loc` 末尾重复了一次 `3`（`[0, 1, 2, 3, 3]`，表示第 4 个幽灵请求长度为 0），`seq_lens` 末尾补了 `0`，`slot_mapping` 末尾填了 `-1`（告诉内核不要写 KV cache），但名叫“实际 token 数”的 **`num_actual_tokens` 却是 `4`——它把 padding 行算进去了！** 翻开 vLLM 源码，你会看到那个字段旁边尴尬地躺着一行注释：`TODO(lucas): rename to num_tokens since it may be padded and this is misleading`。在旧的 MRv1 时代用 `num_actual_tokens` 过滤 padding 是对的，但在 MRv2 的 `FULL` 图模式下，必须用 `InputBatch.num_tokens`。
+6. **`slot_mapping` 揭示了 `n>1` 的物理写入位置。**
+   `slot_mapping` 记录每个 token 写入分页 KV cache 的物理槽位（`物理块号 × 块大小 + 块内偏移`）。在第 1 步里，请求 1 的两个 token 写进了槽位 `48, 49`；而请求 0 裂变出的两个子请求 `0_0` 和 `1_0`，分别写进了 `16..20` 和 `32..36`——当关闭 prefix caching 时，`n=2` 的两个样本会各自独立地把相同的 5 个 prompt token 算一遍、存两份。
 
-### 字段速查
+### 3. 核心结构体字段速查表
 
-**`CommonAttentionMetadata`**（所有后端共享，每步一份）：
+**`CommonAttentionMetadata`**（所有注意力后端共享的公共底座，每步构造一份）：
 
-| 字段 | 含义（实测） |
+| 字段名 | 实测含义与踩坑提示 |
 |---|---|
-| `query_start_loc`、`query_start_loc_cpu` | 每个请求在扁平 batch 里的起点，长度 `num_reqs + 1`；GPU 和 CPU 各一份。FULL 图模式下包含 padding 请求（长度为 0 的段） |
-| `seq_lens` | 算完本步后每个请求的 KV 长度（`computed + scheduled`）；padding 请求为 0 |
-| `num_reqs` | 请求数；FULL 模式下是补齐后的数 |
-| `num_actual_tokens` | token 总数；**FULL 模式下包含 padding** |
-| `max_query_len`、`max_seq_len` | 本步最长的 query 和 KV 长度（后者可能是上界） |
-| `block_table_tensor` | `[num_reqs, max_blocks]`，每个请求的 KV 块号 |
-| `slot_mapping` | 每个 token 写 KV 的槽位；padding 为 −1 |
-| `positions` | 每个 token 在请求里的位置（也就是 `offset`） |
-| `is_prefilling` | 每个请求是否仍在 prompt 阶段（CPU 张量） |
-| `seq_lens_cpu_upper_bound` | `seq_lens` 的 CPU 上界（没有投机解码时就是精确值） |
-| `req_idx`（仅 0.32） | 每行请求在 runner 请求表里的下标，等于 `InputBatch.idx_mapping` |
-| `dcp_local_seq_lens` 等 | decode context parallel 时每个 rank 本地的 KV 长度；未开启时为 None |
-| `logits_indices_padded`、`num_logits_indices` | 只给 fast-prefill 一类特殊 builder 用；普通路径为 None |
+| `query_start_loc` / `query_start_loc_cpu` | 形状 `(num_reqs + 1,)` 的 `int32` 张量（GPU 与 CPU 各一份），记录每个请求在扁平 batch 里的起始行号（前缀和）。`FULL` 图模式下包含长度为 0 的 padding 请求段。 |
+| `seq_lens` | 形状 `(num_reqs,)` 的 GPU `int32` 张量，记录算完本步后每个请求的 KV 长度（`computed + scheduled`）；padding 请求处填 `0`。 |
+| `num_reqs` | 请求数量；注意在 `FULL` 图模式下是补齐后的请求数（如第 5 步为 `4` 而非 `3`）。 |
+| `num_actual_tokens` | 扁平张量的总行数；**在 `FULL` 图模式下包含尾部的 padding 行**，切勿在 MRv2 下拿它当真实 token 数。 |
+| `max_query_len` / `max_seq_len` | 本步所有请求中最长的单步 query 长度与最大 KV 长度（后者在某些后端可能是上界）。 |
+| `block_table_tensor` | `[num_reqs, max_blocks]` 的 GPU `int32` 张量，记录每个请求分配到的物理 KV 页表块号。 |
+| `slot_mapping` | 长度为 `num_actual_tokens` 的 GPU `int64` 张量，记录本步每个 token 在 KV 池中的物理写入槽位；padding 行处固定为 `-1`。 |
+| `positions` | 长度为 `num_actual_tokens` 的 GPU `int64` 张量，即每个 token 在各自序列中的逻辑位置 `offset`。 |
+| `is_prefilling` | 形状 `(真实请求数,)` 的 CPU `bool` 张量，标记每个真实请求是否仍处于 prompt 预填充阶段。 |
+| `seq_lens_cpu_upper_bound` | `seq_lens` 在 CPU 侧的上界拷贝（无投机解码时即精确值）。 |
+| `req_idx`（仅 vLLM 0.32） | `int64` NumPy 数组，记录每个真实请求在 runner 持久请求表中的槽位下标，等同于 `InputBatch.idx_mapping_np`。 |
+| `dcp_local_seq_lens` 等 | 开启 Decode Context Parallel 时每个 rank 本地的 KV 长度；未开启时为 `None`。 |
+| `logits_indices_padded` / `num_logits_indices` | 仅在 fast-prefill 等特殊 builder 路径下使用；常规路径下恒为 `None`。 |
 
-**FlashAttention 后端的 `FlashAttentionMetadata`**：基本是上表的子集（`num_actual_tokens`、`max_query_len`、`query_start_loc`、`max_seq_len`、`seq_lens`、`block_table`、`slot_mapping`、`causal`），外加 FA3 用的 `scheduler_metadata` / `max_num_splits`（FA2 下为空）。`num_decode_reqs` 等字段在这个后端上一直是 0，不要拿来判断阶段。0.27.1 还有级联注意力的 `use_cascade`、`common_prefix_len`、`prefix_kv_lens`、`suffix_kv_lens` 和 `sliding_window`，0.32 去掉了这些。
+**后端专属 Metadata 的差异：**
+* **`FlashAttentionMetadata`（FlashAttention 后端）**：基本是公共底座的子集（含 `num_actual_tokens`、`max_query_len`、`query_start_loc`、`max_seq_len`、`seq_lens`、`block_table`、`slot_mapping`、`causal`），外加供 FA3 调度的 `scheduler_metadata` / `max_num_splits`。**特别注意**：该结构体里的 `num_decode_reqs`、`num_prefill_reqs`、`num_decode_tokens`、`num_prefill_tokens` 在该后端下**恒为 0**，千万不要拿它们来判断阶段！此外，0.27.1 中用于级联注意力的 `use_cascade`、`common_prefix_len` 等字段在 0.32 中被删掉了（`rswa_*` 字段两个版本都有）。
+* **`FlashInferMetadata`（FlashInfer 后端）**：结构体里直接去掉了 `seq_lens` 和 `block_table`——因为它们在构建阶段就已经被提前编译（plan）进了 FlashInfer 的 `prefill` 和 `decode` 两个 C++ wrapper 对象内部。留下的字段里，`num_decodes / num_decode_tokens / num_prefills / num_prefill_tokens` 是真正在工作的（按本步 query 长度切分，要求 decode 行严格排在前面）。
+* **`InputBatch`（MRv2 中 pLLM 真正借用的源头）**：包含 `num_scheduled_tokens`、`num_computed_tokens_np`、`idx_mapping_np`（在 0.27.1 中为 `int32`，在 0.32.0 中升级为 `int64`）、`cu_num_logits_np`、`logits_indices`、`num_reqs / num_reqs_after_padding`、`num_tokens / num_tokens_after_padding`，配合 `req_states.prompt_len` 即可拿到全部三个核心整数。
 
-**FlashInfer 后端的 `FlashInferMetadata`**：没有 `seq_lens` 和 `block_table`——它们在构建时已经被“plan”进了 FlashInfer 的 prefill / decode wrapper 对象里。剩下的是 `num_actual_tokens`、`slot_mapping`、`num_decodes / num_decode_tokens / num_prefills / num_prefill_tokens`（按 query 长度切分，decode 在前）、`prefill` / `decode`（两个 wrapper）、两个 q 的 dtype；0.32 多了 `kv_cache_layout`，0.27.1 多了级联用的 `use_cascade` / `cascade_wrapper`。
+### 4. 多卡并行时会发生什么？
 
-**`InputBatch`（MRv2）里 pLLM 实际使用的列**：`num_scheduled_tokens`、`num_computed_tokens_np`、`idx_mapping_np`（行 → 持久请求槽；0.27.1 是 int32，0.32 是 int64，同一批请求的槽号也不同）、`cu_num_logits_np`、`logits_indices`、`num_reqs / num_reqs_after_padding`、`num_tokens / num_tokens_after_padding`，加上 `req_states.prompt_len`。三个数都在里面。
+我们在两张 A100-SXM4-80GB 上对 **张量并行（TP=2）** 进行了全组合实测（覆盖 vLLM 0.27.1 与 0.32.0 × FlashAttention 与 FlashInfer）。结论非常干净：**在每一步，Rank 0 和 Rank 1 上的 `InputBatch` 与 `attn_metadata` 的每一个字段、探针打印出的每一个张量数值都完全相同。** 和单卡相比，唯一的物理区别在于 KV cache 张量本身的形状——每张卡只持有总 KV 头数的一半（例如 0.5B 模型的 2 个 KV 头变成了每卡 1 个）。因此，行标签在每个 TP rank 上各自独立计算是 100% 确定且对齐的，无需任何跨卡同步。
 
-### 多卡时
-
-**张量并行（TP=2，两张 A100-SXM4-80GB，vLLM 0.27.1 与 0.32.0、FlashAttention 与 FlashInfer 四种组合都测了）。** 两个 rank 上每一步的 `InputBatch` 和 attention metadata 逐字段相同；唯一的区别在 KV cache 张量本身：每个 rank 只存一半的 KV 头（0.5B 的 2 个 KV 头变成每卡 1 个）。所以行标签可以在每个 rank 上独立算，不需要通信——pLLM 正是这么做的。
-
-**以下来自读 vLLM 0.32 的源码，没有实测：** 数据并行（DP）时每个 DP rank 有自己的调度器和自己的 batch，彼此的行毫无关系；为了让各 rank 能用同样的 CUDA graph，它们会商定一个共同的补齐后 token 数，所以 padding 可能比单卡时多。decode context parallel（DCP）时，KV 按 rank 切分，`dcp_local_seq_lens` 给出每个 rank 本地的 KV 长度，而 `seq_lens` 仍是全局长度。prefill context parallel（PCP）走另一条 `pcp_manager.prepare_attn` 路径。pLLM 今天只支持 TP。
+至于其他并行模式（基于 vLLM 0.32 源码分析，pLLM 目前仅支持 TP）：在**数据并行（DP）**下，每个 DP rank 拥有独立的调度器和完全不相干的 batch，但为了能协同执行步调一致的算子，各 rank 会协商一个共同的补齐后 token 数，因此尾部的 padding 行可能会比单卡时更多；在 **Decode Context Parallel（DCP）**下，历史 KV 沿序列维切分到不同卡上，`dcp_local_seq_lens` 会记录本卡持有的局部 KV 长度，而 `seq_lens` 依然保持全局总长度。
