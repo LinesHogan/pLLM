@@ -101,7 +101,7 @@ def test_inplace_neutral_contract(tmp_path):
         InPlaceTTTWorkload(options), config, neutral=InPlaceTTTWorkload(replace(options, learning_rate=0))
     )
     assert "exact decode: eager terminal request state on fixed per-token inputs" in result.passed
-    assert "neutral: greedy and seeded sampling bitwise" in result.passed
+    assert "neutral: greedy and seeded sampling bitwise vs vanilla with the same kernels" in result.passed
     print(result)
 
 
@@ -135,6 +135,8 @@ def test_distribution_contract(monkeypatch, runner):
         temperature=0.8,
         max_mean_kl=0.01,
         max_p99_kl=0.01,
+        max_mean_tv=0.01,
+        max_p99_tv=0.05,
     )
     strong = check_distribution(DoLaWorkload(layers=(0, 2)), config, max_mean_kl=0.01, max_p99_kl=0.01)
     assert near.passed and not strong.passed

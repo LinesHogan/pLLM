@@ -377,9 +377,45 @@ def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[No
         yield vanilla
 
 
-def _neutral(workload: Workload, config: ModelConfig) -> None:
+def _neutral_distribution(workload: Workload, config: ModelConfig) -> str:
+    """Allow BF16 fusion rounding: mean/P99 KL <= .001/.01 nats, TV <= .01/.05.
+
+    The 7B RTX 4090 calibration includes neutral attention, activation, residual and
+    projection hooks. Full-vocabulary distances expose changes hidden by greedy token IDs.
+    """
+    from pllm.testing_distribution import check_distribution
+
+    reports: list[str] = []
+    for temperature in (0, 0.8):
+        result = check_distribution(
+            workload,
+            config,
+            temperature=temperature,
+            max_mean_kl=1e-3,
+            max_p99_kl=1e-2,
+            max_mean_tv=1e-2,
+            max_p99_tv=5e-2,
+        )
+        if not result.passed:
+            raise ContractError(
+                (f"[neutral] teacher-forced full-vocabulary distributions differ from vanilla:\n{result}",)
+            )
+        kl = (result.kl_plain_to_workload, result.kl_workload_to_plain)
+        reports.append(
+            f"T={temperature}: KL mean/P99 {max(item.mean for item in kl):.3g}/{max(item.p99 for item in kl):.3g}, "
+            f"TV {result.tv.mean:.3g}/{result.tv.p99:.3g}"
+        )
+    return "neutral: teacher-forced full-vocabulary KL/TV vs vanilla; " + "; ".join(reports)
+
+
+def _neutral(workload: Workload, config: ModelConfig) -> str:
     if not affects_model(workload, config):
-        return
+        return "neutral: no model or sampler effects"
+    requirements = workload.backend_requirements()
+    if not explain(workload, config).eager_reason:
+        compilation = graph_options(config, requirements).get("compilation_config")
+        if compilation is not None and compilation.backend == "inductor":
+            return _neutral_distribution(workload, config)
     observed = _neutral_tokens(workload, config)
     with plain_model(workload, config) as vanilla:
         expected = tuple(
@@ -396,10 +432,11 @@ def _neutral(workload: Workload, config: ModelConfig) -> None:
     if observed != expected:
         raise ContractError(
             (
-                "[neutral] generated token IDs differ from vanilla in the same graph mode; "
+                "[neutral] generated token IDs differ from vanilla with the same model kernels; "
                 "check that neutral= disables every model/sampler effect, then report a pLLM bug if it does",
             )
         )
+    return "neutral: greedy and seeded sampling bitwise vs vanilla with the same kernels"
 
 
 def _sequence_update(
@@ -514,7 +551,10 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
 def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:
     """Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
 
-    Neutral checks compare greedy and seeded sampled token IDs bitwise in the workload's graph mode.
+    Neutral checks compare greedy and seeded token IDs bitwise when model kernels match vanilla.
+    Inductor model hooks can change fusion: those compare teacher-forced full-vocabulary distributions
+    on greedy and seeded continuations, with mean/P99 KL <= .001/.01 nats (both directions) and
+    mean/P99 TV <= .01/.05. Successful checks report the comparison and measured distances.
     Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
     and replayed per token, as in the CPU script, to exclude base-model rounding differences; custom forwards
     regenerate their readouts. Untrained early exits may need VLLM_BATCH_INVARIANT=1 to exclude
@@ -567,8 +607,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         skipped.append(CheckSkip("neutral", "pass neutral= with the author's disabled settings"))
     else:
         try:
-            _neutral(neutral, config)
-            passed.append("neutral: greedy and seeded sampling bitwise")
+            passed.append(_neutral(neutral, config))
         except ContractError as error:
             failures.extend(error.failures)
     if failures:

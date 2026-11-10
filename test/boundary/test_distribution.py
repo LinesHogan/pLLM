@@ -24,8 +24,8 @@ def test_distribution_arithmetic():
         assert math.isclose(summary.p99, float(expected[:, index].sort().values[98]), abs_tol=2e-6)
         assert math.isclose(summary.max, float(expected[:, index].max()), abs_tol=2e-6)
         assert (summary.worst[0].prompt_index, summary.worst[0].token_offset) == (9, 9)
-    assert not distribution_failures(summaries, 0.1, None)
-    assert len(distribution_failures(summaries, 0.1, 0.1)) == 2
+    assert not distribution_failures(summaries, 0.1, None, 0.1, None)
+    assert len(distribution_failures(summaries, 0.1, 0.1, 0.1, 0.1)) == 3
     support = distribution_distances(torch.tensor([[0.0, -torch.inf]]), torch.tensor([[-torch.inf, 0.0]]))
     assert torch.equal(support, torch.tensor([[torch.inf, torch.inf, 1.0]]))
     assert torch.equal(
@@ -33,7 +33,7 @@ def test_distribution_arithmetic():
     )
     tail = distance_summaries(torch.cat((actual, support)), [(0, i) for i in range(101)], 1)
     assert math.isinf(tail[0].max) and math.isfinite(tail[0].p99)
-    assert distribution_failures(tail, 0.1, None)
-    assert not distribution_failures(tail, None, None)
+    assert distribution_failures(tail, 0.1, None, None, None)
+    assert not distribution_failures(tail, None, None, None, None)
     invalid = distance_summaries(torch.full((1, 3), torch.nan), [(0, 0)], 1)
-    assert len(distribution_failures(invalid, None, None)) == 3
+    assert len(distribution_failures(invalid, None, None, None, None)) == 3

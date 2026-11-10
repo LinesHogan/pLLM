@@ -942,7 +942,7 @@ pllm.testing.DistributionResult(kl_plain_to_workload: 'DistanceSummary', kl_work
     Exact diagnostic values and threshold failures; dataclasses.asdict is JSON-ready.
 pllm.testing.TokenDistance(prompt_index: 'int', token_offset: 'int', value: 'float')
     A distance at a zero-based prompt index and predicted token offset in its full sequence.
-pllm.testing.check_distribution(workload: 'Workload', config: 'ModelConfig', *, prompts: 'Sequence[str] | None' = None, tokens: 'int' = 16, temperature: 'float' = 0, max_mean_kl: 'float | None' = None, max_p99_kl: 'float | None' = None, worst: 'int' = 5) -> 'DistributionResult'
+pllm.testing.check_distribution(workload: 'Workload', config: 'ModelConfig', *, prompts: 'Sequence[str] | None' = None, tokens: 'int' = 16, temperature: 'float' = 0, max_mean_kl: 'float | None' = None, max_p99_kl: 'float | None' = None, max_mean_tv: 'float | None' = None, max_p99_tv: 'float | None' = None, worst: 'int' = 5) -> 'DistributionResult'
     Measure how far a workload moves the plain model's output distribution on CUDA.
 pllm.testing.ContractError(failures: 'tuple[str, ...]')
     All observed contract failures, with the responsible method or framework routing named.

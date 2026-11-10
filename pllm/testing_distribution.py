@@ -258,16 +258,18 @@ def distribution_failures(
     summaries: tuple[DistanceSummary, ...],
     max_mean_kl: float | None,
     max_p99_kl: float | None,
+    max_mean_tv: float | None,
+    max_p99_tv: float | None,
 ) -> tuple[str, ...]:
-    """Describe non-finite distances and KL summaries that exceed the supplied limits."""
+    """Describe non-finite distances and summaries that exceed the supplied limits."""
     failures: list[str] = []
     for name, summary in zip(("KL(plain || workload)", "KL(workload || plain)", "TV"), summaries, strict=True):
         if any(value != value for value in (summary.mean, summary.p99, summary.max)):
             failures.append(f"{name} contains NaN; check the workload's logits")
-        if name != "TV":
-            for statistic, value, limit in (("mean", summary.mean, max_mean_kl), ("P99", summary.p99, max_p99_kl)):
-                if limit is not None and value > limit:
-                    failures.append(f"{name} {statistic} {value:.6g} exceeds {limit:.6g}")
+        mean_limit, p99_limit = (max_mean_tv, max_p99_tv) if name == "TV" else (max_mean_kl, max_p99_kl)
+        for statistic, value, limit in (("mean", summary.mean, mean_limit), ("P99", summary.p99, p99_limit)):
+            if limit is not None and value > limit:
+                failures.append(f"{name} {statistic} {value:.6g} exceeds {limit:.6g}")
     return tuple(failures)
 
 
@@ -280,11 +282,13 @@ def check_distribution(
     temperature: float = 0,
     max_mean_kl: float | None = None,
     max_p99_kl: float | None = None,
+    max_mean_tv: float | None = None,
+    max_p99_tv: float | None = None,
     worst: int = 5,
 ) -> DistributionResult:
     """Measure how far a workload moves the plain model's output distribution on CUDA.
 
-    A dense, cheap quality signal complements the bitwise neutral contract: a workload can look
+    A dense, cheap quality signal complements token equality: a workload can look
     fine on average while breaking rare token positions. P99 exposes that tail; a mean alone can
     hide it. This measures movement, not task quality, and only covers the supplied sequences.
 
@@ -308,7 +312,8 @@ def check_distribution(
 
     Returns mean, nearest-rank P99, max and `worst` positions for each metric, plus timings.
     Positions are (prompt_index, token_offset), zero-based in prompt + continuation, naming
-    the predicted token. max_mean_kl / max_p99_kl bound BOTH KL directions. With no thresholds
+    the predicted token. max_mean_kl / max_p99_kl bound BOTH KL directions;
+    max_mean_tv / max_p99_tv bound total variation. With no thresholds
     this is a measurement; supplied thresholds set result.passed and result.failures without
     discarding the numbers or raising ContractError. NaN distances always fail.
     """
@@ -320,7 +325,13 @@ def check_distribution(
     texts = tuple(CHECK_PROMPTS if prompts is None else prompts)
     if not texts or any(not prompt for prompt in texts) or tokens < 1 or worst < 1:
         raise ValueError("check_distribution needs nonempty prompts, tokens >= 1 and worst >= 1")
-    for name, value in (("temperature", temperature), ("max_mean_kl", max_mean_kl), ("max_p99_kl", max_p99_kl)):
+    for name, value in (
+        ("temperature", temperature),
+        ("max_mean_kl", max_mean_kl),
+        ("max_p99_kl", max_p99_kl),
+        ("max_mean_tv", max_mean_tv),
+        ("max_p99_tv", max_p99_tv),
+    ):
         if value is not None and (not isfinite(value) or value < 0):
             raise ValueError(f"{name} must be finite and >= 0")
     start = perf_counter()
@@ -340,5 +351,5 @@ def check_distribution(
         len(positions),
         plain_seconds + workload_seconds,
         perf_counter() - start,
-        distribution_failures(summaries, max_mean_kl, max_p99_kl),
+        distribution_failures(summaries, max_mean_kl, max_p99_kl, max_mean_tv, max_p99_tv),
     )

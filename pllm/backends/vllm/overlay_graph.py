@@ -1,4 +1,4 @@
-"""vLLM graph startup for parameter overlays and custom residuals: deferred capture and hybrid dispatch.
+"""vLLM graph startup for model hooks: deferred capture and hybrid dispatch.
 
 This file holds only what a vLLM upgrade rewrites; hook math lives in parameter_overlay.py and model_sites.py.
 
@@ -6,7 +6,7 @@ Depends on GPUModelRunner.load_model/profile_run/capture_model, the capture call
 from Worker.compile_or_warm_up_model, the decoder body’s do_not_compile flag,
 ModelCudaGraphManager construction, VllmConfig.compute_hash and
 aot_compile_hash_factors at the first deferred decoder body call, and
-EagerAdaptor.compile for source FX bodies inside the upstream CUDA graph wrappers.
+model compilation inside the upstream CUDA graph wrappers.
 Hybrid dispatch uses GPUModelRunner.update_requests and ModelCudaGraphManager.dispatch
 before prepare_inputs, and the decoder body’s do_not_compile flag to bypass compiled training bodies.
 The upstream manager owns all capture/replay loops; PTTS owns every request version.
@@ -65,14 +65,33 @@ class GraphOptions(TypedDict, total=False):
     compilation_config: CompilationConfig
 
 
+def _compiler_backend(config: ModelConfig, requirements: BackendRequirements) -> str:
+    """Select vLLM's compiler from measured hook costs and capture constraints."""
+    if not config.execution.allow_numerical_transforms:
+        # The numerical opt-out retains the model's source operators.
+        return "eager"
+    if requirements.custom_residual:
+        # All-site LAuReL is 4.8% slower with Inductor on 7B/4090; stateful residuals fail nested FX tracing.
+        return "eager"
+    if requirements.parameter_targets:
+        # The projection op mutates pools: AOT rejects packed optimizer views with different autograd bases.
+        # Exact updates also recompile inside conditional graphs ("Generator not registered").
+        return "eager"
+    if any(layout.keep == "window" for layout in requirements.kv_layouts):
+        # LocalGlobal is 4.6% slower with Inductor on 7B/4090; a repeat confirmed the loss with zero preemptions.
+        return "eager"
+    return "inductor"
+
+
 def graph_options(config: ModelConfig, requirements: BackendRequirements) -> GraphOptions:
     """Announce model hooks before profiling; ordinary workloads keep vLLM's capture sizes."""
     if not model_hooks(requirements):
         return {}
+    conditional_updates = requirements.stateful_residual or bool(requirements.exact_phases)
     # Request memories and exact decode updates both capture only decode capacity.
     capacity = (
         min(config.max_num_batched_tokens, config.max_num_seqs)
-        if requirements.stateful_residual or requirements.exact_phases
+        if conditional_updates
         else config.max_num_batched_tokens
     )
     # Conditional subgraphs own library scratch; all decode counts share one capacity.
@@ -81,14 +100,8 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
         "additional_config": {_BUDGET: config.execution.cuda_graph_pool_budget_bytes or 0},
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            # Attention hooks must keep the same source kernels as the vanilla neutral reference.
-            # Inductor fusion can change model rounding even when the FA2 reads are bitwise identical.
-            backend="eager",
-            cudagraph_mode=(
-                CUDAGraphMode.FULL_DECODE_ONLY
-                if requirements.stateful_residual or requirements.exact_phases
-                else _OVERLAY_GRAPHS
-            ),
+            backend=_compiler_backend(config, requirements),
+            cudagraph_mode=(CUDAGraphMode.FULL_DECODE_ONLY if conditional_updates else _OVERLAY_GRAPHS),
             cudagraph_num_of_warmups=1 if requirements.custom_residual else 0,
             cudagraph_capture_sizes=list(sizes),
             max_cudagraph_capture_size=capacity,
