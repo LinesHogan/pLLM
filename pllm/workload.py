@@ -295,7 +295,7 @@ def _read_operation(
             markers.get(f"__pllm_{marker}__") is not None for marker in ("phase", "effect", "gradient", "rows")
         ):
             raise ValueError(
-                "@pllm.custom_forward methods take (self, layers, marker inputs...) and no other pllm decorator; use layers.save instead of @write"
+                "@pllm.custom_forward methods take (self, layers, marker inputs...) and no other pLLM decorator; use layers.save instead of @write"
             )
         overlap = {
             role

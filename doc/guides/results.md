@@ -1,8 +1,8 @@
 # 结果去哪：导出、logits、采样引导与写状态
 
-在 `pllm` 中，一个方法负责读取张量并完成数学运算。但大模型推理处于连续批处理（continuous batching）与 CUDA Graph 回放的高并发执行环境中：方法计算出的张量如果不做显式声明，框架无法获知应当将其发往何处、以何种生命周期保存、何时发布给后续步骤或外部进程。
+在 pLLM 中，一个方法负责读取张量并完成数学运算。但大模型推理处于连续批处理（continuous batching）与 CUDA Graph 回放的高并发执行环境中：方法计算出的张量如果不做显式声明，框架无法获知应当将其发往何处、以何种生命周期保存、何时发布给后续步骤或外部进程。
 
-除通过梯度与优化器更新权重的在线训练（详见 [在线训练](training.md)）外，`pllm` 提供了四种面向非训练结果的效果装饰器，分别对应四种不同的消费去向：
+除通过梯度与优化器更新权重的在线训练（详见 [在线训练](training.md)）外，pLLM 提供了四种面向非训练结果的效果装饰器，分别对应四种不同的消费去向：
 
 1. **`@pllm.export`**：将张量安全、有界地异步导出到宿主机 CPU，供监控、特征落盘与分析；
 2. **`@pllm.add_logits`**：在采样过滤前向模型 logits 注入逐 token 偏置（如 DoLa 对比解码）；
@@ -77,7 +77,7 @@ with pllm.make_llm(GPU_CONFIG, workload=StreamNorm()) as llm:
 - **行身份 `event.identities`**：类型为 `tuple[RequestIdentity, ...]`，与事件张量的每一行一一对应：
   - `prompt_index`：该行所属 Prompt 在单次 `generate` 调用中的序号（若调用时指定了 `generate(..., prompt_indices=...)`，则为显式指定的索引）；
   - `sample_index`：每个 Prompt 下采样的相对序号（首个采样为 0）；
-  - `request_id`：`pllm` 内部的请求标识（不同于 vLLM 的 `RequestOutput.request_id`）。
+  - `request_id`：pLLM 内部的请求标识（不同于 vLLM 的 `RequestOutput.request_id`）。
 - **位置索引 `event.positions`**：整型元组，指示各行在其请求内的 token 偏移量。
 - **获取 CPU 张量 `event.tensor()`**：调用该方法返回一个独立的 CPU 张量副本。
 - **全量 token 读取 `tokens="all"`**：默认情况下，方法读取当前步的最新行；若需要观测一个步骤内计算出的全部 token（包括 prompt 的全部切片分块），可在输入标记中指定 `tokens="all"`（例如 `pllm.residual(12, tokens="all")`）。全量 token 读取仅对 `@pllm.export` 方法开放。
@@ -307,7 +307,7 @@ print(testing.check(ShallowPredictor(), CONFIG, neutral=ShallowPredictor(beta=0.
 
 1. **全负载至多只能有一个 `@pllm.guide_sampling`**：
    - 规则：一个工作负载（包括其嵌套的所有子组件）中至多声明一个 `@pllm.guide_sampling` 方法。若声明了两个，框架在编译时会直接抛出 `ValueError`。
-   - 原因：引导要在 top-k / top-p 过滤之后的分布上按一个预测重新加权，采样器每步只做这一次。两个预测该相加、取平均还是先后应用，是算法本身的选择，`pllm` 不替你猜：在一个方法里把它们合成一个预测返回；其余的词表修正用 `@pllm.add_logits`。
+   - 原因：引导要在 top-k / top-p 过滤之后的分布上按一个预测重新加权，采样器每步只做这一次。两个预测该相加、取平均还是先后应用，是算法本身的选择，pLLM 不替你猜：在一个方法里把它们合成一个预测返回；其余的词表修正用 `@pllm.add_logits`。
 2. **返回宽度要等于 hidden 宽度**：
    - 规则：返回 `[rows, hidden]`。这个宽度目前不在 CPU 上检查，写错时要到 GPU 上才会出错，所以写完先自己核对最后一维。
 
@@ -394,7 +394,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
    - 原因：在连续数十或上百步的自回归生成中，累加更新通常具有较小的变化步长。如果采用仅有 7 位尾数的 `bfloat16`，微小的更新量加到较大的现有数值上时会发生严重的浮点精度下溢（更新被直接截断归零，即更新吞噬），导致累加停滞；`float32` 保证了跨步长时间累加过程中的数值稳定性。
 3. **读取看到的是当前步开始前已发布的版本**：
    - 规则：在第 $n$ 步执行的方法读取状态时，看到的永远是第 $n-1$ 步结束时发布的版本（第 0 步看到的是初始值）。
-   - 原因：`pllm` 采用版本化发布模型。这种步间隔离机制完全消除了同一时间步内多个方法之间的读写冒险（read-after-write hazard），使得模型前向、自定义写入与观测方法能够被完全捕获进 CUDA Graph 并在不同的 CUDA stream 上安全并行执行。
+   - 原因：pLLM 采用版本化发布模型。这种步间隔离机制完全消除了同一时间步内多个方法之间的读写冒险（read-after-write hazard），使得模型前向、自定义写入与观测方法能够被完全捕获进 CUDA Graph 并在不同的 CUDA stream 上安全并行执行。
 
 ---
 
@@ -433,7 +433,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
 | `export overflow must be 'drop' or 'block'` | `@pllm.export` 的 `overflow=` 参数传入了不支持的值。 | 仅传入 `"drop"`（默认，队列满时丢弃旧事件不阻塞前向）或 `"block"`（阻塞等待队列腾空）。 |
 | `a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase` | 在 `@pllm.add_logits` 或其他采样前方法中读取了 `pllm.base_logits()` 或 `pllm.sampled_tokens()`。 | 采样前不可读取采样后才物化的反馈；读取当前步模型 logits 请改用 `pllm.layer_logits((-1,))`，读取隐藏状态改用 `pllm.final_hidden()`。 |
 | `@pllm.add_logits method ... must return [rows, vocab_size] = ... got ... Read logits=pllm.layer_logits((-1,)) and return logits[:, -1], or project hidden states to the model's vocabulary.` | `@pllm.add_logits` 方法返回的张量形状与期望的 `[rows, vocab_size]` 不匹配。 | 检查返回张量维度，确保第 0 维为请求行数，最后一维等于模型的词表大小 `vocab_size`。 |
-| `@pllm.guide_sampling method ... must return a hidden-state prediction [rows, hidden_size] = ...; got ...` | `@pllm.guide_sampling` 返回的是隐状态预测，pllm 用模型的 LM head 把它投影成 logits；返回形状不是 `[rows, hidden_size]`。 | 返回 `[rows, hidden_size]` 的预测；想直接加 logits 用 `@pllm.add_logits`。 |
+| `@pllm.guide_sampling method ... must return a hidden-state prediction [rows, hidden_size] = ...; got ...` | `@pllm.guide_sampling` 返回的是隐状态预测，pLLM 用模型的 LM head 把它投影成 logits；返回形状不是 `[rows, hidden_size]`。 | 返回 `[rows, hidden_size]` 的预测；想直接加 logits 用 `@pllm.add_logits`。 |
 | `[neutral] guide_sampling still declares a sampler stage; set its beta to zero.` | 在静态契约检查 `testing.check(..., neutral=...)` 中，传入的中性配置未能将采样引导的 $\beta$ 置为 0。 | 确保中性负载实例的 `beta` 方法或属性返回精确的 `0.0`。 |
 | `...: add_logits must return exactly zero` | 在静态契约检查中，传入的中性配置下 `@pllm.add_logits` 方法未能返回严格全零的张量。 | 确保中性负载实例将偏置强度乘数置为 0，使张量数学计算结果精确为全零。 |
 | `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 在独立请求训练中错误地给 `@pllm.train` 配置了 `rows=` 或 `update_rows=` 参数。 | 移除训练方法上的 `rows=` 参数，转而在采样引导方法 `@pllm.guide_sampling(rows=...)` 上声明行选择器。 |

@@ -1,13 +1,13 @@
-# 能力地图：哪些推理时算法今天能用 pllm 写
+# 能力地图：哪些推理时算法今天能用 pLLM 写
 
 推理时的 LLM 算法正在变复杂：查表记忆（如 DeepSeek 的 Engram，按 n-gram 查一张大表）、稀疏 attention 的索引器以及把索引结果跨层复用（如 DeepSeek 的 DSA、IndexCache）、压缩或共享的 KV、循环与可变深度、推理时训练（如 TTT、In-Place TTT）。
-这一页逐个列出这些算法族：今天能不能用 pllm 写、用什么 API 写、对应哪篇教程；对于写不了的算法，也直接把原因说清楚。文中的数字都来自教程和示例库的实测（RTX 4090），设置写在各自的 notebook 里。
+这一页逐个列出这些算法族：今天能不能用 pLLM 写、用什么 API 写、对应哪篇教程；对于写不了的算法，也直接把原因说清楚。文中的数字都来自教程和示例库的实测（RTX 4090），设置写在各自的 notebook 里。
 
 下表中的“状态”列使用三种标记：
 
 - **能写**：在已支持的模型上，用现有的公开 API 可以写，教程里有可运行的例子（或标明“无示例”）。
 - **部分**：能写其中一部分，另一部分写不了，表里写明哪部分。
-- **不支持 / 不在范围**：写不了，或者不属于 pllm 要做的事（例如需要预训练一个新结构），表里写明原因。
+- **不支持 / 不在范围**：写不了，或者不属于 pLLM 要做的事（例如需要预训练一个新结构），表里写明原因。
 
 ## 在 forward 的某个位置读或加一点计算
 
@@ -38,7 +38,7 @@
 | 以更深的层为源的 KV 共享（LCKV 一类） | 源层在当前 token 还没算到；报错信息建议改用 `@pllm.custom_forward` 的 `kv="peek"` | 部分 | [04](../tutorials/04_custom_forward.ipynb) |
 | 压缩的远端记忆（Activation Beacon、DeepSeek V4 的压缩 KV 一类、LastKV 一类） | 暂不支持，原因见[设计取舍](../explain/design-tradeoffs.md) | 不支持 | — |
 | 训练出来的稀疏 attention（DSA、NSA、MoBA） | 是模型结构本身；vLLM 原生支持 DSA，但需要 sm90 及以上的 GPU（H100 一类） | 不在范围 | — |
-| 跨层复用稀疏 attention 的选择（IndexCache、DeepSeek V4.1 的索引源层） | 需要 DSA 模型，而 vLLM 的 DSA 路径需要 sm90 及以上；pllm 的 `pllm.attention(layer, "topk")` 留到那时，目前会报错说明尚未支持 | 不支持（需要硬件） | — |
+| 跨层复用稀疏 attention 的选择（IndexCache、DeepSeek V4.1 的索引源层） | 需要 DSA 模型，而 vLLM 的 DSA 路径需要 sm90 及以上；pLLM 的 `pllm.attention(layer, "topk")` 留到那时，目前会报错说明尚未支持 | 不支持（需要硬件） | — |
 | KV 量化（KIVI 一类） | 属于 vLLM 的 `kv_cache_dtype`；`@pllm.custom_attention` 要求未量化的 KV | 不在范围 | — |
 
 ## 查表记忆
@@ -47,10 +47,10 @@
 
 | 算法（例子） | 今天怎么写 / 为什么不行 | 状态 | 教程 |
 |---|---|---|---|
-| Engram 式 n-gram 记忆（加在现有模型上） | `pllm.input_tokens(history=n)` 取 token 历史，`InstanceState(init=pllm.Pretrained(...))` 读表，`placement="device"/"host"` 由你决定，`@pllm.custom_residual` 把查到的向量加进残差流；表要在别处训练好，pllm 不训练、不更新表 | 能写 | [11](../examples/11_lookup_memory.ipynb) |
+| Engram 式 n-gram 记忆（加在现有模型上） | `pllm.input_tokens(history=n)` 取 token 历史，`InstanceState(init=pllm.Pretrained(...))` 读表，`placement="device"/"host"` 由你决定，`@pllm.custom_residual` 把查到的向量加进残差流；表要在别处训练好，pLLM 不训练、不更新表 | 能写 | [11](../examples/11_lookup_memory.ipynb) |
 | n-gram 语言模型先验（按上下文给 logits 加分） | 同样的查表接 `@pllm.add_logits` | 能写 | [11](../examples/11_lookup_memory.ipynb) |
 | memory layers / product-key memory | 键由 hidden 算出再取 top-k、值从大表里按行取，可以在 `custom_residual` 里写成张量数学（大表可以放主机内存）；本仓库没有示例，未验证 | 应能写（未验证） | — |
-| 模型自带的 Engram（DeepSeek V4.1 等） | 由 vLLM 的模型代码实现；在 pllm 里跑这些模型属于“模型准入”，且需要 sm90 及以上 | 不在范围 | — |
+| 模型自带的 Engram（DeepSeek V4.1 等） | 由 vLLM 的模型代码实现；在 pLLM 里跑这些模型属于“模型准入”，且需要 sm90 及以上 | 不在范围 | — |
 
 ## 深度与循环
 
@@ -59,8 +59,8 @@
 | 算法（例子） | 今天怎么写 / 为什么不行 | 状态 | 教程 |
 |---|---|---|---|
 | 循环深度（Ouro、Huginn 一类） | `@pllm.custom_forward` 里循环调用 `layers(...)`；每一遍都写 KV（Ouro 的“最后一遍复用”）；prompt 每一遍各留一份 KV 目前写不了 | 能写 | [04](../tutorials/04_custom_forward.ipynb) |
-| early exit、按 token 跳层（CALM 式饱和判据、MoD 的因果路由版、MoR 的 token-choice 路由） | `layers(..., active=mask)`；跳过的行由 pllm 补 KV，决定留在 GPU 上，每步没有阻塞同步；只用于 decode token | 能写 | [12](../examples/12_adaptive_depth.ipynb) |
-| MoR 的 expert-choice（在整个 batch 里选 top-k）、原版 MoD（跳过的 token 不进 attention） | 前者让一个 token 的深度依赖同 batch 的其他请求，pllm 故意不支持；后者要求 KV 中间留洞，和按分数驱逐同样的限制 | 不支持 | — |
+| early exit、按 token 跳层（CALM 式饱和判据、MoD 的因果路由版、MoR 的 token-choice 路由） | `layers(..., active=mask)`；跳过的行由 pLLM 补 KV，决定留在 GPU 上，每步没有阻塞同步；只用于 decode token | 能写 | [12](../examples/12_adaptive_depth.ipynb) |
+| MoR 的 expert-choice（在整个 batch 里选 top-k）、原版 MoD（跳过的 token 不进 attention） | 前者让一个 token 的深度依赖同 batch 的其他请求，pLLM 故意不支持；后者要求 KV 中间留洞，和按分数驱逐同样的限制 | 不支持 | — |
 | prompt token 的提前退出 | `active=` 目前只用于 `tokens="decode"` | 不支持 | — |
 | 连续思维 / token 级循环（Coconut 一类） | `custom_forward` + `pllm.PositionState` 把上一位置的状态带到下一位置；要有效果需要训练过的模型 | 部分 | [04](../tutorials/04_custom_forward.ipynb) |
 
@@ -83,7 +83,7 @@
 |---|---|---|---|
 | MTP、投机解码、可回滚的解码 | 需要控制解码循环本身，是另一项路线图上的工作 | 不支持 | — |
 | 从头预训练、改 MoE 路由、全新的 mixer | 需要新结构和预训练 | 不在范围 | — |
-| agent 驱动的算法搜索（AlphaEvolve 一类的循环） | pllm 提供 explain、check 和契约，循环本身是 `examples/algorithm_search` 这个例子；这次演示的分数差别在噪声范围内 | 示例 | [13](../examples/13_algorithm_search.ipynb) |
+| agent 驱动的算法搜索（AlphaEvolve 一类的循环） | pLLM 提供 explain、check 和契约，循环本身是 `examples/algorithm_search` 这个例子；这次演示的分数差别在噪声范围内 | 示例 | [13](../examples/13_algorithm_search.ipynb) |
 
 ## 现成的负载
 
@@ -116,5 +116,5 @@
 - `@pllm.custom_attention` 需要 FlashAttention 2 后端、未量化的 KV，只用于 KV 全部在分页缓存里的模型（稠密 Qwen2/2.5、Llama、Qwen3 和 Qwen3-MoE）。
 - 静态 KV 布局需要 MRv2 runner（默认），不能和 `PositionState` 或 `@pllm.custom_forward` 一起用。
 - 张量并行只在 vLLM 0.32.0 的 MRv2 runner 上，哪些功能可以多卡见[支持矩阵](../reference/support-matrix.md)。
-- 一个原则：贵的选择由你显式写出来，pllm 不替你做——大表放显存还是主机内存、KV 怎么存、训练结果几步后可见（`publish_lag`），都写在你的声明里，`pllm.explain` 把代价列出来。默认值只替你省掉小的决定。
+- 一个原则：贵的选择由你显式写出来，pLLM 不替你做——大表放显存还是主机内存、KV 怎么存、训练结果几步后可见（`publish_lag`），都写在你的声明里，`pllm.explain` 把代价列出来。默认值只替你省掉小的决定。
 - 这些能力各自省的是哪种资源（显存容量、显存带宽、PCIe、卡间通信、时间线气泡、SM、host CPU）、实测效果和边界，见[性能与显存](../explain/performance.md)。

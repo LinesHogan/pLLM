@@ -19,7 +19,7 @@ from pllm.execution.compile_facts import BackendRequirements
 
 SUPPORTED_VLLM = ("0.27.1", "0.32.0")
 if __version__ not in SUPPORTED_VLLM:
-    raise ImportError(f"pllm runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM {__version__}")
+    raise ImportError(f"pLLM runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM {__version__}")
 VLLM_027 = __version__ == "0.27.1"
 
 
@@ -31,7 +31,7 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
     ):
         if type(size) is not int or size != 1:
             raise ValueError(
-                f"pllm needs {name}=1: it spreads a model over GPUs only by tensor parallelism; "
+                f"pLLM needs {name}=1: it spreads a model over GPUs only by tensor parallelism; "
                 "set tensor_parallel_size instead"
             )
     if requirements.custom_attention and config.tensor_parallel_size != 1:
@@ -64,7 +64,7 @@ if VLLM_027:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner as Mrv1GPUModelRunner
 
     class Worker(VllmWorker):
-        """0.27.1 builds its runner inside init_device; 0.32.0 asks this factory, which pllm's worker overrides."""
+        """0.27.1 builds its runner inside init_device; 0.32.0 asks this factory, which pLLM's worker overrides."""
 
         def init_device(self) -> None:
             super().init_device()

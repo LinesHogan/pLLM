@@ -2,17 +2,17 @@
 
 在 Hugging Face 中研究推理算法时，通常只需传入 `output_hidden_states=True` 或在 `model.layers[i]` 上注册 PyTorch `forward hook`，就能拿到每一层的中间激活或 logits。但在高吞吐的 vLLM 服务中，几十个并发请求的 token 会被连续批处理拼进同一个张量，且模型前向传播被捕获进了 CUDA graph——普通 PyTorch hook 既无法分辨张量中的哪一行属于哪个请求，在 CUDA graph 重放时也根本不会执行。
 
-`pllm` 允许你在负载方法中直接声明需要读取的内部张量（例如 `r: torch.Tensor = pllm.residual(12)`）。底层在 vLLM 的 CUDA graph 中预留静态缓冲并在图内完成捕获，既不破坏 CUDA graph，也不引入 CPU 与 GPU 之间的同步等待。方法收到的张量第 0 维自动对齐到当前步的请求行。
+pLLM 允许你在负载方法中直接声明需要读取的内部张量（例如 `r: torch.Tensor = pllm.residual(12)`）。底层在 vLLM 的 CUDA graph 中预留静态缓冲并在图内完成捕获，既不破坏 CUDA graph，也不引入 CPU 与 GPU 之间的同步等待。方法收到的张量第 0 维自动对齐到当前步的请求行。
 
 如果你的算法需要读取负载自身持有的可变参数或模块状态（如 `pllm.parameter`、`pllm.module`、`pllm.version`、`pllm.index`），这些属于状态管理声明，请参阅 [状态](state.md)。
 
 ---
 
-## 快速查阅：从 Hugging Face 到 pllm 来源标记
+## 快速查阅：从 Hugging Face 到 pLLM 来源标记
 
-下表汇总了常见的内部激活与元数据在 Hugging Face 中的概念与 `pllm` 来源标记的对应关系：
+下表汇总了常见的内部激活与元数据在 Hugging Face 中的概念与 pLLM 来源标记的对应关系：
 
-| Hugging Face 概念 / 属性 | pllm 来源标记 | 数据类型（dtype） | 形状（shape） | 含义与典型用途 |
+| Hugging Face 概念 / 属性 | pLLM 来源标记 | 数据类型（dtype） | 形状（shape） | 含义与典型用途 |
 | :--- | :--- | :--- | :--- | :--- |
 | `hidden_states[layer + 1]` | `pllm.residual(layer)` | 模型 dtype (`bfloat16`/`float16`) | `[rows, hidden]` | 第 `layer` 层之后的残差流（累加了 embedding 与前面所有子层输出）；激活引导、SAE、探针的首选输入 |
 | `model.layers[layer].mlp` 的输出 | `pllm.hidden(layer)` | 模型 dtype | `[rows, hidden]` | 第 `layer` 层 MLP 的增量输出（尚未加回残差流）；用于观察或蒸馏该层的新鲜变换 |
@@ -223,9 +223,9 @@ print(testing.check(TokenWatcher(), CONFIG).passed)
 
 ## 性能与成本：为什么读取不破坏 CUDA Graph
 
-许多开发者担心在模型前向传播中“截取”激活值会导致 CUDA graph 打破、回退到低效的 Python eager 执行。在 `pllm` 中，读取内部激活对性能是透明且友好的：
+许多开发者担心在模型前向传播中“截取”激活值会导致 CUDA graph 打破、回退到低效的 Python eager 执行。在 pLLM 中，读取内部激活对性能是透明且友好的：
 
-1. **图内捕获（Hidden Tap）**：`pllm` 在模型编译阶段识别所有 `pllm.residual`、`pllm.hidden`、`pllm.layer_logits` 声明，并在底层相应模块输出处挂载轻量级的拷贝算子。在 CUDA graph 捕获时，该算子直接将数据复制到静态预留的**抽头缓冲（tap buffer）**中，不发生主机等待，因此 `llm.diagnostics().eager_reason` 保持为空字符串 `""`。
+1. **图内捕获（Hidden Tap）**：pLLM 在模型编译阶段识别所有 `pllm.residual`、`pllm.hidden`、`pllm.layer_logits` 声明，并在底层相应模块输出处挂载轻量级的拷贝算子。在 CUDA graph 捕获时，该算子直接将数据复制到静态预留的**抽头缓冲（tap buffer）**中，不发生主机等待，因此 `llm.diagnostics().eager_reason` 保持为空字符串 `""`。
 2. **显存开销**：每个被读取的位置在 GPU 显存中分配一块固定大小的缓冲，大小随 `max_num_seqs` 和 hidden 宽度增长；读 `pllm.layer_logits` 时还要为 LM head 的输出（词表宽度）预留缓冲。同一个负载中多个方法读取同一位置时，它们**自动共享**同一块缓冲。
 
 你可以通过 [`pllm.explain`](explain.md) 在 CPU 上直接看到这些抽头显存：

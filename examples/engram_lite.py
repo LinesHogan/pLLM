@@ -28,7 +28,7 @@ def ngram_keys(ids: torch.Tensor, buckets: int) -> torch.Tensor:
 class EngramLite(pllm.Workload):
     """Gather offline-fitted 2/3-gram memory and gate it into layer 2's attention residual.
 
-    placement is the author's choice; pllm never moves the table to satisfy a budget.
+    placement is the author's choice; pLLM never moves the table to satisfy a budget.
     gate=0 reproduces vanilla bitwise while still executing the lookup.
     """
 

@@ -731,8 +731,8 @@ def create_vllm_llm(
     if config.multiprocessing or config.tensor_parallel_size > 1:
         environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     options: GraphOptions = {} if eager_reason else graph_options(config, requirements)
-    # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pllm adds to the
-    # forward must enter that key, or an engine loads a model compiled for another workload. pllm's entries are
+    # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pLLM adds to the
+    # forward must enter that key, or an engine loads a model compiled for another workload. pLLM's entries are
     # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
     forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV]).encode()).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}

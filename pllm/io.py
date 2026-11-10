@@ -1,4 +1,4 @@
-"""Data crossing pllm's boundary outside generate's arguments.
+"""Data crossing pLLM's boundary outside generate's arguments.
 
 Membership rule: values a program hands to, or receives from, a running workload other than through generate's
 prompts and parameters: fed state (Feed), imported state values (StateImport), traces (TraceEvent, TraceSnapshot,

@@ -293,7 +293,7 @@ class TensorTask:
         except (RuntimeError, ValueError, LookupError) as error:
             if self.observe is not None:
                 error.add_note(
-                    f"pllm input routing failed for `{self.symbol}.{key}` before the method ran; "
+                    f"pLLM input routing failed for `{self.symbol}.{key}` before the method ran; "
                     "report this as a framework bug."
                 )
             raise
@@ -377,7 +377,7 @@ class TensorTask:
         observed_inputs = self.observation_inputs(inputs)
         loss = self.call(inputs)
         if not isinstance(loss, torch.Tensor) or loss.shape != (len(data.rows),):
-            raise ValueError("training methods return one loss per row; pllm reduces the selected rows per state")
+            raise ValueError("training methods return one loss per row; pLLM reduces the selected rows per state")
         if self.observe is not None:
             self.observe(data, observed_inputs, (loss,))
         loss, objective = self._loss(loss, data, rows)

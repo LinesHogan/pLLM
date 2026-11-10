@@ -1,4 +1,4 @@
-# pllm
+# pLLM
 
 当你有一个推理时算法的想法——无论是通过激活引导（activation steering）修正生成风格，用探针或 SAE 实时监测内部特征，给每个请求维护一份动态 LoRA，还是在解码（decode）时在线训练一个小网络并引导采样（如 ESamp）——在 PyTorch 或 Hugging Face 的单请求环境里，通常写几十行代码、挂一两个 forward hook 就能验证原型。
 
@@ -10,9 +10,9 @@
 - **额外计算容易拖垮生成吞吐**：在解码循环中串行运行训练或辅助前向，会导致整体推理吞吐断崖式下跌；要想让额外计算与主前向流水线重叠，必须手动管理底层 CUDA stream 和同步事件；
 - **修改注意力与 KV 结构成本高昂**：若算法需要改变某层 attention 的读取策略或按 token 历史查询外部记忆表，往往需要拆开并深度改写引擎底层代码。
 
-面对这些工程屏障，算法研究者往往不得不花费大量时间去钻研 vLLM 底层架构、拆改模型源码。pllm 把这一整套工程脏活接了过来：你的工作重新回到算法本身——只需**声明**读取模型的哪些内部位置（如特定层的 hidden 或残差流）、持有怎样的状态（如请求级网络与优化器）、计算结果送往何处（如修正 logits、引导采样或写回状态），然后书写纯粹的 PyTorch 张量数学。
+面对这些工程屏障，算法研究者往往不得不花费大量时间去钻研 vLLM 底层架构、拆改模型源码。pLLM 把这一整套工程脏活接了过来：你的工作重新回到算法本身——只需**声明**读取模型的哪些内部位置（如特定层的 hidden 或残差流）、持有怎样的状态（如请求级网络与优化器）、计算结果送往何处（如修正 logits、引导采样或写回状态），然后书写纯粹的 PyTorch 张量数学。
 
-pllm 与 vLLM 的关系，大致就像 eBPF 之于 Linux 内核：你在外部编写小巧的程序，在引擎启动前通过契约检查（contracts），随后装入引擎全速执行；每个程序可以持有自己的状态，计算过程被完整捕获进 CUDA graph，并可通过 `pllm.explain` 和 trace 进行显存与开销观测，而无需侵入或修改底层引擎源码。
+pLLM 与 vLLM 的关系，大致就像 eBPF 之于 Linux 内核：你在外部编写小巧的程序，在引擎启动前通过契约检查（contracts），随后装入引擎全速执行；每个程序可以持有自己的状态，计算过程被完整捕获进 CUDA graph，并可通过 `pllm.explain` 和 trace 进行显存与开销观测，而无需侵入或修改底层引擎源码。
 
 ## 尝鲜：十几行代码，每请求在线训练一个小网络
 
@@ -72,11 +72,11 @@ with pllm.make_llm(config, workload=ESampLite()) as llm:
 
 真实硬件上的吞吐开销如何？[教程 03](doc/tutorials/03_decode_training.ipynb) 在单张 RTX 4090 上测了同样结构的负载（Qwen2.5-0.5B，8 个 prompt × 16 个样本 × 256 token，vLLM 0.27.1）：只在线训练不引导采样时，吞吐与原生 vLLM 相同（该次运行达到 100%）；同时开启训练与引导采样时，吞吐仍保持在原生的 97%。
 
-此外，[示例 08](doc/examples/08_inplace_ttt.ipynb) 在同一张卡上以 eager 模式跑一个 4B 的 In-Place TTT 社区检查点（每个请求一份随 token 更新的快权重）：单个请求、prompt 4096 / 16384 token 时，pllm 是 61.61 / 42.91 token/s，官方 Hugging Face 实现是 53.89 / 34.20 token/s；官方实现一次只能跑一个请求，pllm 同时跑 4 个请求合计 123.76 token/s。
+此外，[示例 08](doc/examples/08_inplace_ttt.ipynb) 在同一张卡上以 eager 模式跑一个 4B 的 In-Place TTT 社区检查点（每个请求一份随 token 更新的快权重）：单个请求、prompt 4096 / 16384 token 时，pLLM 是 61.61 / 42.91 token/s，官方 Hugging Face 实现是 53.89 / 34.20 token/s；官方实现一次只能跑一个请求，pLLM 同时跑 4 个请求合计 123.76 token/s。
 
 ## 能做什么
 
-一个算法适合用 pllm 编写，当它在推理时对模型做的改动属于下面几类之一（这些改动可以互相组合）：
+一个算法适合用 pLLM 编写，当它在推理时对模型做的改动属于下面几类之一（这些改动可以互相组合）：
 
 | 你的算法需要…… | 例子 | 教程与示例 |
 | --- | --- | --- |
@@ -94,7 +94,7 @@ with pllm.make_llm(config, workload=ESampLite()) as llm:
 
 ## 安装
 
-需要 Python 3.11+、Rust 工具链，以及相互匹配的 PyTorch / CUDA / vLLM。先安装平台匹配的 PyTorch 与 vLLM wheel，再安装 pllm：
+需要 Python 3.11+、Rust 工具链，以及相互匹配的 PyTorch / CUDA / vLLM。先安装平台匹配的 PyTorch 与 vLLM wheel，再安装 pLLM：
 
 ```bash
 python -m venv .venv
@@ -102,11 +102,11 @@ source .venv/bin/activate
 python -m pip install -e ".[vllm032,test]"   # 或 ".[vllm027,test]"
 ```
 
-只做 CPU 开发可以只装 `.[test]`。pllm 不安装全局 vLLM 插件。
+只做 CPU 开发可以只装 `.[test]`。pLLM 不安装全局 vLLM 插件。
 
 ## 支持的版本与模型
 
-pllm 目前支持 vLLM 0.27.1 与 0.32.0，准入模型覆盖 Qwen2 / Qwen2.5、Llama、Qwen3、Qwen3.5 以及 DeepSeek V2 / V3 等系列，并原生支持量化底座（GPTQ、AWQ、FP8）和单节点张量并行。各模型支持的具体功能边界、多卡配置与硬件要求详见 [支持矩阵](doc/reference/support-matrix.md)。
+pLLM 目前支持 vLLM 0.27.1 与 0.32.0，准入模型覆盖 Qwen2 / Qwen2.5、Llama、Qwen3、Qwen3.5 以及 DeepSeek V2 / V3 等系列，并原生支持量化底座（GPTQ、AWQ、FP8）和单节点张量并行。各模型支持的具体功能边界、多卡配置与硬件要求详见 [支持矩阵](doc/reference/support-matrix.md)。
 
 ## 下一步
 

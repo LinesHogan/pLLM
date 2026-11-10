@@ -2,7 +2,7 @@
 
 在 PyTorch 或 Hugging Face 中修改模型的计算结构非常直接：改写 `forward()` 函数、插入 hook，或者在层与层之间调用自定义函数。但在以吞吐为第一目标的 vLLM 服务中，数十个并发请求会被连续批处理（continuous batching）拼进同一个大张量，整模型的前向传播又被捕获进 CUDA graph。此时如果直接 fork 模型源码插入 Python 逻辑，不仅会破坏算子融合退回 eager 执行，更无法妥善管理每个并发请求的私有状态。
 
-`pllm` 提供了三个专用于改写前向计算结构的装饰器，让你在保持 CUDA graph 高吞吐和请求隔离的前提下重构前向传播：
+pLLM 提供了三个专用于改写前向计算结构的装饰器，让你在保持 CUDA graph 高吞吐和请求隔离的前提下重构前向传播：
 1. `@pllm.custom_residual`：改写残差流汇入方式、替换 attention 读入的 value，或挂载按块更新的快权重记忆子层。
 2. `@pllm.custom_attention`：改写 attention 的读取方式（只读 top-K、监控注意力分布），或声明物理 KV 缓存保留布局（滑动窗口、保留 prompt 加窗口、跨层共享 KV）。
 3. `@pllm.custom_forward`：用普通 Python 重新编排各层的执行顺序（循环深度、逐 token 早退跳层、连续思维跨步状态）。
@@ -323,11 +323,11 @@ True
 ### 控制流规范：有界循环、禁止张量分支、`pllm.scan`
 1. **有界 Python 循环自动展开**：基于负载字段的 Python `for` 循环（如 `for _ in range(self.loops):`）会在追踪期直接展开录入分段 CUDA graph。
 2. **禁止基于张量值的控制流**：方法体内部绝对**不能**出现 `if tensor.norm() > 1:`、`while` 或 `break`。前向图的拓扑结构必须确定，否则追踪时报错 `methods run inside CUDA graphs, so Python cannot branch on tensor values (if, while or break on a tensor); ...`。循环固定次数，条件用 `torch.where` 或 `active=` 掩码表达（`active=` 需 `tokens="decode"`，见 [12 自适应深度](../examples/12_adaptive_depth.ipynb)）。
-3. **线性扫描（`pllm.scan`）**：若在自定义前向中需要实现长序列线性递推（形如 $S_t = A_t S_{t-1} + B_t$），应调用 `pllm.scan(step, carry=..., over=..., chunk=...)`。pllm 会识别仿射递推，在条件允许时改用 GPU 上的**并行前缀扫描**，比逐块串行的循环快得多（见[性能与显存](../explain/performance.md)）。详见 [04 改写 forward](../tutorials/04_custom_forward.ipynb)。
+3. **线性扫描（`pllm.scan`）**：若在自定义前向中需要实现长序列线性递推（形如 $S_t = A_t S_{t-1} + B_t$），应调用 `pllm.scan(step, carry=..., over=..., chunk=...)`。pLLM 会识别仿射递推，在条件允许时改用 GPU 上的**并行前缀扫描**，比逐块串行的循环快得多（见[性能与显存](../explain/performance.md)）。详见 [04 改写 forward](../tutorials/04_custom_forward.ipynb)。
 
 ### 运行开销、限制与组合
 - **运行开销**：
-  使用 `@pllm.custom_forward` 时，vLLM 原生的大模型整图不再生效，`eager_reason` 会明确标明 `@pllm.custom_forward`。**但这绝不意味着模型退回了逐算子 eager 运行**：`pllm` 为每次调用的层分段分别捕获了独立的分段 CUDA graph。
+  使用 `@pllm.custom_forward` 时，vLLM 原生的大模型整图不再生效，`eager_reason` 会明确标明 `@pllm.custom_forward`。**但这绝不意味着模型退回了逐算子 eager 运行**：pLLM 为每次调用的层分段分别捕获了独立的分段 CUDA graph。
   在 [12 自适应深度](../examples/12_adaptive_depth.ipynb) 实测中，一个无跳层、分段调用的 `custom_forward` 吞吐达到了原生 vLLM CUDA graph 的 **93%**（远高于原生 eager 模式的 41%）。
 - **显存与硬件限制**：
   - 分段图捕获需要更大的池空间，建议在配置中指定较大的捕获预算（例如 `ExecutionOptions(cuda_graph_pool_budget_bytes=4 << 30)` 即 4 GiB）；若预算不足，生成时会直接报错并指明所需的精确字节数。

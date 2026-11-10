@@ -407,7 +407,7 @@ def derive_resources(
                     "or project hidden states to the model's vocabulary."
                     if additive
                     else f"@pllm.guide_sampling method `{symbol}` must return a hidden-state prediction "
-                    f"[rows, hidden_size] = {expected}; got {tuple(result.shape)}. pllm projects it with the model's "
+                    f"[rows, hidden_size] = {expected}; got {tuple(result.shape)}. pLLM projects it with the model's "
                     "LM head; to add logits directly, use @pllm.add_logits."
                 )
         # Model overlays capture bounded tiles, not their whole maximum-shape operation.

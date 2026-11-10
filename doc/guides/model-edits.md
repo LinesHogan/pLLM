@@ -2,7 +2,7 @@
 
 在 PyTorch 或 Hugging Face 里调试算法时，修改模型的激活值或有效权重通常只需要注册一个 `forward_hook`，或者直接改写 `linear.weight`。但在 vLLM 这类高并发推理引擎中，几十个请求的 token 被连续批处理（continuous batching）打平在同一个二维张量中，模型的前向传播也被捕获进了 CUDA graph——Python 层的 hook 既无法区分哪一行张量属于哪个请求，在 CUDA graph 重放时更不会被触发；直接修改共享的权重矩阵则会破坏请求隔离并导致显存冲突。
 
-`pllm` 提供了三种声明式的改模型机制，在不改动共享底座权重的前提下，让每个请求或全局实例按需定制计算：
+pLLM 提供了三种声明式的改模型机制，在不改动共享底座权重的前提下，让每个请求或全局实例按需定制计算：
 
 1. [`pllm.model.ActivationPatch`](../agent/reference.md#all-signatures)：在指定层之后的残差流上叠加激活修正（例如激活引导 Steering、LoReFT），完全运行在模型的 CUDA graph 内。
 2. [`pllm.model.Adapter`](../agent/reference.md#all-signatures)：在指定的投影矩阵（如注意力 Q/K/V 或 MLP 投影）上叠加权重增量 $\Delta W$（例如每请求 LoRA、稠密增量、多头增量），自动按请求隔离并在 CUDA graph 内寻址。
@@ -157,7 +157,7 @@ pllm.model.Adapter(
 
 ### 为什么可训练的低秩状态必须非零初始化
 
-如果状态带有优化器（例如在线训练 LoRA），且算子为 `"low_rank"`，`pllm` 禁止使用默认的 `init=pllm.Zeros()`，必须显式传入非零初值（例如 `init=pllm.Computed(...)`）：
+如果状态带有优化器（例如在线训练 LoRA），且算子为 `"low_rank"`，pLLM 禁止使用默认的 `init=pllm.Zeros()`，必须显式传入非零初值（例如 `init=pllm.Computed(...)`）：
 
 **原因**：低秩输出为 $\Delta y = \text{scale} \cdot (x A^T) B^T$。损失函数对因子 $A$ 的梯度正比于 $B^T$，对 $B$ 的梯度正比于 $A^T$。如果两个因子初始全为 0，那么第一步反向传播计算出的两个梯度的数值严格恒等于 0，优化器永远无法更新参数。常见的做法是在 `pllm.Computed` 中将 $A$ 随机高斯初始化（例如标准差 0.02），将 $B$ 置零：这既保证了初始时的有效增量为 0（不破坏基座表现），又保证了反向传播时 $B$ 能够获得非零梯度。
 
@@ -343,12 +343,12 @@ print(pllm.explain(ManualFastWeights(), CONFIG).eager_reason)
 ### 为什么 Prefix Caching 与 Overlay / 激活补丁互斥
 
 在 vLLM 配置中，`enable_prefix_caching=True` 会在不同的请求之间共享具有相同前缀文本的 KV 块。
-**在 pllm 中，所有 Overlay（Adapter、train_in_forward）与 ActivationPatch 均与 Prefix Caching 严格互斥，组合时会在构建期直接拒绝。**
+**在 pLLM 中，所有 Overlay（Adapter、train_in_forward）与 ActivationPatch 均与 Prefix Caching 严格互斥，组合时会在构建期直接拒绝。**
 
 **原因**：
 Prefix Caching 的基本假设是“相同的 token 序列产生完全相同的 KV 张量”。但无论是每请求的 LoRA 权重，还是逐步更新的快权重，亦或是逐层注入的激活引导，都会改变前向传播的实际数学计算：
 1. 具有相同 prompt 文本的两个请求，若挂载了不同的 LoRA 因子，其产生的 KV 缓存是完全不同的；若强行共享前缀缓存，后一个请求就会直接读取前一个请求在错误权重下生成的激活值。
-因此，`pllm` 采取安全关闭的原则：凡是改写模型激活或投影权重的负载，必须配置 `enable_prefix_caching=False`。
+因此，pLLM 采取安全关闭的原则：凡是改写模型激活或投影权重的负载，必须配置 `enable_prefix_caching=False`。
 
 ---
 

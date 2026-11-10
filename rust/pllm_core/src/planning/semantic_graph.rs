@@ -223,7 +223,7 @@ pub(crate) fn decode_timeline(payload: &str) -> Result<Timeline, String> {
     serde_json::from_str(payload).map_err(|source| format!("invalid Timeline: {source}"))
 }
 
-/// Check the declaration facts a user can get wrong; everything else is pllm-produced and trusted.
+/// Check the declaration facts a user can get wrong; everything else is pLLM-produced and trusted.
 pub(crate) fn validate_graph(graph: &SemanticGraph) -> Result<(), String> {
     debug_assert!(
         graph

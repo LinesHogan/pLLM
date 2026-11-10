@@ -1,6 +1,6 @@
 # 检查正确性
 
-写好负载之后、相信它给出的任何数字之前，先确认它在真实服务的调度下算的就是你想算的东西。本页讲 pllm 提供的三层检查。
+写好负载之后、相信它给出的任何数字之前，先确认它在真实服务的调度下算的就是你想算的东西。本页讲 pLLM 提供的三层检查。
 
 ---
 
@@ -13,7 +13,7 @@
 - **只读输入被原地篡改**：方法的输入张量与模型参数是执行器共享缓冲区的只读视图。若在方法体内执行 `w.add_(1)` 或 `h.mul_(2)` 等原地修改，其他并发任务或后续调度步读到的就是被污染的数据。
 - **状态版本读错**：在线训练与采样引导存在时序依赖，`publish_lag` 明确限定了状态更新对后续计算可见的步数窗口。如果方法读到了尚未提交或超出许可范围的状态版本，计算就会失去确定性。
 
-为了在接触真实 GPU 流量前排除这些隐蔽缺陷，`pllm` 提供了三层互为补充的检查机制：
+为了在接触真实 GPU 流量前排除这些隐蔽缺陷，pLLM 提供了三层互为补充的检查机制：
 1. **CPU 契约检查（`pllm.testing.check`）**：数秒内用真实的规划器与执行器在 CPU 上运行多套固定的三请求调度，验证请求隔离、行重排、分块、抢占重放与版本可见性。
 2. **GPU 引擎检查（`pllm.testing.check_on_gpu`）**：在真实 GPU 引擎中跑满 8 步连续解码，触发强制 KV cache 逐出与重算，检验 CUDA graph 捕获、无宿主同步以及自定义算子的设备等价性。
 3. **GPU 分布偏移度量（`pllm.testing.check_distribution`）**：以基座模型自生成的 token 做 teacher forcing，度量全词表双向 KL 散度与 TV 距离的均值及 P99 尾部，拦截破坏罕见 token 分布的隐藏崩溃。
@@ -50,7 +50,7 @@ class Distill(pllm.Workload):
     @pllm.train(state="distiller")
     def loss(self, shallow: torch.Tensor = pllm.hidden(0), deep: torch.Tensor = pllm.hidden(-1),
              f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
-        # 每行独立计算 loss，返回一维张量 [rows]，由 pllm 负责按状态归约
+        # 每行独立计算 loss，返回一维张量 [rows]，由 pLLM 负责按状态归约
         return (f(shallow.float()) - deep.float()).square().mean(-1)
 
     def strength(self) -> float:
@@ -258,7 +258,7 @@ execution.retire(rows, wait=True)
 | --- | --- |
 | `... mixes rows: equal inputs for this request produced different outputs. Dimension 0 holds request rows; reduce features (dim=-1), not requests (dim=0).` | 方法体跨请求行做了归约（例如误写了 `h.mean(dim=0)` 或 `softmax(dim=0)`）。第 0 维是并发打包的请求行，不同行属于不同请求；必须改为沿特征维归约（`dim=-1`）。 |
 | `... mutates borrowed input ... in place; inputs and parameters are read-only views. Use out-of-place tensor math or clone() before writing; publish state changes through @pllm.write or @pllm.train.` | 方法体原地修改了借用的输入张量（例如 `w.add_(1)` 或 `h.mul_(2)`）。输入和参数都是只读视图；改用非原地张量运算（如 `w + 1`）或在切片赋值前 `.clone()`，并通过 `@pllm.write` 或 `@pllm.train` 发布状态。 |
-| `training methods return one loss per row; pllm reduces the selected rows per state` | 请求行训练方法返回了 0 维标量（在方法末尾自己做了 `.mean()`）。`pllm` 需要每行各自的 loss（形状 `[rows]`）来屏蔽未选中行或填充槽位，并按状态独立归约；去掉方法末尾跨行的归约。 |
+| `training methods return one loss per row; pLLM reduces the selected rows per state` | 请求行训练方法返回了 0 维标量（在方法末尾自己做了 `.mean()`）。pLLM 需要每行各自的 loss（形状 `[rows]`）来屏蔽未选中行或填充槽位，并按状态独立归约；去掉方法末尾跨行的归约。 |
 | `[neutral] guide_sampling still declares a sampler stage; set its beta to zero.` | 零强度对照 `neutral=` 的采样引导未完全关闭。不能在类体里直接写 `beta=beta`（读到的是类的默认值），必须定义方法 `def strength(self) -> float: return self.beta` 并传给装饰器 `@pllm.guide_sampling(beta=strength)`。 |
 | `...: add_logits must return exactly zero` | 零强度对照 `neutral=` 的 logits 修正方法没有返回全零张量。在零强度实例下，`@pllm.add_logits` 方法的返回值必须精确为零（如乘以 `self.scale` 且零强度时 scale 为 0）。 |
 

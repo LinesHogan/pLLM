@@ -41,7 +41,7 @@ print(report.eager_reason == "", report.workload_host_syncs, [export.rows for ex
 | `kernels` | 每步发射的算子数估计（融合前），`graph` 表示在 graph 里重放 |
 | `tap` | 从模型里取出的 hidden 位置、哪些 token（decode / prefill / all）、缓冲字节和共用它的方法 |
 | `state` 表头之后的每一行 | `状态名  作用域  roots  bytes/root  reserved bytes`，再列出每个字段的存储精度、初值来源（`source`）、放置位置（`placement`）、主机内存字节、每行和每步跨 PCIe 的字节。`roots` 是预留的份数，比并发请求多，因为新旧版本要同时存在 |
-| `memory` | pllm 自己要的显存峰值（状态页、任务工作区、CUDA graph 池等，不含权重和 KV）；第二行给出两个阈值：低于第一个，旁路任务改成主 stream 内联；低于第二个，规划失败 |
+| `memory` | pLLM 自己要的显存峰值（状态页、任务工作区、CUDA graph 池等，不含权重和 KV）；第二行给出两个阈值：低于第一个，旁路任务改成主 stream 内联；低于第二个，规划失败 |
 | `budget` | 你设的预算装不下时的报错原文（与 `make_llm` 相同）；报告仍给出不受预算限制的计划 |
 | `preempt` | 请求被抢占后状态保留（`keep`）还是重置（`reset`），以及重置时为什么不能重算 |
 | `host` | 你的数学里 GPU→CPU 同步的次数；模型内部的方法标 `unverified`，要上 GPU 用 `check_on_gpu` 确认 |
@@ -75,7 +75,7 @@ print(report.eager_reason == "", report.workload_host_syncs, [export.rows for ex
 
 ## llm.diagnostics() 的字段
 
-引擎运行中随时可以调用；返回的是查询那一刻的值，pllm 会先等设备上的计数写完。
+引擎运行中随时可以调用；返回的是查询那一刻的值，pLLM 会先等设备上的计数写完。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -106,6 +106,6 @@ print(report.eager_reason == "", report.workload_host_syncs, [export.rows for ex
 
 `on_export` 收到的 `pllm.io.TraceEvent` 中用户常读的字段：`tensor_name`（导出名；组件的导出去掉了字段名前缀）、
 `tensor()`（独立的 CPU 张量）、`identities`（每行一个 `pllm.testing.RequestIdentity`：`prompt_index`、`sample_index`、
-pllm 内部的 `request_id`）、`positions`（每行在请求中的 token 位置）、`step_id`、`dropped_rows`（这一步因 `max_rows`
+pLLM 内部的 `request_id`）、`positions`（每行在请求中的 token 位置）、`step_id`、`dropped_rows`（这一步因 `max_rows`
 被丢弃的行数）。`llm.trace_snapshot()` 返回 `pllm.io.TraceSnapshot`：保留的事件 `events`、缓冲满时丢掉的最旧事件数 `dropped`，
 以及导出投递队列满时丢掉的事件数 `export_dropped`。

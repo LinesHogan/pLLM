@@ -173,7 +173,7 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
     def __init__(self, upstream: VllmSampler) -> None:
         assert type(upstream) is VllmSampler
         if upstream.num_speculative_tokens != 1:
-            raise ValueError("pllm workloads need non-speculative decoding; disable speculative decoding")
+            raise ValueError("pLLM workloads need non-speculative decoding; disable speculative decoding")
         # The loaded vLLM instance's whole state: the inherited apply, draw and logprob methods read it.
         vars(self).update(vars(upstream))
         self._active_guidance: SignedSamplerStages | _SampledGuidance | None = None

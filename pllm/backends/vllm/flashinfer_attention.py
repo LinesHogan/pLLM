@@ -47,7 +47,7 @@ if VLLM_027:
         def build(
             self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
         ) -> FlashInferMetadata:
-            # MRv2's host bound is exact outside speculative decoding, which pllm does not enable.
+            # MRv2's host bound is exact outside speculative decoding, which pLLM does not enable.
             if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
                 common_attn_metadata = replace(
                     common_attn_metadata, _seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound

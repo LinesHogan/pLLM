@@ -476,7 +476,7 @@ class WorkloadContext:
         if mode_now is not None and mode_now != mode:
             raise ValueError(
                 f"{call.symbol} trains on {TRAINING_INPUTS[mode]} but {self.trainers[0][0].symbol} on "
-                f"{TRAINING_INPUTS[mode_now]}; pllm funds one training mode per workload, so move one of them to a "
+                f"{TRAINING_INPUTS[mode_now]}; pLLM funds one training mode per workload, so move one of them to a "
                 "separate workload"
             )
         self.trainers.append((call, self.states[state]))

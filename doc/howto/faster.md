@@ -97,7 +97,7 @@ host     0 syncs in traced workload math
 
 ### 意味着什么
 
-`pllm` 依赖 CPU 超前 GPU 异步准备元数据。一旦在负载方法中调用了 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)`、`float(tensor)` 或 Python 值分支 `if tensor.any():`，CPU 就必须阻塞等待 GPU 将之前发射的所有算子执行完毕并把标量拷回主机内存。这一主机同步会彻底排空 GPU 执行流水线，造成数百微秒至毫秒级的 GPU 停顿。
+pLLM 依赖 CPU 超前 GPU 异步准备元数据。一旦在负载方法中调用了 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)`、`float(tensor)` 或 Python 值分支 `if tensor.any():`，CPU 就必须阻塞等待 GPU 将之前发射的所有算子执行完毕并把标量拷回主机内存。这一主机同步会彻底排空 GPU 执行流水线，造成数百微秒至毫秒级的 GPU 停顿。
 
 ### 怎么改
 
@@ -136,7 +136,7 @@ assert sync_report.workload_host_syncs == 0
 3. 查看 `memory` 行打印的两个阈值：
 
 ```text
-memory   peak 982708000 bytes funded by pllm [per-rank tensor reservations; excludes GPU-dependent BLAS workspace]
+memory   peak 982708000 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace]
          below 982708000 bytes tasks run inline; below 932657440 bytes planning fails
 ```
 

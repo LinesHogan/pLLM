@@ -1,8 +1,8 @@
-# 为什么几行算法会拖慢解码：pllm 性能与显存指南
+# 为什么几行算法会拖慢解码：pLLM 性能与显存指南
 
 写推理时算法（在线训练、记忆查表、残差改写、引导采样、稀疏注意力、自适应深度）时，最容易遇到的困惑是：**算法本身只有几行 PyTorch 张量运算，放进自回归解码（decode）循环后却慢了一大截，甚至直接撑爆显存。**
 
-这篇指南面向正在用 `pllm` 写 workload 的开发者。我们将从自回归解码的物理特性出发，帮你建立判断性能与显存的心智模型，看清 `pllm` 已经在底层替你做了什么、不同写法各自的代价是多少，以及该怎么改代码或调参数才能跑得更快、更省显存。
+这篇指南面向正在用 pLLM 写 workload 的开发者。我们将从自回归解码的物理特性出发，帮你建立判断性能与显存的心智模型，看清 pLLM 已经在底层替你做了什么、不同写法各自的代价是多少，以及该怎么改代码或调参数才能跑得更快、更省显存。
 
 ### 目录
 
@@ -27,7 +27,7 @@
 
 1. **GPU 时间线有没有断掉（气泡）**：CPU 每步能不能把整串算子一口气喂给 GPU？只要有一次 CPU 等待 GPU（host sync），或者退回逐算子发射（eager 模式），GPU 就会大面积空转。
 2. **每步多搬了多少字节（显存带宽与总线通信）**：权重、请求状态、词表级 logits 和主机内存查表每步要读写多少字节？
-3. **给 KV Cache 剩了多少空间（显存容量）**：模型权重、CUDA Graph 私有内存池和 `pllm` 的状态预留先分走固定份额，**剩下的显存才归 vLLM 的 KV cache**。多预留几百 MiB，并发上限就会断崖式下跌。
+3. **给 KV Cache 剩了多少空间（显存容量）**：模型权重、CUDA Graph 私有内存池和 pLLM 的状态预留先分走固定份额，**剩下的显存才归 vLLM 的 KV cache**。多预留几百 MiB，并发上限就会断崖式下跌。
 
 ### 一组值得记住的“标尺数字”
 
@@ -43,7 +43,7 @@
 | **跨 PCIe 搬一次宽表**（Host $\rightarrow$ GPU） | 物理传输约 **$1.7\text{ ms}$ / 步**（超半步前向时间） | PCIe 4.0 x16 有效带宽约 **$22.4\text{ GB/s}$**（仅为 4090 显存带宽 $\sim 1000\text{ GB/s}$ 的 1/45）；128 行查表共需搬运 **$38.9\text{ MB}$** |
 | **多卡 All-Reduce 被旁路任务撞上** | 4 张 A100 跑 7B（TP=4）时，若旁路训练每步与 vLLM 的 Custom All-Reduce 重叠约 **$193\text{–}205\ \mu\text{s}$**，吞吐只有原生的 **87.07%**（同设置单卡为 93.79%） | 旁路训练与 All-Reduce 争抢带宽和 SM，拖慢全卡同步 |
 
-围绕这三个瓶颈，`pllm` 在底层替你做了三件事：
+围绕这三个瓶颈，pLLM 在底层替你做了三件事：
 1. **保住时间线**：稳态 decode 每步 0 次主机同步，把前向改写和旁路训练录进 CUDA Graph，并把每步约 **$700\ \mu\text{s}$** 的 CPU 端准备工作藏进 GPU 执行阴影里。
 2. **省下显存容量**：用分页状态池、按角色自动选精度和 CPU 静态代码追踪，把显存留给 KV cache。
 3. **少搬字节、聪明重叠**：能合并读权重的绝不读两遍；必须搬运或训练的，只在 GPU 对应硬件资源空闲时塞进旁路 stream 重叠执行。
@@ -52,7 +52,7 @@
 
 ## 2. 先看计划：在 CPU 上用 `pllm.explain` 算清账单
 
-`pllm.explain(workload, config)` 是写完 workload 后最重要的性能工具。它只读模型的 `config.json` 并在 CPU 上用 meta 张量做形状与生命周期追踪，**不加载权重、不初始化 CUDA、不占 GPU**（首次调用约 $2.9\text{ s}$，同进程内再次调用 $< 0.1\text{ s}$），就能直接告诉你：模型会不会退回 eager、每个方法排在哪条流、方法里有没有主机同步，以及 `pllm` 要预留多少字节显存。
+`pllm.explain(workload, config)` 是写完 workload 后最重要的性能工具。它只读模型的 `config.json` 并在 CPU 上用 meta 张量做形状与生命周期追踪，**不加载权重、不初始化 CUDA、不占 GPU**（首次调用约 $2.9\text{ s}$，同进程内再次调用 $< 0.1\text{ s}$），就能直接告诉你：模型会不会退回 eager、每个方法排在哪条流、方法里有没有主机同步，以及 pLLM 要预留多少字节显存。
 
 ### 代码示例
 
@@ -116,7 +116,7 @@ predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1
 tap      model.layers.0[0], decode: 460800 bytes shared by loss, predict
 state  scope  roots  bytes/root  reserved bytes [exact]
 distiller  request  514  129104  66359516  field 0: float32, field 1: float32, ...
-memory   peak 982708000 bytes funded by pllm [per-rank tensor reservations; excludes GPU-dependent BLAS workspace]
+memory   peak 982708000 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace]
          below 982708000 bytes tasks run inline; below 932657440 bytes planning fails
 host     0 syncs in traced workload math; exports: none
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
@@ -131,10 +131,10 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
   * `graph` 为 `captured` 说明该方法本身也被录进了 CUDA Graph。
   * `lane` 为 `side` 说明它在旁路 CUDA stream 上运行，会与后续的模型前向重叠；`main` 说明在主 stream 上运行。
   * `anchor` 说明触发时机：`request.prepare` 在一步最开头（模型前向之前），`model.execute` 在模型前向时，`state.publish` 在前向结束、状态发布新版本时，`token.commit` 在这一步的 token 确定之后。
-* **`tap`**：从模型层取出的激活缓冲大小。如果多个方法读同一层同一阶段（如 `loss` 和 `predict` 都读 `pllm.hidden(0)`），`pllm` 只建一份缓冲供它们共享（`460800 bytes shared by loss, predict`）。
+* **`tap`**：从模型层取出的激活缓冲大小。如果多个方法读同一层同一阶段（如 `loss` 和 `predict` 都读 `pllm.hidden(0)`），pLLM 只建一份缓冲供它们共享（`460800 bytes shared by loss, predict`）。
 * **`state` 与 `memory`**：
   * `state` 显示每个状态预留了多少份（`roots`）、每份多少字节、总预留多少字节，以及每个字段解析出的 `dtype`。
-  * `memory` 显示 `pllm` 为任务计算预留的峰值字节数，以及两个关键阈值：`below X bytes tasks run inline; below Y bytes planning fails`（预算低于 X 时旁路任务失去重叠、退回主 stream 内联执行；低于 Y 时无法运行）。
+  * `memory` 显示 pLLM 为任务计算预留的峰值字节数，以及两个关键阈值：`below X bytes tasks run inline; below Y bytes planning fails`（预算低于 X 时旁路任务失去重叠、退回主 stream 内联执行；低于 Y 时无法运行）。
 * **`host`**：正常应显示 `0 syncs in traced workload math`。如果你在方法里写了 `.item()` 一类会触发 GPU 到 CPU 同步的操作，`explain` 根本不会走到这一行，而是在形状追踪时直接报错（见 [3.1 节](#31-零主机同步为什么一行-item-会拖垮吞吐)）。
 
 > **实用建议与边界**
@@ -149,9 +149,9 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 3.1 零主机同步：为什么一行 `.item()` 会拖垮吞吐？
 
-在异步执行模型下，CPU 总是领先 GPU 一步准备元数据。`pllm` 每步在 CPU 上的准备工作总计约 **$700\ \mu\text{s}$**，所需的槽位、掩码等元数据通过一张锁页 `int64` 表一次上传（H2D 约 **$6.24\ \mu\text{s}$**），完全藏在 $3.30\text{ ms}$ 的 GPU 前向阴影里，造成的步间 GPU 空闲仅约 **$4\text{–}6\ \mu\text{s}$**。
+在异步执行模型下，CPU 总是领先 GPU 一步准备元数据。pLLM 每步在 CPU 上的准备工作总计约 **$700\ \mu\text{s}$**，所需的槽位、掩码等元数据通过一张锁页 `int64` 表一次上传（H2D 约 **$6.24\ \mu\text{s}$**），完全藏在 $3.30\text{ ms}$ 的 GPU 前向阴影里，造成的步间 GPU 空闲仅约 **$4\text{–}6\ \mu\text{s}$**。
 
-一旦在方法里写下 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)` 或 `if tensor.any():`，CPU 就必须停下来等 GPU 把前面的所有算子跑完，流水线被彻底排空；而方法又运行在 CUDA Graph 和旁路 stream 里，这样的代码根本无法录制。所以 `pllm` 不让它跑起来：规划时用 meta 张量追踪你的方法，遇到这类操作直接报错，`pllm.explain` 和 `make_llm` 都过不去。
+一旦在方法里写下 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)` 或 `if tensor.any():`，CPU 就必须停下来等 GPU 把前面的所有算子跑完，流水线被彻底排空；而方法又运行在 CUDA Graph 和旁路 stream 里，这样的代码根本无法录制。所以 pLLM 不让它跑起来：规划时用 meta 张量追踪你的方法，遇到这类操作直接报错，`pllm.explain` 和 `make_llm` 都过不去。
 
 ```python
 @dataclass(frozen=True)
@@ -190,15 +190,15 @@ class GoodBias(pllm.Workload):
 `pllm.explain(BadBias(), config)` 抛出 `RuntimeError: Tensor.item() cannot be called on meta tensors`，并附一条提示：`methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values`。`.cpu()`、`torch.nonzero` 等同样在这一步被拦下。`GoodBias` 则正常规划，`host` 行为 `0 syncs`。注意改写后的语义也更对：原写法用整个 batch 的范数做一次判断，会让一个请求的结果受同批其他请求影响；改写后每一行只看自己。
 
 **机制与验证**：
-* `pllm` 保证稳态 decode 每步 0 次阻塞式主机同步，`check_on_gpu` 会检查这一点。在 RTX 4090 的 128 并发剖析中，`pllm` 产生的 Event/Stream 主机等待为 **0**，decode 窗口内 `cudaDeviceSynchronize` 空闲时间为 **0**。
-* 遇到自适应深度分桶、计数 scan 完成判断等必须动态跳转的内部场景，`pllm` 使用 CUDA Graph 内的设备端条件节点（CUDA IF nodes，需 CUDA 12.4+ 驱动路径）直接在 GPU 上跳转，不把条件拷回 CPU。
+* pLLM 保证稳态 decode 每步 0 次阻塞式主机同步，`check_on_gpu` 会检查这一点。在 RTX 4090 的 128 并发剖析中，pLLM 产生的 Event/Stream 主机等待为 **0**，decode 窗口内 `cudaDeviceSynchronize` 空闲时间为 **0**。
+* 遇到自适应深度分桶、计数 scan 完成判断等必须动态跳转的内部场景，pLLM 使用 CUDA Graph 内的设备端条件节点（CUDA IF nodes，需 CUDA 12.4+ 驱动路径）直接在 GPU 上跳转，不把条件拷回 CPU。
 * `explain` 只能追踪普通方法里的数学。模型层内和注意力里的计算要用 `pllm.testing.check_on_gpu(workload, config)` 验证：它在 `torch.cuda.set_sync_debug_mode("error")` 下实跑至少 8 个稳态 decode 步，任何隐式同步都会立即报错。
 
 ### 3.2 全链路 CUDA Graph：把训练、残差和自定义算子都录进图
 
-CUDA Graph 会把一串 GPU kernel 的启动参数预先录制成一张图，之后每步只用一次极轻量的回放（replay）发射整串计算。`pllm` 在三个层面维持图模式：
+CUDA Graph 会把一串 GPU kernel 的启动参数预先录制成一张图，之后每步只用一次极轻量的回放（replay）发射整串计算。pLLM 在三个层面维持图模式：
 
-1. **任务与在线训练整包捕获（`StepCapture`）**：在线训练（如 `@pllm.train`）包含前向、loss、掩码归约、`backward()`、写状态和分页 `AdamW` 等几十个小 kernel。`pllm` 按最大行数和状态容量把它们录进同一张图；输入使用固定缓冲，未满 batch 的空行指向不会污染真实状态的哑槽位（sink state）。因此即便每步活跃请求集合在变，也**不需要重录图**：稳态下每个 decode 步只回放 1 次训练图，0 次重捕获。在一次 128 并发的对比测试中，训练进图让每步从 $6.73\text{ ms}$ 降到 $5.25\text{ ms}$，吞吐提高约 **25%**。
+1. **任务与在线训练整包捕获（`StepCapture`）**：在线训练（如 `@pllm.train`）包含前向、loss、掩码归约、`backward()`、写状态和分页 `AdamW` 等几十个小 kernel。pLLM 按最大行数和状态容量把它们录进同一张图；输入使用固定缓冲，未满 batch 的空行指向不会污染真实状态的哑槽位（sink state）。因此即便每步活跃请求集合在变，也**不需要重录图**：稳态下每个 decode 步只回放 1 次训练图，0 次重捕获。在一次 128 并发的对比测试中，训练进图让每步从 $6.73\text{ ms}$ 降到 $5.25\text{ ms}$，吞吐提高约 **25%**。
 2. **模型层内残差改写进图**：`@pllm.custom_residual` 会被编译为具名算子并直接录进 vLLM 的模型图里（详见 [5.4 节](#54-模型层内残差改写)）。
 3. **自定义算子进图**：用 `torch.library.custom_op` 注册并附上 `register_fake` 的 Triton 或 PyTorch 算子，只要直接调用该 op 对象（不要调 `torch.ops.<namespace>`），就能被捕进图与旁路流（见[示例 09](../examples/09_custom_kernels.ipynb)）。在 RTX 4090（128 并发）下，自定义 Triton 算子吞吐达原生 vLLM 的 **95%**（$37,518\text{ tok/s}$），PyTorch 自定义算子达 **96%**（$37,976\text{ tok/s}$）。
 
@@ -217,7 +217,7 @@ config_strict = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", cuda_graphs=True)
 
 哪些特性会让模型前向退回 eager（或替换整图）？
 * 共享可变 `InstanceState` 的 `pllm.model.Adapter`：退回 eager。
-* `@pllm.custom_forward`：vLLM 的整模型图会被替换为 `pllm` 按层切片捕获的分段图（`eager_reason` 会注明 `@pllm.custom_forward`）。
+* `@pllm.custom_forward`：vLLM 的整模型图会被替换为 pLLM 按层切片捕获的分段图（`eager_reason` 会注明 `@pllm.custom_forward`）。
 
 ### 3.3 旁路 Stream 重叠与 `publish_lag`：什么时候真能提速？
 
@@ -227,7 +227,7 @@ config_strict = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", cuda_graphs=True)
 
 如果要求第 $n$ 步采完样立刻算完梯度、第 $n+1$ 步前向开头必须读到最新权重（即 `publish_lag=0`），那么每步前向都必须干等反向传播和 AdamW 跑完。
 
-`pllm` 默认采用 `publish_lag=1`：
+pLLM 默认采用 `publish_lag=1`：
 * 第 $n$ 步 token 确定后，经过极短的拷贝栅栏，训练任务立刻放到 `side` stream 上异步执行；
 * 第 $n+1$ 步前向直接读取第 $n-1$ 步的旧版本状态，不等待第 $n$ 步的训练；
 * 第 $n$ 步算出的新权重在第 $n+2$ 步生效。
@@ -251,14 +251,14 @@ print(pllm.explain(Distill(), strict_config))
 此时 `explain` 中 `loss` 的 lane 从 `side` 变为 `main`，`timing` 行写着 `publish_lag=0 (you set): updates at step n become readable at n + 1; updates serialize before the next forward`；状态的 `roots` 也随之变少（见 [4.1 节](#41-分页状态池与版本槽位公式roots)）。
 
 > **实用建议与避坑**
-> * **不要对 workload 方法手动套 `@torch.compile`**：`pllm` 已经在内部需要的地方（如词表重加权、只读查表的整图融合）使用了编译，并依靠 `StepCapture` 消除发射开销。在 `ESamp`（$\beta=0$）上测试过直接编译手写的 loss 前向与反向，吞吐（92.77%）与不编译相比没有可测收益。
+> * **不要对 workload 方法手动套 `@torch.compile`**：pLLM 已经在内部需要的地方（如词表重加权、只读查表的整图融合）使用了编译，并依靠 `StepCapture` 消除发射开销。在 `ESamp`（$\beta=0$）上测试过直接编译手写的 loss 前向与反向，吞吐（92.77%）与不编译相比没有可测收益。
 > * **重叠不是越多越好**：`ESamp`（$\beta=0$）即使 CPU 几乎零气泡、开启 `publish_lag=1`，吞吐约为原生的 92%–94%。剩下的差距主要来自 GPU 上实打实的训练图回放（每步约 $100\text{–}140\ \mu\text{s}$）与主干流共用硬件，而不是 CPU 调度。强行提高重叠度（去掉采样器前的等待，让训练挤进正在满负荷扫词表的采样阶段）在测试中反而让吞吐从 94.49% 降到 92.73%：训练没有消失，只是去和采样器抢显存带宽了。
 
 #### 自测小问题（第 1–3 节）
 
 1. **问题**：你在 `@pllm.train` 方法里加了一句 `assert not torch.isnan(loss).any()` 来排查数值问题，会发生什么？
    <details><summary>点击查看答案</summary>
-   <code>assert</code> 要把张量转成 Python <code>bool</code>，这需要一次 GPU 到 CPU 的阻塞式同步。<code>pllm</code> 在规划阶段用 meta 张量追踪方法，这一行会直接报错（<code>RuntimeError: Tensor.item() cannot be called on meta tensors</code>，附带“用 <code>torch.where</code> 等张量操作”的提示），<code>pllm.explain</code> 和 <code>make_llm</code> 都过不去。想观察数值，用 <code>@pllm.export</code> 导出你关心的统计量（第 7 节），或在运行时查询不产生每步同步的 <code>llm.diagnostics().numeric_health</code>，看状态字段里有没有 NaN/Inf。
+   <code>assert</code> 要把张量转成 Python <code>bool</code>，这需要一次 GPU 到 CPU 的阻塞式同步。pLLM 在规划阶段用 meta 张量追踪方法，这一行会直接报错（<code>RuntimeError: Tensor.item() cannot be called on meta tensors</code>，附带“用 <code>torch.where</code> 等张量操作”的提示），<code>pllm.explain</code> 和 <code>make_llm</code> 都过不去。想观察数值，用 <code>@pllm.export</code> 导出你关心的统计量（第 7 节），或在运行时查询不产生每步同步的 <code>llm.diagnostics().numeric_health</code>，看状态字段里有没有 NaN/Inf。
    </details>
 
 2. **问题**：既然 `lane: side` 可以在后台流上跑，如果把一个每步要读写几百 MB 显存的重度任务塞进 `side` 流，能不能白嫖时间？
@@ -270,11 +270,11 @@ print(pllm.explain(Distill(), strict_config))
 
 ## 4. 守住显存容量：分页状态、精度与预算控制
 
-在 vLLM 中，显存分配的顺序是：**模型权重 + CUDA Graph 捕获池 + `pllm` 状态与任务工作区 $\rightarrow$ 剩下的才分给 KV Cache**。一个真实的例子：在 RTX 4090（24 GiB，`gpu_memory_utilization=0.85`）上跑 7B 模型，如果把模型的 CUDA Graph 一直录到 8192 个 token 的批量，捕获池占掉的显存会让可用 KV Cache 从 76,144 个 token 降到 3,872 个，吞吐只剩原生的约 21%。`pllm` 按 vLLM 的常规尺寸录制模型图，并让下面每一字节预留都可见、可控。
+在 vLLM 中，显存分配的顺序是：**模型权重 + CUDA Graph 捕获池 + pLLM 状态与任务工作区 $\rightarrow$ 剩下的才分给 KV Cache**。一个真实的例子：在 RTX 4090（24 GiB，`gpu_memory_utilization=0.85`）上跑 7B 模型，如果把模型的 CUDA Graph 一直录到 8192 个 token 的批量，捕获池占掉的显存会让可用 KV Cache 从 76,144 个 token 降到 3,872 个，吞吐只剩原生的约 21%。pLLM 按 vLLM 的常规尺寸录制模型图，并让下面每一字节预留都可见、可控。
 
 ### 4.1 分页状态池与版本槽位公式（`roots`）
 
-当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，`pllm` 用一个分页的状态池管理显存。当状态更新时，框架执行**字段级写时复制（COW）**：只为被修改的字段分配新物理页，未修改字段直接与旧版本共享物理槽位。
+当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，pLLM 用一个分页的状态池管理显存。当状态更新时，框架执行**字段级写时复制（COW）**：只为被修改的字段分配新物理页，未修改字段直接与旧版本共享物理槽位。
 
 为什么在 `pllm.explain` 里看到的 `roots`（预留槽位数）比 `max_num_seqs` 大得多？
 因为为了支持 `publish_lag` 跨步重叠，当旁路流正在写入新版本时，主干流还在读取旧版本，多个版本必须同时驻留在显存里。精确槽位公式如下（其中“副本数”为并发请求槽位数，即 `max_num_seqs`）：
@@ -286,7 +286,7 @@ print(pllm.explain(Distill(), strict_config))
 
 ### 4.2 自动精度选择：什么时候用 BF16，什么时候必须用 FP32？
 
-声明状态字段时，默认 `dtype="auto"`。`pllm` 会静态分析每个字段在 workload 中的读写角色，自动平衡显存占用与数值稳定性（规约、梯度累加与优化器内部计算始终保持 $\ge$ FP32）：
+声明状态字段时，默认 `dtype="auto"`。pLLM 会静态分析每个字段在 workload 中的读写角色，自动平衡显存占用与数值稳定性（规约、梯度累加与优化器内部计算始终保持 $\ge$ FP32）：
 
 | 字段在方法中的角色 | `dtype="auto"` 自动选择的精度 | 原因与实测影响 |
 | :--- | :--- | :--- |
@@ -322,7 +322,7 @@ class Probe(pllm.Workload):
 
 ### 4.3 工作区自动降级与四个显存预算旋钮
 
-`pllm` 在绑定引擎时，会对你的真实方法代码（含 autograd 保存的张量、优化器和 scan）做生命周期追踪，算出精确的峰值工作区（例如 `ESamp` 的 `predict` 工作区仅需 **$27.8\text{ MB}$**，`OverRIDE` 训练工作区需 **$267\text{ MB}$**）。
+pLLM 在绑定引擎时，会对你的真实方法代码（含 autograd 保存的张量、优化器和 scan）做生命周期追踪，算出精确的峰值工作区（例如 `ESamp` 的 `predict` 工作区仅需 **$27.8\text{ MB}$**，`OverRIDE` 训练工作区需 **$267\text{ MB}$**）。
 
 你可以通过 `pllm.ExecutionOptions` 上的参数控制显存分配与过载保护：
 
@@ -346,7 +346,7 @@ config = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", execution=exec_opts)
 > **实用建议：生命周期与 Prefix Caching**
 > * **用 `with pllm.make_llm(...) as llm:` 管理生命周期**：退出 `with` 块时，框架会按序清理 vLLM、cuBLAS 工作区、CUDA Graph 池与编译缓存，归还显存。唯一的例外是使用了 `@pllm.train_in_forward(visibility="exact")` 捕获的引擎，关闭时暂不能归还全部显存，后续引擎请在新的子进程中启动。
 > * **Prefix Caching 兼容性**：`ModelConfig(enable_prefix_caching=True)` 会自动把 workload 的命名空间混入块哈希，保证数学一致时才复用前缀；但它与 `@pllm.custom_residual` 和 `@pllm.custom_attention` 互斥（这两者要求关闭 prefix caching）。
-> * **量化模型上的在线训练**：在 GPTQ/Marlin 量化底座上做在线训练时，`pllm` 使用瞬态反量化：反量化后的稠密权重只活过一次反向传播，用完即释放，**峰值显存不增加**（14B GPTQ 在 A100 上每个训练步 **$0.193\text{ s}$**；4090 上 14B 的 QKV 反量化仅 **$0.104\text{ ms}$**）。预先缓存反量化权重虽然每步略快（$0.176\text{ s}$），却要多占 $24.63\text{ GiB}$ 常驻显存。
+> * **量化模型上的在线训练**：在 GPTQ/Marlin 量化底座上做在线训练时，pLLM 使用瞬态反量化：反量化后的稠密权重只活过一次反向传播，用完即释放，**峰值显存不增加**（14B GPTQ 在 A100 上每个训练步 **$0.193\text{ s}$**；4090 上 14B 的 QKV 反量化仅 **$0.104\text{ ms}$**）。预先缓存反量化权重虽然每步略快（$0.176\text{ s}$），却要多占 $24.63\text{ GiB}$ 常驻显存。
 
 ---
 
@@ -462,16 +462,16 @@ class LookupPrior(pllm.Workload):
 
 #### 原理与代价：如何把 $1.7\text{ ms}$ 的 PCIe 传输藏进前向里？
 
-以 $2048 \times 151936$（BF16）的查找表为例，表本身占 **$594\text{ MiB}$**。128 个并发请求每步各查一行（每行 $303,872\text{ B}$），每步共需读取 **$38.9\text{ MB}$**。`pllm` 对这种查表做了两层优化：
+以 $2048 \times 151936$（BF16）的查找表为例，表本身占 **$594\text{ MiB}$**。128 个并发请求每步各查一行（每行 $303,872\text{ B}$），每步共需读取 **$38.9\text{ MB}$**。pLLM 对这种查表做了两层优化：
 
 1. **表在显存（`placement="device"`）：Inductor 整图融合**
-   对于只依赖 `pllm.input_tokens` 和不可变状态的不可微查表方法，`pllm` 在绑定引擎时会自动将其中的 gather、类型转换、掩码（`where`）和缩放编译融合为**单次表读取 kernel**，省去把 $38.9\text{ MB}$ 宽向量写回显存再读出来做逐元素运算的往返流量，并把它提前到一步最开头的 `request.prepare` 发射。在 4090 上，设备端查表吞吐达到原生 vLLM 的 **82%**（**$31,750\text{ tok/s}$**，约 $4.03\text{ ms}$/步）。融合可能改变舍入；需要严格位级一致时用 `ExecutionOptions(allow_numerical_transforms=False)` 关闭。
+   对于只依赖 `pllm.input_tokens` 和不可变状态的不可微查表方法，pLLM 在绑定引擎时会自动将其中的 gather、类型转换、掩码（`where`）和缩放编译融合为**单次表读取 kernel**，省去把 $38.9\text{ MB}$ 宽向量写回显存再读出来做逐元素运算的往返流量，并把它提前到一步最开头的 `request.prepare` 发射。在 4090 上，设备端查表吞吐达到原生 vLLM 的 **82%**（**$31,750\text{ tok/s}$**，约 $4.03\text{ ms}$/步）。融合可能改变舍入；需要严格位级一致时用 `ExecutionOptions(allow_numerical_transforms=False)` 关闭。
 2. **表在主机内存（`placement="host"`）：受限 SM 的旁路 UVA 拉取**
-   把 $594\text{ MiB}$ 的表改为 `placement="host"` 后，`pllm` 在 GPU 上预留的显存峰值从 **$702\text{ MiB}$ 直降到 $109\text{ MiB}$**（$1\text{ GiB}$ 的 GPU 预算下也能挂载 $3\text{ GiB}$ 的主机表）。
+   把 $594\text{ MiB}$ 的表改为 `placement="host"` 后，pLLM 在 GPU 上预留的显存峰值从 **$702\text{ MiB}$ 直降到 $109\text{ MiB}$**（$1\text{ GiB}$ 的 GPU 预算下也能挂载 $3\text{ GiB}$ 的主机表）。
    但每步 $38.9\text{ MB}$ 跨过 PCIe 4.0 x16（$\sim 22.4\text{ GB/s}$）需要实打实的 **$1.7\text{ ms}$**。如果直接用普通 GPU kernel 去主机内存拉数据，它会启动 37,984 个线程块占满 4090 的全部 128 个 SM——虽然这些线程块只是在等慢速的 PCIe，但主干流的模型前向根本排不上队：$1,753.7\ \mu\text{s}$ 的读表只有 $26.2\ \mu\text{s}$ 与主干重叠。
-   **`pllm` 的做法**：跑满 PCIe 根本不需要多少 SM。`pllm` 拦截对主机表的按行读取，改用自定义常驻 Triton 算子，**把线程块数量限制在 GPU SM 总数的四分之一**（4090 上只用 32 个线程块），并在一步最开头的 `request.prepare / side` 发射。这样，1/4 的 SM 在后台等 PCIe，剩下 **3/4 的 SM 空出来跑主干模型前向**，剖析中读表时间的 **99.14%** 与主干 kernel 重叠。
+   **pLLM 的做法**：跑满 PCIe 根本不需要多少 SM。pLLM 拦截对主机表的按行读取，改用自定义常驻 Triton 算子，**把线程块数量限制在 GPU SM 总数的四分之一**（4090 上只用 32 个线程块），并在一步最开头的 `request.prepare / side` 发射。这样，1/4 的 SM 在后台等 PCIe，剩下 **3/4 的 SM 空出来跑主干模型前向**，剖析中读表时间的 **99.14%** 与主干 kernel 重叠。
 
-| 配置（RTX 4090，0.5B，128 并发，594 MiB 表） | 吞吐（tok/s） | 相对原生 vLLM 比例 | 单步耗时 | `pllm` 显存峰值 |
+| 配置（RTX 4090，0.5B，128 并发，594 MiB 表） | 吞吐（tok/s） | 相对原生 vLLM 比例 | 单步耗时 | pLLM 显存峰值 |
 | :--- | :--- | :--- | :--- | :--- |
 | 原生 vLLM（无查表） | $38,821$ | 100% | $3.30\text{ ms}$ | — |
 | 查表：`placement="device"` | $31,750$ | **82%** | $4.03\text{ ms}$ | $702\text{ MiB}$ |
@@ -482,7 +482,7 @@ class LookupPrior(pllm.Workload):
 > **实用建议与限制**
 > * **怎么让主机查表成功藏进前向里？** 把查表写成**不带效果装饰器的独立方法**，只读取 `pllm.input_tokens` 和不可变状态，再让 `@pllm.add_logits` 或 `@pllm.custom_residual` 通过 `pllm.result("lookup")` 读它的结果。这样规划器才能把它排到 `request.prepare / side`。如果把查表直接写在 `@pllm.add_logits` 方法体里，它会落在 `model.execute / main`；如果查表方法还读了 `pllm.hidden` 或 `pllm.final_hidden`，它要等前向结束（`state.publish / main`）。两种情况传输都无法与前向重叠。
 > * **怎么估算 PCIe 传输能不能藏住？** 看 `pllm.explain` 输出的 `logical transfer bytes/row`（或 `decode bytes/step`），用 $\frac{\text{并发数} \times \text{bytes/row}}{22\text{ GB/s}}$ 估算 PCIe 耗时。只要它明显短于一次模型前向（如 0.5B 的 $3.3\text{ ms}$），绝大部分传输都能被藏住。
-> * **`placement="host"` 支持的操作**：仅支持只读 `pllm.Pretrained` 表的按行读取，包括直接索引 `table[idx]`（含切片视图如 `table[:, ::2][idx]`）、`torch.index_select`、`torch.nn.functional.embedding` 和 `torch.vmap`，其他操作在规划时被拒绝。模型层内的方法（如 `@pllm.custom_residual`）不能直接读主机表，要通过 `pllm.result` 读取独立查表方法的结果。原因是：模型层内的方法在模型图里、主 stream 上某一层的中间执行，在那里读主机内存，PCIe 搬运会直接卡住这一层之后的前向，藏不掉；拆成只依赖 token 和只读表的独立方法后，规划器才能把它提前到步首的旁路 stream，用少量 SM 读、与前向重叠（见上一条）。同一个查表结果也可以同时交给多个效果方法，而只搬一次。`pllm` 不会为了装下预算自动把表挪到主机内存，这个取舍由你显式声明。
+> * **`placement="host"` 支持的操作**：仅支持只读 `pllm.Pretrained` 表的按行读取，包括直接索引 `table[idx]`（含切片视图如 `table[:, ::2][idx]`）、`torch.index_select`、`torch.nn.functional.embedding` 和 `torch.vmap`，其他操作在规划时被拒绝。模型层内的方法（如 `@pllm.custom_residual`）不能直接读主机表，要通过 `pllm.result` 读取独立查表方法的结果。原因是：模型层内的方法在模型图里、主 stream 上某一层的中间执行，在那里读主机内存，PCIe 搬运会直接卡住这一层之后的前向，藏不掉；拆成只依赖 token 和只读表的独立方法后，规划器才能把它提前到步首的旁路 stream，用少量 SM 读、与前向重叠（见上一条）。同一个查表结果也可以同时交给多个效果方法，而只搬一次。pLLM 不会为了装下预算自动把表挪到主机内存，这个取舍由你显式声明。
 
 ---
 
@@ -603,7 +603,7 @@ class ScaleResidual(pllm.Workload):
 #### 原理与代价：比 `ActivationPatch` 快在哪里？
 
 `pllm.model.ActivationPatch` 通过同一套 `custom_residual` 模型站点在 CUDA Graph 内修改层输出。
-而 `@pllm.custom_residual` 会被 `pllm` 降级为具名算子 `pllm::model_site`，并用设备端索引读写私有状态页，使 vLLM 在录制整模型 CUDA Graph 时**把你的残差改写一并录进图里**。
+而 `@pllm.custom_residual` 会被 pLLM 降级为具名算子 `pllm::model_site`，并用设备端索引读写私有状态页，使 vLLM 在录制整模型 CUDA Graph 时**把你的残差改写一并录进图里**。
 
 在 RTX 4090（0.5B，8 条 prompt $\times n=4$，生成 256 tokens）下的实测吞吐占原生图模式比例：
 * **Value Residual**：**85%**（同样的改写在 eager 下只有 34.4%）
@@ -623,14 +623,14 @@ class ScaleResidual(pllm.Workload):
 
 #### 1) 线性递推 `pllm.scan`：自动并行前缀扫描
 
-在 chunk 内做线性递推时，如果用 Python 循环串行步进，GPU 的 SM 根本填不满。用 `pllm.scan` 写递推后，`pllm` 的规划器会自动识别形如 $S_t = A_t S_{t-1} + B_t$ 的仿射递推，在显存工作区预算允许且系数为 FP32 时，替换为**并行前缀扫描（Parallel Prefix Scan）**：
+在 chunk 内做线性递推时，如果用 Python 循环串行步进，GPU 的 SM 根本填不满。用 `pllm.scan` 写递推后，pLLM 的规划器会自动识别形如 $S_t = A_t S_{t-1} + B_t$ 的仿射递推，在显存工作区预算允许且系数为 FP32 时，替换为**并行前缀扫描（Parallel Prefix Scan）**：
 * **微基准**：单头 $64 \times 64$ 状态扫描从串行的 $1.439\text{ ms}$ 降到 **$0.219\text{ ms}$（6.57 倍）**；14 头 $64 \times 64$ 为 **1.85 倍**；完整状态转移从 $5.879\text{ ms}$ 降到 **$1.759\text{ ms}$（3.34 倍）**。
 * **自动回退**：当状态维度很大（如 $d=896$）导致树形扫描不划算时，形状守卫会保留串行循环；CPU 上、部分扫描或需要求导的调用也保持串行。你也可以设 `ExecutionOptions(tuning="measured")` 让引擎在绑定时实测挑选最快实现，或用 `allow_numerical_transforms=False` 禁止并行重排。
 
 #### 2) 前向内精确更新 `@pllm.train_in_forward(visibility="exact")`
 
 默认情况下，`@pllm.train_in_forward` 使用 `visibility="forward_pinned"`（同一次前向的所有 chunk 读同一个起始状态）。对于 In-Place TTT 等要求“同一前向内后一个 chunk 必须读到前一个 chunk 更新后的快权重”的算法，需声明 `visibility="exact"`：
-* **实测表现**：`pllm` 会把 `visibility="exact"` 的 decode 阶段捕获进 CUDA Graph（prefill 仍为 eager）。在 RTX 4090 上跑 In-Place TTT 4B 模型（4096 prompt + 256 生成），batch size = 1 达 **$61.61\text{ tok/s}$**（16k 上下文达 **$42.91\text{ tok/s}$**，均快于官方 HF 实现的 $54.8 / 34.9\text{ tok/s}$），batch size = 4 达 **$123.76\text{ tok/s}$**（官方实现只支持 batch size = 1）。
+* **实测表现**：pLLM 会把 `visibility="exact"` 的 decode 阶段捕获进 CUDA Graph（prefill 仍为 eager）。在 RTX 4090 上跑 In-Place TTT 4B 模型（4096 prompt + 256 生成），batch size = 1 达 **$61.61\text{ tok/s}$**（16k 上下文达 **$42.91\text{ tok/s}$**，均快于官方 HF 实现的 $54.8 / 34.9\text{ tok/s}$），batch size = 4 达 **$123.76\text{ tok/s}$**（官方实现只支持 batch size = 1）。
 
 #### 3) 自适应深度跳层（`@pllm.custom_forward` + `active=mask`）：为什么只有“整批全跳”才省读权重？
 
@@ -656,7 +656,7 @@ class SkipMiddle(pllm.Workload):
         return layers(20, hidden=h20)[-1]  # 第 20–23 层
 ```
 
-**被跳过的层到底做了什么：状态传播。** 一行在某一段层上 `active=False` 时，它的残差流原样穿过这段层（等价于把这几层当作恒等映射）。但后面的 token 在每一层做 attention 时，仍然要读到这个位置在这一层的 K/V，所以 pllm 会为这行补写被跳过层的 K/V：拿它停下时的隐藏状态，经过每个被跳过层自己的输入 norm、K/V 投影和 RoPE 算出 K/V 写进 KV cache（第一次跳过时补写一次，约占一层计算量的 7%；之后再跳过同一层时保留已写入的值）。这就是 CALM 提出的“状态传播”：它给出的 K/V，正是“这些层输出等于输入”这个假设下该位置本应有的 K/V，误差只局限在被跳过的 token 自己的深层状态上。
+**被跳过的层到底做了什么：状态传播。** 一行在某一段层上 `active=False` 时，它的残差流原样穿过这段层（等价于把这几层当作恒等映射）。但后面的 token 在每一层做 attention 时，仍然要读到这个位置在这一层的 K/V，所以 pLLM 会为这行补写被跳过层的 K/V：拿它停下时的隐藏状态，经过每个被跳过层自己的输入 norm、K/V 投影和 RoPE 算出 K/V 写进 KV cache（第一次跳过时补写一次，约占一层计算量的 7%；之后再跳过同一层时保留已写入的值）。这就是 CALM 提出的“状态传播”：它给出的 K/V，正是“这些层输出等于输入”这个假设下该位置本应有的 K/V，误差只局限在被跳过的 token 自己的深层状态上。
 
 为什么默认用状态传播，而且它能覆盖各种需求：
 * **KV 的形状和语义都不变。** 每一层、每个位置都有 K/V，所以分页 KV cache、原生 FlashAttention、prefix cache、抢占后重算都照常工作，后面的 token 在任何一层都按正常方式做 attention。
@@ -669,7 +669,7 @@ class SkipMiddle(pllm.Workload):
 * **为什么 128 个 token 里跳过 50% 并不会让这几层快一倍？**
   因为 decode 阶段的矩阵乘是**权重带宽受限**的（例如 7B 模型单层权重达 $466\text{ MB}$）。哪怕 128 行里只有 1 行 `active=True`，GPU 也必须把这一层几百 MB 的权重完整读进 SM 才能算这 1 行！被跳过的行只省下了它自己的注意力 KV 读取流量（且首次被跳过时仍需用原生算子补齐约占单层开销 7% 的 norm/QKV/RoPE，以维持后续 KV 连续）。
 * **什么时候才能省下读权重的带宽？**
-  `pllm` 使用 CUDA Graph 条件节点将活跃行压实（compact）到 2 的幂次桶里执行。**只有当整个 batch 在该层全部跳过（活跃行数为 0，落入 `bucket 0`）时，GPU 才会通过条件节点直接跳过整层算子，真正省下读权重的带宽。**
+  pLLM 使用 CUDA Graph 条件节点将活跃行压实（compact）到 2 的幂次桶里执行。**只有当整个 batch 在该层全部跳过（活跃行数为 0，落入 `bucket 0`）时，GPU 才会通过条件节点直接跳过整层算子，真正省下读权重的带宽。**
 * **实测数字（RTX 4090，0.5B，8 条 prompt $\times n=4$，第 16–19 层可跳）**：
   * 从不跳过：原生图模式吞吐的 **93%**（对比原生 eager 仅 45%）
   * 约 14% token 跳过（阈值 0.85）：原生图吞吐的 **90%**
@@ -678,7 +678,7 @@ class SkipMiddle(pllm.Workload):
 
 > **实用建议与限制**
 > * `active=` 仅支持 `@pllm.custom_forward(tokens="decode")`，跳层不会释放被跳层的 KV 显存。
-> * **为什么 `active=` 只用于生成的 token？** 一个 token 跳过某些层时，pllm 用它“停下时”的隐藏状态补算这些层的 K/V。这些 K/V 只是近似值，后面的 token 读到的就是这份近似。对生成的 token，这份近似只影响同一请求接下来的几个 token，而且它跳层的前提是“已经算够了”（CALM、LayerSkip 等早退方法也只让生成的 token 退出）。prompt token 不一样：它不需要输出任何东西，唯一的作用就是给后面所有 token 提供 K/V；它的深层 K/V 被近似之后，影响的是整段回答，还会通过 prefix cache 和 n 个样本扩散出去。Ouro 论文的实测也是：prefill 阶段的 K/V 用近似值会掉 10 个以上的 GSM8K 点，decode 阶段却几乎不掉。另外，prompt 是整块并行计算的，被压紧后的行位置不连续，原生的 FlashAttention 无法直接计算它们，省下的矩阵乘大多会被额外的 attention 开销抵消。所以 prompt 默认按原模型完整深度运行，你不需要为它另写方法；只有当你要改变 prompt 的计算方式（例如固定的层循环）时，才写一个不带 `active=` 的 `tokens="prefill"` 方法，并优先用 `over="span"`（逐 token 的程序在 prefill 上会按位置串行执行）。
+> * **为什么 `active=` 只用于生成的 token？** 一个 token 跳过某些层时，pLLM 用它“停下时”的隐藏状态补算这些层的 K/V。这些 K/V 只是近似值，后面的 token 读到的就是这份近似。对生成的 token，这份近似只影响同一请求接下来的几个 token，而且它跳层的前提是“已经算够了”（CALM、LayerSkip 等早退方法也只让生成的 token 退出）。prompt token 不一样：它不需要输出任何东西，唯一的作用就是给后面所有 token 提供 K/V；它的深层 K/V 被近似之后，影响的是整段回答，还会通过 prefix cache 和 n 个样本扩散出去。Ouro 论文的实测也是：prefill 阶段的 K/V 用近似值会掉 10 个以上的 GSM8K 点，decode 阶段却几乎不掉。另外，prompt 是整块并行计算的，被压紧后的行位置不连续，原生的 FlashAttention 无法直接计算它们，省下的矩阵乘大多会被额外的 attention 开销抵消。所以 prompt 默认按原模型完整深度运行，你不需要为它另写方法；只有当你要改变 prompt 的计算方式（例如固定的层循环）时，才写一个不带 `active=` 的 `tokens="prefill"` 方法，并优先用 `over="span"`（逐 token 的程序在 prefill 上会按位置串行执行）。
 > * 使用 `@pllm.custom_forward` 时，同一个 workload 内不能再声明读取 `pllm.hidden` / `pllm.final_hidden` 的方法（请改用 `pllm.residual` 或 `pllm.layer_logits`），也不能用 `pllm.model.Adapter`。按层切片的图可能需要调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`（例如 0.5B 模型在 32 并发下捕获池约需 $748\text{ MiB}$，128 并发约需 $1,392\text{ MiB}$）；`explain` 不估算这部分，预算不够时报错信息会给出所需字节数。
 
 ---
@@ -687,12 +687,12 @@ class SkipMiddle(pllm.Workload):
 
 当模型单卡装不下或需要更高带宽时，可以通过 `ModelConfig(tensor_parallel_size=...)` 开启多卡张量并行（需 vLLM 0.32.0 与 `runner="mrv2"`）。
 
-### 原理与代价：为什么 `pllm` 选择“小状态按卡复制 + 流优先级错峰”？
+### 原理与代价：为什么 pLLM 选择“小状态按卡复制 + 流优先级错峰”？
 
-在张量并行下，vLLM 每算完一层注意力或 MLP 都要做一次全卡同步（Custom All-Reduce）。如果：① `pllm` 自己也发起跨卡集合通信，或者 ② 旁路流上的在线训练刚好在某张卡上和 vLLM 的 All-Reduce 撞在一起抢带宽，全卡就会一起被卡住。
+在张量并行下，vLLM 每算完一层注意力或 MLP 都要做一次全卡同步（Custom All-Reduce）。如果：① pLLM 自己也发起跨卡集合通信，或者 ② 旁路流上的在线训练刚好在某张卡上和 vLLM 的 All-Reduce 撞在一起抢带宽，全卡就会一起被卡住。
 
-因此，`pllm` 在 TP 下采用两条机制：
-1. **零 `pllm` 集合通信**：hidden tap、路由计算、`PositionState` 和请求级小状态在每个 TP rank 上各存一份完全相同的副本，各卡独立执行完全相同的确定性逻辑（实测各 TP 规模下与原生 vLLM 的 logits 均方根差为 0），`@pllm.export` 只在 rank 0 交付。
+因此，pLLM 在 TP 下采用两条机制：
+1. **零 pLLM 集合通信**：hidden tap、路由计算、`PositionState` 和请求级小状态在每个 TP rank 上各存一份完全相同的副本，各卡独立执行完全相同的确定性逻辑（实测各 TP 规模下与原生 vLLM 的 logits 均方根差为 0），`@pllm.export` 只在 rank 0 交付。
 2. **流优先级与发布错峰**：将 TP 推理主 stream 设为高优先级（`-1`）、旁路训练 stream 设为普通优先级（`0`），并让自动状态更新在采样前写入私有状态、在 token 提交时发布，使**旁路训练与 vLLM Custom All-Reduce 的重叠时间降为 $0\ \mu\text{s}$/步**。
 
 **实测表现（A100-SXM4-80GB，`Qwen/Qwen2.5-7B-Instruct`，`ESamp` $\beta=0$，128 并发）**：
@@ -701,7 +701,7 @@ class SkipMiddle(pllm.Workload):
 * **TP = 4**：原生 vLLM 吞吐的 **97.60%**
 
 > **实用建议与限制**
-> * **TP 不会减少单卡上 `pllm` 状态的显存占用**：因为状态是按 rank 复制而非分片的（`pllm.explain` 会在输出中提示 `reservations are per rank`）。TP 省下的是底座模型权重在单卡上的占用。
+> * **TP 不会减少单卡上 pLLM 状态的显存占用**：因为状态是按 rank 复制而非分片的（`pllm.explain` 会在输出中提示 `reservations are per rank`）。TP 省下的是底座模型权重在单卡上的占用。
 > * **TP > 1 不支持的特性**：以下能力在 `tensor_parallel_size > 1` 时会被直接拒绝：`@pllm.custom_residual`、`@pllm.custom_attention`、除按分片的 dense / low-rank 改写（只由 `@pllm.train_in_forward` 在本卡分片上更新）之外的权重改写、经 `pllm.causal_model` 的整模型训练、状态投喂（`pllm.Fed`），以及 `pllm.testing.check_on_gpu`（请先在 `tensor_parallel_size=1` 下跑通 `check_on_gpu`）。
 
 ---

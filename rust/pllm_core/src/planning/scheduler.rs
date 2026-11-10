@@ -450,7 +450,7 @@ fn plan_memory(
         .filter(|&budget| peak > budget)
     {
         return Err(format!(
-            "pllm execution needs {peak} bytes at its peak but only {budget} fit; lower \
+            "pLLM execution needs {peak} bytes at its peak but only {budget} fit; lower \
              max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; \
              reduce device tables or explicitly declare placement=\"host\" for read-only lookup tables"
         ));

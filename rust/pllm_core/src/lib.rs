@@ -1,4 +1,4 @@
-//! pllm._core: planning, validation and packed-row preparation for PLLM.
+//! pllm._core: planning, validation and packed-row preparation for pLLM.
 //!
 //! Tensor, CUDA, IPC, and plugin instances remain in the Python runtime.
 

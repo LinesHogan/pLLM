@@ -1,6 +1,6 @@
 # 支持矩阵
 
-本页按模型、功能、vLLM 版本和并行方式列出 pllm 支持什么。每条限制后面写了原因；不支持的算法族及其原因见
+本页按模型、功能、vLLM 版本和并行方式列出 pLLM 支持什么。每条限制后面写了原因；不支持的算法族及其原因见
 [能力地图](../guides/capability-map.md) 和 [设计取舍](../explain/design-tradeoffs.md)，换模型的具体步骤见
 [在新模型家族上使用](../howto/new-model-families.md)。
 
@@ -8,14 +8,14 @@
 
 | 项目 | 支持 | 说明 |
 | --- | --- | --- |
-| vLLM 版本 | 0.27.1、0.32.0 | 其他版本在导入 pllm 时报错：pllm 接入 vLLM 的模型和调度器内部，只对这两个版本做过对齐 |
+| vLLM 版本 | 0.27.1、0.32.0 | 其他版本在导入 `pllm` 时报错：pLLM 接入 vLLM 的模型和调度器内部，只对这两个版本做过对齐 |
 | runner | `"mrv2"`（默认）、`"mrv1"` | `"mrv1"` 下负载一律以 eager 运行；`pllm.input_tokens`、`PositionState`、`@pllm.custom_forward`、静态 KV 布局需要 `"mrv2"` |
 | 张量并行 | vLLM 0.32.0 + `"mrv2"` | 见下文[张量并行](#张量并行) |
 | 流水线并行、数据并行 | 不支持 | 必须为 1 |
 
 ## 模型与功能
 
-pllm 按 vLLM 的**具体模型类**准入，子类不算：Phi3、Mistral 这类近亲可能改变投影布局或 logits，pllm 只对列出的类核对过
+pLLM 按 vLLM 的**具体模型类**准入，子类不算：Phi3、Mistral 这类近亲可能改变投影布局或 logits，pLLM 只对列出的类核对过
 投影怎么切、KV 怎么存、层怎么重跑。
 
 | 功能 | Qwen2 / Qwen2.5、Llama、Qwen3（稠密） | Qwen3-MoE | Qwen3.5（Gated DeltaNet 混合，含 MoE 版） | DeepSeek V2 / V3、gpt-oss |
@@ -33,10 +33,10 @@ pllm 按 vLLM 的**具体模型类**准入，子类不算：Phi3、Mistral 这�
 1. Qwen3-MoE 的 MLP 把 token 路由给专家，没有一个统一的稠密 MLP 投影可以加增量，所以只能改 attention 的投影。
 2. Gated DeltaNet 层没有 q/k/v 投影；Qwen3.5 的全注意力层把每个头的 query 与输出门交错存放，单独改 query 会改到门，
    所以只开放 v 投影。
-3. Gated DeltaNet 层的递归状态不在分页 KV cache 里，pllm 无法只靠 KV 页重放或改读这些层。
+3. Gated DeltaNet 层的递归状态不在分页 KV cache 里，pLLM 无法只靠 KV 页重放或改读这些层。
 4. DeepSeek V2/V3 用 MLA（没有单独的 V 投影，KV cache 存的是压缩后的潜变量）和按专家拆分的 MoE 投影；gpt-oss 用带
-   sink 的滑动窗口 attention 和 MXFP4 的专家投影。pllm 没有为这些布局实现改写，只开放只读功能。
-5. 整模型训练的反向是 pllm 按稠密 Qwen2、Llama、Qwen3 的结构写的，并要求 BF16 底座、embedding 与 LM head 不量化。
+   sink 的滑动窗口 attention 和 MXFP4 的专家投影。pLLM 没有为这些布局实现改写，只开放只读功能。
+5. 整模型训练的反向是 pLLM 按稠密 Qwen2、Llama、Qwen3 的结构写的，并要求 BF16 底座、embedding 与 LM head 不量化。
 
 Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构测试，功能边界同 DeepSeek V3，见
 [在新模型家族上使用](../howto/new-model-families.md)。
@@ -50,7 +50,7 @@ Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构测
 | --- | --- |
 | 读取与导出、采样效果、请求状态训练（反向与 AdamW 一起捕获）、`@pllm.write` | vLLM 的 CUDA graph |
 | `ActivationPatch`、请求状态上的 `Adapter`、`@pllm.custom_residual`、`@pllm.custom_attention`、按 token 历史查表 | vLLM 的 CUDA graph（vLLM 捕获模型原本的算子，不做 inductor 融合） |
-| `@pllm.custom_forward` | 不用 vLLM 的整模型 graph；pllm 按层段调度并捕获自己的 graph |
+| `@pllm.custom_forward` | 不用 vLLM 的整模型 graph；pLLM 按层段调度并捕获自己的 graph |
 | 读共享 `InstanceState` 的 `Adapter` | eager |
 | `runner="mrv1"`、`cuda_graphs=False` | eager |
 

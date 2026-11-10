@@ -216,7 +216,7 @@ class Decoder:
         return f"{cls.__module__}.{cls.__qualname__}"
 
     def projection(self, target: Projection) -> tuple[LinearBase, int, int, Mlp | None]:
-        """Resolve the supported projection and its disjoint output slice; reject layouts pllm cannot slice."""
+        """Resolve the supported projection and its disjoint output slice; reject layouts pLLM cannot slice."""
         from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
         from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextSparseMoeBlock
 
@@ -320,7 +320,7 @@ def bind_model(model: nn.Module) -> Decoder:
     architectures = _architectures()
     if type(model) not in architectures:
         raise ValueError(
-            f"pllm runs vLLM's own model classes, not subclasses of them; got {type(model).__name__}. "
+            f"pLLM runs vLLM's own model classes, not subclasses of them; got {type(model).__name__}. "
             "Load the checkpoint with its stock vLLM architecture"
         )
     assert isinstance(model, architectures)

@@ -596,7 +596,7 @@ def write_json(path: Path, value: JSON) -> None:
 
 
 def assets(remote: Source) -> dict[str, bytes]:
-    """Fetch tokenizer assets; Kimi code stays beside the slice, never imported by pllm."""
+    """Fetch tokenizer assets; Kimi code stays beside the slice, never imported by pLLM."""
     result: dict[str, bytes] = {}
     for name in (
         "tokenizer.json",

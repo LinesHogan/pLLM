@@ -21,7 +21,7 @@ class ParameterOverlayOperator(StrEnum):
     HEAD_ADD = "head_add"
 
 
-# Hugging Face module names of the projections pllm can adapt, in their order inside one decoder layer.
+# Hugging Face module names of the projections pLLM can adapt, in their order inside one decoder layer.
 ProjectionName = Literal["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
 _PROJECTION_ORDER: tuple[ProjectionName, ...] = get_args(ProjectionName)
 

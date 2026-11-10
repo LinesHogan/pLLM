@@ -184,7 +184,7 @@ def _global_names(code: CodeType) -> set[str]:
 
 _OP_ACCESS = (
     "call the op object you defined with torch.library.custom_op (from mykernels import gated_add), "
-    "not torch.ops.<namespace>.<op>, so pllm can sign its source; use torch.ops.aten or torch.ops.prims "
+    "not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims "
     "only for built-in operators"
 )
 

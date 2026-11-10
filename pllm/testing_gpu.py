@@ -61,7 +61,7 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
     actual = explain_facts(workload, config, shape, facts, runner.hidden_layouts)
     failures: list[str] = []
     if expected != actual:
-        failures.append("[explain/probe] config and loaded-model costs differ; report a pllm planning bug")
+        failures.append("[explain/probe] config and loaded-model costs differ; report a pLLM planning bug")
     if expected.kv_capacity:
         model = runner.decoder.kv_writable("attention capacity checks")
         for capacity in expected.kv_capacity:
@@ -77,22 +77,22 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
                     f"[explain/KV] layer {capacity.layout.layer}: {capacity.blocks} predicted blocks vs {blocks} native blocks"
                 )
     if expected.eager_reason != handle.diagnostics().eager_reason:
-        failures.append("[explain/graphs] engine graph mode differs from explain; report a pllm admission bug")
+        failures.append("[explain/graphs] engine graph mode differs from explain; report a pLLM admission bug")
     if sum(state.reserved_bytes for state in actual.states) != handle.attachment.plan.states.reserved_bytes:
-        failures.append("[explain/state] allocated state reservations differ; report a pllm allocation bug")
+        failures.append("[explain/state] allocated state reservations differ; report a pLLM allocation bug")
     if not requirements.parameter_targets:
         plan = handle.attachment.plan
         if (
             actual.peak_memory_bytes != plan.schedule.peak_memory_bytes
             or tuple(anchor.reserved_bytes for anchor in actual.anchors) != plan.timeline.reserved_bytes
         ):
-            failures.append("[explain/reservations] installed plan differs from the probe; report a pllm planning bug")
+            failures.append("[explain/reservations] installed plan differs from the probe; report a pLLM planning bug")
     if failures:
         raise ContractError(tuple(failures))
 
 
 class SynchronizationCheck:
-    """Check pllm anchors and model-site staging after two decode warmup steps at each packed width."""
+    """Check pLLM anchors and model-site staging after two decode warmup steps at each packed width."""
 
     def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
         session = handle.runner.require_session()
@@ -255,7 +255,7 @@ class _Generation:
                 (
                     f"[{contract}] greedy tokens changed: {self.tokens} -> {replayed.tokens}; "
                     "rerun with VLLM_BATCH_INVARIANT=1 to exclude batch-width rounding, "
-                    "then report a pllm recompute bug if they still differ",
+                    "then report a pLLM recompute bug if they still differ",
                 )
             )
         self.compare_states(replayed, contract)
@@ -263,14 +263,14 @@ class _Generation:
     def compare_states(self, replayed: _Generation, contract: str) -> None:
         """Compare fixed-input state with dtype tolerances; floating transforms may change greedy tokens."""
         if self.states.keys() != replayed.states.keys():
-            raise ContractError((f"[{contract}] request states disappeared; report a pllm retirement bug",))
+            raise ContractError((f"[{contract}] request states disappeared; report a pLLM retirement bug",))
         for request, fields in self.states.items():
             for index, (expected, actual) in enumerate(zip(fields, replayed.states[request], strict=True)):
                 try:
                     torch.testing.assert_close(actual, expected)
                 except AssertionError as error:
                     raise ContractError(
-                        (f"[{contract}] request {request}, field {index}: {error}; report a pllm recompute bug",)
+                        (f"[{contract}] request {request}, field {index}: {error}; report a pLLM recompute bug",)
                     ) from error
 
 
@@ -352,7 +352,7 @@ def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generati
     with patch.object(manager, "allocate_slots", new=eviction.wrap(manager.allocate_slots)):
         result = _state_tokens(handle, reference)
     if eviction.request is None or not any(request.num_preemptions for request in eviction.requests.values()):
-        raise ContractError(("[preempted] no KV eviction occurred; report a pllm GPU checker bug",))
+        raise ContractError(("[preempted] no KV eviction occurred; report a pLLM GPU checker bug",))
     return result
 
 
@@ -397,7 +397,7 @@ def _neutral(workload: Workload, config: ModelConfig) -> None:
         raise ContractError(
             (
                 "[neutral] generated token IDs differ from vanilla in the same graph mode; "
-                "check that neutral= disables every model/sampler effect, then report a pllm bug if it does",
+                "check that neutral= disables every model/sampler effect, then report a pLLM bug if it does",
             )
         )
 
@@ -471,7 +471,7 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
                 or workload.backend_requirements().input_token_history >= 0
                 and sync.token_checked < 8
             ):
-                raise ContractError(("[host syncs] fewer than eight steady decode steps; report a pllm checker bug",))
+                raise ContractError(("[host syncs] fewer than eight steady decode steps; report a pLLM checker bug",))
             passed.append("host syncs: eight steady decode steps")
         except (RuntimeError, ContractError) as error:
             failures.append(f"[host syncs] {error}; remove host reads/synchronization from the named per-step path")

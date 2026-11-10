@@ -134,7 +134,7 @@ def custom_op(value: object) -> CustomOp | None:
     if mutated:
         raise ValueError(
             f"{name} mutates {', '.join(mutated)}; kernels called from workload math must return new tensors "
-            "(mutates_args=()); change state only through pllm effects"
+            "(mutates_args=()); change state only through pLLM effects"
         )
     attributes: dict[str, object] = vars(value)
     if attributes["_abstract_fn"] is None:
@@ -163,7 +163,7 @@ def custom_op(value: object) -> CustomOp | None:
 
 
 def custom_op_definition(target: object) -> CustomOpDef | None:
-    """Resolve a traced operator through Torch's own definitions, without a pllm registry."""
+    """Resolve a traced operator through Torch's own definitions, without a pLLM registry."""
     return _maybe_get_opdef(target.name()) if isinstance(target, OpOverload) else None
 
 

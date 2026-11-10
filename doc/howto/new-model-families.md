@@ -8,11 +8,11 @@
 
 ## 1. 准入规则：基于 vLLM 具体模型类准入
 
-当你在 Qwen2.5 上验证完一个算法负载并准备迁移到其他开源模型时，遇到的第一个问题通常是：**pllm 怎么判定一个模型能不能跑？**
+当你在 Qwen2.5 上验证完一个算法负载并准备迁移到其他开源模型时，遇到的第一个问题通常是：**pLLM 怎么判定一个模型能不能跑？**
 
-pllm 的底层运行时直接按 vLLM 的**具体模型类**进行准入判断，**不支持模型子类**。
+pLLM 的底层运行时直接按 vLLM 的**具体模型类**进行准入判断，**不支持模型子类**。
 
-- **为什么不支持子类（动机）**：像 Phi-3、Mistral 等近亲变体或第三方派生子类，可能会改变注意力投影的物理布局（例如 QKV 的打包与切片划分规则、交错顺序）或 LM Head / logits 计算与归一化逻辑。pllm 需要精确绑定每一层内部残差流与子层归一化（LayerNorm / RMSNorm）的挂载点、投影输出分片和 logits 计算位置；如果允许任意子类准入，一旦底层张量切片假设失效，就会引发静默的数值错误或未定义行为。因此，必须使用原生 vLLM 模型类。
+- **为什么不支持子类（动机）**：像 Phi-3、Mistral 等近亲变体或第三方派生子类，可能会改变注意力投影的物理布局（例如 QKV 的打包与切片划分规则、交错顺序）或 LM Head / logits 计算与归一化逻辑。pLLM 需要精确绑定每一层内部残差流与子层归一化（LayerNorm / RMSNorm）的挂载点、投影输出分片和 logits 计算位置；如果允许任意子类准入，一旦底层张量切片假设失效，就会引发静默的数值错误或未定义行为。因此，必须使用原生 vLLM 模型类。
 
 目前已准入的原生模型类分为四类：
 
@@ -66,7 +66,7 @@ assert testing.check(ObserveResidual(), config).passed
 
 ## 3. 各模型家族的功能边界与原因
 
-不同模型家族在注意力机制、KV 存储和前馈网络结构上的差异，决定了它们在 pllm 中的能力边界。各模型的详细特性对照见[支持矩阵](../reference/support-matrix.md)；本节总结各家族的能力边界及背后的设计原因。
+不同模型家族在注意力机制、KV 存储和前馈网络结构上的差异，决定了它们在 pLLM 中的能力边界。各模型的详细特性对照见[支持矩阵](../reference/support-matrix.md)；本节总结各家族的能力边界及背后的设计原因。
 
 ### 稠密模型（Qwen2 / Qwen2.5、Llama、Qwen3 稠密版）
 
@@ -101,15 +101,15 @@ assert testing.check(ObserveResidual(), config).passed
 
 ## 4. 量化底座模型
 
-在实际部署中，许多模型是以 GPTQ、AWQ 或 FP8 检查点的形式提供的。在 pllm 中，**量化底座是一等公民**：
+在实际部署中，许多模型是以 GPTQ、AWQ 或 FP8 检查点的形式提供的。在 pLLM 中，**量化底座是一等公民**：
 
 - **准入规则一致**：量化检查点按照其所属模型家族的相同规则准入。例如，AWQ 格式的 Qwen2.5 具备与浮点 Qwen2.5 完全相同的能力。
-- **权重改写机制（LoRA / Adapter）**：在量化基座上做 LoRA 或参数覆盖时，pllm 遵循与 vLLM 原生量化 LoRA 相同的机制：在底层量化算子（如 Marlin、Scaled MM 等）的输出张量上，直接累加一份高精度（BF16/FP16）的低秩修正量：
+- **权重改写机制（LoRA / Adapter）**：在量化基座上做 LoRA 或参数覆盖时，pLLM 遵循与 vLLM 原生量化 LoRA 相同的机制：在底层量化算子（如 Marlin、Scaled MM 等）的输出张量上，直接累加一份高精度（BF16/FP16）的低秩修正量：
 
   $$\text{output} = \text{quant\_linear}(x) + \Delta W(x)$$
 
   这种机制**不需要反量化基座权重，也不需要占用额外的稠密未量化权重显存**。
-- **整模型训练机制（QLoRA 式反向传播）**：若在量化模型上执行整模型因果训练（例如 TLM），pllm 采用类似 QLoRA 的机制：前向传播利用高效量化算子，在反向传播计算梯度时，根据量化 scale 与 zero-point 临时反量化权重参与求导，兼顾显存节省与导数计算。
+- **整模型训练机制（QLoRA 式反向传播）**：若在量化模型上执行整模型因果训练（例如 TLM），pLLM 采用类似 QLoRA 的机制：前向传播利用高效量化算子，在反向传播计算梯度时，根据量化 scale 与 zero-point 临时反量化权重参与求导，兼顾显存节省与导数计算。
 
 ```python
 # check-docs: skip: quantized model execution requires CUDA
@@ -130,7 +130,7 @@ with pllm.make_llm(quant_config, workload=ObserveResidual()) as llm:
 
 研究或验证算法时，经常需要确认负载在千亿参数大模型（如 DeepSeek V3 或 Kimi K2.5 的 MLA 结构、384 路由专家）上的张量通路与结构兼容性。然而，单张显卡或常规服务器通常无法装下完整模型（动辄需要数百 GB 显存）。
 
-pllm 提供了 `tools/model_slice.py` 工具。它利用 HTTP Range 请求按字节范围直接读取远程 Hugging Face 仓库（或本地共享目录）中的权重与 safetensors 索引，仅提取所选解码器层并生成局部切片夹具，无需下载完整权重。
+pLLM 提供了 `tools/model_slice.py` 工具。它利用 HTTP Range 请求按字节范围直接读取远程 Hugging Face 仓库（或本地共享目录）中的权重与 safetensors 索引，仅提取所选解码器层并生成局部切片夹具，无需下载完整权重。
 
 ### Kimi INT4 文本切片配方
 
@@ -159,7 +159,7 @@ Tokenizer 必须使用该版本的 `tokenization_kimi.py`、`tiktoken.model`、`
 
 K2.5 采用 Modified MIT License，允许本地使用，要求保留版权与许可信息；其额外条款要求超过指定月活/月收入门槛的商业产品显示 “Kimi K2.5”。完整条款随切片目录保留。
 
-### 在 pllm 中加载切片
+### 在 pLLM 中加载切片
 
 单张 A100 GPU 即可运行该切片的 INT4 Marlin MoE 内核，显存需求约 51 GiB：
 
@@ -183,12 +183,12 @@ with pllm.make_llm(slice_config, workload=ObserveResidual()) as llm:
 
 ## 6. 常见准入报错与排查
 
-更换模型家族时，如果负载超出了目标架构的能力边界，pllm 会抛出对应的校验异常。对照下表排查原因与改法：
+更换模型家族时，如果负载超出了目标架构的能力边界，pLLM 会抛出对应的校验异常。对照下表排查原因与改法：
 
 | 你看到的报错 | 原因与应对方式 |
 | --- | --- |
-| `choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads` | 传入了未在准入名单中的模型架构。pllm 需要与具体的 vLLM 架构对齐内部残差流与子层归一化位置，目前请选择列表中的模型架构。 |
-| `pllm runs vLLM's own model classes, not subclasses of them` | 传入了原生类的派生子类。派生子类可能改变投影布局或 logits 计算，pllm 拒绝子类准入；请使用原生模型类。 |
+| `choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads` | 传入了未在准入名单中的模型架构。pLLM 需要与具体的 vLLM 架构对齐内部残差流与子层归一化位置，目前请选择列表中的模型架构。 |
+| `pLLM runs vLLM's own model classes, not subclasses of them` | 传入了原生类的派生子类。派生子类可能改变投影布局或 logits 计算，pLLM 拒绝子类准入；请使用原生模型类。 |
 | `... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model` | 试图在只读模型（如 DeepSeek V2/V3 或 gpt-oss）上运行 LoRA 权重改写、整模型因果训练或 forward 重放。这些模型采用压缩的潜在 KV（MLA）或多专家稀疏路由，缺乏单一稠密投影矩阵；请将负载限制在只读观测、ESamp、激活补丁或采样引导阶段。 |
 | `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model` | 在 Qwen3.5 混合模型上使用了 `@pllm.custom_forward` 或 `@pllm.custom_attention`。Gated DeltaNet 层的循环隐藏状态独立于分页 KV 缓存，无法从 KV 中重算历史状态；重放 forward 或自定义 attention 请使用全注意力稠密模型或 Qwen3-MoE。 |
 | `layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead` | 试图在 MoE 模型的专家层上挂载 LoRA 改写。每个 token 被动态路由到不同专家，不存在单一稠密的 MLP 矩阵；请将参数改写挂载到注意力的 query 或 value 投影上。 |
@@ -204,7 +204,7 @@ with pllm.make_llm(slice_config, workload=ObserveResidual()) as llm:
 <details>
 <summary>答案</summary>
 
-Qwen3-MoE 保留了与 Qwen3 相同的注意力结构，注意力层的 `v_proj` 是规整的单一稠密矩阵，可以切出清晰的低秩修正。而其 MLP 层是稀疏专家层，token 会被路由门控分发到许多独立的小专家网络中，不存在单一的稠密投影矩阵，因此 pllm 拒绝在此挂载单一的 MLP LoRA 改写。
+Qwen3-MoE 保留了与 Qwen3 相同的注意力结构，注意力层的 `v_proj` 是规整的单一稠密矩阵，可以切出清晰的低秩修正。而其 MLP 层是稀疏专家层，token 会被路由门控分发到许多独立的小专家网络中，不存在单一的稠密投影矩阵，因此 pLLM 拒绝在此挂载单一的 MLP LoRA 改写。
 </details>
 
 2. 为什么在加载 Kimi K2.5 切片时必须显式指定 `trust_remote_code=True`，而模型本身却能使用 vLLM 原生的 DeepSeek V3 算子运行？

@@ -1,6 +1,6 @@
 # 文档
 
-pllm 的文档按用途分成五类，每一页只做一件事：**教程**带你从零学会写负载；**用户指南**按功能讲清每个声明怎么用、代价是什么；
+pLLM 的文档按用途分成五类，每一页只做一件事：**教程**带你从零学会写负载；**用户指南**按功能讲清每个声明怎么用、代价是什么；
 **操作指南**是解决一个具体问题的步骤；**参考**供逐条查证；**解释**讲规则背后的原因。另有一个**示例库**，每篇实现一个算法族、
 附带实测。
 
@@ -12,7 +12,7 @@ pllm 的文档按用途分成五类，每一页只做一件事：**教程**带�
 查字段、配置、报错原文 → 参考
 ```
 
-改 pllm 框架本身的贡献者文档在 [dev/](dev/README.md)；让编码 agent 写负载，把 [agent skill](agent/SKILL.md) 和
+改 pLLM 框架本身的贡献者文档在 [dev/](dev/README.md)；让编码 agent 写负载，把 [agent skill](agent/SKILL.md) 和
 [agent 参考](agent/reference.md)（英文，含全部公开 API 的签名）交给它。
 
 ## 教程
@@ -32,7 +32,7 @@ pllm 的文档按用途分成五类，每一页只做一件事：**教程**带�
 
 按功能组织，每页先说是什么、何时用，再给可运行的短例子，然后讲代价和限制的原因。
 
-- [能力地图](guides/capability-map.md)：哪些推理时算法今天能用 pllm 写、用什么写、现成的负载
+- [能力地图](guides/capability-map.md)：哪些推理时算法今天能用 pLLM 写、用什么写、现成的负载
 - [负载的组成](guides/workload-anatomy.md)：三类声明、方法体的规则、方法何时运行、选择器、开发循环
 - [读取模型内部](guides/reading.md)：hidden、残差流、逐层 logits、token 历史、采样结果
 - [状态](guides/state.md)：请求状态与实例状态、字段、初值来源、精度、carry 字段
@@ -70,7 +70,7 @@ pllm 的文档按用途分成五类，每一页只做一件事：**教程**带�
 
 - [核心概念](explain/core-concepts.md)：为什么不是 hook、行、一步的时间线、状态版本与 `publish_lag`、为什么有边界
 - [设计取舍](explain/design-tradeoffs.md)：为什么有些算法今天写不了，以及替代做法
-- [性能与显存](explain/performance.md)：decode 的瓶颈、pllm 替你省了什么、各写法的实测代价
+- [性能与显存](explain/performance.md)：decode 的瓶颈、pLLM 替你省了什么、各写法的实测代价
 
 ## 示例库
 

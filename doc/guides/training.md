@@ -8,7 +8,7 @@
 - 推理阶段默认关闭自动求导（autograd），在模型外部手动调用反向传播会打断推理流水线；
 - 如果反向传播与优化器更新串行阻塞在下一步前向之前，推理吞吐将严重下降。
 
-`pllm` 允许你以纯声明的方式定义在线训练：在状态上声明优化器（如 `optimizer=pllm.AdamW(...)`），在方法上挂 `@pllm.train(state=...)` 并返回逐行损失向量。`pllm` 负责掩码填充、按状态求导归约、调用优化器以及发布新版本，并将整条训练管线捕获进 CUDA Graph，置于旁路 CUDA stream 上与模型主干前向异步重叠。
+pLLM 允许你以纯声明的方式定义在线训练：在状态上声明优化器（如 `optimizer=pllm.AdamW(...)`），在方法上挂 `@pllm.train(state=...)` 并返回逐行损失向量。pLLM 负责掩码填充、按状态求导归约、调用优化器以及发布新版本，并将整条训练管线捕获进 CUDA Graph，置于旁路 CUDA stream 上与模型主干前向异步重叠。
 
 ---
 
@@ -76,7 +76,7 @@ check_result = testing.check(ShallowDistiller(), CONFIG, neutral=ShallowDistille
 print("publish_lag" in check_result.passed)
 ```
 
-当你运行上述代码时，`pllm` 在背后自动完成了以下工作：
+当你运行上述代码时，pLLM 在背后自动完成了以下工作：
 1. **自动掩码与隔离**：自动屏蔽未激活的填充槽位，确保每个请求仅根据自己的输入更新自己的参数；
 2. **局部求导**：在方法内部构建一阶计算图，从损失反向传播至 `distiller` 参数；
 3. **优化器步进**：针对每个请求的状态执行 AdamW 更新；
@@ -91,13 +91,13 @@ print("publish_lag" in check_result.passed)
 不要在 Python 方法体里将行轴压平（例如调用 `.mean()` 或 `.sum()` 返回标量）。
 
 - **原因**：在连续批处理中，输入张量的第 0 维动态拼接了当前批次所有活跃请求的 token。框架必须获取每一行独立的损失数值，才能根据当前的请求拓扑过滤无效填充行、对每个状态独立实施归约，并保持请求之间的隔离性。如果你在 Python 中直接求全局均值，不同请求的损失就会在求导前混在一起，彻底破坏请求间的数学隔离。
-- **违反后果**：若方法返回标量，`testing.check` 和执行器会在形状追踪时直接抛出异常：`training methods return one loss per row; pllm reduces the selected rows per state`。
+- **违反后果**：若方法返回标量，`testing.check` 和执行器会在形状追踪时直接抛出异常：`training methods return one loss per row; pLLM reduces the selected rows per state`。
 
 ---
 
 ## 状态上的优化器与执行步调
 
-在 `pllm` 中，**优化器直接声明在状态上，而不是装饰器上**：
+在 pLLM 中，**优化器直接声明在状态上，而不是装饰器上**：
 
 ```python
 head = pllm.RequestState(
@@ -112,7 +112,7 @@ head = pllm.RequestState(
 
 ### 引擎步进与分块依赖
 
-在执行步调上，`pllm` 遵循严格的物理规则：**每个状态在每个引擎步（engine step）执行且仅执行一次优化器更新**。
+在执行步调上，pLLM 遵循严格的物理规则：**每个状态在每个引擎步（engine step）执行且仅执行一次优化器更新**。
 
 - **Decode 阶段**：每个活跃请求每步生成 1 个 token，对应 1 行输入，因此每个请求状态在每一步推进一次优化器。
 - **Prefill 阶段（Prompt 行）**：当开启分块预填充（chunked prefill）时，长 Prompt 会被调度器拆分成多个分块跨步处理。每个引擎步中处理的分块会作为一个整体参与当步的训练方法，该状态也随该分块更新一次。因此，Prompt 阶段的训练步数和更新轨迹天然依赖于调度器的分块边界。
@@ -124,7 +124,7 @@ head = pllm.RequestState(
 
 ## 训练的归约：mean 还是 sum
 
-用 `@pllm.train(state=..., reduction=...)` 定义在线请求训练时，方法针对当前批次的请求行返回一个形状为 `[rows]` 的逐行损失向量。pllm 的步进模型是：**每个状态在每个引擎步（engine step）执行一次优化器更新**，更新前先将该状态在本步中被选中的行归约为一个标量损失。
+用 `@pllm.train(state=..., reduction=...)` 定义在线请求训练时，方法针对当前批次的请求行返回一个形状为 `[rows]` 的逐行损失向量。pLLM 的步进模型是：**每个状态在每个引擎步（engine step）执行一次优化器更新**，更新前先将该状态在本步中被选中的行归约为一个标量损失。
 
 如果你写的是最常见的、按默认 `request_id` 隔离的 decode 阶段训练，每个请求在每个引擎步里只有 1 行（该状态本步选中行数 $n_s = 1$）。此时对 1 个数求均值和求和完全一样，`reduction="mean"` 与 `reduction="sum"` 没有任何区别，你不需要为此操心。
 
@@ -227,7 +227,7 @@ rows= and update_rows= on request training require a model effect without sample
 
 如果要求第 $n$ 步生成的 token 在算完梯度后，其最新权重必须在第 $n+1$ 步前向的开头立刻生效（即 `publish_lag=0`），那么每一步模型前向都必须强制等待反向传播和 AdamW 算子完全执行完毕，GPU 时间线上将出现巨大的同步空隙。
 
-`pllm` 默认采用 `publish_lag=1` 机制：
+pLLM 默认采用 `publish_lag=1` 机制：
 1. 第 $n$ 步采样完成后，训练任务被派发到独立的旁路 CUDA stream（`side` stream）上异步执行；
 2. 第 $n+1$ 步的模型前向**直接读取第 $n-1$ 步已发布的稳定版本状态**，完全无需等待第 $n$ 步训练完成；
 3. 第 $n$ 步计算出的新权重在第 $n+2$ 步的前向中正式生效。
@@ -413,7 +413,7 @@ print(f"eager_reason: {report.eager_reason!r}")
 
 | 报错信息 | 触发原因与排查修复 |
 | :--- | :--- |
-| `training methods return one loss per row; pllm reduces the selected rows per state` | 训练方法返回了标量（如调用了 `.mean()` 将行轴压平）。**修复**：仅在特征维归约（`dim=-1`），保留第 0 维，返回 `[rows]` 的逐行损失。 |
+| `training methods return one loss per row; pLLM reduces the selected rows per state` | 训练方法返回了标量（如调用了 `.mean()` 将行轴压平）。**修复**：仅在特征维归约（`dim=-1`），保留第 0 维，返回 `[rows]` 的逐行损失。 |
 | `@pllm.train reads ... which trains with ... declare ... with optimizer=...` | 状态上缺少优化器声明，或声明的优化器与训练模式不匹配。**修复**：为对应的 `RequestState` 声明 `optimizer=pllm.AdamW(lr)`。 |
 | `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 独立在线训练或配合 `@pllm.guide_sampling` 的训练使用了行选择器，该路径要求无条件更新。**修复**：移除训练方法上的 `rows=`，改在采样方法上筛选，或使用 `reduction="sum"` 配合零权重。 |
 | `every @pllm.differentiate result must feed a @pllm.train loss` | 上游声明了 `@pllm.differentiate` 的中间结果没有被任何 `@pllm.train` 方法消费。**修复**：确保中间结果经由 `pllm.result` 最终输入至损失函数，或移除未使用的可微标记。 |

@@ -1,6 +1,6 @@
 # 报错目录
 
-pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check`）拒绝写错或不支持的声明，报错尽量说明
+pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check`）拒绝写错或不支持的声明，报错尽量说明
 改法。本页按主题收录常见报错的原文、原因和改法；`...` 代表随你的代码变化的部分。排查的步骤见
 [排查报错](../howto/troubleshooting.md)。
 
@@ -8,10 +8,10 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 
 | 报错（原文） | 为什么 | 改法 |
 | --- | --- | --- |
-| `...: give every input a source as its default, e.g. ...` | pllm 只从默认值知道参数读什么，不按参数名猜 | `h: torch.Tensor = pllm.hidden(0)` |
+| `...: give every input a source as its default, e.g. ...` | pLLM 只从默认值知道参数读什么，不按参数名猜 | `h: torch.Tensor = pllm.hidden(0)` |
 | `the workload has no effect on the model: add @pllm.train, ...` | 没有去处的计算不会被安排 | 给方法加效果装饰器，或声明 `ActivationPatch` / `Adapter` |
-| `a method takes one pllm decorator of each kind; split stacked effects into one method per effect` | 后一个装饰器会覆盖前一个 | 一个效果一个方法，用 `pllm.result` 共享计算 |
-| `property ... needs a return annotation; annotate state declarations with -> pllm.RequestState or -> pllm.InstanceState, and other properties with their return type` | pllm 不执行 getter 也要认出状态 | 给 property 写返回类型 |
+| `a method takes one pLLM decorator of each kind; split stacked effects into one method per effect` | 后一个装饰器会覆盖前一个 | 一个效果一个方法，用 `pllm.result` 共享计算 |
+| `property ... needs a return annotation; annotate state declarations with -> pllm.RequestState or -> pllm.InstanceState, and other properties with their return type` | pLLM 不执行 getter 也要认出状态 | 给 property 写返回类型 |
 | `... is not a declared state of ...` | 方法读的状态名不存在 | 检查拼写；形状依赖设置的状态写成带类型的 property |
 | `pllm.parameter(..., ...) names no declared field; declared: ...` | 字段名不存在 | `shape=` 声明的状态只有字段 `"value"`；`FromModule` 状态用 `pllm.module` 读 |
 | `...: pllm.module needs a state declared with init=pllm.FromModule(...)` | 只有模块状态能当模块调用 | 用 `pllm.parameter` 读字段，或改用 `init=pllm.FromModule(...)` |
@@ -30,14 +30,14 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `methods run inside CUDA graphs, so Python cannot branch on tensor values (if, while or break on a tensor); ...` | 按张量值的 `if`、`while`、`break`（多见于 `@pllm.custom_forward` 的循环）让每步算的东西随数据变化，无法录进 graph | 循环固定次数，用 `torch.where` 选行；`custom_forward` 里用 `layers(..., active=mask)` 让已停下的行保持不变（需 `tokens="decode"`） |
 | `... cannot compile as one full graph: ...` | 方法里有不能整图编译的操作 | 用可追踪的张量操作；自写算子给出 fake 实现；或 `ExecutionOptions(allow_numerical_transforms=False)` |
 | `@pllm.train reads ..., which trains with ...; declare ... with optimizer=...` | 训练方式由方法读的输入决定，优化器写在状态上 | 给状态加报错里说的优化器 |
-| `training methods return one loss per row; pllm reduces the selected rows per state` | 只有 pllm 知道哪些行属于哪份状态 | 返回 `[rows]` 的 loss，不要 `.mean()` |
+| `training methods return one loss per row; pLLM reduces the selected rows per state` | 只有 pLLM 知道哪些行属于哪份状态 | 返回 `[rows]` 的 loss，不要 `.mean()` |
 
 ## 效果与组合的报错
 
 | 报错（原文） | 为什么 | 改法 |
 | --- | --- | --- |
 | `... both declare @pllm.guide_sampling; keep at most one guidance method` | 采样器每步只按一个预测加权 | 合成一个预测；其余用 `@pllm.add_logits` |
-| `... trains on ... but ... on ...; pllm funds one training mode per workload, so move one of them to a separate workload` | 一个负载只有一种训练方式 | 分到两个引擎，或宿主状态用 `make_host` |
+| `... trains on ... but ... on ...; pLLM funds one training mode per workload, so move one of them to a separate workload` | 一个负载只有一种训练方式 | 分到两个引擎，或宿主状态用 `make_host` |
 | `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 这条训练路径每步更新每个状态 | 在采样方法上选行，或 `reduction="sum"` 加零权重 |
 | `@pllm.write needs distinct field names and no rows=; it writes every row` | 写入发布整份新版本 | 用 `torch.where` 保留不想改的行 |
 | `... and ... both write state ... from the same version; let one method write it` | 同一版本只能有一个写入者 | 合并成一个方法 |
@@ -73,13 +73,13 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | --- | --- | --- |
 | `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | custom forward 里一层可能跑多遍或不跑 | 读 `pllm.residual` 或 `pllm.layer_logits` |
 | `Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. ...` | prompt 的近似 K/V 会被后续所有 token 读到 | `tokens="decode"` |
-| `@pllm.custom_forward methods take (self, layers, marker inputs...) and no other pllm decorator; use layers.save instead of @write` | custom forward 自己就是一个效果 | 位置状态用 `layers.save` |
+| `@pllm.custom_forward methods take (self, layers, marker inputs...) and no other pLLM decorator; use layers.save instead of @write` | custom forward 自己就是一个效果 | 位置状态用 `layers.save` |
 | `...: use pllm.parameter or pllm.module after layers; read plain settings from self` | `layers` 之后只能读状态 | 普通设置从 `self` 读 |
 | `PositionState is read and written by layers.load/save inside a @pllm.custom_forward method` | 位置状态只在 custom forward 里有意义 | 加一个 custom forward，或去掉它 |
 | `layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead` | MoE 层没有统一的稠密 MLP 投影 | 改 attention 的投影 |
 | `@pllm.custom_residual rewrites every row of its sites: remove rows= and @pllm.differentiate` | 残差改写作用于这一层的每一行 | 在方法里用掩码 |
 | `@pllm.custom_residual(state=...) needs one attention or MLP site of one layer, chunk=, and a pllm.RequestState with one field, its carry, and no optimizer` | 带状态的子层每个请求一份携带量、按块更新 | 按报错补齐声明 |
-| `...: take the site tensors ... first, without defaults, then markers` | 位置张量由 pllm 按顺序传入 | 先写 `x, y`（或 `v`），再写带默认值的输入 |
+| `...: take the site tensors ... first, without defaults, then markers` | 位置张量由 pLLM 按顺序传入 | 先写 `x, y`（或 `v`），再写带默认值的输入 |
 | `...: take q and kv first, without defaults, then markers` | 同上 | 先写 `q, kv` |
 | `keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources` | 更深的层在当前 token 还没算到 | 源选更早的层，或用 custom forward |
 | `kv.attend topk needs integer positions [rows, k] or [rows, heads, k], padded with -1` | top-K 是逻辑位置 | 按形状给整数位置，不足的用 -1 补 |
@@ -93,8 +93,8 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 
 | 报错（原文） | 为什么 | 改法 |
 | --- | --- | --- |
-| `pllm runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...` | pllm 只对这两个版本做过对齐 | 安装 0.27.1 或 0.32.0 |
-| `pllm runs vLLM's own model classes, not subclasses of them` | 子类可能改变投影布局或 logits | 用列出的模型类，见[支持矩阵](support-matrix.md) |
+| `pLLM runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...` | pLLM 只对这两个版本做过对齐 | 安装 0.27.1 或 0.32.0 |
+| `pLLM runs vLLM's own model classes, not subclasses of them` | 子类可能改变投影布局或 logits | 用列出的模型类，见[支持矩阵](support-matrix.md) |
 | `completions carry each sample's final hidden row, which only a workload collects; ...` | `generate_completions` 和 `generate_feedback` 要把每个样本最终位置的 hidden 交给宿主，只有装了负载的引擎才会采集 | 只做重试或打分、不训练时，给 `make_llm` 传 `workload=pllm.workloads.DummyWorkload()` |
 | `pllm.input_tokens needs runner="mrv2"` | token 历史来自 MRv2 runner | `runner="mrv2"` |
 | `...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | `cuda_graphs=True` 时负载里有需要 eager 的写法 | 去掉那个写法，或允许 eager |
@@ -111,4 +111,4 @@ pllm 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `method ... mutates borrowed input ... in place; inputs and parameters are read-only views. ...` | 输入与参数和别的方法、别的版本共享 | 返回新张量；改状态用 `@pllm.write` 或 `@pllm.train` |
 | `guide_sampling still declares a sampler stage; set its beta to zero.` | `neutral=` 的负载仍在引导采样，常见原因是装饰器写了 `beta=beta` | 用设置方法 `beta=strength` |
 | `add_logits must return exactly zero` | 强度为零时加法必须为零 | 让强度乘在整个结果上 |
-| `pllm misrouted rows ...` | 先排除自己的代码：原地写参数，或混用不同状态的行；排除后这是框架的 bug | 按报错把信息报告给我们 |
+| `pLLM misrouted rows ...` | 先排除自己的代码：原地写参数，或混用不同状态的行；排除后这是框架的 bug | 按报错把信息报告给我们 |

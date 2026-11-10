@@ -47,7 +47,7 @@ class _GraphConfiguration(Protocol):
 
 
 def _additional_config(config: _GraphConfiguration) -> dict[str, int]:
-    """pllm's entries in vLLM's compile-cache key; runtime.py adds its forward digest as an integer, too."""
+    """pLLM's entries in vLLM's compile-cache key; runtime.py adds its forward digest as an integer, too."""
     return decode_boundary(encode_boundary(config.additional_config), dict[str, int])
 
 

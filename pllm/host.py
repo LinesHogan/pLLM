@@ -1,4 +1,4 @@
-"""Host loops: generate -> score -> feed back, with pllm-managed training between generate calls.
+"""Host loops: generate -> score -> feed back, with pLLM-managed training between generate calls.
 
 Membership rule: a value is only meaningful in a host loop, not inside a model step: make_host, HostConfig and the
 HostTrainer it returns, the host batches training reads, and the completion, reward, retry and barrier types a

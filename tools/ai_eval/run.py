@@ -316,7 +316,7 @@ def main() -> None:
         parser.error("--output must be a new directory; prior evidence is never overwritten")
     commit = subprocess.check_output(["git", "rev-parse", args.revision], cwd=ROOT, text=True).strip()
     runtime = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    # Runtime is this checkout; reject comparison against a different pllm tree.
+    # Runtime is this checkout; reject comparison against a different pLLM tree.
     subprocess.run(
         ["git", "diff", "--exit-code", commit, "--", "pllm", "rust", "doc", "README.md"], cwd=ROOT, check=True
     )

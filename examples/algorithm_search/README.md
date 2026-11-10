@@ -2,7 +2,7 @@
 
 This example searches workload math for Qwen2.5-0.5B-Instruct on the first 200
 GSM8K test questions. It makes no quality claim beyond that slice. It adds no
-search API to pllm. Agent proposals are **not reproducible**; the pinned greedy
+search API to pLLM. Agent proposals are **not reproducible**; the pinned greedy
 scores are reproducible.
 
 From the repository root, using its venv (bubblewrap and the selected authenticated
@@ -52,7 +52,7 @@ greedy generation with up to 512 tokens, model length 2048 and batch 8, with a
 fixed zero-shot Qwen chat prompt. The last number in the response is normalized
 and compared exactly to the GSM8K answer.
 
-The ledger embeds candidate source, pllm's signed declaration fingerprint, git
+The ledger embeds candidate source, pLLM's signed declaration fingerprint, git
 SHA, pinned model/dataset commits and dataset content hash, question IDs, seeds,
 runtime versions, agent CLI version/model, explain and check text, GPU type,
 answers and three-round timing samples. Highest accuracy passing all contracts

@@ -2,7 +2,7 @@
 
 当推理时算法需要执行 PyTorch 无法高效表达的步骤——例如查表哈希、状态分块扫描（chunked scan）或稀疏注意力页打分时，研究者通常会编写专门的 Triton 或 CUDA 核函数。
 
-在 `pllm` 中，接入自定义核函数无需学习专有算子框架：使用 PyTorch 原生的 `torch.library.custom_op` 将核函数包装为算子对象，并在 `pllm.Workload` 的方法体中像调用普通函数一样直接调用它。`pllm` 会负责将其捕获进连续批处理下的 CUDA graph、在 CPU 上完成元张量形状与显存规划、追踪 GPU 到 CPU 的同步，并通过契约检查验证核函数与 CPU 参考实现的数值等价性。
+在 pLLM 中，接入自定义核函数无需学习专有算子框架：使用 PyTorch 原生的 `torch.library.custom_op` 将核函数包装为算子对象，并在 `pllm.Workload` 的方法体中像调用普通函数一样直接调用它。pLLM 会负责将其捕获进连续批处理下的 CUDA graph、在 CPU 上完成元张量形状与显存规划、追踪 GPU 到 CPU 的同步，并通过契约检查验证核函数与 CPU 参考实现的数值等价性。
 
 ## 快速上手：在负载中使用自写算子
 
@@ -64,7 +64,7 @@ result = testing.check(ExportNorm(), config)
 
 定义算子时必须声明 `mutates_args=()`，方法体内不要对入参张量做任何原地修改（如 `x.add_()` 或切片赋值），必须返回新张量。
 
-- **原因**：在连续批处理与 CUDA graph 下，方法接收到的激活值和状态张量是框架借给当前任务的共享或分页内存视图。同一步内的其他方法可能正在读取同一块激活，而旧版本状态页面也可能仍被前序任务引用。原地修改会绕过 `pllm` 的版本发布机制破坏数据。
+- **原因**：在连续批处理与 CUDA graph 下，方法接收到的激活值和状态张量是框架借给当前任务的共享或分页内存视图。同一步内的其他方法可能正在读取同一块激活，而旧版本状态页面也可能仍被前序任务引用。原地修改会绕过 pLLM 的版本发布机制破坏数据。
 - **做法**：算子内部始终将结果写入新分配的张量并返回；任何持久化状态变更一律通过 `@pllm.write` 或 `@pllm.train` 等框架效果发布。
 
 ### 2. 必须注册 `register_fake`
@@ -85,14 +85,14 @@ result = testing.check(ExportNorm(), config)
 
 在负载方法中，必须直接调用通过 `torch.library.custom_op` 声明的算子对象（如 `row_norm(h)`），不要通过分发器写成 `torch.ops.my_ops.row_norm(h)`。
 
-- **原因**：`pllm` 在编译和分析负载时，会静态检查方法引用的全局对象，提取算子定义及其底层的 Triton/CUDA 核函数源码。核函数的源码变更会被计入负载身份指纹，从而在核函数修改时自动使旧图缓存失效。通过 `torch.ops` 分发器间接查找会遮蔽源码对象，使框架无法追踪其版本。
+- **原因**：pLLM 在编译和分析负载时，会静态检查方法引用的全局对象，提取算子定义及其底层的 Triton/CUDA 核函数源码。核函数的源码变更会被计入负载身份指纹，从而在核函数修改时自动使旧图缓存失效。通过 `torch.ops` 分发器间接查找会遮蔽源码对象，使框架无法追踪其版本。
 - **做法**：在模块顶层定义或通过 `from my_kernels import my_op` 导入算子对象，在方法内直接传参调用。
 
 ### 5. 在线训练时需注册 `register_autograd`
 
 如果该算子处于 `@pllm.train` 在线训练的反向传播计算路径上，必须通过 `op.register_autograd(...)` 注册反向传播规则。
 
-- **原因**：`pllm` 的在线训练依赖 PyTorch 的 autograd 引擎构建梯度图。若梯度需要穿过自定义算子而算子没有反向规则，自动求导会在该节点报错中断。若算子仅用于推理前向、残差改写、采样引导或激活导出，则无需注册。
+- **原因**：pLLM 的在线训练依赖 PyTorch 的 autograd 引擎构建梯度图。若梯度需要穿过自定义算子而算子没有反向规则，自动求导会在该节点报错中断。若算子仅用于推理前向、残差改写、采样引导或激活导出，则无需注册。
 - **做法**：编写返回各入参梯度的 backward 函数，并通过 `op.register_autograd(backward_fn)` 完成绑定。
 
 ### 6. 在逐 token 单元中需注册 `register_vmap`
@@ -166,10 +166,10 @@ PyTorch 算子:  37745 token/s，为原生 vLLM 的 96%
 
 | 报错信息 | 触发原因 | 解决方法 |
 | :--- | :--- | :--- |
-| `... mutates ...; kernels called from workload math must return new tensors (mutates_args=()); change state only through pllm effects` | 算子试图原地修改输入张量（未指定 `mutates_args=()` 或修改了参数内容） | 保持纯函数语义，将结果写入新张量并返回；状态修改通过 `@pllm.write` 等效果发布 |
+| `... mutates ...; kernels called from workload math must return new tensors (mutates_args=()); change state only through pLLM effects` | 算子试图原地修改输入张量（未指定 `mutates_args=()` 或修改了参数内容） | 保持纯函数语义，将结果写入新张量并返回；状态修改通过 `@pllm.write` 等效果发布 |
 | `... has no fake implementation; add @....register_fake` | 算子未注册 meta 形状推导函数，显存规划器无法推导其输出尺寸 | 使用 `@op.register_fake` 注册形状推导函数，返回同形状、同 dtype 的空张量 |
 | `methods run inside CUDA graphs, so outputs need shapes fixed by the inputs; return a fixed-size tensor and a tensor mask instead of ctx.new_dynamic_size()` | 算子输出了依赖数据内容的动态形状（如使用了 `ctx.new_dynamic_size()`） | CUDA graph 必须固定形状：返回静态最大尺寸的张量并配合布尔掩码（mask） |
-| `call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so pllm can sign its source; use torch.ops.aten or torch.ops.prims only for built-in operators` | 在负载方法内通过 `torch.ops.<ns>.<op>` 分发调用算子 | 在方法体内直接调用自定义算子对象（如 `my_op(...)`），以便框架记录源码指纹 |
+| `call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims only for built-in operators` | 在负载方法内通过 `torch.ops.<ns>.<op>` 分发调用算子 | 在方法体内直接调用自定义算子对象（如 `my_op(...)`），以便框架记录源码指纹 |
 | `... trains through ..., which has no autograd formula; add ....register_autograd(...)` | 在 `@pllm.train` 反向传播链路上调用了未注册梯度的算子 | 使用 `op.register_autograd(...)` 为算子补充反向梯度传播函数 |
 | `... runs in a per-token cell under torch.vmap; register a batching rule (register_vmap) or call it with over="span"` | 在逐 token（`over="token"`）单元中调用了未注册 vmap 规则的算子 | 使用 `op.register_vmap(...)` 注册批处理规则，或将单元改为 `over="span"` 调度 |
 | `[device equivalence] ...: ...` | GPU 核函数与 CPU 参考实现的数值差异超出了对应 dtype 的容差上限 | 检查核函数的计算逻辑、累加精度（如中间步骤转 float32）与 CPU 实现是否对齐 |
@@ -179,7 +179,7 @@ PyTorch 算子:  37745 token/s，为原生 vLLM 的 96%
 <details>
 <summary>1. 为什么在负载方法体里必须直接调用自定义算子对象，而不能写 <code>torch.ops.my_lib.my_kernel(...)</code>？</summary>
 
-`pllm` 需要静态分析方法引用的全局符号，直接读取自定义算子及其底层的 Triton/CUDA 核函数源码。核函数的源码变更会被哈希进负载身份指纹，确保核函数修改后能够自动触发图重编。通过 `torch.ops` 分发器查找会绕过这一源码分析过程，使框架无法感知核函数代码的变化。
+pLLM 需要静态分析方法引用的全局符号，直接读取自定义算子及其底层的 Triton/CUDA 核函数源码。核函数的源码变更会被哈希进负载身份指纹，确保核函数修改后能够自动触发图重编。通过 `torch.ops` 分发器查找会绕过这一源码分析过程，使框架无法感知核函数代码的变化。
 </details>
 
 <details>

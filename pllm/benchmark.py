@@ -385,7 +385,7 @@ def cuda_profile_totals(path: Path) -> CudaProfileTotals:
     launches are a subset, not the number of device kernels executed by a graph.
     Kernel duration sums may overlap; GPU activity includes memcpy/memset without overlap.
     Memcpy bytes exclude kernel-internal loads/stores and all allocator figures.
-    Foreign trace metadata is deliberately not a closed PLLM wire contract.
+    Foreign trace metadata is deliberately not a closed pLLM wire contract.
     """
     events: list[_TraceEvent] = json.loads(path.read_text())["traceEvents"]
     kernels, kernel_us, transfer = 0, 0.0, 0

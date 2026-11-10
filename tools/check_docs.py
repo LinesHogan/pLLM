@@ -160,7 +160,7 @@ def attribute_chain(node: ast.Attribute) -> tuple[str, str] | None:
 
 
 def pllm_names(tree: ast.Module) -> dict[str, str]:
-    """Local names this code binds to pllm objects through imports, mapped to their dotted pllm path."""
+    """Local names this code binds to pLLM objects through imports, mapped to their dotted pLLM path."""
     names: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -174,7 +174,7 @@ def pllm_names(tree: ast.Module) -> dict[str, str]:
 
 
 def missing_symbols(blocks: list[Block]) -> list[str]:
-    """Unresolvable pllm references in `blocks`; imports in earlier blocks stay visible to later ones."""
+    """Unresolvable pLLM references in `blocks`; imports in earlier blocks stay visible to later ones."""
     trees: list[tuple[Block, ast.Module]] = []
     failures: list[str] = []
     for block in blocks:
@@ -255,7 +255,7 @@ def broken_links(path: Path, texts: list[str], anchors: dict[Path, set[str]]) ->
 
 @cache
 def source_strings() -> str:
-    """Every string literal of pllm's Python and Rust sources, joined by NUL; f-string values also become NUL, so a
+    """Every string literal of pLLM's Python and Rust sources, joined by NUL; f-string values also become NUL, so a
     quoted piece of a message never spans text that depends on the user's code."""
     texts: list[str] = []
     for path in (ROOT / "pllm").rglob("*.py"):
@@ -293,10 +293,10 @@ def quoted_messages(text: str) -> list[tuple[int, str]]:
 
 
 def stale_messages(text: str) -> list[str]:
-    """Quoted error messages with a piece that no pllm source string contains."""
+    """Quoted error messages with a piece that no pLLM source string contains."""
     corpus = source_strings()
     return [
-        f"line {number}: quoted message `{message}` is not in pllm's sources; copy the current text and write ... "
+        f"line {number}: quoted message `{message}` is not in pLLM's sources; copy the current text and write ... "
         "for the parts that depend on the user's code"
         for number, message in quoted_messages(text)
         if any(piece.strip() not in corpus for piece in message.split("...") if piece.strip())

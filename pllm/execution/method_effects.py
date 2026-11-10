@@ -513,7 +513,7 @@ def _chunked_in_forward(
         )
     pending["_pending_length"] = Field((), dtype=torch.int64)
     if (pending.keys() | {"_prompt_end"}) & (fields.keys() | bindings.keys()):
-        raise ValueError("rename the state fields or arguments that start with _pending_; pllm reserves them")
+        raise ValueError("rename the state fields or arguments that start with _pending_; pLLM reserves them")
     fields.update(pending)
     bindings.update((name, name) for name in pending)
     if optimizer is not None:
@@ -576,7 +576,7 @@ class TrainInForward(Effect):
                 )
                 name = f"__invariant_{key}"
                 if name in fields:
-                    raise ValueError("rename fields starting with __invariant_; pllm reserves them")
+                    raise ValueError("rename fields starting with __invariant_; pLLM reserves them")
                 invariants[name] = (source.state, views)
                 bindings[key] = name
             elif isinstance(source, Operand):

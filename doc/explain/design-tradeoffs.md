@@ -2,9 +2,9 @@
 
 在独立 PyTorch 脚本或 Hugging Face `generate` 循环中，研究员只需几行 `register_forward_hook`、在循环体里插入一段条件分支，或者对张量调用 `.item()`，就能迅速验证一项新算法构想。然而，当尝试把同样的算法直接搬入以连续批处理（continuous batching）和 CUDA Graph 异步回放为基石的高吞吐服务引擎（如 vLLM）时，往往会撞上各种各样的物理与架构限制。
 
-`pllm` 的定位不是一个收录海量现成算法的黑盒算法库，而是连接前沿建模算法与现代服务引擎之间的**可编程状态化底座（substrate）**。底座的职责是把连续批处理打包、CUDA Graph 静态图捕获、版本化快照发布以及显存生命周期规划等底层工程脏活接管下来，让能够与现代高吞吐物理机制相容的算法以极致性能运行。
+pLLM 的定位不是一个收录海量现成算法的黑盒算法库，而是连接前沿建模算法与现代服务引擎之间的**可编程状态化底座（substrate）**。底座的职责是把连续批处理打包、CUDA Graph 静态图捕获、版本化快照发布以及显存生命周期规划等底层工程脏活接管下来，让能够与现代高吞吐物理机制相容的算法以极致性能运行。
 
-当某种算法的设计假设与底层物理机制（固定内存形状、分页块表、流式异步执行、请求间严格隔离）发生根本冲突时，`pllm` 明确选择**不静默妥协、不隐式降级**，而是将系统边界和数学原因清晰地暴露给开发者。这一页梳理了目前不支持或受限的 11 项典型设计决策。每一节都按照统一的逻辑展开：**要解决的问题 $\to$ `pllm` 的选择 $\to$ 为什么这样选 $\to$ 替代方案**。
+当某种算法的设计假设与底层物理机制（固定内存形状、分页块表、流式异步执行、请求间严格隔离）发生根本冲突时，pLLM 明确选择**不静默妥协、不隐式降级**，而是将系统边界和数学原因清晰地暴露给开发者。这一页梳理了目前不支持或受限的 11 项典型设计决策。每一节都按照统一的逻辑展开：**要解决的问题 $\to$ pLLM 的选择 $\to$ 为什么这样选 $\to$ 替代方案**。
 
 ---
 
@@ -14,9 +14,9 @@
 
 在长序列生成中，KV 缓存的物理显存占用与上下文长度呈线性增长。以 H2O、SnapKV、PyramidKV 为代表的“按分数动态驱逐”算法，希望在自回归生成过程中持续统计每个历史 token 的累积注意力分数，并据此在物理显存中直接释放那些注意力权重低于阈值的“不重要”token，仅保留开头若干注意力和关键 heavy hitters，从而在理论上把显存占用压到极低水平。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 不支持按注意力分数动态释放 KV 物理显存。
+pLLM 不支持按注意力分数动态释放 KV 物理显存。
 
 ### 为什么这样选
 
@@ -66,9 +66,9 @@ report = pllm.explain(LocalGlobalAttention(), CONFIG)
 
 Activation Beacon 或各类型压缩 KV 算法试图将远端历史上下文（例如过去成百上千个 token）压缩为少量浓缩的表示（Summary Tokens 或压缩条目），以此兼顾长上下文检索与有限的显存容量。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 目前未将压缩远端记忆（compressed remote memory）集成到底座的标准流水线中。
+pLLM 目前未将压缩远端记忆（compressed remote memory）集成到底座的标准流水线中。
 
 ### 为什么这样选
 
@@ -91,9 +91,9 @@ Activation Beacon 或各类型压缩 KV 算法试图将远端历史上下文（�
 
 在 DeepSeek 稀疏注意力（DSA，如 DeepSeek V3/V4 系列）中，模型使用轻量索引器提前计算 query 与 key 的匹配程度并选出 top-k 个最重要的块或 token。研究员通常希望直接读取该索引器的选择结果（IndexCache），并在后续若干层中直接复用这一索引，避免重复计算打分。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 目前不支持读取并跨层复用底层原生 DSA 的 top-k 索引结果。
+pLLM 目前不支持读取并跨层复用底层原生 DSA 的 top-k 索引结果。
 
 ### 为什么这样选
 
@@ -114,9 +114,9 @@ Mixture-of-Depths (MoD) 与 Mixture-of-Recursions (MoR) 旨在为不同的 token
 1. **MoR 的 expert-choice 路由**：让每一层在整个 batch 内部展开自顶向下的竞争，挑选分数排在前 $k$ 名的 token 执行计算；
 2. **原版 MoD**：被跳过的 token 完全不进入该层计算，也不在该层写入任何 KV。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 明确不支持批次竞争式的 expert-choice 路由，也不支持原版 MoD 这种完全不写 KV 的跳层模式；`pllm` 支持的是基于每行独立掩码的 **token-choice 自适应深度** 与 **早退（Early Exit）**。
+pLLM 明确不支持批次竞争式的 expert-choice 路由，也不支持原版 MoD 这种完全不写 KV 的跳层模式；pLLM 支持的是基于每行独立掩码的 **token-choice 自适应深度** 与 **早退（Early Exit）**。
 
 ### 为什么这样选
 
@@ -126,7 +126,7 @@ Mixture-of-Depths (MoD) 与 Mixture-of-Recursions (MoR) 旨在为不同的 token
 ### 替代方案
 
 - **使用 token-choice 自适应路由**：每个 token 仅根据自身的隐藏特征或局部路由判定网络独立决定是否执行某一层（例如通过 sigmoid 阈值独立过滤），不与其他请求争抢配额。
-- **GPU 端自动补齐 KV 并在图内调度**：在 `@pllm.custom_forward` 中传入动态布尔掩码 `active=mask`（形状为 `[行, 1]`）。未激活的行跳过该层前向，而 `pllm` 会在 GPU 上通过被跳过层的归一化和投影自动计算近似的 K/V 并写入缓存，确保后续 token 永远读到结构完整的 KV 序列；同时，跳层判定完全留在 GPU 上通过 CUDA Graph 的分组分支节点执行，不产生任何 GPU 到 CPU 的同步阻断。详见 [12 自适应深度](../examples/12_adaptive_depth.ipynb)。
+- **GPU 端自动补齐 KV 并在图内调度**：在 `@pllm.custom_forward` 中传入动态布尔掩码 `active=mask`（形状为 `[行, 1]`）。未激活的行跳过该层前向，而 pLLM 会在 GPU 上通过被跳过层的归一化和投影自动计算近似的 K/V 并写入缓存，确保后续 token 永远读到结构完整的 KV 序列；同时，跳层判定完全留在 GPU 上通过 CUDA Graph 的分组分支节点执行，不产生任何 GPU 到 CPU 的同步阻断。详见 [12 自适应深度](../examples/12_adaptive_depth.ipynb)。
 
 ```python
 from dataclasses import dataclass
@@ -166,7 +166,7 @@ check = pllm.testing.check(SkipMiddle(), CONFIG)
 
 在自适应深度算法（如 LayerSkip、CALM 等）中，开发者有时希望将早退逻辑推广到 prefill（处理 prompt）阶段，让 prompt 中的部分 token 在浅层及早退出以缩短首字延迟（TTFT）。
 
-### `pllm` 的选择
+### pLLM 的选择
 
 `@pllm.custom_forward` 中的动态跳层掩码 `active=` 严格限制为仅在 `tokens="decode"` 时生效；若在 `tokens="all"` 或 prefill 阶段尝试传入 `active=`，构建期将抛出异常：
 
@@ -176,7 +176,7 @@ Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens wou
 
 ### 为什么这样选
 
-当某一行跳过后面的层时，`pllm` 要为被跳过的层补上近似的 K/V，否则之后的 token 读不到这些位置。
+当某一行跳过后面的层时，pLLM 要为被跳过的层补上近似的 K/V，否则之后的 token 读不到这些位置。
 - decode 时被跳过的只是这一个新位置；
 - prompt 的每个 token 都是之后所有生成 token 要读的上下文。在 prefill 时跳层，会把整段上下文在高层的 K/V 换成近似值，误差会影响此后生成的每一步。
 
@@ -195,13 +195,13 @@ Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens wou
 
 多 Token 预测（Multi-Token Prediction / MTP）、投机解码（Speculative Decoding，如草稿模型投机或 Medusa 多头投机）以及基于树状搜索的可回滚解码（Rollback / Tree Speculation），希望在单步推理中同时预测多个未来 token，或者根据验证结果将请求的生成进度与已写入的 KV 缓存向后回滚若干步。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 目前不支持接管外层解码调度循环的算法（包括草稿生成与验证循环、KV 缓存回滚和动态树状分支展开）。
+pLLM 目前不支持接管外层解码调度循环的算法（包括草稿生成与验证循环、KV 缓存回滚和动态树状分支展开）。
 
 ### 为什么这样选
 
-`pllm` 的定位是**模型前向内部与单步推理周围的可编程扩展底座**。它介入的生命周期是单步推理时间线（从请求准入、前向计算、隐藏状态读写、残差流改写、注意力拦截到采样前后处理与在线梯度反向）。
+pLLM 的定位是**模型前向内部与单步推理周围的可编程扩展底座**。它介入的生命周期是单步推理时间线（从请求准入、前向计算、隐藏状态读写、残差流改写、注意力拦截到采样前后处理与在线梯度反向）。
 
 投机解码与回滚算法的本质是**改变外层调度循环的控制状态机**：它们需要管理草稿模型的调度流、候选树的分支剪枝、生成位置计数器的减小、以及物理 KV 块表的事务性回滚操作。这些控制逻辑属于服务调度器（Scheduler）与批处理引擎的外环状态机，超出了单步前向建模底座的职责范围。
 
@@ -219,20 +219,20 @@ Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens wou
 
 算法研究员可能希望从零开始发明一种全新的神经网络拓扑，例如一种完全摒弃自注意力机制的新型 token mixer、重新设计的底层 MoE 路由分发器，或者用随机初始化从头预训练一个全新架构的模型。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-从零开始预训练全新架构（Pretraining from scratch）不在 `pllm` 的工作范围内。
+从零开始预训练全新架构（Pretraining from scratch）不在 pLLM 的工作范围内。
 
 ### 为什么这样选
 
-`pllm` 的核心使命在于解决**推理期与测试期算法**（如激活引导、在线微调、自适应计算、快权重记忆、查表残差等）在服务引擎上的落地难题。
+pLLM 的核心使命在于解决**推理期与测试期算法**（如激活引导、在线微调、自适应计算、快权重记忆、查表残差等）在服务引擎上的落地难题。
 
-从头预训练一个全新的基础模型，需要的是大规模分布式训练集群编排（如 Megatron-LM、FSDP、DeepSpeed）、海量数据集流式加载与容错检查点系统，这是一套完全不同的工程技术栈。`pllm` 的全部抽象都围绕“现有预训练权重的服务与适配”展开。
+从头预训练一个全新的基础模型，需要的是大规模分布式训练集群编排（如 Megatron-LM、FSDP、DeepSpeed）、海量数据集流式加载与容错检查点系统，这是一套完全不同的工程技术栈。pLLM 的全部抽象都围绕“现有预训练权重的服务与适配”展开。
 
 ### 替代方案
 
 - **在现有基座上接入新子层**：通过 [`@pllm.custom_residual`](../guides/forward-structure.md)、`pllm.model.ActivationPatch`、`pllm.model.Adapter` 等接口，把基于现有基座微调或增量训练好的权重挂载到模型中运行。
-- **支持新型已准入混合架构**：对于社区中已经完成预训练的新型混合结构（例如线性注意力与全注意力混合的 Qwen3.5），只要其已被列入支持矩阵，即可直接在 `pllm` 中加载使用。
+- **支持新型已准入混合架构**：对于社区中已经完成预训练的新型混合结构（例如线性注意力与全注意力混合的 Qwen3.5），只要其已被列入支持矩阵，即可直接在 pLLM 中加载使用。
 - **测试期在线学习**：测试期训练（Test-Time Training / TTT / ESamp / TLM）完全受支持，可通过 `@pllm.train` 或 `@pllm.train_in_forward` 在推理过程中持续更新状态，详见 [在线训练](../guides/training.md)。
 
 ---
@@ -243,9 +243,9 @@ Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens wou
 
 开发者尝试传入自定义的模型包装类、派生子类（如继承自 `Qwen2ForCausalLM` 的子类），或者来自相似模型家族（如 Phi3、Mistral）的非登记类。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 严格按照 vLLM 的具体原生模型类进行准入验证（`type(model) in architectures`），明确拒绝任何未登记的模型子类：
+pLLM 严格按照 vLLM 的具体原生模型类进行准入验证（`type(model) in architectures`），明确拒绝任何未登记的模型子类：
 
 ```text
 choose a native vLLM model class; workload admission does not accept model subclasses
@@ -253,9 +253,9 @@ choose a native vLLM model class; workload admission does not accept model subcl
 
 ### 为什么这样选
 
-`pllm` 的高效与零拷贝能力建立在底层模型精细结构的不变性契约之上：
+pLLM 的高效与零拷贝能力建立在底层模型精细结构的不变性契约之上：
 
-1. **残差流拦截点契约**：`pllm` 在模型内部各层拦截激活时，依赖于被准入家族统一遵循的子层规范——即 $2L+1$ 个 LayerNorm / RMSNorm 必须严格接受 `(branch, residual)` 二元组并返回 `(normalized, sum)`；任何未经准入的子类一旦修改了 Norm 签名或调用顺序，残差挂载将完全失效。
+1. **残差流拦截点契约**：pLLM 在模型内部各层拦截激活时，依赖于被准入家族统一遵循的子层规范——即 $2L+1$ 个 LayerNorm / RMSNorm 必须严格接受 `(branch, residual)` 二元组并返回 `(normalized, sum)`；任何未经准入的子类一旦修改了 Norm 签名或调用顺序，残差挂载将完全失效。
 2. **权重投影的命名与排布**：`pllm.model.Adapter` 和模型权重重写直接绑定到模型具体的投影属性（如 `q_proj`、`k_proj`、`v_proj`、`gate_proj` 等）。许多衍生模型或自定义子类会合并投影（例如将 QKV 打包为单个矩阵）、改变张量对齐或改变 LM Head 的计算方式。如果不做白名单式的精确类准入，一旦底层张量切分不匹配，不仅会导致 CUDA Graph 录制崩溃，甚至可能在显存中读写错误偏移的数据。
 
 ### 替代方案
@@ -271,9 +271,9 @@ choose a native vLLM model class; workload admission does not accept model subcl
 
 在复杂的实验环境或服务部署中，当出现显存不足、图捕获受阻、或者组件之间产生依赖竞争时，传统深度学习库往往倾向于“静默回退（Silent Fallback）”——例如悄悄关掉 CUDA Graph 退回极其缓慢的 eager 解释执行、悄悄把张量从 GPU 溢写到 CPU 内存、或者默默忽略某些更新。
 
-### `pllm` 的选择
+### pLLM 的选择
 
-`pllm` 坚持**闭合失败（Fail-Closed）**原则：任何语义歧义、未声明的超额资源占用或不相容的组合，在构建阶段（`pllm.explain` 或 `pllm.make_llm`）立刻抛出异常明确拒绝，不悄悄换一条路径执行。唯一的自动退让是 CUDA graph：默认 `cuda_graphs="auto"` 下，个别暂时不能进 graph 的写法（例如读共享 `InstanceState` 的 `Adapter`）会让模型以 eager 运行，但原因写在 `explain` 的 `forward` 行和 `eager_reason` 里，设 `cuda_graphs=True` 则直接报错。昂贵的系统取舍必须由开发者在代码中显式声明：
+pLLM 坚持**闭合失败（Fail-Closed）**原则：任何语义歧义、未声明的超额资源占用或不相容的组合，在构建阶段（`pllm.explain` 或 `pllm.make_llm`）立刻抛出异常明确拒绝，不悄悄换一条路径执行。唯一的自动退让是 CUDA graph：默认 `cuda_graphs="auto"` 下，个别暂时不能进 graph 的写法（例如读共享 `InstanceState` 的 `Adapter`）会让模型以 eager 运行，但原因写在 `explain` 的 `forward` 行和 `eager_reason` 里，设 `cuda_graphs=True` 则直接报错。昂贵的系统取舍必须由开发者在代码中显式声明：
 - **存储位置**：大查找表是放 GPU 显存还是 CPU 主机内存（`placement="device"` 还是 `"host"`）；
 - **KV 物理布局**：是否牺牲某些位置释放显存（`keep="window"`、`sink=True` 还是 `keep="none", source=k`）；
 - **训练结果可见滞后**：参数更新是严格无滞后阻塞等待（`publish_lag=0`），还是隔步发布以与下一步前向完全异步重叠（`publish_lag=1`）。
@@ -298,7 +298,7 @@ choose a native vLLM model class; workload admission does not accept model subcl
 
 开发者在一个复合负载（例如组合了两个独立算法子模块）中，尝试在两个不同的方法上同时添加 `@pllm.guide_sampling` 装饰器，希望两个模型或两套特征同时引导最终的采样分布。
 
-### `pllm` 的选择
+### pLLM 的选择
 
 一个负载（含所有嵌套子组件）中最多只能包含一个 `@pllm.guide_sampling` 方法。若声明了两个或更多，编译期将直接报错：
 
@@ -309,8 +309,8 @@ choose a native vLLM model class; workload admission does not accept model subcl
 ### 为什么这样选
 
 这与 `@pllm.add_logits` 的性质有着本质区别：
-- `@pllm.add_logits` 只是在过滤前向未归一化的 logits 上累加一个偏置向量。加法运算满足交换律与结合律（$A + B = B + A$），多个修改先后相加，数学结果完全一致，因此 `pllm` 允许任意多个 `@pllm.add_logits` 并存。
-- `@pllm.guide_sampling` 则是运行在采样器内部、经过 top-k / top-p 截断过滤之后的**非线性分布重加权**（基于对比引导公式 `(1 + beta) * logits - beta * pred_logits`）。当存在两个不同的隐藏层预测向量时，它们应该在特征空间先求平均？还是在概率空间先做乘法？亦或是先后级联应用两次不同的截断？不同的组合方式代表着完全不同的算法语义。`pllm` 坚决不替开发者做任何主观猜想。
+- `@pllm.add_logits` 只是在过滤前向未归一化的 logits 上累加一个偏置向量。加法运算满足交换律与结合律（$A + B = B + A$），多个修改先后相加，数学结果完全一致，因此 pLLM 允许任意多个 `@pllm.add_logits` 并存。
+- `@pllm.guide_sampling` 则是运行在采样器内部、经过 top-k / top-p 截断过滤之后的**非线性分布重加权**（基于对比引导公式 `(1 + beta) * logits - beta * pred_logits`）。当存在两个不同的隐藏层预测向量时，它们应该在特征空间先求平均？还是在概率空间先做乘法？亦或是先后级联应用两次不同的截断？不同的组合方式代表着完全不同的算法语义。pLLM 坚决不替开发者做任何主观猜想。
 
 ### 替代方案
 
@@ -342,7 +342,7 @@ bias_report = pllm.explain(VocabularyBiases(), CONFIG)
 
 在多轮对话或系统提示词（System Prompt）较长的场景下，开发者希望开启前缀缓存（`enable_prefix_caching=True`），同时又在负载中使用了 `@pllm.custom_residual`、`@pllm.custom_attention`、参数覆盖（`pllm.model.Adapter`）或激活补丁（`pllm.model.ActivationPatch`）来改写模型的前向计算。
 
-### `pllm` 的选择
+### pLLM 的选择
 
 当负载改写了模型内部计算节点时，必须保持前缀缓存关闭（`enable_prefix_caching=False`，默认值）；若在改写前向的同时开启了前缀缓存，系统在准入期直接报错拦截：
 
@@ -364,7 +364,7 @@ disable prefix caching when using parameter overlays or activation patches
 
 ### 替代方案
 
-- 保持 `ModelConfig(enable_prefix_caching=False)`（这是 `pllm` 的默认配置）。
+- 保持 `ModelConfig(enable_prefix_caching=False)`（这是 pLLM 的默认配置）。
 - 对于纯只读观测型负载（如通过 `@pllm.export` 提取探针特征）或纯词表偏置型负载（`@pllm.add_logits`），由于它们并不修改模型层内的前向激活或 KV 生成过程，前缀缓存可以安全开启。
 
 ---
@@ -373,12 +373,12 @@ disable prefix caching when using parameter overlays or activation patches
 
 ---
 
-## 算法不是 pllm 的工作：pllm 提供的是底座
+## 算法不是 pLLM 的工作：pLLM 提供的是底座
 
 在评估一项新算法能否在服务引擎中高效运行时，一个核心心智模型是区分**算法数学**与**系统基质**：
 
 - **算法数学属于开发者**：你的前向投影公式、隐藏状态插值、损失函数计算、甚至自定义 Triton 核函数，都由你自由定义与编写。
-- **系统基质属于 `pllm` 与 vLLM**：张量的显存排布、CUDA Graph 的静态拓扑录制、连续批处理的动态打包切分、跨请求的严格内存隔离，是系统保证高吞吐、低延迟与确定性输出的底层防线。
+- **系统基质属于 pLLM 与 vLLM**：张量的显存排布、CUDA Graph 的静态拓扑录制、连续批处理的动态打包切分、跨请求的严格内存隔离，是系统保证高吞吐、低延迟与确定性输出的底层防线。
 
 当一个算法因为触碰了物理法则或服务化边界而“今天写不了”时，说明该算法需要与高吞吐并发推理的现实条件做一次明确的理论对齐。理解这些设计取舍，不仅能帮助你写出正确可运行的 `pllm.Workload`，也能让你在设计新算法时，从第一天起就具备服务化与系统级性能的全局视野。
 
@@ -386,14 +386,14 @@ disable prefix caching when using parameter overlays or activation patches
 
 ## 自测
 
-1. **为什么在 `pllm` 中可以声明多个 `@pllm.add_logits`，却只能声明一个 `@pllm.guide_sampling`？**
+1. **为什么在 pLLM 中可以声明多个 `@pllm.add_logits`，却只能声明一个 `@pllm.guide_sampling`？**
    <details><summary>答案</summary>
-   <code>@pllm.add_logits</code> 只是在采样前向词表 logits 累加偏置向量，加法运算满足交换律与结合律（$A + B = B + A$），无论添加顺序如何，数学结果完全唯一确定。而 <code>@pllm.guide_sampling</code> 是在经过 top-k / top-p 过滤后的分布上执行非线性的对比重加权（基于 $(1 + \beta)\text{logits} - \beta\,\text{pred\_logits}$）。如果存在多个预测特征，它们应该在特征空间加权平均、在对数概率空间相加、还是分层级联截断，代表着完全不同的算法意图，<code>pllm</code> 拒绝替开发者做出未经证实的语义猜测。
+   <code>@pllm.add_logits</code> 只是在采样前向词表 logits 累加偏置向量，加法运算满足交换律与结合律（$A + B = B + A$），无论添加顺序如何，数学结果完全唯一确定。而 <code>@pllm.guide_sampling</code> 是在经过 top-k / top-p 过滤后的分布上执行非线性的对比重加权（基于 $(1 + \beta)\text{logits} - \beta\,\text{pred\_logits}$）。如果存在多个预测特征，它们应该在特征空间加权平均、在对数概率空间相加、还是分层级联截断，代表着完全不同的算法意图，pLLM 拒绝替开发者做出未经证实的语义猜测。
    </details>
 
 2. **如果一位研究员希望通过丢弃 prompt 中不重要的 token 来缩减首字延迟（TTFT），为什么不能在 `@pllm.custom_forward` 中直接给 prompt 传入 `active=` 掩码？**
    <details><summary>答案</summary>
-   当某一行早退跳过某一层时，为了保证 KV 缓存的物理与结构完整，<code>pllm</code> 会用当前隐藏状态经过该层的投影补齐近似的 K/V。Prompt 通常由数十到数千个连续 token 组成，如果在 prompt 阶段大面积早退，高层网络中整段上下文的 KV 将全被合成的近似值占据；在接下来的数百步自回归解码中，后续生成的每一个 decode token 在做因果注意力时都会读取这些严重失真的 prompt KV，导致生成文本迅速退化。
+   当某一行早退跳过某一层时，为了保证 KV 缓存的物理与结构完整，pLLM 会用当前隐藏状态经过该层的投影补齐近似的 K/V。Prompt 通常由数十到数千个连续 token 组成，如果在 prompt 阶段大面积早退，高层网络中整段上下文的 KV 将全被合成的近似值占据；在接下来的数百步自回归解码中，后续生成的每一个 decode token 在做因果注意力时都会读取这些严重失真的 prompt KV，导致生成文本迅速退化。
    </details>
 
 3. **为什么开启前缀缓存（Prefix Caching）与使用 `@pllm.custom_residual` 或参数覆盖是互斥的？**

@@ -1,6 +1,6 @@
 # 核心概念
 
-跑通一两篇教程（如 [00 快速上手](../tutorials/00_quickstart.ipynb) 或 [03 decode 时训练](../tutorials/03_decode_training.ipynb)）之后，你可能会注意到：在 `pllm` 里写算法和在 Hugging Face `generate` 里挂载 PyTorch forward hook 很不相同。输入要写成参数默认值的标记，方法里不能调用 `.item()` 或对张量值写 Python `if`，归约只能沿最后一维（`dim=-1`）进行，而每步训练算出的新参数默认要隔一步（在第 $n+2$ 步）才会被读到。
+跑通一两篇教程（如 [00 快速上手](../tutorials/00_quickstart.ipynb) 或 [03 decode 时训练](../tutorials/03_decode_training.ipynb)）之后，你可能会注意到：在 pLLM 里写算法和在 Hugging Face `generate` 里挂载 PyTorch forward hook 很不相同。输入要写成参数默认值的标记，方法里不能调用 `.item()` 或对张量值写 Python `if`，归约只能沿最后一维（`dim=-1`）进行，而每步训练算出的新参数默认要隔一步（在第 $n+2$ 步）才会被读到。
 
 这些规则并不是随意规定的语法限制，而是由现代推理引擎的两项底层物理机制直接决定的：**连续批处理（continuous batching）**与 **CUDA Graph 异步执行**。理解下面五个核心概念——为什么用声明代替 hook、什么是“行”、一步推理的时间线与流重叠、状态如何按版本发布，以及为什么构建期会直接拒绝越界组合——你就能一眼看出每条规则背后的原因，并在写代码前预判负载的行为与开销。
 
@@ -15,15 +15,15 @@
 1. **CUDA Graph 回放期根本不执行 Python 代码**：在自回归解码（decode）阶段，GPU 每步只为每个并发请求生成 1 个 token，算子本身耗时极短。为了消除逐个从 Python 发射算子的 CPU 开销，vLLM 会把整个模型前向录制成一张 CUDA Graph，后续每步只向 GPU 发射一次图回放指令（关掉 CUDA Graph 退回 eager 模式，仅发射开销就会让解码吞吐掉到图模式的约 45%，见 [性能与显存](performance.md)）。图回放期间，Python 解释器完全不参与层的执行，挂在模块上的 Python hook 根本不会被调用。
 2. **打包张量没有请求身份，且 Python 分支会触发主机同步**：即便退回 eager 模式，连续批处理也会把几十个并发请求的 token 拼进同一个二维张量。普通模块 hook 只拿到这块拼好的张量，不知道哪一行属于哪个请求、哪一行是刚算完的 prompt 末尾。更糟的是，如果 hook 里写了 `if h.norm() > 1:` 或 `print(h.item())`，CPU 就必须停下来等待 GPU 把前面的算子全部算完並把数值拷回主机内存（host sync），直接打断 GPU 流水线，也让 CUDA Graph 无法录制。
 
-### `pllm` 的做法：一次声明、静态追踪、整图捕获
+### pLLM 的做法：一次声明、静态追踪、整图捕获
 
-`pllm` 用**声明 + 纯张量数学**代替运行时回调。你编写的 `pllm.Workload` 子类只声明三件事（详见 [负载的组成](../guides/workload-anatomy.md)）：
+pLLM 用**声明 + 纯张量数学**代替运行时回调。你编写的 `pllm.Workload` 子类只声明三件事（详见 [负载的组成](../guides/workload-anatomy.md)）：
 
 - **读什么**：写在方法参数的默认值上（如 `pllm.hidden(0)`、`pllm.residual(12)`、`pllm.parameter("distiller", "w")`）；
 - **拥有什么状态**：写成类属性或带类型注解的 `@property`（如 `pllm.RequestState`、`pllm.InstanceState`）；
 - **结果去哪**：写成方法装饰器或模型位置声明（如 `@pllm.train`、`@pllm.guide_sampling`、`@pllm.export`、`pllm.model.ActivationPatch`）。
 
-在创建引擎（`pllm.make_llm`）或查看执行计划（[`pllm.explain`](../guides/explain.md)）时，`pllm` 只在启动期读取一次这些声明，在 CPU 上用 PyTorch 的 `meta` 张量把每个方法追踪（trace）一遍，算出所有中间张量的形状、显存生命周期与依赖关系，然后把你的张量数学（包括反向传播和 `AdamW` / `SGD` 更新）直接编译并捕获进 CUDA Graph。
+在创建引擎（`pllm.make_llm`）或查看执行计划（[`pllm.explain`](../guides/explain.md)）时，pLLM 只在启动期读取一次这些声明，在 CPU 上用 PyTorch 的 `meta` 张量把每个方法追踪（trace）一遍，算出所有中间张量的形状、显存生命周期与依赖关系，然后把你的张量数学（包括反向传播和 `AdamW` / `SGD` 更新）直接编译并捕获进 CUDA Graph。
 
 ```python
 from dataclasses import dataclass
@@ -107,9 +107,9 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 调度器在每一步把当前活跃的 token 紧缩打包进张量的第 0 维，**行的排列顺序由调度器决定，每一步都在变，你无法控制**。
 
-### `pllm` 中的“一行”代表什么
+### pLLM 中的“一行”代表什么
 
-在负载方法收到的所有按行张量中，第 0 维始终是**行轴（`[rows, ...]`）**。`pllm` 已经在底层替你完成了行筛选与状态对齐：当你读取 `pllm.RequestState`（通过 `pllm.parameter` 或 `pllm.module`）时，参数张量的第 `r` 行保证属于激活张量第 `r` 行所在的那个请求。
+在负载方法收到的所有按行张量中，第 0 维始终是**行轴（`[rows, ...]`）**。pLLM 已经在底层替你完成了行筛选与状态对齐：当你读取 `pllm.RequestState`（通过 `pllm.parameter` 或 `pllm.module`）时，参数张量的第 `r` 行保证属于激活张量第 `r` 行所在的那个请求。
 
 具体“一行对应哪个 token”，取决于你声明的输入来源（详见 [读取模型内部](../guides/reading.md)）：
 
@@ -123,7 +123,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 ### 对你写代码的直接影响
 
 - **只沿特征维（`dim=-1`）归约，绝不跨行（`dim=0`）归约**：写下 `h - h.mean(0)`、`softmax(dim=0)`、批归一化（BatchNorm）或按行排序，都会让某一个请求的输出取决于“这一步恰好和谁拼在同一个 batch 里”。所有均值、范数、归一化都应沿 `dim=-1` 计算（如 `h.float().norm(dim=-1, keepdim=True)`）。
-- **逐行训练方法返回形状为 `[rows]` 的一维 loss，不要自己对整批求均值**：在请求行上的 `@pllm.train` 方法里，不同行属于不同请求（而且为了复用固定尺寸的 CUDA Graph，未满 batch 的尾部还带有指向哑槽位的填充行）。因此方法体应返回每行各自的 loss（如 `.square().mean(-1)`，形状 `[rows]`）；由 `pllm` 负责屏蔽无效行，并按每份状态副本归约属于它的选中行（默认 `reduction="mean"`，可选 `"sum"`）。只有读取 `pllm.batch(...)` 的宿主批训练才由方法自己归约并返回单个标量。
+- **逐行训练方法返回形状为 `[rows]` 的一维 loss，不要自己对整批求均值**：在请求行上的 `@pllm.train` 方法里，不同行属于不同请求（而且为了复用固定尺寸的 CUDA Graph，未满 batch 的尾部还带有指向哑槽位的填充行）。因此方法体应返回每行各自的 loss（如 `.square().mean(-1)`，形状 `[rows]`）；由 pLLM 负责屏蔽无效行，并按每份状态副本归约属于它的选中行（默认 `reduction="mean"`，可选 `"sum"`）。只有读取 `pllm.batch(...)` 的宿主批训练才由方法自己归约并返回单个标量。
 - **用 `pllm.testing.check` 在 CPU 上验证行独立性**：你不靠肉眼排查是否误写了跨行耦合。[`pllm.testing.check`](../guides/checking.md) 会在 CPU 上用真实的规划器与执行器跑三个请求的多种固定调度，逐一检验这些契约：
 
 ```python
@@ -154,7 +154,7 @@ PASS    neutral
 
 ### 一步的时间线：锚点（anchors）与阶段窗口（`pllm.Phase`）
 
-`pllm` 把引擎的每一步划分为有序的时间轴**锚点（anchors）**。当你在 `pllm.explain` 的 `member` 列看到 `token.commit / side / captured` 时，第一项就是任务挂载的锚点：
+pLLM 把引擎的每一步划分为有序的时间轴**锚点（anchors）**。当你在 `pllm.explain` 的 `member` 列看到 `token.commit / side / captured` 时，第一项就是任务挂载的锚点：
 
 1. `request.prepare`：一步开始；活跃请求槽位与历史输入 token（`pllm.input_tokens`）就绪。
 2. `model.execute`：基座模型执行前向传播（`ActivationPatch`、`Adapter`、`@pllm.custom_residual`、`@pllm.custom_attention`、`@pllm.train_in_forward`、`@pllm.custom_forward` 在此期间运行）。
@@ -197,7 +197,7 @@ PASS    neutral
 
 ### 对你写代码的直接影响
 
-- **数据只能在产生它的阶段及之后被读取**：如果一个方法在某项输入诞生之前就去读它，`pllm` 会在构建期报错：`a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase`。最常见的例子是 `pllm.sampled_tokens()` 和 `pllm.base_logits()`：它们在采样结束后的 `token.commit` 才存在，因此只能用于 `@pllm.train` 或带 `@pllm.on(pllm.Phase.AFTER_SAMPLE)` 的方法；如果你想在采样前的 `@pllm.add_logits` 或 `@pllm.export` 里读取模型最后一层的 logits，应使用 `pllm.layer_logits((-1,))`。
+- **数据只能在产生它的阶段及之后被读取**：如果一个方法在某项输入诞生之前就去读它，pLLM 会在构建期报错：`a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase`。最常见的例子是 `pllm.sampled_tokens()` 和 `pllm.base_logits()`：它们在采样结束后的 `token.commit` 才存在，因此只能用于 `@pllm.train` 或带 `@pllm.on(pllm.Phase.AFTER_SAMPLE)` 的方法；如果你想在采样前的 `@pllm.add_logits` 或 `@pllm.export` 里读取模型最后一层的 logits，应使用 `pllm.layer_logits((-1,))`。
 - **把可提前的计算拆成独立辅助方法以获得流重叠**：如果你用 `placement="host"` 把大查找表放在主机内存里，希望跨 PCIe 的按行读取与模型前向重叠，就需要把查表写成一个不带效果装饰器的独立方法（只读 `pllm.input_tokens` 和 `pllm.parameter`），再让 `@pllm.add_logits` 或 `@pllm.custom_residual` 用 `pllm.result("lookup")` 读取它的返回值。如果把查表和 `pllm.hidden(0)` 写在同一个方法里，该方法就必须等到前向结束后的 `state.publish` 才能启动，失去与前向重叠的机会（详见 [性能与显存](performance.md)）。
 
 ---
@@ -213,7 +213,7 @@ PASS    neutral
 
 ### 作用域、不可变版本与在途隔离
 
-在 `pllm` 中，**状态（State）是唯一可变的东西**（详见 [状态](../guides/state.md)）。
+在 pLLM 中，**状态（State）是唯一可变的东西**（详见 [状态](../guides/state.md)）。
 
 首先，你通过状态类型与 `key_fields` 声明每份状态副本的归属范围：
 
@@ -243,8 +243,8 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 在 [03 decode 时训练](../tutorials/03_decode_training.ipynb) 的在线蒸馏（ESamp）中，第 $n$ 步的训练方法 `loss` 在采样确定（`token.commit`）后启动，需要在旁路流（`side`）上跑完前向、反向传播和 `AdamW` 更新。
 
 - 如果要求第 $n+1$ 步的 `predict` 立刻读到第 $n$ 步训练出的新权重（即 `publish_lag=0`），主流上的第 $n+1$ 步就必须停下来干等第 $n$ 步的训练全部算完，训练和推理被迫串行。
-- `pllm` 默认设置 **`publish_lag=1`**：第 $n$ 步算出的更新在第 **$n+2$** 步才对其他读取者可见。这样，当第 $n$ 步的训练在 `side` 流上运行时，第 $n+1$ 步的主流可以直接读取第 $n-1$ 步已发布的版本（`boundary, 1`，距离最新差 1 步），完全不用等待；与此同时，训练任务自己始终基于最新版本迭代（`latest, 0`，距离为 0），不会丢失任何一步梯度（详见 [在线训练](../guides/training.md)）。
-- 因为 `side` 流正在写的新版本和 `main` 流正在读的旧版本必须同时留在显存里，`pllm` 为每个状态预留的份数比并发请求数多（`explain` 里 `state` 行的 `roots`：`max_num_seqs=8` 时 `Distill` 预留 34 份）。`publish_lag` 越大，同时存在的版本越多，预留的份数也越多。
+- pLLM 默认设置 **`publish_lag=1`**：第 $n$ 步算出的更新在第 **$n+2$** 步才对其他读取者可见。这样，当第 $n$ 步的训练在 `side` 流上运行时，第 $n+1$ 步的主流可以直接读取第 $n-1$ 步已发布的版本（`boundary, 1`，距离最新差 1 步），完全不用等待；与此同时，训练任务自己始终基于最新版本迭代（`latest, 0`，距离为 0），不会丢失任何一步梯度（详见 [在线训练](../guides/training.md)）。
+- 因为 `side` 流正在写的新版本和 `main` 流正在读的旧版本必须同时留在显存里，pLLM 为每个状态预留的份数比并发请求数多（`explain` 里 `state` 行的 `roots`：`max_num_seqs=8` 时 `Distill` 预留 34 份）。`publish_lag` 越大，同时存在的版本越多，预留的份数也越多。
 
 ### 对你写代码的直接影响
 
@@ -259,9 +259,9 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 在研究脚本里，如果两个模块组合在一起存在语义歧义，或者某个张量超出了预留显存，很多工具会选择“悄悄退回慢路径”（例如关掉图捕获、悄悄把张量挪到 CPU 内存，或者按某种隐式顺序覆盖）。在服务引擎里，这种静默回退是灾难性的：代码看似跑通了，但要么吞吐掉了一大半却没人察觉，要么梯度永远是零、算法根本没有生效。
 
-### `pllm` 的原则：构建期验证，贵的决定由作者显式写出来
+### pLLM 的原则：构建期验证，贵的决定由作者显式写出来
 
-`pllm` 把负载编译当成一次静态校验（详见 [组合规则](../reference/composition-rules.md) 与 [报错目录](../reference/errors.md)）：
+pLLM 把负载编译当成一次静态校验（详见 [组合规则](../reference/composition-rules.md) 与 [报错目录](../reference/errors.md)）：
 
 1. **在触碰 GPU 之前拒绝非法或歧义组合**：`pllm.explain` 和 `pllm.make_llm` 使用同一套准入规则。只要声明之间存在真实冲突或语义未定义，构建期立即抛出异常并说明原因与改法，不会悄悄换一条路径执行。唯一的自动退让是 CUDA graph：默认 `cuda_graphs="auto"` 下，个别暂时不能进 graph 的写法会让模型以 eager 运行，但原因写在 `explain` 的 `forward` 行和 `llm.diagnostics().eager_reason` 里；设 `ModelConfig(cuda_graphs=True)` 则直接报错。
 2. **默认值只替你做廉价的局部决定**：例如状态字段默认 `dtype="auto"` 会根据字段角色自动选择精度——被优化器更新的参数或“读出旧值再写回”的累加器使用 `torch.float32`（防止微小梯度下溢或长序列累加上漂），只读字段则跟随模型精度 `bfloat16`/`float16`（省下一半显存容量与带宽）。
@@ -273,13 +273,13 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 四个典型边界及其背后的原因
 
-下面四个例子展示了 `pllm` 为什么在构建期拦下某些写法，以及每个限制背后的数学或原因（更多关于“某类算法为什么不支持”的讨论见 [设计取舍](design-tradeoffs.md)，写法指南见 [改模型](../guides/model-edits.md) 与 [改 forward 结构](../guides/forward-structure.md)）：
+下面四个例子展示了 pLLM 为什么在构建期拦下某些写法，以及每个限制背后的数学或原因（更多关于“某类算法为什么不支持”的讨论见 [设计取舍](design-tradeoffs.md)，写法指南见 [改模型](../guides/model-edits.md) 与 [改 forward 结构](../guides/forward-structure.md)）：
 
 | 被拒绝的写法 | 构建期报错信息（节选） | 为什么有这条边界 / 该怎么写 |
 | :--- | :--- | :--- |
-| 同一个负载（含子组件）声明了两个 `@pllm.guide_sampling` | `... and ... both declare @pllm.guide_sampling; keep at most one guidance method` | 多个 `@pllm.add_logits` 只是在过滤前把词表偏置相加，先加哪个结果都一样，因此可以共存。`@pllm.guide_sampling` 则要把一个 hidden 预测投影到词表，在 top-k / top-p 过滤后的分布上按 `(1 + beta) * logits - beta * pred_logits` 重新加权，采样器每步只做这一次。两个预测该相加、取平均还是先后应用，是算法本身的选择，`pllm` 不替你猜：在一个方法里把它们合成一个预测返回，其余词表修正改用 `@pllm.add_logits`。 |
+| 同一个负载（含子组件）声明了两个 `@pllm.guide_sampling` | `... and ... both declare @pllm.guide_sampling; keep at most one guidance method` | 多个 `@pllm.add_logits` 只是在过滤前把词表偏置相加，先加哪个结果都一样，因此可以共存。`@pllm.guide_sampling` 则要把一个 hidden 预测投影到词表，在 top-k / top-p 过滤后的分布上按 `(1 + beta) * logits - beta * pred_logits` 重新加权，采样器每步只做这一次。两个预测该相加、取平均还是先后应用，是算法本身的选择，pLLM 不替你猜：在一个方法里把它们合成一个预测返回，其余词表修正改用 `@pllm.add_logits`。 |
 | 使用 `@pllm.custom_forward` 的同时，又有方法读取 `pllm.hidden` 或 `pllm.final_hidden` | `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | 标准前向里每层恰好跑一次，`pllm.hidden(L)` 唯一对应第 `L` 层的那次 MLP 输出；而在 `@pllm.custom_forward` 中，同一层可能在循环深度里跑多遍，或在早退时被跳过，“第 `L` 层的唯一输出”不再有定义。改用 `pllm.residual(layer)` 或 `pllm.layer_logits(...)` 读取每层最后一次访问后的残差流。 |
-| 在 `@pllm.custom_forward(tokens="all")` 中对 `layers(...)` 传入早退掩码 `active=` | `Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. ...` | 当某一行在第 $L$ 层早退跳过后续层时，`pllm` 会为被跳过的层补齐近似的 Q/K/V。如果在 prefill 阶段对 prompt token 早退，整段 prompt 在高层都会留下近似的 KV，后续每一个 decode token 做注意力时都会读到这些近似值。因此早退 `active=` 仅用于 `tokens="decode"`，prompt 默认跑完整模型。 |
+| 在 `@pllm.custom_forward(tokens="all")` 中对 `layers(...)` 传入早退掩码 `active=` | `Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. ...` | 当某一行在第 $L$ 层早退跳过后续层时，pLLM 会为被跳过的层补齐近似的 Q/K/V。如果在 prefill 阶段对 prompt token 早退，整段 prompt 在高层都会留下近似的 KV，后续每一个 decode token 做注意力时都会读到这些近似值。因此早退 `active=` 仅用于 `tokens="decode"`，prompt 默认跑完整模型。 |
 | 可训练的低秩 `pllm.model.Adapter(operator="low_rank")` 使用默认的全零初始化 | `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | 低秩适配器计算的增量是 $\text{scale} \cdot B A x$。若 $A$ 和 $B$ 初值同时为 0，反向传播时 $A$ 的梯度正比于 $B^\top=0$，$B$ 的梯度正比于 $A^\top=0$，梯度永远是 0，参数一步也不会更新。使用 `init=pllm.Computed(...)` 将其中一个因子（如 $A$）初始化为随机小值、另一个因子（$B$）初始化为 0。 |
 
 ---

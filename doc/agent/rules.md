@@ -1,34 +1,34 @@
-# Rules for pllm workloads and why they exist
+# Rules for pLLM workloads and why they exist
 
-pllm reads a workload's declarations once, when the engine is built, and from them plans where every
+pLLM reads a workload's declarations once, when the engine is built, and from them plans where every
 method runs, how much memory it reserves, what it captures in CUDA graphs and when state versions become
 visible. The rules below are what that planning relies on. Each states its reason so you can tell which
-change satisfies it. The messages pllm raises when a rule is broken, and their fixes, are in
+change satisfies it. The messages pLLM raises when a rule is broken, and their fixes, are in
 [pitfalls.md](pitfalls.md).
 
 ## Invariants
 
 | Rule | Reason |
 | --- | --- |
-| Every parameter after `self` has a marker default (`pllm.hidden(0)`, `pllm.parameter("s", "w")`, ...). | pllm decides inputs from defaults, never from parameter names or annotations, so nothing is guessed. |
+| Every parameter after `self` has a marker default (`pllm.hidden(0)`, `pllm.parameter("s", "w")`, ...). | pLLM decides inputs from defaults, never from parameter names or annotations, so nothing is guessed. |
 | A method's rows are independent: compute along `dim=-1`, never across `dim=0`. | Dimension 0 packs unrelated requests in an order that changes every step; a row may only depend on its own request. `testing.check` permutes and mixes rows to catch violations. |
 | Methods never synchronize with the host (`.item()`, `.tolist()`, `.cpu()`, `print(tensor)`, Python `if` on tensor values). | Methods are shape-traced to plan memory, captured in CUDA graphs and run on side streams that overlap the forward; a sync either fails tracing or stalls the engine. |
-| Inputs and parameters are read-only. | They are views shared with other methods and with pllm's state versions; an in-place write corrupts what others read. |
-| State changes only through effects: `@pllm.write`, `@pllm.train`, `@pllm.train_in_forward`, `init=` sources, imports and feeds. | pllm versions every state, publishes new versions atomically and may replay them; a write it does not know about breaks versions and replay. |
-| A workload holds declarations and settings only: plain values, enums, dataclasses, other workloads. No tensors, modules, open files or mutable globals. | The workload is hashed into its identity (`workload_digest`) and rebuilt by import in worker processes; tensors belong in state that pllm places and pages. |
+| Inputs and parameters are read-only. | They are views shared with other methods and with pLLM's state versions; an in-place write corrupts what others read. |
+| State changes only through effects: `@pllm.write`, `@pllm.train`, `@pllm.train_in_forward`, `init=` sources, imports and feeds. | pLLM versions every state, publishes new versions atomically and may replay them; a write it does not know about breaks versions and replay. |
+| A workload holds declarations and settings only: plain values, enums, dataclasses, other workloads. No tensors, modules, open files or mutable globals. | The workload is hashed into its identity (`workload_digest`) and rebuilt by import in worker processes; tensors belong in state that pLLM places and pages. |
 | Method code uses only `torch`, `math`, `pllm`, `triton`, `typing`, `collections.abc` and builtins, plus your own `nn.Module` subclasses, enums, dataclasses and module-level helper functions. | Method code is frozen and hashed; other modules cannot be traced, fingerprinted or shipped. |
 | A setting that depends on the instance is a function of the workload (`beta=strength` with `def strength(self) -> float`). | Decorators run when the class is defined; a field name in the class body is its class default (see [pitfalls.md](pitfalls.md#a-dataclass-field-named-in-the-class-body-passes-the-class-default)). |
 | A method has at most one decorator of each kind, and one effect. | One method has one destination; the plan gives each a single anchor. |
 | At most one `@pllm.guide_sampling` per workload, components included; any number of `@pllm.add_logits`. | The sampler applies one guidance per step; logit additions are summed before it. |
 | One training mode per workload: request rows, or host batches. | The two reserve different memory and run at different times of the step. |
 | One writer per state per step. | Two writers starting from the same version would overwrite each other's result. |
-| Request-row training returns `[rows]`; pllm masks, reduces (`reduction="mean"` or `"sum"`) and steps the optimizer. Host-batch training returns one scalar. | pllm knows which rows are padding and which state each row belongs to; a pre-reduced scalar loses that. |
+| Request-row training returns `[rows]`; pLLM masks, reduces (`reduction="mean"` or `"sum"`) and steps the optimizer. Host-batch training returns one scalar. | pLLM knows which rows are padding and which state each row belongs to; a pre-reduced scalar loses that. |
 | Results flow one way within a step (`pllm.result` has no cycles). | Tasks of a step are ordered by their reads. |
-| Sampler feedback (`pllm.sampled_tokens()`, `pllm.base_logits()`) is read only by the `@pllm.train` method of a workload that also has `@pllm.add_logits`, or by read-only helpers feeding that training. | Feedback exists only after the draw; pllm delivers it to the training that closes an add-logits loop and to nothing else. |
+| Sampler feedback (`pllm.sampled_tokens()`, `pllm.base_logits()`) is read only by the `@pllm.train` method of a workload that also has `@pllm.add_logits`, or by read-only helpers feeding that training. | Feedback exists only after the draw; pLLM delivers it to the training that closes an add-logits loop and to nothing else. |
 | Components (workloads held as dataclass fields) are independent: their names get the field prefix (`probe.norm`) and they cannot read each other's state. | Composition must not create hidden coupling; to share state, put both methods in one workload. |
 | `publish_lag` is one engine-wide setting; a component that requires a lag must match it. | There is one timeline of state versions per engine. |
 | At most one `init=pllm.Fed(...)` state, one `init=pllm.Imported()` state and one `@pllm.train_in_forward` method per workload. | A feed and a `StateImport` each fill one state per call; one method drives all projection hooks. |
-| Declarations are fixed when the engine is built; methods are not hooks Python calls at run time. | pllm plans placement, memory and capture once; changing a setting means a new workload and a new engine. |
+| Declarations are fixed when the engine is built; methods are not hooks Python calls at run time. | pLLM plans placement, memory and capture once; changing a setting means a new workload and a new engine. |
 
 ## Combinations that are refused
 
@@ -53,7 +53,7 @@ change satisfies it. The messages pllm raises when a rule is broken, and their f
 
 ### Models
 
-pllm admits exact vLLM model classes (not subclasses: relatives such as Phi3 or Mistral may change
+pLLM admits exact vLLM model classes (not subclasses: relatives such as Phi3 or Mistral may change
 projection layouts or logits).
 
 | Family | Supported | Not supported, and why |
@@ -86,7 +86,7 @@ Qwen2/Llama/Qwen3 model in bfloat16 whose embedding and LM head are not quantize
 | `pllm.model.ActivationPatch`, `@pllm.custom_residual`, `@pllm.custom_attention`, token-history lookups | CUDA graphs (vLLM captures source operators instead of inductor-fused ones) |
 | `pllm.model.Adapter` on a `RequestState` | CUDA graphs |
 | `pllm.model.Adapter` on an `InstanceState` | eager: `CUDA-graph overlays do not support adapters backed by shared InstanceState` |
-| `@pllm.custom_forward` | pllm captures its own graphs per layer slice: `@pllm.custom_forward schedules model slices and owns their wave graphs` |
+| `@pllm.custom_forward` | pLLM captures its own graphs per layer slice: `@pllm.custom_forward schedules model slices and owns their wave graphs` |
 | `runner="mrv1"` or `cuda_graphs=False` | eager |
 
 ### Tensor parallelism (`tensor_parallel_size > 1`)
@@ -119,7 +119,7 @@ these to make something pass without telling the user.
 | `pllm.model.Adapter` on an `InstanceState` | — | The model forward runs eagerly | `forward` line |
 | `ExecutionOptions(guidance_capacity=None)` | `4096` | Exact dense guidance over the full vocabulary instead of the top 4096 survivors | `timing guidance_capacity` |
 | `ExecutionOptions(max_host_training_rows=n)` | `1` | Host-fed training rows per state per step; more memory | `state` and `memory` lines |
-| Memory budgets: `state_page_budget_bytes`, `execution_peak_budget_bytes`, `cuda_graph_pool_budget_bytes` | observed free capacity / unlimited / traced | Caps pllm's own reservations (not weights or KV); planning fails with a message when they do not fit | `state`, `memory`, `budget` lines |
+| Memory budgets: `state_page_budget_bytes`, `execution_peak_budget_bytes`, `cuda_graph_pool_budget_bytes` | observed free capacity / unlimited / traced | Caps pLLM's own reservations (not weights or KV); planning fails with a message when they do not fit | `state`, `memory`, `budget` lines |
 | `ModelConfig(cuda_graphs=False)` | `"auto"` | Whole engine eager | `forward` line |
 | `ModelConfig(tensor_parallel_size=n)` | `1` | Feature limits above | `parallel` line |
 

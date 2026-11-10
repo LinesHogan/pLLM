@@ -109,7 +109,7 @@ class Phase(Enum):
 #
 # A setting that depends on the workload's configuration is a function of the workload instead of a value: usually
 # a method defined above, `pllm.hidden(source_layer)` with `def source_layer(self) -> int`, which the IDE follows and
-# the type checker checks. pllm calls it once when the workload is bound.
+# the type checker checks. pLLM calls it once when the workload is bound.
 
 
 def hidden(layer: int | Callable[[Any], int] = 0, *, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
@@ -734,7 +734,7 @@ def _mark(
         # A second marker of one kind would silently replace the first, e.g. @export over @train never trains.
         if any(f"__pllm_{name}__" in vars(function) for name in markers):
             raise ValueError(
-                "a method takes one pllm decorator of each kind; split stacked effects into one method per effect"
+                "a method takes one pLLM decorator of each kind; split stacked effects into one method per effect"
             )
         for name, marker in markers.items():
             setattr(function, f"__pllm_{name}__", marker)

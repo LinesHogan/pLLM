@@ -2,7 +2,7 @@
 
 在 Hugging Face 的 `generate` 里实验一个推理期算法，通常只需要注册一个 `forward hook`，或者在解码循环外面包一层张量运算。但把同样的算法放进真实的 vLLM 服务时，几十个并发请求会被连续批处理（continuous batching）拼进同一个张量，模型前向又被捕获进 CUDA graph——Python hook 既不知道张量的哪一行属于哪个请求，在 CUDA graph 重放时甚至根本不会被调用。
 
-`pllm` 把**算法声明**与**引擎调度**拆开：你写一个 `pllm.Workload` 子类，用声明回答三个问题——**读什么**、**存什么**、**结果去哪**——再在方法体里写普通的 PyTorch 张量数学。`pllm` 在构建引擎时只读一次这些声明，自动规划每个方法在什么时机、哪条 CUDA stream 上运行，替你管理每个请求的状态显存并将计算捕获进 CUDA graph。
+pLLM 把**算法声明**与**引擎调度**拆开：你写一个 `pllm.Workload` 子类，用声明回答三个问题——**读什么**、**存什么**、**结果去哪**——再在方法体里写普通的 PyTorch 张量数学。pLLM 在构建引擎时只读一次这些声明，自动规划每个方法在什么时机、哪条 CUDA stream 上运行，替你管理每个请求的状态显存并将计算捕获进 CUDA graph。
 
 先看一个最小的可运行负载：不存任何状态，只读取模型第 12 层之后的残差流，算出每个请求当前 token 的 L2 范数并导出到 CPU。
 
@@ -77,7 +77,7 @@ class Distill(pllm.Workload):
 
 一个负载是 `pllm.Workload` 的子类。当负载带有超参数或开关（如上面的 `beta: float = 0.5`）时，把它写成 `@dataclass(frozen=True)`。
 
-为什么要冻结（`frozen=True`）？因为 `pllm` 在构建引擎时一次性读取负载实例上的配置并生成执行计划；引擎启动后再去修改 Python 实例的属性，不会改变已经在 GPU 上编译好的执行图。使用冻结的 dataclass 既能防止运行期误改属性，又能随时用 `Distill(beta=0.0)` 或 `dataclasses.replace(workload, beta=0.0)` 构造一个零强度的对照实例，交给 `pllm.testing.check` 检查“关闭算法时是否严格等价于原模型”。
+为什么要冻结（`frozen=True`）？因为 pLLM 在构建引擎时一次性读取负载实例上的配置并生成执行计划；引擎启动后再去修改 Python 实例的属性，不会改变已经在 GPU 上编译好的执行图。使用冻结的 dataclass 既能防止运行期误改属性，又能随时用 `Distill(beta=0.0)` 或 `dataclasses.replace(workload, beta=0.0)` 构造一个零强度的对照实例，交给 `pllm.testing.check` 检查“关闭算法时是否严格等价于原模型”。
 
 负载里的所有声明都归为三类：
 
@@ -89,9 +89,9 @@ class Distill(pllm.Workload):
 
 全部公开接口的参数签名可查 [API 签名汇总](../agent/reference.md#all-signatures)。写这三类声明时有三条基本规则：
 
-1. **除 `self` 外的每个输入参数都必须写标记默认值。** Python 参数名（如 `shallow`、`deep`）只是方法体内部使用的局部变量名，`pllm` 不会根据参数名猜测你想读哪一层；默认值（如 `= pllm.hidden(0)`）才是给规划器看的声明，类型注解（`: torch.Tensor`）则告诉 IDE 和类型检查器方法体拿到的值是什么类型。（唯一的例外是 `@pllm.custom_residual` 的流张量 `x, y`、`@pllm.custom_attention` 的 `q, kv` 以及 `@pllm.custom_forward` 的 `layers`，它们作为打头的位置参数传入，后面的参数依然使用标记默认值。）
-2. **产出结果的方法必须挂效果装饰器。** 一个普通方法只返回张量、不挂 `@pllm.export` / `@pllm.train` 等装饰器时，`pllm` 不知道返回值该送往采样器、导出队列还是优化器，因此不会单独调度它（除非它被另一个方法通过 `pllm.result("方法名")`、`rows="方法名"` 引用，或显式挂了 `@pllm.on`）。若整个负载没有任何效果声明，构建时会直接报错提醒。
-3. **同一个方法上同一种类的 `pllm` 装饰器最多挂一个。** 不要在一个方法上同时叠放 `@pllm.export` 和 `@pllm.train`——如果允许叠放，外层装饰器会覆盖内层装饰器的效果属性，导致其中一个效果静默丢失。因此 `pllm` 在声明检查时直接拒绝叠放效果；需要把同一份计算结果用于两个效果时，拆成两个方法并用 `pllm.result("方法名")` 复用结果即可。
+1. **除 `self` 外的每个输入参数都必须写标记默认值。** Python 参数名（如 `shallow`、`deep`）只是方法体内部使用的局部变量名，pLLM 不会根据参数名猜测你想读哪一层；默认值（如 `= pllm.hidden(0)`）才是给规划器看的声明，类型注解（`: torch.Tensor`）则告诉 IDE 和类型检查器方法体拿到的值是什么类型。（唯一的例外是 `@pllm.custom_residual` 的流张量 `x, y`、`@pllm.custom_attention` 的 `q, kv` 以及 `@pllm.custom_forward` 的 `layers`，它们作为打头的位置参数传入，后面的参数依然使用标记默认值。）
+2. **产出结果的方法必须挂效果装饰器。** 一个普通方法只返回张量、不挂 `@pllm.export` / `@pllm.train` 等装饰器时，pLLM 不知道返回值该送往采样器、导出队列还是优化器，因此不会单独调度它（除非它被另一个方法通过 `pllm.result("方法名")`、`rows="方法名"` 引用，或显式挂了 `@pllm.on`）。若整个负载没有任何效果声明，构建时会直接报错提醒。
+3. **同一个方法上同一种类的 pLLM 装饰器最多挂一个。** 不要在一个方法上同时叠放 `@pllm.export` 和 `@pllm.train`——如果允许叠放，外层装饰器会覆盖内层装饰器的效果属性，导致其中一个效果静默丢失。因此 pLLM 在声明检查时直接拒绝叠放效果；需要把同一份计算结果用于两个效果时，拆成两个方法并用 `pllm.result("方法名")` 复用结果即可。
 
 ---
 
@@ -117,7 +117,7 @@ class Distill(pllm.Workload):
 
 方法体里不能出现 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)`，也不能写 `if h.norm() > 1:` 或 `while not converged:` 这类依赖张量值的 Python 分支与循环。
 
-- **原因**：有两个层面的原因。第一，在构建引擎（以及运行 `pllm.explain`）时，`pllm` 会先用 PyTorch 的 `meta` 张量（只有形状和 dtype、没有实际数据存储）追踪一遍方法体来推导形状与显存预算；在 `meta` 张量上调用 `.item()` 或做布尔判断会立刻触发 `RuntimeError: Tensor.item() cannot be called on meta tensors`。第二，在 GPU 运行期，方法会被捕获进 CUDA graph，并且常常放在旁路 CUDA stream 上与模型前向重叠执行；CUDA graph 只能记录固定的算子序列，无法录制 Python 的动态分支，而 GPU→CPU 同步则会阻塞主机线程并破坏流捕获。
+- **原因**：有两个层面的原因。第一，在构建引擎（以及运行 `pllm.explain`）时，pLLM 会先用 PyTorch 的 `meta` 张量（只有形状和 dtype、没有实际数据存储）追踪一遍方法体来推导形状与显存预算；在 `meta` 张量上调用 `.item()` 或做布尔判断会立刻触发 `RuntimeError: Tensor.item() cannot be called on meta tensors`。第二，在 GPU 运行期，方法会被捕获进 CUDA graph，并且常常放在旁路 CUDA stream 上与模型前向重叠执行；CUDA graph 只能记录固定的算子序列，无法录制 Python 的动态分支，而 GPU→CPU 同步则会阻塞主机线程并破坏流捕获。
 - **做法**：
   - 条件逻辑用布尔掩码和 `torch.where(mask, a, b)` 表达；
   - 想在运行期查看张量数值，用 `@pllm.export` 异步导出到 CPU 的 `on_export` 回调；
@@ -127,7 +127,7 @@ class Distill(pllm.Workload):
 
 - **精度（dtype）**：模型内部的激活输入（`pllm.hidden`、`pllm.residual`、`pllm.final_hidden`）默认以模型的计算精度（通常为 `bfloat16`）存储和捕获，而 `pllm.layer_logits` 为 `float32`。做平方误差、范数或累加时，先调用 `.float()` 转成 `float32`，可以避免 `bfloat16` 下溢或精度损失。
 - **返回形状**：
-  - 按请求行训练的 `@pllm.train` 方法必须返回一维的 `[rows]` loss 张量（每行一个标量），**不要**在方法末尾自己做 `.mean()` 归约成 0 维标量。原因是同一个批次里的不同行可能属于不同请求的状态（且捕获表中的填充行或未选中行需要由框架先用掩码剔除），`pllm` 会按状态对有效行做归约（默认 `reduction="mean"`，可选 `"sum"`）。相反，读取 `pllm.batch(...)` 的宿主批训练方法针对整个外部批次做一步更新，由方法自己返回单个标量 loss（见[在线训练](training.md)与[宿主循环与批训练](host-loops.md)）。
+  - 按请求行训练的 `@pllm.train` 方法必须返回一维的 `[rows]` loss 张量（每行一个标量），**不要**在方法末尾自己做 `.mean()` 归约成 0 维标量。原因是同一个批次里的不同行可能属于不同请求的状态（且捕获表中的填充行或未选中行需要由框架先用掩码剔除），pLLM 会按状态对有效行做归约（默认 `reduction="mean"`，可选 `"sum"`）。相反，读取 `pllm.batch(...)` 的宿主批训练方法针对整个外部批次做一步更新，由方法自己返回单个标量 loss（见[在线训练](training.md)与[宿主循环与批训练](host-loops.md)）。
   - `@pllm.add_logits` 必须返回 `[rows, vocab_size]`；`@pllm.guide_sampling` 必须返回 `[rows, hidden_size]`（框架再用模型自己的 LM head 把它投影到词表空间）。
 
 ---
@@ -150,13 +150,13 @@ class BadDistill(pllm.Workload):
 ```
 
 - **原因**：Python 在执行 `class` 定义体时就会求值 `@pllm.guide_sampling(beta=beta)` 的参数，此时还没有任何 `self` 实例存在。名字 `beta` 拿到的是类属性默认值 `0.5`。当你之后实例化 `BadDistill(beta=0.0)` 传给 `testing.check(..., neutral=BadDistill(beta=0.0))` 时，装饰器里绑定的仍然是 `0.5`，导致零强度检查报错：`[neutral] guide_sampling still declares a sampler stage; set its beta to zero.`。
-- **做法**：任何装饰器参数或输入标记参数（如 `@pllm.guide_sampling(beta=...)`、`pllm.hidden(layer)`、`pllm.layer_logits(layers)`、`@pllm.export(every=...)`、`@pllm.train(steps=...)`）只要依赖实例字段，就传一个**接收负载实例并返回该配置值的方法**（或者 `lambda self: self.beta`）。`pllm` 会在绑定具体实例时调用一次这个方法。写成带返回类型注解的方法（如 `def strength(self) -> float:`）还能让 IDE 支持跳转定义，并让类型检查器校验返回类型。
+- **做法**：任何装饰器参数或输入标记参数（如 `@pllm.guide_sampling(beta=...)`、`pllm.hidden(layer)`、`pllm.layer_logits(layers)`、`@pllm.export(every=...)`、`@pllm.train(steps=...)`）只要依赖实例字段，就传一个**接收负载实例并返回该配置值的方法**（或者 `lambda self: self.beta`）。pLLM 会在绑定具体实例时调用一次这个方法。写成带返回类型注解的方法（如 `def strength(self) -> float:`）还能让 IDE 支持跳转定义，并让类型检查器校验返回类型。
 
 ### 为什么状态写成 `@property` 时必须标注返回类型？
 
 当状态的形状依赖实例字段（如 `self.rank`）时，类属性拿不到 `self`，需要把状态写成 `@property`。此时**必须**给 `@property` 加上返回类型注解（如 `-> pllm.RequestState` 或 `-> pllm.InstanceState`；模型改动属性则标 `-> pllm.model.Adapter`、`-> pllm.model.ActivationPatch` 或 `-> pllm.PositionState`）。如果类里还定义了其他普通辅助 `@property`，同样要标上它们各自的返回类型（如 `-> int`）。
 
-- **原因**：`pllm` 在分析负载类时，需要在不盲目执行任意用户 getter 代码的前提下，先识别出哪些成员是状态或模型改动声明，并对方法与函数做依赖快照，随后才按顺序求值状态声明。通过检查 `@property` 的返回类型注解（包含 `from __future__ import annotations` 下的字符串注解），框架无需运行未知的 property 代码就能准确认出声明属性。
+- **原因**：pLLM 在分析负载类时，需要在不盲目执行任意用户 getter 代码的前提下，先识别出哪些成员是状态或模型改动声明，并对方法与函数做依赖快照，随后才按顺序求值状态声明。通过检查 `@property` 的返回类型注解（包含 `from __future__ import annotations` 下的字符串注解），框架无需运行未知的 property 代码就能准确认出声明属性。
 
 下面的例子同时展示了“用方法向输入标记传递层号 `self.layer`”和“用带返回类型注解的 `@property` 声明依赖 `self.rank` 的状态”：
 
@@ -204,7 +204,7 @@ print(testing.check(ConfigurableProbe(layer=6, rank=4), CONFIG).passed)
 
 `pllm.Phase` 共有六个枚举值：`BEFORE_FORWARD`、`IN_FORWARD`、`AFTER_FORWARD`、`BEFORE_SAMPLE`、`AFTER_SAMPLE`、`AUTOMATIC`。
 
-它们表示引擎单步时间轴上的**窗口**，而不是运行时触发的回调函数。构建引擎时，`pllm` 把每个方法放进所属窗口，并根据方法之间的数据依赖（例如方法 B 通过 `pllm.result("A")` 读取方法 A 的输出，或读取某块状态的发布版本）自动排出拓扑顺序。
+它们表示引擎单步时间轴上的**窗口**，而不是运行时触发的回调函数。构建引擎时，pLLM 把每个方法放进所属窗口，并根据方法之间的数据依赖（例如方法 B 通过 `pllm.result("A")` 读取方法 A 的输出，或读取某块状态的发布版本）自动排出拓扑顺序。
 
 这也是为什么**一个值只能在产出它的阶段或更晚的阶段被读取**：
 - 当前步的 `pllm.hidden`、`pllm.residual`、`pllm.final_hidden` 只有在模型前向完成后才存在，不能在 `BEFORE_FORWARD` 中读取；
@@ -239,7 +239,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
 
 回到开头的 `Distill` 负载：新请求刚进入解码的第 0 步时，它的 `distiller` 小网络还没有训练过任何一步（更新次数 `version == 0`），此时用随机初值去引导采样只会引入噪声。我们希望“只有当一个请求的状态至少更新过 1 次之后，才对它开启采样引导”。
 
-因为方法体在 CUDA graph 里运行，不能写 `if version > 0:`，也不能动态删减张量的行（那会改变张量形状）。`pllm` 的做法是**行选择器（`rows="方法名"`）**：定义一个读取标记输入、返回一维布尔掩码 `bool [rows]` 的方法，再把方法名传给效果装饰器的 `rows=`。
+因为方法体在 CUDA graph 里运行，不能写 `if version > 0:`，也不能动态删减张量的行（那会改变张量形状）。pLLM 的做法是**行选择器（`rows="方法名"`）**：定义一个读取标记输入、返回一维布尔掩码 `bool [rows]` 的方法，再把方法名传给效果装饰器的 `rows=`。
 
 ```python
 @dataclass(frozen=True)
@@ -379,7 +379,7 @@ print(testing.check_on_gpu(GatedDistill(), GPU_CONFIG, neutral=GatedDistill(beta
 <details>
 <summary>答案</summary>
 
-`class` 定义体执行时还没有实例 `self`，直接写 `beta=beta` 会把类属性的默认值（如 `0.5`）固定进装饰器里，之后构造 `MyWorkload(beta=0.0)` 也不会改变它。应在类里定义方法 `def strength(self) -> float: return self.beta`，并在装饰器里写 `@pllm.guide_sampling(beta=strength)`，让 `pllm` 在绑定该实例时读取 `self.beta`。
+`class` 定义体执行时还没有实例 `self`，直接写 `beta=beta` 会把类属性的默认值（如 `0.5`）固定进装饰器里，之后构造 `MyWorkload(beta=0.0)` 也不会改变它。应在类里定义方法 `def strength(self) -> float: return self.beta`，并在装饰器里写 `@pllm.guide_sampling(beta=strength)`，让 pLLM 在绑定该实例时读取 `self.beta`。
 </details>
 
 3. 想在每步解码时把一个新张量存入每个请求自己的状态里，能不能在普通方法里直接对 `w: torch.Tensor = pllm.parameter("state", "w")` 调用 `w.copy_(new_val)`？为什么？

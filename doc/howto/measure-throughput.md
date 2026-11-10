@@ -2,7 +2,7 @@
 
 在为大语言模型设计推理期算法时（如激活引导、每请求 LoRA、decode 期在线训练 ESamp 或查表内存），我们不仅关心算法带来的算法质量收益，更关心它相对原生基准究竟带来了多少吞吐开销。然而，大模型推理的吞吐测定极其容易受到各种隐匿因素的干扰：早停导致的 token 总量缩水、Python 发射开销带来的虚假落差、预热冷启动干扰、CUPTI 插桩的驱动污染，或者把不同的显存口径混为一谈。
 
-这是一份面向算法研究员与工程师的操作指南。我们将建立一套无偏的基准测试标准，介绍 `pllm` 提供的两组测试工具——通用的 `pllm.benchmark.throughput` 与严格对齐的 `pllm.benchmark.compare`，讲解内置 CLI 基准脚本的参数与用法，以及如何正确解读输出的吞吐、显存与性能分析数据。
+这是一份面向算法研究员与工程师的操作指南。我们将建立一套无偏的基准测试标准，介绍 pLLM 提供的两组测试工具——通用的 `pllm.benchmark.throughput` 与严格对齐的 `pllm.benchmark.compare`，讲解内置 CLI 基准脚本的参数与用法，以及如何正确解读输出的吞吐、显存与性能分析数据。
 
 ---
 
@@ -186,7 +186,7 @@ for res in results:
 
 ## 4. 使用内置 CLI 脚本测定标准算法场景
 
-`pllm` 仓库在 `tools/` 目录下提供了数个维护中的基准测试场景脚本。它们直接封装了 `BenchmarkOptions.parse`，无需编写任何胶水代码即可通过命令行运行：
+pLLM 仓库在 `tools/` 目录下提供了数个维护中的基准测试场景脚本。它们直接封装了 `BenchmarkOptions.parse`，无需编写任何胶水代码即可通过命令行运行：
 
 - **`tools/benchmark_esamp.py`**：测试 ESamp（解码期在线训练小网络并进行采样引导）。默认 rank 4，支持 `--beta` 调节引导强度，显式开启 `require_training=True`；
 - **`tools/benchmark_lora.py`**：测试 Output LoRA。支持 `--scope instance|request|both`（实例共享或每请求私有）、`--rank`、`--max-training-rows`、`--training-fraction` 与 `--state-groups`；
@@ -274,7 +274,7 @@ python -m tools.benchmark_lora --batch 8 --tokens 256 --rounds 3 --scope request
 
 ## 6. 深入分析耗时：为什么 `--profile` 必须在计时后独立重放
 
-当你需要用性能分析器（Profiler）排查内核瓶颈时，可以直接在 CLI 脚本后加上 `--profile DIRECTORY` 参数。`pllm` 在执行 Profiling 时采用了一种特殊的**两阶段机制**：
+当你需要用性能分析器（Profiler）排查内核瓶颈时，可以直接在 CLI 脚本后加上 `--profile DIRECTORY` 参数。pLLM 在执行 Profiling 时采用了一种特殊的**两阶段机制**：
 
 1. **第一阶段：纯净计时**：所有算法臂首先在没有挂载任何 Profiler 的干净环境下跑完所有轮次，输出基准吞吐；
 2. **第二阶段：独立重放与插桩**：重新初始化模型引擎并完成预热，在完全相同的输入与测量轮次下挂载 PyTorch Profiler，并把每个臂的 Chrome trace 存到指定目录下以臂名命名的 `.json` 文件。
@@ -286,7 +286,7 @@ python -m tools.benchmark_lora --batch 8 --tokens 256 --rounds 3 --scope request
 - CUPTI 插桩在 Profiler 的上下文退出之后，仍可能让后续的 CUDA API 调用变慢。
 - 所以先在同一进程里做 Profiling 再测吞吐，测出的吞吐会偏低；边插桩边计时，分析本身的开销也会混进吞吐数字。
 
-因此，`pllm` 始终让纯净计时在前、插桩分析在后。**在编写自己的测试脚本时，也绝对不要在同一个 Python 进程内跑完 Profiler 后再次启动稳态计时比较**。
+因此，pLLM 始终让纯净计时在前、插桩分析在后。**在编写自己的测试脚本时，也绝对不要在同一个 Python 进程内跑完 Profiler 后再次启动稳态计时比较**。
 
 导出的 trace 文件可用 Chrome 浏览器（访问 `chrome://tracing`）或 Perfetto 打开。报告会输出 GPU 真实活跃时间（`gpu_activity_microseconds`）、内核执行总数（`kernel_count`）、CUDA 图发射次数（`cuda_graph_launch_api_count`）以及内存拷贝字节数。注意：trace 中的 API 时间包含主机同步等待，不是纯 CPU 提交时间；重叠执行的内核时间是算术相加的，不等于物理墙钟时间。
 

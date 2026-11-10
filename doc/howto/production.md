@@ -97,10 +97,10 @@ with pllm.make_llm(tp_config, workload=StreamMonitor()) as llm:
 
 ### 运行机制：零跨卡集合通信与错峰发布
 
-张量并行下，vLLM 在每一层注意力与 MLP 之后都必须进行一次全卡同步（Custom All-Reduce）。如果 pllm 自身也引入跨卡集合通信，或者旁路流上的训练计算与 vLLM 的 All-Reduce 产生总线带宽竞争，所有卡都会发生严重停顿。
+张量并行下，vLLM 在每一层注意力与 MLP 之后都必须进行一次全卡同步（Custom All-Reduce）。如果 pLLM 自身也引入跨卡集合通信，或者旁路流上的训练计算与 vLLM 的 All-Reduce 产生总线带宽竞争，所有卡都会发生严重停顿。
 
-为此，pllm 采取两项设计：
-1. **零 pllm 跨卡集合通信**：隐藏状态读取（`pllm.hidden`、`pllm.residual`、`pllm.final_hidden`）、采样引导（`@pllm.guide_sampling`）、Logits 调整（`@pllm.add_logits`）和请求级状态在每个 TP rank 上各存一份完全相同的副本，各卡独立执行相同的确定性计算，彼此不交换数据。
+为此，pLLM 采取两项设计：
+1. **零 pLLM 跨卡集合通信**：隐藏状态读取（`pllm.hidden`、`pllm.residual`、`pllm.final_hidden`）、采样引导（`@pllm.guide_sampling`）、Logits 调整（`@pllm.add_logits`）和请求级状态在每个 TP rank 上各存一份完全相同的副本，各卡独立执行相同的确定性计算，彼此不交换数据。
 2. **流优先级与错峰发布**：将张量并行推理主流设为高优先级（`-1`），旁路训练流设为普通优先级（`0`），并让状态更新在采样前写入、在 token 提交时发布，避免旁路计算与 All-Reduce 撞车。
 
 ### TP > 1 的支持边界
@@ -115,12 +115,12 @@ with pllm.make_llm(tp_config, workload=StreamMonitor()) as llm:
 | **必须设为 TP=1 的特性** | 直接拒绝报错 | `operator="per_head"` 的适配器增量、带优化器或非 `Zeros` / `Computed` 初始化的适配器状态、经 `pllm.causal_model` 的整模型训练、外部状态投喂（`pllm.Fed`）、`@pllm.custom_residual`、`@pllm.custom_attention`（单卡只能看到本地分配的头，无法做全局注意力重写），以及 `pllm.testing.check_on_gpu`（须先在 TP=1 下验证）。 |
 
 > [!IMPORTANT]
-> **TP 不会减少单卡上请求状态的显存占用**：`pllm.explain` 在报告显存时会提示 `reservations are per rank`。张量并行平摊的是底座模型的权重显存，但 pllm 的请求状态在每张卡上均保留完整副本，因此请求状态占用的显存不会随卡数增加而减少。
+> **TP 不会减少单卡上请求状态的显存占用**：`pllm.explain` 在报告显存时会提示 `reservations are per rank`。张量并行平摊的是底座模型的权重显存，但 pLLM 的请求状态在每张卡上均保留完整副本，因此请求状态占用的显存不会随卡数增加而减少。
 
 <details>
 <summary>自测：开启 TP=2 后，为什么单卡上的请求状态显存没有减半？</summary>
 
-因为张量并行切分的是底座模型的投影层权重，而 pllm 为了保证零跨卡通信与确定性执行，在每个 TP rank 上都独立维护一份请求状态副本。因此单卡上的请求状态显存需求保持不变。
+因为张量并行切分的是底座模型的投影层权重，而 pLLM 为了保证零跨卡通信与确定性执行，在每个 TP rank 上都独立维护一份请求状态副本。因此单卡上的请求状态显存需求保持不变。
 </details>
 
 ---
@@ -129,11 +129,11 @@ with pllm.make_llm(tp_config, workload=StreamMonitor()) as llm:
 
 在生产部署中，服务通常使用 FP8、AWQ 或 GPTQ 量化权重以削减显存占用并提升访存受限阶段的 decode 吞吐。
 
-pllm 将量化底座作为一等公民支持：
+pLLM 将量化底座作为一等公民支持：
 1. **模型准入规则相同**：量化检查点遵循与稠密模型相同的家族准入规则（如 Qwen2/2.5、Llama、Qwen3 等，详见[支持矩阵](../reference/support-matrix.md)）。
 2. **LoRA 类增量不反量化底座**：通过 `pllm.model.Adapter` 或 `@pllm.train_in_forward` 施加的权重增量，就像 vLLM 原生对量化模型应用 LoRA 一样，在量化矩阵乘法算子的输出上直接累加高精度（BF16 或 FP32）的修正项 `(x @ A.T) @ B.T`，底座权重全程保持量化状态，不需要在显存中展开为稠密矩阵。
 3. **整模型训练按需反量化**：经 `pllm.causal_model` 训练时，采用类似 QLoRA 的机制：前向使用量化算子计算，反向传播求导时临时对参与计算的权重进行反量化，兼顾显存节省与导数计算。
-4. **物化稠密权重**：在 `@pllm.train_in_forward` 中如果声明读取 `pllm.operand("weight")`，pllm 会在显存中物化出一份稠密的浮点权重副本供方法使用。
+4. **物化稠密权重**：在 `@pllm.train_in_forward` 中如果声明读取 `pllm.operand("weight")`，pLLM 会在显存中物化出一份稠密的浮点权重副本供方法使用。
 
 ---
 
@@ -177,9 +177,9 @@ testing.check_on_gpu(
 ## 显存旋钮与请求抢占（Preemption）
 
 在生产环境中，单卡 GPU 显存主要由四部分构成：
-$$\text{总显存} = \text{底座模型权重} + \text{CUDA Graph 内存池} + \text{pllm 状态与执行工作区} + \text{vLLM KV Cache 块}$$
+$$\text{总显存} = \text{底座模型权重} + \text{CUDA Graph 内存池} + \text{pLLM 状态与执行工作区} + \text{vLLM KV Cache 块}$$
 
-模型权重、CUDA Graph 内存池与 pllm 的状态显存优先分走固定份额，剩下的显存全部归 vLLM 的分页 KV Cache 使用。
+模型权重、CUDA Graph 内存池与 pLLM 的状态显存优先分走固定份额，剩下的显存全部归 vLLM 的分页 KV Cache 使用。
 
 ### 核心显存旋钮
 

@@ -1,4 +1,4 @@
-"""vLLM model runners that host one pllm workload session.
+"""vLLM model runners that host one pLLM workload session.
 
 Runner installs hidden taps and attaches a VllmSession; WorkloadModelRunner is the MRv2 runner class the
 worker instantiates. Used by runtime.py (construction) and pllm.worker.

@@ -238,7 +238,7 @@ class ExplainResult:
             for state in self.states
         )
         lines.append(
-            f"memory   peak {self.peak_memory_bytes} bytes funded by pllm [{self.memory_label}; execution_peak_budget_bytes]"
+            f"memory   peak {self.peak_memory_bytes} bytes funded by pLLM [{self.memory_label}; execution_peak_budget_bytes]"
         )
         if self.overlap_threshold_bytes is not None:
             lines.append(
@@ -766,7 +766,7 @@ def explain_facts(
         _exports(binding, facts),
         _settings(binding, config, plan, facts),
         (
-            "Hidden taps, route math and PositionState are replicated across TP ranks; pllm issues no tensor collectives. PositionState uses each rank's KV budget.",
+            "Hidden taps, route math and PositionState are replicated across TP ranks; pLLM issues no tensor collectives. PositionState uses each rank's KV budget.",
             "GPU fit is decided at make_llm after vLLM allocates; weights, KV cache, vLLM activations and fragmentation are excluded.",
             "Projection and scan BLAS workspace depends on the GPU; affected peaks and overlap thresholds are lower bounds until make_llm.",
             "FLOP and byte estimates use max_num_seqs decode rows, declared-field reads and full-root transitions including optimizer fields, no cache reuse; prompt/model-site costs can differ.",

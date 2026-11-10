@@ -4,7 +4,7 @@ Membership rule: the top level holds the vocabulary for writing a workload (Work
 marker, state types, their init= sources and pllm.Field, optimizers, Phase, UpdateOutput, pllm.scan) and the entry point
 make_llm and explain with ModelConfig and ExecutionOptions. Domain objects live in sub-namespaces: pllm.model (a place in,
 or a change to, the base model's computation), pllm.host (host loops between generate calls), pllm.io (data
-crossing pllm's boundary outside generate's arguments) and pllm.testing (checking and stepping workloads in tests).
+crossing pLLM's boundary outside generate's arguments) and pllm.testing (checking and stepping workloads in tests).
 """
 
 from __future__ import annotations

@@ -144,7 +144,7 @@ class _Run:
         for index, row in enumerate(rows):
             if task.phase is not None and row not in data.step.rows.producer_rows(task.phase):
                 self.failures.append(
-                    f"pllm misrouted request {row.identity.request_id!r} at token {row.token_offset} "
+                    f"pLLM misrouted request {row.identity.request_id!r} at token {row.token_offset} "
                     f"to `{task.symbol}` with tokens={task.phase.value!r}; report a framework phase-selection bug."
                 )
             point = row.identity.request_id, row.token_offset, str(task.symbol)
@@ -444,7 +444,7 @@ def _check_idle_state(
     if execution.math.parameter_phases or len(run.operations) != observed or isinstance(value.batch, StateImport):
         return
     run.failures.extend(
-        f"pllm published request state {resource!r} without running a tensor method; "
+        f"pLLM published request state {resource!r} without running a tensor method; "
         "report a framework tokens= or @pllm.on dispatch bug."
         for resource, ref in versions
         if execution.arena.latest(ref.lineage_id) != ref
@@ -717,11 +717,11 @@ def _fault(reference: _Run, candidate: _Run, point: Point) -> str:
             )
         if changed:
             return (
-                f"pllm misrouted rows before `{key[2]}`: its per-request inputs already differ. "
+                f"pLLM misrouted rows before `{key[2]}`: its per-request inputs already differ. "
                 "Report this message as a framework bug."
             )
     return (
-        "pllm misrouted rows: per-request method outputs agree, but the state, sampler or export destination differs. "
+        "pLLM misrouted rows: per-request method outputs agree, but the state, sampler or export destination differs. "
         "Report this message as a framework bug."
     )
 

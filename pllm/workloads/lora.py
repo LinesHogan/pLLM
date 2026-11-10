@@ -1,7 +1,7 @@
 """Output LoRA: low-rank logits added before sampling, trained by SGD on weighted cross-entropy batches.
 
 The state is shared by all requests (instance scope) or kept per request key (request scope). Training
-batches arrive as `pllm.host.WeightedCEBatch` inputs; pllm runs the SGD steps and publishes the new factors.
+batches arrive as `pllm.host.WeightedCEBatch` inputs; pLLM runs the SGD steps and publishes the new factors.
 """
 
 from collections.abc import Callable, Mapping

@@ -2,7 +2,7 @@
 
 在 PyTorch 或 Hugging Face 中离线训练好探针（probe）、稀疏自编码器（SAE）、超网络（hypernetwork）、LoRA 适配层、引导向量（steering vector）或 n-gram 统计大表后，下一步是将这些权重加载到 `pllm.Workload` 状态中，供 vLLM 连续批处理引擎高效读取或在线训练。
 
-由于现代推理引擎依赖 CUDA Graph 消除 CPU 发射开销，模型执行期间 Python 解释器并不介入。`pllm` 通过声明式的状态初始化（`init=`）在引擎构建期解析张量、静态核算显存并验证契约。本指南提供六种常见场景的加载配方与排查建议。
+由于现代推理引擎依赖 CUDA Graph 消除 CPU 发射开销，模型执行期间 Python 解释器并不介入。pLLM 通过声明式的状态初始化（`init=`）在引擎构建期解析张量、静态核算显存并验证契约。本指南提供六种常见场景的加载配方与排查建议。
 
 ---
 
@@ -161,7 +161,7 @@ print(testing.check(ModuleProbe(), CONFIG).passed)
 3. **工厂函数只能捕获纯数值，不要闭包捕获模块或张量对象**：
    `factory` 只能是一个纯函数或仅引用普通标量（int、float、str）的可调用对象。
    **为什么？**
-   在多进程服务引擎（如多卡张量并行或 `ModelConfig(multiprocessing=True)`）中，负载必须能够在各个独立的 worker 子进程中重新构建（rebuilt in worker processes）并在各子进程的独立 GPU 设备上下文中分配显存。如果工厂函数闭包捕获了父进程创建的 `nn.Module` 实例或 `torch.Tensor`，对象跨进程序列化会导致设备上下文错乱和内存逃逸。`pllm` 的静态代码指纹分析会在分析阶段检测此类闭包，并显式拒绝。
+   在多进程服务引擎（如多卡张量并行或 `ModelConfig(multiprocessing=True)`）中，负载必须能够在各个独立的 worker 子进程中重新构建（rebuilt in worker processes）并在各子进程的独立 GPU 设备上下文中分配显存。如果工厂函数闭包捕获了父进程创建的 `nn.Module` 实例或 `torch.Tensor`，对象跨进程序列化会导致设备上下文错乱和内存逃逸。pLLM 的静态代码指纹分析会在分析阶段检测此类闭包，并显式拒绝。
 
 **自测**：
 在定义 `FromModule` 时，为什么写成 `mlp = MyModule(); init=pllm.FromModule(lambda m: mlp)` 会被拒绝？
@@ -361,7 +361,7 @@ print(pllm.explain(PromptLoRA(), CONFIG).states[0].name)
    - **在线训练的 LoRA（声明了 `optimizer=`）**：
      **不要使用全零初始化（`pllm.Zeros()`）！**
      **为什么？**
-     低秩增量为 $B A$。若 $A$ 和 $B$ 初值同时为 0，反向传播时 $A$ 的梯度正比于 $B^\top = 0$，$B$ 的梯度正比于 $A^\top = 0$。双方梯度全部恒等于 0，优化器永远无法迈出第一步！`pllm` 会在构建期直接拦截并抛出错误。在线训练必须使用 `init=pllm.Computed(...)` 将一个因子（如 $A$）初始化为随机小值、另一个因子（$B$）初始化为 0。
+     低秩增量为 $B A$。若 $A$ 和 $B$ 初值同时为 0，反向传播时 $A$ 的梯度正比于 $B^\top = 0$，$B$ 的梯度正比于 $A^\top = 0$。双方梯度全部恒等于 0，优化器永远无法迈出第一步！pLLM 会在构建期直接拦截并抛出错误。在线训练必须使用 `init=pllm.Computed(...)` 将一个因子（如 $A$）初始化为随机小值、另一个因子（$B$）初始化为 0。
 3. **RequestState vs InstanceState 的执行代价**：
    - 挂载在 `RequestState` 上的 `Adapter`：不同请求在同一个批次中各自读取自己请求副本的因子，**完全保留在 CUDA Graph 内部运行**，没有任何 CPU 调度额外开销。
    - 挂载在 `InstanceState` 上的 `Adapter`：修改的是跨请求全局共享的投影权重，会导致模型前向**退回 eager 模式**运行（详见 [改模型](../guides/model-edits.md)）。
@@ -376,7 +376,7 @@ print(pllm.explain(PromptLoRA(), CONFIG).states[0].name)
 
 ## 常见报错与排查
 
-在加载离线权重时，如果配置违反了上述物理限制，`pllm` 会在启动前明确抛出异常。下表列出常见错误信息及修正方案：
+在加载离线权重时，如果配置违反了上述物理限制，pLLM 会在启动前明确抛出异常。下表列出常见错误信息及修正方案：
 
 | 报错信息 | 产生原因 | 解决办法 |
 | --- | --- | --- |

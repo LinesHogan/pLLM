@@ -56,7 +56,7 @@ def config(directory: Path) -> pllm.ModelConfig:
 
 
 def load_submission(path: Path) -> ModuleType:
-    """Import a candidate through its real module name so pllm can fingerprint its functions."""
+    """Import a candidate through its real module name so pLLM can fingerprint its functions."""
     spec = importlib.util.spec_from_file_location("ai_eval_submission", path)
     if spec is None or spec.loader is None:
         raise ValueError("write submission.py with class Workload")
