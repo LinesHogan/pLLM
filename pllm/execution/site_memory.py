@@ -157,7 +157,8 @@ class SiteMemorySchedule:
                     tracing_mode="fake",
                     _allow_non_fake_inputs=True,
                 )(fields, x, y, count, invariants)
-                function = compile_math(body)
+                # FX module error formatting walks a traceback generator under Dynamo and masks runtime OOMs.
+                function = compile_math(body.forward)
                 result = function(fields, x, y, count, invariants)
                 self._buckets[key] = function
                 return result
