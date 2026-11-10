@@ -158,6 +158,12 @@ class RequestStateDirectory:
         return tuple(s for s in self.states if s.scope is StateScope.INSTANCE)
 
     @property
+    def pinned_states(self) -> tuple[SemanticState, ...]:
+        """Instance states each admitted request pins: an Adapter or ActivationPatch reads its admission version."""
+        reads = self.arena.plan.semantic_graph.admission_reads
+        return tuple(s for s in self.instance_states if s.resource in reads)
+
+    @property
     def active_count(self) -> int:
         return len(self._lineages)
 
@@ -204,7 +210,7 @@ class RequestStateDirectory:
                 for identity in identities
             )
             instances = StateRefs.of(
-                tuple(self.arena.latest(self._lineages[key]) for key in addresses if key.key is None)
+                tuple(self.arena.latest(self._lineages[StateAddress(s.resource, None)]) for s in self.pinned_states)
             )
         write = self.arena.prepare_admission(tuple(str(key.resource) for key in new), stream) if new else None
         pins: list[tuple[RequestIdentity, PagePin]] = []
@@ -282,7 +288,7 @@ class RequestStateDirectory:
             pins: tuple[PagePin, ...] = ()
             leaving: tuple[StateAddress, ...] = ()
         else:
-            pins = tuple(self._inference_pins[identity] for identity in identities) if self.instance_states else ()
+            pins = tuple(self._inference_pins[identity] for identity in identities) if self.pinned_states else ()
             leaving = tuple(key for key in addresses if key.key is not None)
             releasing = tuple(
                 key

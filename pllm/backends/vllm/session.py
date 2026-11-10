@@ -418,7 +418,7 @@ class VllmSession(Generic[DataT, ResultT]):
             pending = tuple(
                 identity
                 for identity in identities
-                if instance_states and not execution.directory.has_inference_pin(identity)
+                if execution.directory.pinned_states and not execution.directory.has_inference_pin(identity)
             )
             if pending:
                 execution.admit(pending, stream)

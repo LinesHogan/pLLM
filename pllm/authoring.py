@@ -20,7 +20,7 @@ from pllm.contracts.host_batch import (
     WeightedRowBatch as WeightedRowBatch,
     map_host_batch as map_host_batch,
 )
-from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline, StateScope
+from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
     attachment_buffer_bytes,
@@ -114,7 +114,7 @@ class BackendWorkload(ABC, Generic[DataT, ResultT]):
             (graph, layouts),
             facts.timeline,
             facts.providers,
-            facts.max_admitted_lineages if any(state.scope is StateScope.REQUEST for state in graph.states) else 1,
+            facts.max_admitted_lineages,
             facts.state_page_budget_bytes,
         )
         return bind_backend_attachment(

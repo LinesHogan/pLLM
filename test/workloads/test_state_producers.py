@@ -19,6 +19,7 @@ from pllm.workloads.state_producers import (
     FactorAdapterWorkload,
     PromptFactorsWorkload,
     PromptMixtureWorkload,
+    seed_factors,
 )
 from test.backend_facts import assert_finite_resources
 
@@ -185,6 +186,32 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
     assert not x.requires_grad and not target.requires_grad
     execution.retire(ids, wait=True)
     assert execution.diagnostics().active_states == 0
+
+
+class InstanceDecodeFactors(DecodeFactorsWorkload):
+    """DecodeFactors with one factor state shared by every request's Adapter."""
+
+    @property
+    def factors(self) -> pllm.InstanceState:
+        return pllm.InstanceState(
+            {"a": pllm.Field(lambda i, o: (self.rank, i)), "b": pllm.Field(lambda i, o: (o, self.rank))},
+            optimizer=self.optimizer,
+            init=pllm.Computed(seed_factors),
+        )
+
+
+def test_requests_admitted_between_writes_keep_their_instance_versions():
+    """Every step writes the shared factors; each request's Adapter keeps reading the version it was admitted with."""
+    execution = deployment(InstanceDecodeFactors()).execution
+    execution.admit_instances()
+    a, b = RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0)
+    for step, rows in enumerate(((a,), (a, b), (a, b), (a, b))):
+        if step < 2:
+            execution.admit(rows[-1:])
+        hidden = {testing.hidden_binding(layer, layer_count=10): torch.randn(len(rows), 4) for layer in (0, 9)}
+        testing.run_step(execution, testing.step_input(rows, hidden, step_id=step, token_offset=step))
+    assert [ref.version_id for r in (a, b) for ref in execution.directory.inference_pin(r).refs] == [0, 1]
+    execution.retire((a, b), wait=True)
 
 
 def test_import_and_write_share_views_and_cancel_private_publication(monkeypatch, device):

@@ -1002,7 +1002,7 @@ class TensorDeclaration:
                 "a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet "
                 "combine with a pllm.model.Adapter; train the adapter's state in that method or use two workloads"
             )
-        self.model_reads(tuple(StateResource(binding.resource) for binding in bindings))
+        self.model_reads(tuple(StateResource(binding.resource) for binding in bindings), at_admission=True)
         self.effects = replace(
             self.effects,
             overlay_bindings=(*self.effects.overlay_bindings, *bindings),
@@ -1012,16 +1012,20 @@ class TensorDeclaration:
 
     def activation_patch(self, bindings: tuple[ActivationPatchBinding, ...]) -> None:
         """Declare activation patches and the model state reads they need."""
-        self.model_reads(tuple(binding.resource for binding in bindings))
+        self.model_reads(tuple(binding.resource for binding in bindings), at_admission=True)
         self.effects = replace(self.effects, activation_bindings=(*self.effects.activation_bindings, *bindings))
 
     def custom_forward(self, task: TaskSymbol) -> None:
         """Select the task that supplies the model's custom forward."""
         self.effects = replace(self.effects, custom_forward=task)
 
-    def model_reads(self, resources: tuple[StateResource, ...]) -> None:
-        """Note states the model forward reads, so planning keeps their versions readable."""
-        self.graph = replace(self.graph, model_reads=tuple(sorted({*self.graph.model_reads, *resources})))
+    def model_reads(self, resources: tuple[StateResource, ...], *, at_admission: bool = False) -> None:
+        """Note states the model forward reads, so planning keeps their versions readable. Reads `at_admission` see
+        the version each request was admitted with, so planning keeps one version per admitted request."""
+        graph = replace(self.graph, model_reads=tuple(sorted({*self.graph.model_reads, *resources})))
+        if at_admission:
+            graph = replace(graph, admission_reads=tuple(sorted({*graph.admission_reads, *resources})))
+        self.graph = graph
 
     @property
     def affects_model(self) -> bool:

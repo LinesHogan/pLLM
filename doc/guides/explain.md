@@ -134,7 +134,7 @@ member  effect  anchor / lane / graph  state reads (origin, distance)
 apply  Adapter  model site or inactive method
   forward eager because apply: CUDA-graph overlays do not support adapters backed by shared InstanceState
 state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-lora  instance  6  90112  540728  field 0: bfloat16, ...
+lora  instance  130  90112  11714616  field 0: bfloat16, ...
 preempt  state keep; replay rejection: not applicable to kept state
 host     0 syncs in traced workload math
 ```

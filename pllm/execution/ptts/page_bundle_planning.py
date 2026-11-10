@@ -132,8 +132,11 @@ class PageBundleProviderFacts:
         elif instance and state.immutable:
             capacity = 1
         elif instance:
-            # Requests admitted before the latest write keep reading the version they pinned at admission.
-            capacity = max(self.minimum_pages, version_capacity(1, history, written=True) + 1)
+            # One lineage, plus the version each admitted request pins when an Adapter or ActivationPatch reads it
+            # (requests keep their admission version). Admitting one request per written step pins distinct
+            # versions; after 1 + history more writes all of them are older than the lineage's own versions.
+            pins = max_admitted_lineages if state.resource in graph.admission_reads else 0
+            capacity = max(self.minimum_pages, version_capacity(1, history, written=True) + pins)
         else:
             capacity = max(
                 self.minimum_pages, version_capacity(max_admitted_lineages, history, written=not state.immutable)

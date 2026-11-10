@@ -87,7 +87,7 @@ def test_reward_head_matches_reward_update_retry_and_control_quorum(
     with pytest.raises(ValueError):  # seven rows exceed max_input_rows
         execution.step(excess, stream)
     assert execution.arena.latest(initial.lineage_id) == initial
-    for _ in range(2):
+    for update in range(2):
         result = execution.step(step, stream)
         if stream is not None:
             stream.synchronize()
@@ -134,13 +134,15 @@ def test_reward_head_matches_reward_update_retry_and_control_quorum(
         )
         for value, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(value, reference)
-    if stream is not None:
-        # The snapshot must be ready for comparison on the caller's default stream.
-        with torch.cuda.stream(stream):
-            torch.cuda._sleep(100_000_000)
-    for value, reference in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
-        torch.testing.assert_close(value, reference, rtol=0, atol=0)
-    execution.arena.wait_release(execution.arena.release_pin(old_pin))
+        if update == 0:
+            # The held initial version is unchanged; release it, since the plan reserves no page for extra pins.
+            if stream is not None:
+                # The snapshot must be ready for comparison on the caller's default stream.
+                with torch.cuda.stream(stream):
+                    torch.cuda._sleep(100_000_000)
+            for value, reference in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
+                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+            execution.arena.wait_release(execution.arena.release_pin(old_pin))
     pending = execution.start_step(step, stream)
     execution.execute_anchor(pending, AnchorId(0))
     execution.cancel_step(pending)

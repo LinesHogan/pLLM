@@ -80,6 +80,7 @@ def page_arena(*, heterogeneous: bool = False) -> PageBundleArena:
                 *plan.semantic_graph.states,
                 SemanticState(StateResource("global_factors"), StateScope.INSTANCE, ()),
             ),
+            admission_reads=(StateResource("global_factors"),),
         )
         plan = replan_states(plan, graph, layouts, 4096)
     return PageBundleArena(plan)

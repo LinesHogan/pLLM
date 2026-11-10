@@ -289,7 +289,7 @@ COW 省的是“同一次更新里没改的字段”。`Distill` 和 `ESamp` 的
 * **读落后版本的可写 `RequestState`**：例如第 2 节的 `Distill`（7B，hidden 3584，`predict` 读 `(boundary, 1)`）：`max_num_seqs=128`、默认 `publish_lag=1` 时，$\text{roots} = 3 \times 128 = \mathbf{384}$，每份 $516,176\text{ B}$，总预留 $198,211,644\text{ B} \approx \mathbf{189\text{ MiB}}$。改成 `publish_lag=0` 后为 $2 \times 128 = 256$ 份（约 126 MiB）。
 * **只读最新版本的可写 `RequestState`**：例如 `ESamp`（$\beta=0$，只有 `loss` 读 `(latest, 0)`）、前向内精确更新（`@pllm.train_in_forward(visibility="exact")`），以及模型前向里读状态的适配器：$H=0$，$\text{roots} = 2 \times \text{max\_num\_seqs}$，与 `publish_lag` 无关。
 * **只读 `RequestState`**：$\text{roots} = (1 + H) \times \text{max\_num\_seqs}$。
-* **`InstanceState`**：可写实例状态按一个槽位计算，再加 1 份：在最近一次写之前接纳的请求会一直读它接纳时的版本，即 $\text{roots} = 1 + H + 1 + 1$（例如 `OverRIDE` 在 `publish_lag=1` 时为 4）；只读实例状态只需 **1 个 root**；由 `pllm.Fed` 供给的状态固定 3 个 root（引擎读一份、一份排队、生产者写下一份）。
+* **`InstanceState`**：可写实例状态按一个槽位计算，即 $\text{roots} = 1 + H + 1$（例如 `OverRIDE` 在 `publish_lag=1` 时为 3）。如果 `pllm.model.Adapter` 或 `pllm.model.ActivationPatch` 读它，每个请求一直读自己准入时的版本，而请求先后准入、中间每步都有写，每个请求留住的版本可能各不相同，所以再加 `max_num_seqs` 份：$\text{roots} = 1 + H + 1 + \text{max\_num\_seqs}$（例如 [explain 指南](../guides/explain.md#一个会退回-eager-的负载共享的-lora) 里的共享 LoRA 在 `max_num_seqs=128` 时为 130）；只读实例状态只需 **1 个 root**；由 `pllm.Fed` 供给的状态固定 3 个 root（引擎读一份、一份排队、生产者写下一份）。
 
 ### 4.2 自动精度选择：什么时候用 BF16，什么时候必须用 FP32？
 

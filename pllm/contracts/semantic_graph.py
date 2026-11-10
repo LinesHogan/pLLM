@@ -235,6 +235,8 @@ class SemanticGraph:
     edges: tuple[SemanticEdge, ...] = ()
     input_groups: tuple[ConditionalInputGroup, ...] = ()
     model_reads: tuple[StateResource, ...] = ()
+    # States an Adapter or ActivationPatch reads at the version each request was admitted with.
+    admission_reads: tuple[StateResource, ...] = ()
     model_results: tuple[TaskSymbol, ...] = ()
     training_mode: TrainingMode | None = None
 
