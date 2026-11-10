@@ -81,12 +81,9 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
         "additional_config": {_BUDGET: config.execution.cuda_graph_pool_budget_bytes or 0},
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
-            # Capture the model's source CUDA operators; the shared region selects overlay kernels.
-            backend=(
-                "eager"
-                if requirements.parameter_targets or requirements.custom_residual or requirements.activation_layers
-                else "inductor"
-            ),
+            # Attention hooks must keep the same source kernels as the vanilla neutral reference.
+            # Inductor fusion can change model rounding even when the FA2 reads are bitwise identical.
+            backend="eager",
             cudagraph_mode=(
                 CUDAGraphMode.FULL_DECODE_ONLY
                 if requirements.stateful_residual or requirements.exact_phases

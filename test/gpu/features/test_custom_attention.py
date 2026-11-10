@@ -62,9 +62,10 @@ def test_attention_contracts(workload, monkeypatch):
             assert mass and all(torch.all((value > 0) & (value <= 1.001)) for value in mass)
 
 
-def test_native_lse_and_selected_oracle():
+@pytest.mark.parametrize("heads,kv_heads,dim", ((14, 2, 64), (28, 4, 128)))
+def test_native_lse_and_selected_oracle(heads, kv_heads, dim):
     torch.manual_seed(41)
-    heads, kv_heads, dim, block = 14, 2, 64, 16
+    block = 16
     cache = torch.randn(16, kv_heads, block, 2 * dim, device="cuda", dtype=torch.bfloat16)
     keys, values = cache.transpose(1, 2).chunk(2, -1)
     table = torch.randperm(16, device="cuda").int().reshape(2, 8)
