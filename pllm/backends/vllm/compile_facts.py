@@ -8,7 +8,6 @@ import torch
 from pllm.backends.vllm.architecture import hidden_binding, kv_rejection
 from pllm.backends.vllm.hidden_taps import HiddenTapLayout
 from pllm.backends.vllm.model_shape import ModelShape
-from pllm.backends.vllm.overlay_graph import graph_mode
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import (
     TOKEN_CAPTURE_CAPABILITY,
@@ -53,7 +52,7 @@ def compile_facts(
     *,
     model_identity: str,
     hidden_layouts: tuple[HiddenTapLayout, ...],
-    overlay_graph_bytes: int,
+    overlay_graph_mode: AttachmentGraphMode,
     memory_bytes: int,
     checkpoint: str = "",
     blas_workspace_bytes: int = 0,
@@ -84,7 +83,7 @@ def compile_facts(
     )
     custom_forward_capabilities = (
         ("model/custom_forward@1", TOKEN_CAPTURE_CAPABILITY)
-        if config.runner == "mrv2" and graph_mode(overlay_graph_bytes) is AttachmentGraphMode.EAGER
+        if config.runner == "mrv2" and overlay_graph_mode is AttachmentGraphMode.EAGER
         else ()
     )
     probe = ModelProbe(
@@ -110,7 +109,7 @@ def compile_facts(
         kv_heads=shape.kv_heads,
         head_dim=shape.head_dim,
         intermediate_size=shape.intermediate_size,
-        graph_mode=graph_mode(overlay_graph_bytes),
+        graph_mode=overlay_graph_mode,
         device_kind=StateDeviceKind.CUDA,
         tensor_dtype=TensorDType(config.dtype),
         max_packed_rows=config.max_num_batched_tokens,
@@ -151,7 +150,6 @@ def compile_facts(
         requirements.sampler_stages,
         requirements.sampler_feedback,
     )
-    required = tuple(value + overlay_graph_bytes for value in required)
     capacity = version_capacity(
         config.max_num_seqs, publish_lag, exact_decode=HiddenPhase.DECODE in requirements.exact_phases
     )

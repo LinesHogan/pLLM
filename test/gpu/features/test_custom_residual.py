@@ -26,7 +26,6 @@ CONFIG = pllm.ModelConfig(
     # These tiny schedules need little KV; leave room for the resident FP32 oracle on a 24 GiB GPU.
     gpu_memory_utilization=0.2,
     cuda_graphs=False,
-    execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20),
 )
 # The largest per-token logprob gap of bf16 vLLM to an FP32 oracle over these prompts: one near-tie dominates it, so it
 # varies by GPU (0.24 on an RTX 4090, 0.06 on an A100) while a wrong residual update moves logprobs by more than 1.

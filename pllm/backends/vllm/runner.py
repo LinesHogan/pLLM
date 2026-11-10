@@ -44,6 +44,7 @@ from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.sampler import GuidedSampler, SamplerGuidance
 from pllm.backends.vllm.session import VllmSession
 from pllm.config import RunnerName
+from pllm.contracts.backend_attachment import AttachmentGraphMode
 from pllm.contracts.codec import decode_boundary
 from pllm.contracts.kv_layout import KVLayout
 from pllm.execution.position_state import PositionAnnouncement
@@ -86,7 +87,7 @@ class Runner:
             return
         self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)
 
-    overlay_graph_bytes: int = 0
+    overlay_graph_mode: AttachmentGraphMode = AttachmentGraphMode.EAGER
     workload_session: VllmSession[Any, Any] | None = None
 
     def attach_workload(

@@ -203,7 +203,7 @@ class ExplainResult:
                 )
                 if task.capture_resident_bytes:
                     lines.append(
-                        f"  CUDA-graph pool reservation: {task.capture_resident_bytes} bytes [workload estimate or cuda_graph_pool_budget_bytes]"
+                        f"  CUDA-graph pool reservation: {task.capture_resident_bytes} bytes [planned capture residency; cuda_graph_pool_budget_bytes caps the pool]"
                     )
                 if task.estimate is not None:
                     estimate = task.estimate
@@ -647,11 +647,21 @@ def _specialize(
     try:
         funded, binding = workload.specialize(facts, config.execution)
     except ValueError as error:
-        if config.execution.execution_peak_budget_bytes is None and not config.execution.state_page_budget_bytes:
+        if (
+            config.execution.execution_peak_budget_bytes is None
+            and not config.execution.state_page_budget_bytes
+            and config.execution.cuda_graph_pool_budget_bytes is None
+        ):
             raise
         # If the declaration is invalid independently of a budget, this raises its own error again.
         funded, binding = workload.specialize(
-            facts, replace(config.execution, execution_peak_budget_bytes=None, state_page_budget_bytes=0)
+            facts,
+            replace(
+                config.execution,
+                execution_peak_budget_bytes=None,
+                state_page_budget_bytes=0,
+                cuda_graph_pool_budget_bytes=None,
+            ),
         )
         errors = (str(error),)
     return (
@@ -670,10 +680,10 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
 
     Declared pretrained state files are read and validated on CPU.
 
-    Memory excludes base-model weights, KV cache and vLLM activations. GPU fit is decided by make_llm.
+    Memory excludes base-model weights, KV cache and vLLM model-graph/activation pools. GPU fit is decided by make_llm.
     A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.
     """
-    from pllm.backends.vllm.admission import admit_workload, model_cuda_graph_pool_budget_bytes, model_hooks
+    from pllm.backends.vllm.admission import admit_workload, model_hooks
     from pllm.backends.vllm.compile_facts import compile_facts
     from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
     from pllm.backends.vllm.model_shape import ModelShape
@@ -690,9 +700,9 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
         config,
         model_identity=shape.architecture,
         hidden_layouts=layouts,
-        overlay_graph_bytes=model_cuda_graph_pool_budget_bytes(config, requirements)
+        overlay_graph_mode=AttachmentGraphMode.CUDA_GRAPH
         if model_hooks(requirements) and not reason
-        else 0,
+        else AttachmentGraphMode.EAGER,
         memory_bytes=1 << 60,
     )
     return explain_facts(workload, config, shape, facts, layouts)
@@ -754,7 +764,7 @@ def explain_facts(
         ),
         _taps(binding, facts, layouts),
         plan.schedule.peak_memory_bytes,
-        "per-rank tensor reservations; excludes GPU-dependent BLAS workspace",
+        "per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace",
         threshold,
         inline_peak,
         (*specialization_errors, *errors),

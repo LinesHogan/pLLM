@@ -317,7 +317,9 @@ class TensorExecutor:
 
     def resident(self, capture_bytes: int) -> int:
         """Reserve graph residency for a captured body."""
-        return 0 if self.capture is None else capture_bytes
+        if self.capture is None:
+            return 0
+        return capture_bytes + 8 * self.table_size
 
     def warmup(
         self,

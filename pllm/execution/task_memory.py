@@ -411,11 +411,14 @@ def derive_resources(
                     "LM head; to add logits directly, use @pllm.add_logits."
                 )
         # Model overlays capture bounded tiles, not their whole maximum-shape operation.
-        required = operation.resident(usage.capture) if task is not None else 0
-        required_capture = max(required_capture, required)
-        resident = operation.resident(
-            options.cuda_graph_pool_budget_bytes or required or options.model_cuda_graph_pool_budget_bytes
-        )
+        required = operation.resident(usage.capture)
+        if task is not None:
+            required_capture = max(required_capture, required)
+        resident = required
+        if options.cuda_graph_pool_budget_bytes is not None:
+            resident = min(
+                options.cuda_graph_pool_budget_bytes, operation.resident(options.cuda_graph_pool_budget_bytes)
+            )
         shapes = operation.input_shapes(
             facts.probe.max_packed_rows if symbol in binding.model_site_tasks else len(data.rows),
             facts.probe.hidden_size,

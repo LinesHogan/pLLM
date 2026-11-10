@@ -53,11 +53,16 @@ class ExecutionOptions:
     33,737 at K=256, 34,069 at K=1024 and 32,624 with dense guidance. Policy p99.9 TV
     was about 6e-14 with 100% shared-Gumbel draw agreement on those measured corpora.
     These measurements do not guarantee that other workloads fit the capacity.
+
+    Capture pools are automatic unless cuda_graph_pool_budget_bytes sets a cap.
+    Tensor tasks reserve their traced requirements; vLLM owns its model-graph pool,
+    whose measured allocation is checked against an explicit cap after capture.
+    explain reports task funding and excludes vLLM model-graph/activation pools.
     """
 
     # Host-fed training rows per state per step; decode rows are separate.
     max_host_training_rows: int = 1
-    # Per task/model CUDA-graph pool; None derives task reservations from tracing.
+    # Optional cap per task/model CUDA-graph pool; None sizes tasks from tracing and lets vLLM own model capture.
     cuda_graph_pool_budget_bytes: int | None = None
     # PTTS device state pages; zero uses backend-observed free capacity.
     state_page_budget_bytes: int = 0
@@ -72,11 +77,6 @@ class ExecutionOptions:
     # Peaked full-vocabulary rows use their true nucleus. None opts out to exact dense.
     # Unsupported runners/heads select exact dense automatically.
     guidance_capacity: int | None = 4096
-
-    @property
-    def model_cuda_graph_pool_budget_bytes(self) -> int:
-        """Model CUDA-graph pool budget: explicit pool budget or 64 MiB before backend overlay allowances."""
-        return self.cuda_graph_pool_budget_bytes or 64 << 20
 
     def __post_init__(self) -> None:
         if self.guidance_capacity is not None and self.guidance_capacity not in (

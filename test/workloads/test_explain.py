@@ -172,7 +172,8 @@ def test_guidance_width_is_checked_at_build(model_config):
         pllm.explain(_NarrowGuide(), model_config)
 
 
-def test_esamp_attribution_and_budget_fallback(model_config):
+@pytest.mark.parametrize("budget", ("state_page_budget_bytes", "cuda_graph_pool_budget_bytes"))
+def test_esamp_attribution_and_budget_fallback(model_config, budget):
     workload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
     report = pllm.explain(workload, model_config)
     members = {member.name: member for member in report.members}
@@ -196,9 +197,7 @@ def test_esamp_attribution_and_budget_fallback(model_config):
     )
     assert failed.budget_errors and "max_num_batched_tokens" in str(failed)
     assert failed.peak_memory_bytes == report.peak_memory_bytes
-    state_failed = pllm.explain(
-        workload, replace(model_config, execution=pllm.ExecutionOptions(state_page_budget_bytes=1))
-    )
+    state_failed = pllm.explain(workload, replace(model_config, execution=pllm.ExecutionOptions(**{budget: 1})))
     assert state_failed.budget_errors
 
 

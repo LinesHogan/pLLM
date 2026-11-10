@@ -837,7 +837,7 @@ def probe_backend(
         config,
         model_identity=runner.decoder.identity,
         hidden_layouts=runner.hidden_layouts,
-        overlay_graph_bytes=runner.overlay_graph_bytes,
+        overlay_graph_mode=runner.overlay_graph_mode,
         memory_bytes=free_bytes,
         blas_workspace_bytes=blas_workspace_bytes(),
         checkpoint=checkpoint_directory(config.model, config.revision) if requirements.checkpoint_names else "",

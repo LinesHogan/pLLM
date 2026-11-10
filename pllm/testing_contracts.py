@@ -19,7 +19,7 @@ from pllm.backends.vllm.compat import admit_parallel
 from pllm.backends.vllm.compile_facts import compile_facts
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
-from pllm.contracts.backend_attachment import AttachmentHiddenResource, BackendAttachment
+from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentHiddenResource, BackendAttachment
 from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
@@ -780,7 +780,7 @@ def contract_facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape,
         replace(config, max_num_seqs=3, max_num_batched_tokens=15),
         model_identity=shape.architecture,
         hidden_layouts=(),
-        overlay_graph_bytes=0,
+        overlay_graph_mode=AttachmentGraphMode.EAGER,
         memory_bytes=1 << 40,
         checkpoint=checkpoint_directory(config.model, config.revision) if requirements.checkpoint_names else "",
     )

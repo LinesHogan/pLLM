@@ -26,7 +26,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.admission import model_cuda_graph_pool_budget_bytes, model_hooks
+from pllm.backends.vllm.admission import model_hooks
 from pllm.backends.vllm.architecture import DecoderBody, bind_model
 from pllm.backends.vllm.parameter_overlay import capacities, uniform_decode
 from pllm.config import ModelConfig
@@ -37,7 +37,7 @@ from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.cuda_graph import conditional_graph_pool
 from pllm.execution.torch_private import compilation_cleanups, cuda_graph_pool_bytes, release_compilation
 
-_BUDGET = "pllm_pinned_projection_v2_bytes"
+_BUDGET = "pllm_model_graph_pool_cap_bytes"
 _OVERLAY_GRAPHS = CUDAGraphMode.FULL_AND_PIECEWISE
 
 
@@ -78,7 +78,7 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
     # Conditional subgraphs own library scratch; all decode counts share one capacity.
     sizes = (capacity,) if HiddenPhase.DECODE in requirements.exact_phases else capacities(capacity)
     return {
-        "additional_config": {_BUDGET: model_cuda_graph_pool_budget_bytes(config, requirements)},
+        "additional_config": {_BUDGET: config.execution.cuda_graph_pool_budget_bytes or 0},
         "compilation_config": CompilationConfig(
             mode=CompilationMode.VLLM_COMPILE,
             # Capture the model's source CUDA operators; the shared region selects overlay kernels.
@@ -97,11 +97,6 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
             max_cudagraph_capture_size=capacity,
         ),
     }
-
-
-def graph_mode(budget: int) -> AttachmentGraphMode:
-    """Describe only the intervention placement; ESamp's external tasks remain unchanged."""
-    return AttachmentGraphMode.CUDA_GRAPH if budget > 0 else AttachmentGraphMode.EAGER
 
 
 class _HybridGraphManager(compat.CudaGraphManager):
@@ -140,13 +135,17 @@ class OverlayGraphRunner(compat.ModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
         self.projection_model: DecoderBody | None = None
-        self.overlay_graph_bytes = _graph_budget(vllm_config)
+        self.overlay_graph_budget_bytes = _graph_budget(vllm_config)
         self._compile_cleanups: tuple[int, ...] = ()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
         self.decoder = bind_model(self.model)
-        if graph_mode(self.overlay_graph_bytes) is AttachmentGraphMode.CUDA_GRAPH:
+        if (
+            _BUDGET in _additional_config(self.vllm_config)
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            self.overlay_graph_mode = AttachmentGraphMode.CUDA_GRAPH
             self.projection_model = self.decoder.model.model
             self.projection_model.do_not_compile = True
 
@@ -228,7 +227,7 @@ class OverlayGraphRunner(compat.ModelRunner):
         finally:
             self._compile_cleanups += tuple(compilation_cleanups() - cleanups)
         used = cuda_graph_pool_bytes(pool, self.device.index or 0) - before
-        if used > self.overlay_graph_bytes:
+        if self.overlay_graph_budget_bytes and used > self.overlay_graph_budget_bytes:
             raise ValueError(
                 f"CUDA graphs of the adapted model need {used} bytes; raise ExecutionOptions.cuda_graph_pool_budget_bytes"
             )

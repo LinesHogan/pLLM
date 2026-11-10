@@ -35,6 +35,8 @@ R = TypeVar("R")
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkOptions:
+    """Aligned benchmark settings; capture and state pages size themselves unless explicitly capped."""
+
     model: str = "Qwen/Qwen2.5-0.5B-Instruct"
     batch: int = 8
     tokens: int = 256
@@ -42,8 +44,8 @@ class BenchmarkOptions:
     warmup: int = 1
     gpu_memory_utilization: float = 0.25
     profile: Path | None = None
-    cuda_graph_pool_budget_bytes: int = 256 * 1024**2
-    state_page_budget_bytes: int = 256 * 1024**2
+    cuda_graph_pool_budget_bytes: int | None = None
+    state_page_budget_bytes: int = 0
     execution_peak_budget_bytes: int | None = None
     sampling_n: int = 16  # completions per prompt, as in the aligned throughput settings
     cuda_graphs: bool = True  # --eager switches every arm and its vanilla reference to eager execution
@@ -73,14 +75,13 @@ class BenchmarkOptions:
         parser.add_argument(
             "--cuda-graph-pool-budget-mib",
             type=int,
-            default=256,
-            help="CUDA-graph pool budget per tensor task and for model capture",
+            help="optional CUDA-graph pool cap per tensor task and for model capture; default: automatic",
         )
         parser.add_argument(
             "--state-page-budget-mib",
             type=int,
-            default=256,
-            help="PTTS device state-page budget for timing and profile reconstruction",
+            default=0,
+            help="PTTS device state-page budget; default: backend-observed free capacity",
         )
         parser.add_argument(
             "--execution-peak-budget-mib",
@@ -101,7 +102,7 @@ class BenchmarkOptions:
             args.warmup,
             args.gpu_memory_utilization,
             args.profile,
-            args.cuda_graph_pool_budget_mib * 1024**2,
+            None if args.cuda_graph_pool_budget_mib is None else args.cuda_graph_pool_budget_mib * 1024**2,
             args.state_page_budget_mib * 1024**2,
             None if args.execution_peak_budget_mib is None else args.execution_peak_budget_mib * 1024**2,
             sampling_n=args.sampling_n,
@@ -111,19 +112,12 @@ class BenchmarkOptions:
         return options, args
 
     def __post_init__(self) -> None:
-        if (
-            min(
-                self.batch,
-                self.tokens,
-                self.rounds,
-                self.warmup,
-                self.sampling_n,
-                self.cuda_graph_pool_budget_bytes,
-                self.state_page_budget_bytes,
-            )
-            < 1
-        ):
+        if min(self.batch, self.tokens, self.rounds, self.warmup, self.sampling_n) < 1:
             raise ValueError("positive batch, tokens, rounds, warmup and capture/state capacities required")
+        if self.cuda_graph_pool_budget_bytes is not None and self.cuda_graph_pool_budget_bytes < 1:
+            raise ValueError("cuda_graph_pool_budget_bytes must be positive or None for automatic sizing")
+        if self.state_page_budget_bytes < 0:
+            raise ValueError("state_page_budget_bytes must be nonnegative; use 0 for automatic sizing")
 
     def model_config(self) -> ModelConfig:
         return ModelConfig(
