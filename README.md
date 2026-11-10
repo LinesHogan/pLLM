@@ -70,9 +70,9 @@ with pllm.make_llm(config, workload=ESampLite()) as llm:
     outputs = llm.generate(["Explain gradient descent:"] * 8, SamplingParams(n=16, max_tokens=256))
 ```
 
-真实硬件上的吞吐开销如何？[教程 03](doc/tutorials/03_decode_training.ipynb) 在单张 RTX 4090 上测了同样结构的负载（Qwen2.5-0.5B，8 个 prompt × 16 个样本 × 256 token，vLLM 0.27.1）：只在线训练不引导采样时，吞吐与原生 vLLM 相同（该次运行达到 100%）；同时开启训练与引导采样时，吞吐仍保持在原生的 97%。
+真实硬件上的吞吐开销如何？[教程 03](doc/tutorials/03_decode_training.ipynb) 在单张 RTX 4090 上测了同样结构的负载（Qwen2.5-7B-Instruct，bf16，8 个 prompt × 16 个样本 × 256 token，vLLM 0.32.0，CUDA graph，预热 1 轮后 3 轮取中位数）：只在线训练不引导采样时，吞吐是原生 vLLM 的 98%；同时开启训练与引导采样时，是原生的 97%。
 
-此外，[示例 08](doc/examples/08_inplace_ttt.ipynb) 在同一张卡上以 eager 模式跑一个 4B 的 In-Place TTT 社区检查点（每个请求一份随 token 更新的快权重）：单个请求、prompt 4096 / 16384 token 时，pLLM 是 61.61 / 42.91 token/s，官方 Hugging Face 实现是 53.89 / 34.20 token/s；官方实现一次只能跑一个请求，pLLM 同时跑 4 个请求合计 123.76 token/s。
+此外，[示例 08](doc/examples/08_inplace_ttt.ipynb) 在同一张卡上跑一个 4B 的 In-Place TTT 社区检查点（每个请求一份随 token 更新的快权重；vLLM 0.32.0，CUDA graph 开启，贪心生成 256 token，预热 1 轮后 3 轮取中位数）：单个请求、prompt 4096 / 16384 token 时，pLLM 是 59.64 / 42.27 token/s，官方 Hugging Face 实现按同样协议是 54.79 / 34.89 token/s；官方实现一次只能跑一个请求，pLLM 同时跑 4 个请求合计 111.38 token/s。
 
 ## 能做什么
 
