@@ -1,28 +1,24 @@
 # 参数覆盖层：顺着 PyTorch 的抽象层往下走
 
-在单卡的 PyTorch 脚本里，给一个线性投影层加一点“私货”是全世界最容易的事。
+在单请求的 PyTorch 研究脚本里，修改一个线性层的权重是再直接不过的事。如果要给权重矩阵 $W$ 加上一个稠密增量 $\Delta W$，只需写下 `y = x @ (W + delta).T`；如果要挂接一对低秩适配器（LoRA），也不过是多写一次乘法：`y = x @ W.T + (x @ A.T) @ B.T`。研究代码的舒服之处在于，它默认世界上只有一个请求，张量形状规整，权重就放在显存里，随时可以读取或原地修改。
 
-如果你要加一个稠密的权重增量 $\Delta W$，一行矩阵乘就够了：`y = x @ (W + delta).T`。如果你要挂一对低秩适配器（LoRA），也不过是多写一次乘法：`y = x @ W.T + (x @ A.T) @ B.T`。在研究者的笔记本里，权重就摆在那里，形状规规矩矩，你想读就读，想改就改。
+但一旦把这个需求放进生产级推理引擎（如 vLLM），问题就立刻变得棘手起来。
 
-但只要你试着把这行代码搬进像 vLLM 这样的生产级推理引擎，平静的水面下立刻会浮出两座冰山。
+首先是**多租户并发下的异构读取**。在像 Text-to-LoRA 这类按输入实时生成适配器的算法里，或者当外部系统为不同会话导入各自的稠密权重增量时，同时在线的 128 个请求拥有 128 份彼此不同的参数。连续批处理（continuous batching）会把这 128 个请求的输入拍扁并首尾相接，拼成同一张二维张量 `[num_tokens, hidden_size]` 送进模型的线性层（见[《行模型》](04-packed-rows.md)）。当这张张量流经某一层 MLP 的 `down_proj` 时，第 0 行需要乘请求 A 的增量，第 1 行需要乘请求 B 的增量，而第 2 到 33 行可能属于正在做预填充（prefill）的请求 C。
 
-第一座冰山是**成百上千个请求各怀心事**。像 Text-to-LoRA 这类方法会为每一个请求实时生成一份专属的 LoRA 权重；或者外部系统会给每个请求导入一份独立的稠密增量。当 128 个请求被连续批处理（continuous batching）拍扁并拼成同一个二维张量 `[num_tokens, hidden_size]`，冲进同一层 MLP 的 `down_proj` 时，第 0 行需要乘张三的增量，第 1 行需要乘李四的增量，第 2 到 33 行又属于正在做预填充（prefill）的王五。
+更进一步的挑战是**在前向传播的同时在线更新权重**。以 In-Place TTT（*In-Place Test-Time Training*）为例，它没有往 Transformer 里引入新的序列混合层，而是直接把选定层 MLP 的下投影矩阵 `down_proj` 当作每个请求私有的“快权重（fast weights）”。模型在消费上下文的同时，每攒够一个固定长度的块（例如 `chunk_size = 1024` 个 token），就根据当前块的中间激活 $Z$ 与目标投影 $V$ 计算一次外积更新：
 
-第二座冰山更陡峭：**在模型前向传播的半路上直接训练权重**。
+$$\Delta W \leftarrow \Delta W + \eta \cdot V^\top Z$$
 
-以 ByteDance Seed 提出的 In-Place TTT（*In-Place Test-Time Training*）为例。传统的 Transformer 把上下文记忆全部塞进 KV cache，而 In-Place TTT 干了一件很酷的事：它不往模型里加新层，而是直接把选定层 MLP 的最后一个投影矩阵 `down_proj` 当作可写的“快权重（fast weights）”。模型一边读入 token，每攒够一个固定大小的块（比如 1024 个 token），就当场算一次外积更新：
+这类算法对执行次序有一条硬性要求：**在同一趟前向传播中，后一个块必须立即读到前一个块刚刚更新完的权重**。
 
-$$\Delta W = \eta \cdot V^\top Z$$
-
-其中 $Z$ 是进入 `down_proj` 前的中间激活，$V$ 是由 MLP 输入经过一层一维卷积与线性投影算出的目标。最要命的是它的可见性铁律：**在同一趟前向传播里，后一个块必须立刻读到前一个块刚刚更新完的权重**。
-
-如果你去翻 In-Place TTT 的官方开源仓库，它基于 Hugging Face 的 `generate` 循环写成，而在推理入口处静静地躺着这样一行断言：
+去翻看 In-Place TTT 的官方开源实现（基于 Hugging Face 的 `generate` 循环），会在推理入口处看到这样一行断言：
 
 `assert len(input_ids) == 1, "only support bs=1 for TTT inference"`
 
-我完全理解官方作者为什么要写这行 `assert`。当每个请求都有自己的一套 570 MiB 快权重、每个请求的更新边界落在不同的位置、有的请求在 prefill 里一口气跨过四个块、有的请求在 decode 里刚好吐出凑满第 1024 个位置的那个 token，还要同时兼顾 CUDA Graph 录制与多卡张量并行（Tensor Parallelism，TP）时——如果你让算法作者自己去写批处理切片、页表寻址、图捕获与跨卡同步，那篇论文的代码大概永远也写不完。
+这行断言非常诚实地反映了算法研究与服务系统之间的鸿沟。当每个请求各自维护着几百兆的快权重、各个请求的块边界落在不同位置、同一个批次里既有跨越多块的长 prefill 又有单步推进的 decode，并且还得兼容 CUDA Graph 静态录制与多卡张量并行（Tensor Parallelism，TP）时，如果让算法作者用裸 PyTorch 手写批处理切片、页表寻址、反向求导和跨卡同步，几行就能写完的数学更新公式会膨胀成数千行脆弱的工程代码。
 
-我们希望算法作者写出来的代码是什么样的？翻开 `pllm/workloads/inplace_ttt.py`，核心的 `step` 方法长这样：
+在 pLLM 中，算法作者实际编写的 In-Place TTT 核心更新函数 `step` 是这样的：
 
 ```python
 # check-docs: skip: excerpt from pllm/workloads/inplace_ttt.py
@@ -55,39 +51,35 @@ def step(
     return delta + update, inputs @ delta.to(inputs.dtype).T
 ```
 
-仔细看这个函数的参数签名。它接收的只是“**一个请求**的快权重增量 `delta`”、“**一个块**的输入 `inputs` 与目标 `targets`”，返回的也只是“更新后的 `delta`”和“这一块输入在旧权重下读出的修正量 `inputs @ delta.T`”。
+观察 `step` 的签名：它接收的是**单个请求**的快权重增量 `delta`、**单个块**的输入 `inputs` 与目标 `targets`，返回的也只是更新后的 `delta` 以及当前块在旧权重下的修正输出 `inputs @ delta.T`。代码里没有 batch 维度，没有请求槽位索引，也没有任何关于 CUDA Graph 或多卡切分的逻辑。
 
-这里没有 batch 维，没有请求 ID，没有分页池的槽号，甚至感知不到自己脚下是一张显卡还是四张显卡。它纯粹得就像从论文算法框图里直接拓印下来的数学公式。
+怎样在不改动作者这一处单请求数学公式的前提下，让它在高并发、开启 CUDA Graph、甚至跨越多张 GPU 的推理引擎里正确高效地运行？
 
-怎么在不改动作者哪怕一行公式的前提下，让这个“单请求、单块”的玩具般的函数，无缝跑在 128 并发、开启 CUDA Graph、甚至跨越多张 GPU 的 vLLM 引擎里？
-
-答案不是去手搓几千行专用的 C++/CUDA 内核。事实上，**为了实现整套参数覆盖层（Parameter Overlays），我们没有写哪怕一个专用算子内核**。我们所做的，是顺着 PyTorch 自己的抽象阶梯一层一层往下走。每当我们撞上一堵系统工程的墙，恰好都能在 PyTorch 现有的工具箱里找到一件趁手的兵器：
+实现这套参数覆盖层（Parameter Overlays）并不需要从头编写专用的 C++/CUDA 内核——事实上，覆盖层的数学部分没有一个专用的手写内核，只复用了 PTTS 通用的分页拷贝内核（量化底座另需一个通用的反量化内核）。我们的做法是顺着 PyTorch 自身的抽象层往下走：把“单请求语义与多租户引擎”之间的差距拆解成五个正交的系统问题，让每一层 PyTorch 原生变换各自解决其中一个问题。
 
 ```text
-Author's Code:  step(delta, inputs, targets)   <-- Pure single-request, single-chunk math
+Author's Math:  step(delta, inputs, targets)   <-- Written for 1 request, 1 chunk
   │
-  ├─► Layer 1: torch.func.vmap                 <-- Maps 1 request to N concurrent requests
-  ├─► Layer 2: Bounded index_select + bmm      <-- Amortizes 128-request grouped projection reads
-  ├─► Layer 3: torch.library.custom_op         <-- Crosses into vLLM's compiled CUDA Graph via table.data_ptr()
-  ├─► Layer 4: grad ──► vmap ──► torch.compile <-- Generates per-chunk backward without mixing BF16 reductions
-  └─► Layer 5: make_fx (Global vs. Shard)      <-- Proves TP>1 updates need zero extra cross-GPU communication
+  ├─► 1. torch.func.vmap                 <-- Vectorizes single-request math across a batch
+  ├─► 2. Bounded index_select + bmm      <-- Amortizes grouped weight reads in continuous batching
+  ├─► 3. torch.library.custom_op         <-- Enters vLLM's compiled CUDA Graph via table.data_ptr()
+  ├─► 4. grad ──► vmap ──► torch.compile <-- Generates per-chunk backward without mixing BF16 reductions
+  └─► 5. make_fx (Global vs. Shard)      <-- Proves TP>1 updates require zero extra communication
 ```
 
-让我们从只有一个请求的世界出发，每次往里加一个真实世界的麻烦，看看这五层抽象是怎么严丝合缝地咬合在一起的。
-
-> **实验环境说明**：除特别注明外，文中所有性能与显存数据均在单张 NVIDIA RTX 4090（24 GiB）、vLLM 0.32.0、CUDA Graph 开启下测得。In-Place TTT 实验使用社区 4B 检查点 `zhongweixie/inplace-ttt-qwen3-4b-32k-ttt`（36 层，第 0、6、12、18、24、30 层的 `down_proj` 为 `[2560, 9728]` 快权重，块长 1024，学习率 3.0），贪心解码生成 256 个 token，1 轮预热后取 3 轮中位数，吞吐定义为“生成 token 总数 / 含 prefill 的整次 `generate` 耗时”；官方基线使用 `ByteDance-Seed/In-Place-TTT` 仓库基于 Hugging Face `generate`（BF16 + FlashAttention 2）在同一张 RTX 4090 上按相同协议测得。量化底座反量化数据测自 A100（80 GiB）上的 14B GPTQ 模型。
+下面我们从最简单的单请求前向出发，逐一引入真实服务环境里的五道约束，看每一层抽象为什么必须长成现在的样子。
 
 ---
 
-## 第一关：从 1 个请求到一批请求——让 `vmap` 替作者操心
+## 一、 从单个请求到一批请求：用 `vmap` 隔离批处理维度
 
-只有一个请求的时候，什么魔法都不用施展：拿这个请求的权重，调作者写的函数。
+如果系统里永远只有一个请求，框架只需取出该请求的参数张量，直接调用作者写的函数即可。
 
-但当线上同时跑着两个、十个、一百个请求时呢？每个请求都有自己独立的一份参数（比如在状态池里各自占着一行展平的向量 `flat`），而模型传过来的激活张量也是按行打包好的。如果我们要求作者在写代码时自己去对齐“第 $i$ 行激活乘第 $r(i)$ 号请求的第 $k$ 个参数矩阵”，那不仅枯燥，而且几乎是一切多租户串味 bug 的温床（见[《在 serving 引擎里信任一段用户程序》](02-trusting-user-programs.md)）。
+一旦进入多请求并发环境，每个请求各自持有一份独立的参数，而模型传来的激活张量则是按行拼在一起的。如果把 batch 维度直接暴露给作者，要求作者自己去写批量矩阵乘或张量索引，不仅容易写错维度，还会带来隐患：一旦作者不小心在 batch 维（第 0 维）上做了归约或归一化，不同租户的数据就会互相污染（见[《在 serving 引擎里信任一段用户程序》](02-trusting-user-programs.md)）。
 
-怎么让一段只认识“单行、单份参数”的代码，自动学会处理一整批请求？
+要让一段只针对“单行、单份参数”编写的代码自动扩展到一批请求，同时从构造上禁止跨请求的数据混合，最直接的工具是函数式向量化变换 `torch.func.vmap`。
 
-在函数式编程里，这个操作叫 `map`；在 PyTorch 2 里，它叫 `torch.func.vmap`。当作者在方法里调用一个绑定在请求状态上的 `nn.Module` 小网络时，框架在底层用 `ModuleCall`（`pllm/execution/module_graph.py`）悄悄给它包了一层外壳：
+当用户在负载中调用一个绑定在请求状态上的 `nn.Module` 时，`pllm/execution/module_graph.py` 中的 `ModuleCall` 会将模块调用包在如下变换中：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/module_graph.py
@@ -105,25 +97,24 @@ def _run(self, module: torch.nn.Module, prefix: str, args: tuple[torch.Tensor, .
     return vmap(row)(self._flat, *args) if self._per_row else call(self._flat, *args)
 ```
 
-我特别喜欢 `row` 里面的那行注释：“模块看到的是由一行组成的 batch，和在普通 PyTorch 代码里一模一样。”
-
-看它是怎么工作的：`_views` 把属于单个请求的那条扁平参数向量 `flat` 切分并重塑回模块各个参数的原始形状，然后用 `functional_call` 把无状态的算子逻辑和这组参数拼在一起。在 `row` 函数里，我们给输入 `arg` 轻轻加上一个长度为 1 的伪 batch 维（`unsqueeze(0)`），算完再把它捏掉（`squeeze(0)`）。最后，`vmap(row)` 在最外层大笔一挥，沿着请求维把所有算子自动向量化。
-
-作者以为自己在写 `bs=1` 的玩具代码，而底层发出去的已经是合并后的批量算子。
+这里的逻辑分为三步：
+1. 每个请求的参数在底层被展平存放在连续的一维切片 `flat` 中；`_views` 将这片一维内存重新切分并还原为模块各个权重张量的原始形状，交给 `torch.func.functional_call` 进行无状态调用。
+2. 在内部函数 `row` 中，输入激活被临时加上一个长度为 1 的首维（`unsqueeze(0)`），执行完模块前向后再将该维度去掉（`squeeze(0)`）。因此，对模块内部的代码而言，它看到的永远是一个 `batch_size = 1` 的标准输入。
+3. 最外层的 `vmap(row)` 沿着请求维度将该单行函数自动映射为批量算子。作者无需感知并发请求的存在，而底层发出的依然是合并后的张量运算。
 
 ---
 
-## 第二关：128 个请求挂在同一个投影上——用分块 `bmm` 摊薄读取
+## 二、 连续批处理下的分组投影：用定长分块 `bmm` 摊薄权重读取
 
-`vmap` 解决了同构函数的批量映射。但在连续批处理的模型前向内部，只读覆盖层（或者固定读起始状态的 `visibility="forward_pinned"`）还会遇到一个更骨感的几何难题。
+`vmap` 解决了“每行输入对应一份独立参数”的同构调用。但在连续批处理的模型前向内部，只读覆盖层（或固定读取本步起始权重的 `visibility="forward_pinned"`）会遇到一个更具体的访存效率问题。
 
-想象一下，vLLM 正在跑一步混合了 chunked prefill 和 decode 的前向：128 个请求共享同一个 `down_proj` 层，但每个请求挂载着不同的权重增量（或者各自驻留在 PTTS 状态池的不同物理槽位里，见[《PTTS：给每个请求一块会“长版本”的显存》](01-ptts.md)）。其中请求 A 正在做 prefill，一口气占了 80 行；请求 B、C、D 正在做 decode，每人只占 1 行。
+在推理引擎的同一个执行步里，不同请求占用的行数往往是不均匀的：正在做分块预填充（chunked prefill）的请求 A 可能一口气占了 80 行，而正在做解码（decode）的请求 B、C、D 各自只占 1 行。所有这些行共享同一个基座线性层，但每个请求的权重增量（稠密矩阵 $\Delta W$、低秩因子对 $A, B$ 或按头的增量）各自驻留在不同槽位里。这些槽位由底层的 **PTTS（Paged Tensor Transition System，分页张量状态迁移系统）** 统一管理（详见[《PTTS：给每个请求一块会“长版本”的显存》](01-ptts.md)；顺便说明一句，PTTS 开头的 P 指的是 Paged，即像操作系统虚拟内存与 vLLM 的 PagedAttention 那样做分页与页表管理，和 pLLM 名字里代表 programmable 的 p 没有关系）。
 
-这就是臭名昭著的“批内分组矩阵乘（Grouped GEMM）”。如果你用 `for` 循环给每个请求单独发射一次小矩阵乘，128 个请求就是 128 个微小的 kernel，CPU 发射开销会直接把 GPU 拖垮；如果你为每一行输入都去状态池里单独拷一份权重矩阵出来做 `bmm`（Batch Matrix Multiplication），那么请求 A 的 80 行明明用的是同一份权重，你却把那块权重矩阵在显存里重复搬运了 80 遍！
+在 GPU 上执行这种“不同行乘不同权重”的计算，本质上是一个分组矩阵乘（Grouped GEMM）问题。如果采取最天真的两种做法，都会撞上硬件瓶颈：
+* **做法一：按请求循环，为每个请求单独发射一次矩阵乘。** 当批次里有 128 个 decode 请求时，一次线性投影就会碎裂成 128 个极小的 kernel，CPU 发射开销与小网格的低占用率会严重拖慢执行。
+* **做法二：为每一行输入都从状态池里单独 gather 一份权重，拼成 `[num_tokens, ...]` 做一次批量矩阵乘（`torch.bmm`）。** 这样虽然只有一个 kernel，但对于占了 80 行的 prefill 请求 A 来说，同一份权重矩阵会被重复从显存读取并拷贝 80 遍，白白烧掉显存带宽。
 
-怎么在不写定制 CUDA 内核的前提下，既不让 kernel 数量爆炸，又不做愚蠢的重复搬运？
-
-我们在 `pllm/execution/parameter_projection.py` 里用了一个极其朴素的“定长分块装车”策略：
+要在不编写定制 CUDA 内核的前提下兼顾这两头，关键在于让读取粒度与计算阶段对齐：`pllm/execution/parameter_projection.py` 采用了按请求定长分块（bounded blocks）的策略。
 
 ```text
 Packed Hidden [Rows, H]         Bounded Blocks [Blocks, Count, H]       Pinned Pools
@@ -139,7 +130,7 @@ Packed Hidden [Rows, H]         Bounded Blocks [Blocks, Count, H]       Pinned P
                                 Scattered back to [Rows, Out] via owners mask
 ```
 
-规则只有两句话：我们把属于同一个请求的连续行切分成固定宽度 `count` 的小块（`blocks`）。如果当前步全是单行 decode（`rows <= requests`），每块宽度就是 `1`；只要混入了多行 prefill，每块宽度就设为常数 `ROWS_PER_BLOCK = 32`。每一个块只需要从分页池里抽取**一份**权重矩阵（或一对低秩的 A/B 因子），然后所有块一起跑一次标准的 `torch.bmm`：
+具体而言，我们将属于同一个请求的连续输入行切分为固定宽度 `count` 的块（`blocks`）。如果当前步全部是单行 decode（`rows <= requests`），块宽 `count` 就取 `1`；只要批次中混入了多行 prefill，块宽就固定为常数 `ROWS_PER_BLOCK = 32`（块内不足 32 行的尾部补齐并在写回时掩码清零）。这样，每个 32 行的块只需从状态页池里抽取**一次**权重，就把权重的显存读取成本平摊给了块内的 32 个 token：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/parameter_projection.py
@@ -159,37 +150,27 @@ def projection_read(
     return (result.index_select(0, owners.clamp_min(0)).masked_fill((owners < 0)[:, None], 0),)
 ```
 
-这段代码总共只有五句话，用的全是 PyTorch 现成的 `index_select`、`bmm` 和 `masked_fill`：
-1. 用 `rows` 索引把打散的隐藏状态 `hidden` 捞出来，排成规整的三维张量 `[blocks, count, hidden_size]`；
-2. 用 `slots` 索引从状态页池 `pools` 里为每个块捞出一份权重；
-3. 调 `parameter_correction(..., batched=True)` 做一次批量矩阵乘，把 prefill 时读取一次权重的带宽成本平摊给块内的 32 个 token；
-4. 用 `owners` 索引把算好的修正量贴回原始的行位置，顺手把凑块用的无效填充位置（`owners < 0`）涂成 `0`。
+这段实现完全由标准 ATen 原语（`index_select`、`bmm`、`masked_fill`）组成，为了配合静态图捕获，总块数 `blocks` 会在初始化时按 2 的幂次分档（`capacities`）预先编译与热身。
 
-为了能录进静态形状的图里，块数会按 2 的幂次分档（`capacities`）预先热身。
+这里需要做一笔诚实的横向对比。如果你的生产场景只需要同时服务成百上千个**只读、静态**的 LoRA 适配器，像 S-LoRA、Punica 以及 vLLM 原生内置的 multi-LoRA 拥有专门手写的分组 GEMM 内核（如基于 Punica BGMV / SGMV 的定制算子），它们能够在算子内部直接根据指针数组寻址不同 rank 的因子并支持 QKV 融合，省去了显式的 `index_select` 权重聚集。在纯静态只读的 multi-LoRA 场景下，专用内核比我们这套 `index_select + bmm` 更快、功能也更完备。
 
-当然，天下没有免费的午餐，我们得老老实实把账算清楚：**如果你在生产环境里唯一的需求就是同时服务成百上千个只读的 LoRA，我们这套 `index_select + bmm` 肯定不如专门的分组矩阵乘快。** 像 S-LoRA、Punica 以及 vLLM 自带的 multi-LoRA，底层都有手写的分组 GEMM 内核（比如基于 cutlass 或 Triton 的 SGMV / BGMV），不仅省掉了显式的权重 gather 拷贝，还能直接处理不同 rank 混排和 QKV 融合。如果你只需要部署静态只读的 LoRA，请直接用 vLLM 原生的 multi-LoRA。
-
-我们之所以选择用纯 ATen 算子搭这套分块读取，看中的是它的**正交性与通用性**：同一套五行的 `projection_read`，不改一字就能同时通吃稠密矩阵增量、低秩因子对和按注意力头的增量；更重要的是，它直接读取 PTTS 的版本化页池——这意味着它读到的权重可以是在线训练出来的、带版本的、甚至在生成中途随时更新的。
+`projection_read` 选择用短短五行标准算子来构建，换取的是**对状态形态与演化的通用性**：同一套代码不加修改即可同时支持稠密矩阵增量（`dense`）、低秩因子对（`low_rank`）和按注意力头的增量（`per_head`）；更重要的是，它的源张量直接来自版本化的分页状态池——这意味着被读取的权重可以是在线训练实时更新的、具有多版本并发隔离的活状态。
 
 ---
 
-## 第三关：钻进 CUDA Graph——再用一次“地址即身份”
+## 三、 跨越编译与 CUDA Graph 边界：用张量地址充当会话身份
 
-现在，我们的投影读取要把手伸进 decode 阶段了。
+有了分块读取逻辑，下一步是让它进入 vLLM 的稳态解码图。
 
-在[《Python 只在录制时活着》](03-whole-algorithm-in-cuda-graphs.md)里我们已经领教过 CUDA Graph 的厉害：为了省掉 CPU 逐个发射 kernel 的微秒级开销，vLLM 会把整个模型的前向过程录制成一张静态图。录制一旦结束，Python 解释器就退场了；每次回放时，GPU 只会机械地按录制时的固定内存地址去读数据。
+正如我们在[《Python 只在录制时活着》](03-whole-algorithm-in-cuda-graphs.md)中所讨论的，vLLM 会使用 `torch.compile`（Dynamo）追踪模型前向，并将解码步录制成静态的 CUDA Graph。在图回放期间，Python 解释器完全不参与执行，GPU 内核只能访问录制时绑定好的固定显存地址。然而，在连续批处理中，每一步里哪些请求在场、每个请求当前应该读取哪个物理页槽（`slots`），是每步都在变化的。
 
-这给我们出了个难题：在每一步 decode 里，第 0 行可能换成了另一个请求，或者同一个请求的快权重刚刚升到了新版本（槽号从 `Slot 2` 变成了 `Slot 5`）。既然回放时不能向 CPU 发问，GPU 怎么知道当前步去哪个槽位拿权重？
+解决地址固定的办法依然是“加一层间接表”：每个目标投影层挂载的 `ProjectionReader` 持有一张地址固定不变的 `int64` 设备索引表 `table`。在每一步图回放之前，CPU 将当前步算好的 `slots`、`rows` 和 `owners` 异步拷入 `table`；图内的算子只对着固定地址的 `table` 和固定地址的状态页池 `pools` 寻址。
 
-答案依然是那张贯穿全系列的“固定地址 `int64` 小表”。在每一步发射图之前，CPU 把当前步算好的块槽号 `slots`、行号 `rows` 和归属映射 `owners` 统统打包写进一张地址永远不变的设备张量 `table` 里。
+但要把这段读取逻辑放进 `torch.compile` 追踪的模型图里而不引发图断裂（graph break），我们必须将它注册为一个不透明的 PyTorch 自定义算子 `@torch.library.custom_op`。这会立刻撞上我们在[《图内挂载点》](05-in-graph-attach-points.md)中也遇到过的同一个编译器约束：
 
-但要想让 vLLM 的编译器（Dynamo / Inductor）乖乖把我们的读取逻辑录进整模型图，还得跨过一道关卡：我们必须把它包装成一个不透明的自定义算子 `@torch.library.custom_op`。
+`custom_op` 的函数签名只允许传递 `Tensor` 和基础标量（`int`, `float` 等），不能直接传入 Python 层的 `ProjectionReader` 对象。如果改成传一个整数编号 `reader_id: int` 去全局字典里查找呢？在单次脚本里可行，但在 vLLM 里不行——因为 Dynamo 编译出的计算图（包括持久化的编译缓存）会把传入的整数标量当作编译期常量直接烘焙（bake in）进生成的代码里，导致不同引擎会话或重绑定的实例在复用编译图时查到错误的整数 ID。
 
-这就撞上了我们在[《图内挂载点》](05-in-graph-attach-points.md)里遇到过的同一个窘境：PyTorch 的 `custom_op` 契约极其严格，它的参数列表只允许传张量（`Tensor`）和基本标量（`int`/`float`），绝不允许传自定义的 Python 对象（比如管理这层投影状态的 `ProjectionReader` 实例）。你可能会想：“那我给每个 `ProjectionReader` 分配一个整数编号 `reader_id`，当成标量传进去去全局字典里查不就行了？”
-
-不行。因为 vLLM 的编译图（包括 AOT 编译缓存）会把传入的标量参数当成编译期常数直接烘焙（bake）进图里！如果你传整数 ID，编译器就会把它焊死在图里，在不同会话之间张冠李戴。
-
-怎么只靠传张量，就能在算子内部认出“我是哪一层的哪个 `ProjectionReader`”？我们在 `pllm/backends/vllm/parameter_overlay.py` 里重施故技——**拿那张索引表张量 `table` 的显存首地址当身份证**：
+既然标量会被当成常量焊死，而输入 `Tensor` 不会被焊死，我们就可以利用张量自身携带的一个唯一整数：**它在 GPU 显存中的物理起始地址 `table.data_ptr()`**。
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/parameter_overlay.py
@@ -207,19 +188,17 @@ def pinned_projection(
     _READERS[table.data_ptr()].emit(hidden, desired, pools, table, output, captured, desired_capture)
 ```
 
-每一个 `ProjectionReader` 在初始化时都会分配一张自己专属的 `table` 张量，并在关闭（`close()`）之前一直死死攥着它的所有权，绝不让 PyTorch 的显存分配器把这个地址回收复作他用。然后，它把 `self.table.data_ptr()`——也就是这块显存的 64 位整数地址——作为键，把自己注册进全局字典 `_READERS`。
-
-当 `pinned_projection` 被调用时，对 Dynamo 编译器来说，`table` 只是一个再普通不过的运行时输入张量，图结构干干净净，没有任何标量特化；而在算子内部，`table.data_ptr()` 瞬间就能在 `_READERS` 里找回对应的 `ProjectionReader` 实例，发射出刚刚那套 `projection_read` 算子序列。
+每个 `ProjectionReader` 在创建时分配自己专属的 `table` 张量，并在整个会话生命周期内持有它的引用（直到 `close()` 时才释放并注销）。只要张量不释放，CUDA 分配器就不会把这块物理地址分给其他张量。在初始化时，reader 以 `self.table.data_ptr()` 为键将自己登记到全局字典 `_READERS` 中；当 `pinned_projection` 在图内被调用时，编译器看到的 `table` 只是一个普通的运行时张量输入，而在算子内部，一次 `.data_ptr()` 查找就能准确找回对应的 `ProjectionReader` 实例。
 
 ---
 
-## 第四关：在前向里边走边训——`grad`、`vmap` 与 `compile` 的洋葱顺序
+## 四、 在前向传播中求导：`grad`、`vmap` 与 `compile` 的组合次序
 
-到目前为止，权重还只是被读取。现在我们要揭开最刺激的部分：**在前向传播的过程中直接训练这些权重。**
+解决了图内读取，接下来看更核心的问题：如果权重需要在模型前向传播的半路上按块（chunk）在线训练，反向传播和批量更新该怎么组织？
 
-在 pLLM 里，前向内训练有两种写法。第一种像文章开头的 In-Place TTT，作者直接手写状态转移公式 `return delta + update, readout`；第二种更省心，作者连更新公式都不用推，只需要给状态配一个优化器（在 `RequestState` 上写 `optimizer=pllm.SGD(self.learning_rate)`），然后在 `@pllm.train_in_forward` 修饰的方法里只写出**每一行的损失函数（loss）**。
+在 pLLM 中，前向内训练（`@pllm.train_in_forward`）支持两种声明方式。第一种如开篇的 In-Place TTT，作者直接写出从 `(旧权重, 块输入)` 到 `(新权重, 块读出)` 的显式更新算式；第二种则允许作者给状态绑定一个优化器（如 `optimizer=pllm.SGD(self.learning_rate)`），在方法体里只写前向的逐行损失函数（loss），把求导和参数更新全部交给框架。
 
-来看看 `pllm/workloads/prefill_adapters.py` 里的 `PrefillAdaptersWorkload`。它在阅读长 prompt 的过程中，每隔 128 个 token（一个 chunk）就在第 0、2、4、6、8 层的 `down_proj` 上实时训练一对低秩适配器 `a` 和 `b`，目标是让这层输出尽可能重构出指定目标 `target`，并在 prompt 读完时立刻把尾部不满一块的梯度也刷进去（`flush="prompt_end"`）：
+例如在 `pllm/workloads/prefill_adapters.py` 的 `PrefillAdaptersWorkload` 中，模型在阅读长 prompt 时，每隔 128 个 token 就在第 0、2、4、6、8 层的 `down_proj` 上实时训练一对低秩因子 `a` 和 `b`，以最小化该层输出对目标的均方重构误差，并在 prompt 结束时将尾部不满一块的梯度也刷入权重（`flush="prompt_end"`）：
 
 ```python
 # check-docs: skip: excerpt from pllm/workloads/prefill_adapters.py
@@ -245,9 +224,7 @@ def learn(
     return (prediction.to(dtype) - target.to(dtype)).square().mean(-1)
 ```
 
-看，作者只写了三行求均方误差的前向数学。那反向求导呢？多请求批处理呢？算子融合编译呢？
-
-全都在 `pllm/execution/overlay_task.py` 的 `overlay_gradient` 里，由三层 PyTorch 变换像剥洋葱一样套起来完成：
+作者只写了三行计算误差的前向代码。为了把它变成一个能同时对多个请求的块求梯度并融合执行的内核，`pllm/execution/overlay_task.py` 中的 `overlay_gradient` 将三个 PyTorch 变换按严格的次序组合在一起：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/overlay_task.py
@@ -264,61 +241,53 @@ def overlay_gradient(function: Callable[..., torch.Tensor], *, batched: bool = F
         # Folding requests into the frozen-base GEMM changes CUDA's BF16 reduction.
         # Compile the chunks together while retaining each source GEMM's shape.
         eager = torch.vmap(eager, in_dims=(0, 0, None, 0), chunk_size=1)
-    compiled = torch.compile(
+    compiled = torch.compile(  # pyright: ignore[reportUnknownMemberType]
         eager, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
     )
 ```
 
-盯着这不到二十行代码看一会儿，里面藏着两个只有真正在 GPU 上踩过坑才会明白的细节。
+这段不到二十行的代码里，有两个非常关键的技术细节：
 
-第一个细节是**洋葱的顺序**：为什么必须是先 `torch.func.grad`，再 `torch.vmap`，最后 `torch.compile`？
-因为 `torch.func.grad` 要求被求导的函数输出一个**标量（scalar）**。在单个请求内部，我们用 `valid` 掩码把属于当前块的有效行挑出来求和（`sum()`），变成一个标量 loss，这样 `grad(loss)` 就能干净地算出这一个请求的参数梯度。接着，外层的 `vmap` 把这个“单请求求梯度”的函数沿着请求维铺开，并且通过 `in_dims=(0, 0, None, 0)` 告诉 PyTorch：参数、输入操作数和有效掩码是每个请求各有一份的（沿第 0 维切开），唯独第三个参数 `constants`——也就是那块冻结的底座权重 `base`——是所有人共享的（`None`，直接广播，绝不复制！）。最后，最外层的 `torch.compile` 把展开后的整套前向 + AOTAutograd 反向图一口气编译融合。
+第一，**为什么变换次序必须是 `grad` 在最里层、`vmap` 在中间、`torch.compile` 在最外层？**
+`torch.func.grad` 要求被求导的函数必须返回一个标量（scalar）。在 `loss` 函数内部，我们针对单个请求的一个块，用 `valid` 掩码滤除填充行后求和（`.sum()`），得到该请求的标量损失，再由 `torch.func.grad(loss)` 生成单请求的参数梯度函数。随后，中间层的 `torch.vmap` 沿着请求维度将该梯度函数向量化，并通过 `in_dims=(0, 0, None, 0)` 指定：每个请求的参数 `parameters`、激活操作数 `operands` 与掩码 `valid` 按第 0 维切分，而第三个参数 `constants`（即模型冻结的基座权重 `base`）设为 `None`——直接跨请求广播共享，绝不在显存里复制基座权重。最后，最外层的 `torch.compile`（AOTAutograd + Inductor）将展开后的前向与反向图一起编译融合。
 
-第二个细节更加微妙，就在 `torch.vmap(..., chunk_size=1)` 那行注释里：**既然用了 `vmap`，为什么还要加一个看似自废武功的 `chunk_size=1`？**
+第二，**既然已经用了 `vmap` 做批处理，为什么要显式传一个 `chunk_size=1`？**
+注意看代码里的注释。在 `learn` 函数中包含一项基座矩阵乘 `x @ base.T`。对于单个请求，输入 `x` 的形状是 `[C, H]`；如果让默认的 `vmap` 把 $B$ 个请求的输入沿着行维彻底折叠进同一个矩阵乘里，送给 cuBLAS 的左矩阵形状就会变成 `[B * C, H]`。
+在实数代数上，矩阵乘的每一行互不相干，拼成 `[B * C, H]` 算和按 `[C, H]` 算完全等价；但在 GPU 的浮点数实现里并非如此。当 GEMM 的 $M$ 维（行数）从 $C$ 变成 $B \times C$ 时，cuBLAS 的启发式选择器往往会切换到另一个分块（tile）尺寸不同的内核，导致内部 BF16 乘累加的归约顺序发生改变。这会让同一个请求在“单独运行”和“与其他请求同批运行”时算出微小的梯度差异，破坏多租户引擎严格要求的批次大小不变性（batch invariance）。加上 `chunk_size=1` 后，每个请求针对共享基座 `base` 的 GEMM 保持了各自原本的 `[C, H]` 形状，而外层依然处在同一个 `torch.compile` 图内统一编译，在守住逐请求数值一致的同时消除了 Python 循环开销。
 
-我们在做逐请求与批处理的数值对齐测试时，曾抓到一个诡异的幽灵：在 `learn` 函数里有一句 `x @ base.T`，用来算冻结底座权重的输出。如果让 `vmap` 放开手脚把 $B$ 个请求的输入全折进同一次矩阵乘里，输入形状就会从 `[C, H]` 变成 `[B * C, H]`。按理说，矩阵乘的每一行是独立的，拼在一起算和分开算应该一模一样对吧？
+### 设计取舍：跨步分块时的“最小割重计算”与“梯度累加”
 
-在数学上是的，但在 GPU 的 cuBLAS 库里不是！当矩阵的 M 维（行数）从 `C` 变成 `B * C` 时，cuBLAS 的启发式算法会挑选另一个分块（tile）尺寸不同的内核，导致内部 BF16 乘累加的归约顺序发生细微改变。于是，同一个请求在单跑时和跟别人拼批跑时，算出来的梯度在最后几个比特上出现了漂移！加上 `chunk_size=1` 之后，`vmap` 在面对共享底座 `base` 的 GEMM 时会保持每个请求原本的 `[C, H]` 形状，而在外层依然被 `torch.compile` 放在同一个编译图里一起优化——既保住了逐请求比特级一致的铁律，又没丢掉编译融合。
+在把 `overlay_gradient` 放进连续批处理时，还有一个棘手的跨步生命周期问题：一个训练块（例如 `chunk = 128` 或 `1024` 个 token）通常不会在同一个引擎步里一次到齐。在分块预填充时，它可能分两步到达（每步 64 个 token）；到了解码阶段，更是每一步只到达 1 个新 token。只有当攒满整个 `chunk` 时，优化器才能真正执行一次权重更新。
 
-### 一段插曲：那个被我们留在设计稿里的“最小割”方案
+那么，在块还没攒满的中间这几步里，系统应该在显存里保存什么？
 
-聊到这里，我还想跟你坦白一个我们在设计“跨步攒块训练”时放弃掉的漂亮点子。
+一个从编译器视角看非常诱人的思路是：把跨越多步的一个 chunk 看作**“一次被拉长到多步的联合前向与反向”**。PyTorch 的 AOTAutograd 内部配有一个最小割重计算分割器（`min_cut_rematerialization_partition`），它能自动分析前向与反向图之间的张量依赖，求出一个最小割，决定哪些中间激活值得保存下来传给反向、哪些激活不如在反向时重算。如果让这个分割器对单行计算图做切分，决定每一步到达的 token 需要把哪些切口上的中间张量存进 PTTS 页池，等攒满整个 chunk 的那一步再统一运行反向传播，在概念上似乎极其优雅。
 
-在连续批处理里，一个块（比如 128 或 1024 个 token）往往不是在同一步里到齐的。可能第 1 步分块 prefill 来了 64 个 token，第 2 步又来了 64 个 token，到了 decode 阶段更是每步只蹦出 1 个 token。只有当攒满一整块（或者遇到 `flush="prompt_end"`）时，优化器才能真正迈出一步，更新权重。
+但只要审视一下块内训练的数学前提，就会发现有一条简单得多的路。
 
-当初在设计这个机制时，我们脑子里蹦出了一个极具编译器美感的方案：既然一块数据分好几步才到齐，那我们能不能把这几步看成**“一次被拉长到多步的前向 + 反向”**？
+由于在同一个 chunk 尚未攒满之前，该请求对外可见的快权重是**固定不变**的，每一行输入对权重的损失函数都是独立可加的：
 
-具体来说，PyTorch 的 AOTAutograd 内部有一个非常聪明的最小割重计算分割器（`min_cut_rematerialization_partition`）。当你把前向和反向的联合计算图交给它时，它会自动求一个最小割，决定前向算出来的哪些中间激活值得保存下来传给反向，哪些激活太占显存、不如留到反向时重算。我们当时设想：让这个最小割分割器来决定每一步到达的行需要保存哪些中间张量，而 pLLM 只负责把这些切口上的张量存进 PTTS 的状态页里，等攒满一块的那一步再统一跑反向图！
+$$\nabla_\theta \sum_{i=1}^{C} \ell(x_i; \theta) = \sum_{i=1}^{C} \nabla_\theta \ell(x_i; \theta)$$
 
-这个方案写进设计文档时，我们自己都觉得太酷了：“分割器决定存什么，PTTS 决定存在哪、存多久。”
+这意味着，“先把每一步到达的行的中间激活存起来、等攒满 $C$ 行再一起求一次导”，与**“每一步直接对刚刚到达的这几行求导、把算出的梯度累加进状态池的待提交梯度字段（`_pending_grad_*`）里、等攒满 $C$ 行时直接用累加好的总梯度走一步优化器”**，在数学上是严格等价的。后者就是最标准的**梯度累加（Gradient Accumulation）**。
 
-但冷静下来一算账，我们决定**不做它**。
-
-为什么？看看块内训练的数学结构就知道了：在一个块还没攒满之前，请求的快权重是**固定不变**的。既然权重在块内不变，那么“把每步到达的行存起来、等凑满一整块再一起求梯度”，和“**每步对刚刚到达的这几行直接求梯度，把算出来的梯度累加进 PTTS 的 `_pending_grad_*` 字段里，等攒满一块时直接拿累加好的总梯度做一次优化器更新**”，在数学上是 100% 严格等价的！
-
-后者有一个大家耳熟能详的名字，叫**梯度累加（Gradient Accumulation）**。
-
-如果走跨步最小割分割器的路线，我们需要动用 PyTorch 的私有内部 API，在代码库里多维护两三百条语句的图切分与跨步张量生命周期胶水；而走梯度累加路线，AOTAutograd 的最小割分割器依然在为我们工作，只不过它只需要安静地待在**每一步自己的 `torch.compile` 内部**决定保存还是重算，跨步留存的只有形状永远固定、跟参数一模一样的梯度张量。
-
-“如无必要，勿增实体。”先用最简单且数学等价的做法把问题解决掉，把那个华丽的跨步分割器留在设计稿里——直到某天真的出现一个块内行与行之间在激活层互相耦合、无法拆成梯度累加的算法为止。
+如果走跨步激活分割的路线，不仅需要依赖 PyTorch 私有的内部图分割接口、多维护几百条语句的跨步激活页生命周期管理，而且当块很大（如 `chunk = 1024`）时，跨步保存几百上千行的中间激活会消耗大量显存。而采用梯度累加，AOTAutograd 的最小割分割器依然在工作，只不过它只需要安静地待在**每一步自己的 `torch.compile` 内部**处理当步的临时激活；跨步留存下来的，只有形状永远固定、与参数大小完全一致的梯度张量。当简单的数学等价已经能把问题彻底解掉时，没有必要引入更复杂的编译器机制。
 
 ---
 
-## 第五关：张量并行（TP > 1）——用 `make_fx` 双图同构当证明器
+## 五、 张量并行（TP > 1）：用 `make_fx` 双图同构证明“零通信”
 
-现在，让我们把难度调到最高档：如果模型太大，单张显卡装不下，我们用 `tensor_parallel_size=2` 或 `4` 把模型切开放在多张 GPU 上跑，覆盖层还能工作吗？
+当基座模型增大到单卡显存不够宽裕时，服务引擎会开启张量并行（如 `tensor_parallel_size = 2` 或 `4`），将线性层的权重矩阵切分到多张 GPU 上。此时参数覆盖层面临的问题是：如果我们在多卡上运行，读写和更新这些增量权重会不会引入昂贵的跨卡集合通信（`all-reduce` / `all-gather`）？
 
-先看只读（或者读取当前生效权重）的那一半。以 MLP 的 `down_proj` 为例，在 vLLM 里它是一个行并行线性层（`RowParallelLinear`）：如果输入特征总宽度是 $H$，那么在 TP=2 下，0 号卡只持有左半边输入 $x_0$ 和左半边权重 $W_0$，1 号卡只持有右半边输入 $x_1$ 和右半边权重 $W_1$。每张卡各自算出部分和 $y_j = x_j W_j^\top$，然后 vLLM 调用一次跨卡的 `all-reduce` 把它们加起来，得到完整输出 $y = \sum_j x_j W_j^\top = x W^\top$。
+先看**读取**路径。以最常挂载覆盖层的 MLP `down_proj` 为例，它在 vLLM 中是一个行并行线性层（`RowParallelLinear`）：设输入特征总宽度为 $H$，在 TP=$P$ 下，第 $j$ 张卡只持有输入激活的第 $j$ 个特征分片 $x_j \in \mathbb{R}^{\text{rows} \times (H/P)}$ 和基座权重的对应列分片 $W_j \in \mathbb{R}^{\text{out} \times (H/P)}$。每张卡先独立算出局部矩阵乘 $x_j W_j^\top$，随后由 vLLM 发起一次跨卡 `all-reduce` 求和。
 
-这时候如果要加上请求专属的稠密增量 $\Delta W$（或者低秩增量 $B A$），我们需要额外加一次跨卡通信吗？
+由于矩阵乘法在被收缩的特征维上天然满足分配律：
 
-完全不需要！因为矩阵乘法在线性代数上对被收缩的特征维是天然可加的：
+$$x(W + \Delta W)^\top = \sum_{j=0}^{P-1} x_j (W_j + \Delta W_j)^\top = \sum_{j=0}^{P-1} \left( x_j W_j^\top + x_j \Delta W_j^\top \right)$$
 
-$$x (W + \Delta W)^\top = \sum_j x_j (W_j + \Delta W_j)^\top = \sum_j \left( x_j W_j^\top + x_j \Delta W_j^\top \right)$$
+只要我们也把稠密增量 $\Delta W$（或低秩因子对 $B A$ 中右边的输入侧因子 $A$）沿着同样的特征维 $H$ 切分成 $\Delta W_j$，让每张卡在 vLLM 执行那次 `all-reduce` **之前**，把本地算出的修正量 $x_j \Delta W_j^\top$ 加到基座的局部和上，修正量就能直接搭上 vLLM 原本那次 `all-reduce` 的顺风车完成跨卡归约，不需要增加任何一次额外的跨卡通信！（对于像 `q_proj`、`k_proj`、`v_proj` 或 `gate_proj`、`up_proj` 这样的列并行线性层 `ColumnParallelLinear`，输入 $x$ 是全卡复制的，而输出特征维被切分，因此沿着输出维切分 $\Delta W$ 或低秩左因子 $B$ 同样天然免通信。）
 
-只要我们也把稠密增量 $\Delta W$（或者低秩因子里的输入侧矩阵 $A$）按输入特征维切成两半，让每张卡在 vLLM 发起那次 `all-reduce` **之前**，把自己算出来的修正量加到本卡的部分和上，修正量就能白搭一趟上游原有的 `all-reduce` 顺风车！全过程零次额外通信。
-
-为了搭上这趟顺风车，`pllm/backends/vllm/parameter_overlay.py` 里的 `ProjectionHook` 做了一个非常精细的拦截：
+为了把修正量精确塞进 `RowParallelLinear` 的 `all-reduce` 之前，同时不破坏多卡下的浮点精度，`pllm/backends/vllm/parameter_overlay.py` 中的 `ProjectionHook` 是这样拦截的：
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/parameter_overlay.py
@@ -338,41 +307,37 @@ class ProjectionHook:
         return self.apply(self.module, hidden, self.bias).float(), None
 ```
 
-在单卡（`TP=1`）时，它只是个普通的 `forward` 钩子；而在多卡行并行（`_row_parallel`）时，它真正伸手拦住的是里面的 `quant_method.apply`——也就是本卡刚算完局部 GEMM、还没进 `all-reduce` 的那一刻（外层 `forward` 只换成一层在求和之后做舍入的薄壳 `reduced`）。更讲究的是 `base` 里的那个 `.float()`：如果每张卡先把修正量加进 BF16 的部分和里再去 `all-reduce`，每张卡都会多引入一次 BF16 舍入误差；所以我们让局部和加上修正量之后保持宽裕的 FP32 穿过 vLLM 的 `all-reduce`，等所有卡加完了，最后再在 `reduced` 里做唯一一次向 BF16 的舍入。
+这里有一个很容易被忽略的数值细节：在 `TP > 1` 的行并行层上，`ProjectionHook` 并没有在 `module.forward` 的出口（即 `all-reduce` 之后）才去加修正量，而是下沉一层，直接拦截了 `module.quant_method.apply`（局部 GEMM 刚算完、尚未进入 `all-reduce` 的位置）。更重要的是，如果每张卡先把局部修正量加进 BF16 的局部和里再去做跨卡归约，那么 $P$ 张卡就会各自多引入一次向 BF16 的舍入误差；因此 `base` 方法先用 `.float()` 将局部结果提升为 FP32，在 FP32 下叠加上覆盖层的修正量并直接穿过 vLLM 的 `all-reduce`，等所有卡求和完毕后，再在最外层做唯一一次向 BF16 的舍入。
 
-读取搞定了，但真正让人头皮发麻的问题来了：**如果这个覆盖层包含在线更新（`@pllm.train_in_forward`），每张卡只拿着自己那一半输入特征，各自跑一遍作者写的更新函数，算出来的新权重还对吗？**
+读取路径搭上了顺风车，但真正的难题在于**在线更新（`@pllm.train_in_forward`）**：当每张卡手里只有输入特征的一个分片 $x_j$ 和权重的一个分片 $\Delta W_j$ 时，如果让每张卡各自独立运行一遍作者编写的更新函数，算出来的新权重分片还正确吗？
 
-这完全取决于作者在更新函数里写了什么！
+这完全取决于作者在更新函数里写了什么样的代数运算：
+* **回顾开篇的 In-Place TTT 外积更新**：`update = values.T @ inputs`。在这里，由 MLP 输入算出的目标 `values`（形状 `[C, Out]`）在每张卡上是完整复制的，而 `inputs`（形状 `[C, H/P]`）是按特征维切分的。矩阵乘法收缩的是长度为 `C` 的块内行维度，特征维 `H/P` 只是外积的自由维度。因此，每张卡独立计算 `values.T @ inputs_shard`，得到的结果恰好就是完整外积矩阵的第 $j$ 个列分片，完全不需要与其他卡交换信息。
+* **再看上一节的 `PrefillAdapters` 重构误差求导**：`prediction = x @ base.T + (x @ a.T) @ b.T`，随后对 `(prediction - target).square()` 求导。在这里，输入 `x`（`[C, H/P]`）与权重 `base`（`[Out, H/P]`）都是沿特征维切分的，矩阵乘 `x @ base.T` 收缩的恰恰是被切开的那个特征维！单张卡算出的只是局部部分和，如果不先跨卡 `all-reduce` 求和就直接在本地算重构误差并求梯度，每张卡算出的梯度就是彻底错误的。
 
-让我们对比刚刚见过的两个例子：
-*   **例子 A（In-Place TTT 的外积更新）**：`update = values.T @ inputs`。这里目标 `values`（形状 `[C, Out]`）在每张卡上是完整复制的，而输入 `inputs`（形状 `[C, H/2]`）是按特征维切开的。矩阵乘收缩的是长度为 `C` 的块内行维度，特征维 `H/2` 只参与外积展开，互不干扰。0 号卡算左半边权重更新，1 号卡算右半边权重更新，两边拼起来和单卡算出来的分毫不差！
-*   **例子 B（PrefillAdapters 的重构误差求导）**：`prediction = x @ base.T + (x @ a.T) @ b.T`，然后对 `(prediction - target).square()` 求导。注意看第一项：`x` 是切片的 `[C, H/2]`，`base` 也是切片的 `[Out, H/2]`，乘完之后得到了本卡的局部预测值。但要想算出真正的重构误差去更新低秩因子，你必须先把所有卡的局部预测值加起来（跨过被切开的 `H` 维求和），才能知道完整的 `prediction` 偏离了 `target` 多少！如果每张卡闷头只用自己那半截输入算误差求梯度，算出来的权重就是彻底错乱的，而且不会报任何运行时错误，只会让模型悄悄吐出胡言乱语。
+作为一个拒绝静默算错（fail-closed）的系统，我们必须在加载模型之前自动判定：用户写的更新函数（或其自动生成的梯度图）究竟是不是“分片本地（shard-local）”的？
 
-我们绝不能允许系统悄悄算错。但怎么在加载模型之前，自动判断一段任意的 PyTorch 更新函数是不是“分片本地（shard-local）”的？
+如果按照传统编译器的做法，我们需要编写一套完整的分片传播静态分析器，为成百上千个 ATen 算子逐一定制分片推导规则。但在 `pllm/execution/overlay_parallel.py` 中，我们利用 `make_fx` 将这个问题简化成了一次**双图同构检验**：
 
-按照传统编译器的套路，你得写一部庞大的“张量分片传播静态分析器（Sharding Propagation Analyzer）”，为 PyTorch 成百上千个算子逐一编写分片维度推导规则。那将是一个几万行代码的大工程，而且永远有漏网之鱼。
-
-我们在 `pllm/execution/overlay_parallel.py` 里想出了一个偷懒得多、却异常锋利的招数：**既然 PyTorch 的 `make_fx` 可以用不占显存的假张量（Meta / FakeTensor）把函数追踪成一张计算图，那我们干脆把作者的更新函数追踪两遍——第一遍喂给它单卡的完整形状（比如特征宽 $H$），第二遍喂给它切了一半的分片形状（特征宽 $H/2$）——然后把两张图并排摆在桌子上“找不同”！**
+既然 `make_fx` 可以用不占物理内存的假张量（FakeTensor）把函数追踪成符号计算图，我们干脆把同一个更新函数追踪两遍——**第一遍喂给它单卡的全局完整形状（例如特征宽 $H$），第二遍喂给它切分后的单卡本地形状（例如特征宽 $H/P$）——然后把两张 FX 图并排放在一起，逐个节点比对它们的输出形状！**
 
 ```text
-Case 1: In-Place TTT Outer Product (ADMITTED)
-  Global Trace (width = H)              Shard Trace (width = H/2)
-  inputs [C, H]   values [C, Out]       inputs [C, H/2] (sharded axis=1)  values [C, Out]
+Case 1: In-Place TTT Outer Product (Shard-Local -> ADMITTED)
+  Global Trace (width = H)              Shard Trace (width = H/P)
+  inputs [C, H]   values [C, Out]       inputs [C, H/P] (sharded axis=1)  values [C, Out]
          └───┬───┘                             └─────┬─────┘
              ▼ aten.mm                               ▼ aten.mm
-       update [Out, H]                         update [Out, H/2]  <-- Axis 1 still sharded! OK!
+       update [Out, H]                         update [Out, H/P]  <-- Axis 1 still sharded! OK!
 
-Case 2: Reconstruction Error / Feature Norm (REJECTED)
-  Global Trace (width = H)              Shard Trace (width = H/2)
-  inputs [C, H]   base.T [H, Out]       inputs [C, H/2] (sharded axis=1)  base.T [H/2, Out]
+Case 2: Feature-Axis Contraction / Reduction (Needs All-Reduce -> REJECTED)
+  Global Trace (width = H)              Shard Trace (width = H/P)
+  inputs [C, H]   base.T [H, Out]       inputs [C, H/P] (sharded axis=1)  base.T [H/P, Out]
          └───┬───┘                             └─────┬─────┘
              ▼ aten.mm                               ▼ aten.mm
        pred   [C, Out]                         pred   [C, Out]    <-- Sharded axis vanished! REJECT!
 ```
 
-看上面这张对比图，真相是不是一目了然？
-
-我们甚至不需要教分析器什么是外积、什么是内积。只要看每个节点输出张量在两张图里的形状对比就够了！在 `pllm/execution/overlay_parallel.py` 里，判定两个张量之间是否存在合法分片轴的函数 `_axis` 短得让人发笑：
+看上面的对比图：我们根本不需要给算子写复杂的线性代数定理，分片张量自己在两张图上的形状变化就已经把答案招出来了。在 `overlay_parallel.py` 中，判断一个节点输出处于“全卡复制”还是“单轴均匀分片”状态的函数 `_axis` 只有寥寥数行：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/overlay_parallel.py
@@ -385,12 +350,9 @@ def _axis(whole: torch.Tensor, local: torch.Tensor, size: int) -> int | None:
     return axes[0]
 ```
 
-拿着全局图 `whole` 和分片图 `local` 里对应的两个输出张量，比对它们的每一维：
-*   如果所有维度都一样长（`not axes`），说明这个张量是全卡复制的（返回 `None`）；
-*   如果有且仅有一个维度不同，且全局长度恰好等于分片长度乘以 TP 卡数 `size`，说明这个张量在该轴上是均匀切分的（返回分片轴下标 `axes[0]`）；
-*   其他任何情况，当场判出局。
+拿着全局图 `whole` 和分片图 `local` 在同一节点处的输出张量形状逐维比对：如果所有维度长度完全相等（`not axes`），说明该张量是全卡复制的（返回 `None`）；如果恰好只有一个维度不同，且全局维度恰好是分片维度的 `size`（即 TP 卡数）倍，说明该张量在该轴上保持着均匀分片（返回该分片轴下标 `axes[0]`）；其余情况直接拒绝。
 
-有了 `_axis`，`admit_update` 和 `_check_graphs` 的核心证明逻辑就水到渠成了：
+在此基础上，`_check_graphs` 对剪除死代码（`eliminate_dead_code()`，去掉仅用于当前步读出而不影响新权重的分支）后的两张图做拉链式遍历：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/overlay_parallel.py
@@ -413,50 +375,46 @@ def _check_graphs(whole: tuple[Node, ...], local: tuple[Node, ...], size: int) -
             raise _reject(label)
 ```
 
-我们用 `make_fx(update, tracing_mode="fake")` 追出全局和分片两张图，先调 `eliminate_dead_code()` 剪掉只用于当前步读出、不影响新权重的旁支节点，然后把两张图的存活节点一对一拉链式（`zip`）对齐：
-1. 如果两张图的节点数不一样，或者对应节点的算子对不上，说明代码里写了依赖张量宽度的 `if/else` 控制流——直接拒绝；
-2. 如果里面出现了张量字面量常量（`get_attr`）或带随机种子的算子（`nondeterministic_seeded`），各卡可能生成不一致的随机数——直接拒绝；
-3. **最核心的黄金铁律就在最后几行**：我们先找出当前节点所有带分片轴的输入 `inputs`。只要一个节点吃进了哪怕一个分片输入（`inputs` 非空），它的输出就**绝不能变成未分片状态**（`if axis is None: raise _reject(label)`）！
+遍历时执行的核心判据非常清晰：
+1. 两张图的节点数量与算子目标必须一一对应，否则说明存在依赖张量宽度的 Python 控制流，直接拒绝；
+2. 禁止出现张量常量属性或带随机种子的非确定性算子；
+3. **分片守恒检查**：找出当前节点所有带分片轴的输入节点 `inputs`。如果一个算子没有消费任何分片输入且输出也未分片（`not inputs and axis is None`），说明它是像计算 `values` 那样的纯复制计算，直接放行；但**只要一个算子消费了哪怕一个带分片轴的输入（`inputs` 非空），它的输出就必须继续保持分片状态**（一旦 `axis is None`，说明被切分的特征轴在算子内部被归约或收缩消掉了，立刻触发 `_reject`）！
 
-一旦像例子 B 那样，在分片轴上做了矩阵乘收缩或 `sum`/`mean` 归约，分片图上的输出形状就会变得和全局图一模一样，`axis` 瞬间变成 `None`，立刻触发 `_reject`，在模型加载前报错拦下：
+当有人试图在 `TP > 1` 下运行前面那个需要跨卡求和的 `PrefillAdapters` 时，`admit_update` 会在模型加载前的规划阶段直接拦截，并指出具体的违规算子与修改方向：
 
 `TP projection update is not shard-local at aten.mm.default; its update/gradient needs other ranks' shards or an unproved operation. Use a shard-local update or tensor_parallel_size=1`
 
-这就是全篇我最偏爱的一段代码。总共两百行出头，它把一个看似需要深度程序分析的编译难题，巧妙地转化成了“用两种假形状跑出来的两张 FX 图是否同构、分片标记是否守恒”。虽然这套白名单很保守（目前在 `TP > 1` 下只放行通过该检验的前向内稠密或低秩更新；旁路训练的适配器、外部导入或带状态的通用模块适配器、以及读取共享可变 `InstanceState` 的适配器仍限制在 `TP = 1`），但凡是拿到准入通行证的函数，在多卡运行时都**不需要插入任何运行时检查或额外集合通信**。我们在 TP=2 下用 FP64 的 GPU 基准（oracle）做过严格验算：覆盖层在双卡上的均方根（RMS）误差不超过原生 TP=2 自身浮点误差的 105%，最大绝对误差不超过 1 个 BF16 ULP（最小精度单位）。
+通过比较同一个函数在全局形状与分片形状下的两张 FX 图，仅用两百行代码就完成了无通信分片更新的证明。凡是通过准入的稠密或低秩前向内更新，在 `TP > 1` 下均无需插入任何额外集合通信。在 TP=2 下以 FP64 GPU 参考实现作为基准（oracle）进行核对时，覆盖层输出的均方根（RMS）误差不超过原生 TP=2 自身浮点误差的 105%，最大绝对误差不超过 1 个 BF16 ULP。
 
 ---
 
-## 把 In-Place TTT 放上跑道：跨块可见性、吞吐与被吞掉的尾数
+## 六、 实测表现与浮点尾数的算术账
 
-五层抽象全部就位。现在，让我们把开头那个社区训练的 4B In-Place TTT 检查点加载进来，看看这套机器在真实硬件上是怎么运转的。
+将这五层机制组合起来，我们在真实的 4B In-Place TTT 检查点上验证它的运行行为与性能。
 
-在真正把 8 GB 的模型权重搬进显存之前，我们可以先在 CPU 上花零点几秒调一次 `pllm.explain`，给显存算一笔明白账。在这个 36 层的 4B 模型里，每隔 6 层（第 0、6、12、18、24、30 层）有一个形状为 `[2560, 9728]` 的 `down_proj` 快权重矩阵，6 层加起来一共是 `149,422,080` 个参数。按 FP32 存放，光这 6 个 `delta` 矩阵就要占约 570 MiB；再加上暂存未满 1024 块输入行的缓冲，每个请求的一份状态根（root）重达 **`714.0 MiB`**（而 6 层共享的卷积与投影参数 `target_parameters` 只占 `75.1 MiB`）。
+以下 In-Place TTT 实验均在单张 NVIDIA RTX 4090（24 GiB）、vLLM 0.32.0、CUDA Graph 开启下运行，使用社区开源的 4B 检查点 `zhongweixie/inplace-ttt-qwen3-4b-32k-ttt`（共 36 层，第 0、6、12、18、24、30 层的 `down_proj` 为 `[2560, 9728]` 的快权重，块大小 `chunk_size = 1024`，学习率 `3.0`），贪心解码生成 256 个 token，预热 1 轮后取 3 轮中位数；吞吐定义为“生成的 token 总数除以包含 prefill 在内的整次 `generate` 耗时”。官方基线使用 `ByteDance-Seed/In-Place-TTT` 仓库基于 Hugging Face `generate`（BF16 + FlashAttention 2）在同一张 RTX 4090 上按相同协议测得。
 
-因为 PTTS 采用不可变版本与写时复制，即使只跑 1 个请求，为了在跨块更新的那一刻同时容纳正在被读取的旧版本和正在写入的新版本，系统也需要预留 4 份根（`714.0 MiB × 4`）；当并发开到 4 个请求时，连同在途版本一共需要 10 份根。在 24 GiB 的 RTX 4090 上，我们需要把 `gpu_memory_utilization` 设为 `0.48`，给快权重池留出足够的呼吸空间。
+### 1. 显存账本与跨块精确可见性
 
-### 亲眼看见第 1024 个 token 跨过边界
+在这个 4B 模型中，6 个目标层的 `[2560, 9728]` 快权重矩阵共有 `149,422,080` 个参数。若以 FP32 存放，仅这 6 个增量矩阵就要占约 570 MiB；加上暂存未满 1024 块输入行的缓冲，每个请求的一份状态根（root）占 **`714.0 MiB`**（6 层共享的只读卷积与投影权重 `target_parameters` 另占 `75.1 MiB`）。由于 PTTS 采用不可变版本与写时复制，单请求运行时需预留 4 份根，4 并发请求时需预留 10 份根，因此测试时将 vLLM 的 `gpu_memory_utilization` 设为 `0.48`，为快权重状态池留出固定显存空间。
 
-在测速度之前，我们先做个有趣的显微镜实验，验证一下 `visibility="exact"` 到底有没有兑现承诺：**当快权重的更新点恰好落在逐字生成的 decode 半路上时，究竟哪一个 token 读旧权重，哪一个 token 开始读新权重？**
+为了直观检验 `visibility="exact"` 在解码过程中的边界行为，我们可以构造一个刚好卡在块边界上的输入：取 Python 标准库 `argparse.py` 源码的前 **1023 个 token** 作为 prompt（比块长 1024 少 1 个 token），然后贪心解码生成 5 个 token。实验组（`TTT`）使用正常的 `chunk_size = 1024`；对照组（`不更新`）将 `chunk_size` 设为 `2048`（整条序列共 $1023 + 5 = 1028$ 个 token，永远不会触发更新）。
 
-我们拿每台机器上都有的 Python 标准库 `argparse.py` 源码当输入，故意截取前 **1023 个 token** 作为 prompt——比块长 1024 刚好少 1 个 token！然后让模型贪心解码连续生成 5 个 token。我们同时跑两组对比：实验组（`TTT`）使用正常的 `chunk_size=1024`；对照组（`不更新`）把 `chunk_size` 改成 `2048`（因为整条序列加起来只有 $1023 + 5 = 1028$ 个 token，永远凑不满 2048，所以对照组全程更新 0 次）。
+对比两组在每一步生成的 token 及其对数概率（logprob）：
 
-看看两组在每一步生成 token 时的对数概率（logprob）：
-
-| 生成序号 | 生成的 token | 算出它的位置下标 | `TTT` 的 logprob | `不更新` 的 logprob | 差值 | 发生了什么？ |
+| 生成序号 | 生成的 token | 产出该词的位置下标 | `TTT` 的 logprob | `不更新` 的 logprob | 差值 | 权重状态与可见性 |
 |---:|---|---:|---:|---:|---:|---|
-| 1 | `' _'` | 1022 | `-0.4400` | `-0.4400` | `+0.0000` | 第 1023 个 token，未满一块，读初始权重 |
-| 2 | `'get'` | 1023 | `-1.9058` | `-1.9058` | `+0.0000` | **第 1024 个 token，凑满第一块并触发更新，但它自己仍读旧权重！** |
-| 3 | `'_default'` | 1024 | `-2.2565` | `-2.3191` | `+0.0626` | **第二块的第 1 个 token，立刻读到新权重！** |
-| 4 | `'_action'` | 1025 | `-1.8538` | `-1.8214` | `-0.0324` | 继续读更新后的新权重 |
-| 5 | `'(action'` | 1026 | `-1.7855` | `-1.7124` | `-0.0732` | 继续读更新后的新权重 |
+| 1 | `' _'` | 1022 | `-0.4400` | `-0.4400` | `+0.0000` | 第 1023 个位置，未满一块，读取初始权重 |
+| 2 | `'get'` | 1023 | `-1.9058` | `-1.9058` | `+0.0000` | **第 1024 个位置：凑满第一块并触发更新，但其自身前向仍读旧权重** |
+| 3 | `'_default'` | 1024 | `-2.2565` | `-2.3191` | `+0.0626` | **第二块的第 1 个位置：立即读到更新后的新权重** |
+| 4 | `'_action'` | 1025 | `-1.8538` | `-1.8214` | `-0.0324` | 继续读取更新后的新权重 |
+| 5 | `'(action'` | 1026 | `-1.7855` | `-1.7124` | `-0.0732` | 继续读取更新后的新权重 |
 
-盯着第 2 行和第 3 行的分界线看：位置 `1023`（全序列的第 1024 个 token）进来的那一刻，第一块正好凑满，6 个快权重层各自触发了一次外积更新（`update_count = 6`）。但是按照因果序，第 1024 个 token 自己前向传播时看到的仍然是更新前的旧权重，所以它算出的 logprob 和对照组分毫不差（`+0.0000`）。紧接着下一步，位置 `1024`（第二块的头一个 token）进来时，新版本的 PTTS 状态根已经原子切换完毕，logprob 立刻跳变了 `+0.0626`！
+可以看到，当位置 `1023`（全序列的第 1024 个 token）进入模型时，第一块刚好凑满 1024 个 token，6 个快权重层各自触发了一次外积更新。但按照严格的因果语义，第 1024 个 token 自身的前向输出仍然由更新前的旧权重算出，因此它的 logprob 与不更新的对照组完全一致（差值为 `0.0000`）。到了紧接着的下一步（位置 `1024`，即第二块的第一个 token），PTTS 状态根已完成切换，模型立即读到新权重，logprob 随之发生 `+0.0626` 的改变。
 
-而且，这一切都是在开启了 CUDA Graph 的 decode 循环里自动发生的（单独计时纯 decode 阶段，把 `exact` 更新录进 CUDA Graph 让单请求吞吐从 eager 的 `57.59` 提升到 `59.51 tok/s`，4 请求从 `107.56` 提升到 `113.16 tok/s`）。
+### 2. 端到端吞吐与 BF16 尾数吞噬现象
 
-### 与官方实现的吞吐对比，以及为什么我们默认用 FP32
-
-现在来看整次生成（含 prefill）的端到端吞吐对比：
+在长上下文（4096 与 16384 prompt 长度）及多请求并发下，整次生成的吞吐对比如下：
 
 | 实现与快权重精度 | 1 个请求，prompt 4096 | 1 个请求，prompt 16384 | 4 个请求，prompt 4096 |
 |---|---:|---:|---:|
@@ -464,11 +422,11 @@ def _check_graphs(whole: tuple[Node, ...], local: tuple[Node, ...], size: int) -
 | pLLM，BF16 快权重 | `57.12 tok/s` | `40.64 tok/s` | 未测 |
 | pLLM，FP32 快权重（默认） | `59.64 tok/s` | `42.27 tok/s` | `111.38 tok/s`（4 请求合计） |
 
-先看同精度的公平对比（第二行 vs 第一行）：在完全复现官方 BF16 快权重舍入行为的前提下，pLLM 在 4k 长度下比官方快约 4%，在 16k 长度下快约 16%。而当并发增加到 4 个请求时，官方实现因为 `bs=1` 的硬限制无法运行，pLLM 的合计吞吐则达到了 **`111.38 tok/s`**，约为单请求的 1.9 倍。（顺便提一句诚实的代价：因为块与块之间存在严格的串行依赖，`visibility="exact"` 的 prefill 阶段必须以 eager 模式按块顺序推进；如果你的线上负载几乎全是超长 prompt 而只生成几个 token，这条路径并不会创造速度奇迹。此外，一旦改写了模型权重，相同前缀算出的 KV 就不再相同，因此覆盖层天然与 prefix caching 互斥；且使用了 `exact` 图捕获的引擎在关闭时暂不能归还全部显存，后续引擎需要在新子进程中启动。）
+在同为 BF16 快权重的设置下，pLLM 在 4k 长度下比官方实现快约 4%，在 16k 长度下快约 16%；当并发数增加到 4 个请求时，官方实现受限于 `bs=1` 无法运行，而 pLLM 的合计吞吐提升至 **`111.38 tok/s`**（另一组较早的、只对纯 decode 阶段计时的测量里——4096 prompt，BF16 官方快权重配 FP32 残差存储——把 `exact` 更新录进 CUDA Graph，使单请求纯解码吞吐从 eager 的 `57.59` 升至 `59.51 tok/s`，4 请求从 `107.56` 升至 `113.16 tok/s`）。
 
-但看着上面那张表，你一定注意到了一个反直觉的现象：**为什么用 32 位浮点数（FP32）存快权重，跑得反而比 16 位的 BF16 还要快？而且为什么 pLLM 要把 FP32 设成默认模式？**
+观察上表，有一个现象非常值得拿出来细看：**为什么将快权重设为 32 位浮点数（FP32）不仅成了 pLLM 的默认选项，而且跑起来反而比 16 位的 BF16 更快？**
 
-这就要掀开我们在开篇省略掉的那几行 `inplace_ttt.py` 代码了：
+答案就在前面省略的 `inplace_ttt.py` 末尾那几行分支代码里：
 
 ```python
 # check-docs: skip: excerpt from pllm/workloads/inplace_ttt.py
@@ -479,22 +437,20 @@ if self.dtype is torch.bfloat16:
 return delta + update, inputs @ delta.to(inputs.dtype).T
 ```
 
-原来，官方 Hugging Face 代码在加载模型时，是直接把 BF16 的 `down_proj` 权重矩阵复制了一份当作快权重，每次算完 $\Delta W$ 就直接往这个 BF16 矩阵上硬加（$W \leftarrow \text{BF16}(W + \Delta W)$），身边并没有保留一份 FP32 的主副本（master weight）。
+在官方的 Hugging Face 实现中，推理代码直接把 BF16 的 `down_proj` 权重克隆一份作为快权重，每次算出微小的更新量 $\Delta W$ 后，直接在 BF16 精度下往完整的权重矩阵上硬加：$W \leftarrow \text{BF16}(W + \Delta W)$，没有维护 FP32 主副本（master weights）。
 
-在数值分析里，把一个微小的增量直接加到一个数值较大的低精度浮点数上，是一场灾难——**大数吃小数（swamping）**。
+从数值分析的角度看，直接用 BF16 累加微小权重更新会遭遇严重的大数吃小数（mantissa swamping）。BF16 只有 7 位有效尾数，相对精度台阶约为 $2^{-7} \approx 0.78\%$。我们可以拿这个 4B 检查点第 0 层真实的 `down_proj` 权重矩阵（共 `24,903,680` 个元素）做一次简单的数值实验：原论文附录 C.2 说，对 Qwen3-4B 报告的所有评测，每个块的局部更新都按 Frobenius 范数裁剪到 `1e-5`。如果将一个范数为 `1e-5` 的更新矩阵直接在 BF16 下加到第 0 层的基座权重上，在全部 **`24,903,680`** 个元素中，只有 **`472`** 个元素的值真正发生了改变——其余 99.998% 的元素因为增量小于 BF16 的最低有效位（ULP），在加法完成后被直接舍入回了原值，整次更新实际留存下来的改变量只有预期值的约 **`0.97%`**。（注：该社区检查点本身采用的是官方仓库默认的不裁剪设置且学习率为 3.0，单步更新幅度比 `1e-5` 大得多，因此上述实验仅用于说明浮点尾数的精度边界，而非对该检查点生成质量的评测。）
 
-BF16 只有 7 位尾数（精度大约是 $2^{-7} \approx 0.78\%$）。我们专门拿这个检查点第 0 层的真实 `down_proj` 权重矩阵（一共 `24,903,680` 个元素）做过一次算术实验：在论文的正文评测设置（Track T2）里，每一次块的更新矩阵在乘学习率前会被范数裁剪到 `1e-5`。如果我们真的拿一个范数为 `1e-5` 的更新矩阵，直接用 BF16 加到第 0 层的权重上，猜猜会发生什么？
-
-在全部 **`24,903,680`** 个元素里，只有可怜的 **`472`** 个元素的值发生了改变！其余 99.998% 的元素加完之后，因为增量跨不过 BF16 的最小精度台阶，直接被硬件舍入回了原值，整次更新实际生效的改变量只有预期值的约 **`0.97%`**！（当然，我们手头这个社区检查点遵循的是官方仓库默认的不裁剪设置，且学习率高达 3.0，单步更新比 `1e-5` 大得多；这只是一个展示浮点尾数效应的数值实验，而非模型生成质量评测。）
-
-一旦我们把底座权重 `W` 和快权重增量 `delta` 解耦开来——底座 `W` 依然安静地待在 BF16（甚至是 GPTQ/Marlin 量化格式！在 A100 上跑 14B GPTQ 模型时，我们只需在反向求导读底座那一刻做一次瞬态反量化，用完即焚，单步训练耗时从 `1.117 s` 降到 `0.193 s` 且不涨一分钱峰值显存），而每个请求单独用 FP32 存放从零开始累积的增量 `delta`——那只“吃掉小更新的怪兽”就消失了。哪怕单次更新再微小，也能在 FP32 的 `delta` 里稳稳当当地积少成多。而且在前向计算时，FP32 模式只需要额外算一次 `inputs @ delta.to(inputs.dtype).T` 加到底座输出上；反倒是严格复现官方 BF16 舍入的兼容模式，为了在不污染共享底座的前提下模拟“先合成 BF16 权重再相乘”的舍入误差，不得不做两次矩阵乘再相减。这就是为什么 FP32 模式既保住了微小的梯度信号，跑起来反而还更轻快。
+一旦我们将“只读的基座权重 $W$”与“每个请求私有的快权重增量 $\Delta W$”解耦开来——基座 $W$ 保持原本的 BF16（甚至是量化格式：在 A100 80 GiB 上运行 14B GPTQ 量化模型时，训练求导只需在读取基座那一刻做一次用完即焚的瞬态反量化；用一个直接的 Triton 分块逆变换代替借 vLLM 单位矩阵乘的反量化后，单步训练耗时从 `1.117 s` 降至 `0.193 s`，峰值显存不变），而每个请求单独用 FP32 累加从零起步的增量 `delta`——微小更新被基座大数吞噬的问题就彻底消失了。同时，在计算前向修正时，FP32 模式只需做一次 `inputs @ delta.to(inputs.dtype).T`；反倒是严格模拟官方 BF16 舍入行为的分支，为了在不改动共享基座的前提下复现“先合成 BF16 权重再做矩阵乘”的舍入误差，不得不做两次矩阵乘再相减。这就是为什么 FP32 快权重既保住了数值精度，执行起来反而更加轻快。
 
 ---
 
-## 回头看那五级台阶
+## 七、 边界与代价
 
-合上 `parameter_overlay` 的源码，最让我感到踏实的不是我们写了多少精妙的代码，而是我们**少写了多少代码**。
+把每层抽象的工作原理摊开之后，这套参数覆盖层的设计边界与代价也就一清二楚了：
 
-当面对“多租户隔离、分组读取、进 CUDA Graph、前向内分块求导、多卡零通信证明”这五道连环关卡时，人们很容易产生一种撸起袖子从零发明一套深度学习编译器的冲动。但实际上，PyTorch 社区这些年已经把“批处理向量化（`vmap`）”、“函数式自动微分（`grad`）”、“算子图捕获与融合（`compile`）”、“向编译器声明不透明边界（`custom_op`）”以及“符号化追踪计算图（`make_fx`）”分别锤炼成了坚固而正交的原语。
+* **前缀缓存（Prefix Caching）互斥**：前缀缓存的前提是相同的 token 前缀永远算出相同的 KV Cache。一旦在线性层上挂载了随请求变化或随步更新的参数覆盖层，相同的 token 在不同请求或不同步里会算出不同的隐藏状态与 KV，因此覆盖层必须关闭或隔离前缀缓存。
+* **`exact` 模式的串行预填充与图池驻留**：因为 `visibility="exact"` 要求后一个块必须读到前一个块更新后的权重，块与块之间存在严格的因果串行依赖，所以它的 prefill 阶段必须以 eager 模式按块顺序推进；如果你的负载全是超长 prompt 而只生成寥寥几个 token，这条路径无法并行重叠块间更新。此外，启用了 `exact` 解码图捕获的引擎在关闭时无法将私有图池显存全部归还给 CUDA，同一进程若要启动下一个大模型引擎需在独立子进程中运行。
+* **多卡张量并行的准入范围**：目前 `TP > 1` 仅对通过了 `make_fx` 双图同构检验的前向内稠密或低秩更新开放；在旁路流上异步训练的适配器、外部动态导入或带状态的通用 `nn.Module` 适配器、以及读取共享可变 `InstanceState` 的适配器（后者还会使模型退回 eager 模式）目前均限制在 `TP = 1`。
 
-系统工程师真正的活儿，不是去重造这五块砖，而是看清每一堵物理约束背后的数学本质，把这五块砖按唯一正确的顺序（比如先 `grad`、再 `vmap(chunk_size=1)`、最后 `compile`）垒在一起；并且在诱惑面前保持克制——当普通的梯度累加在数学上已经等价时，微笑着把那个需要几百行私有 API 的跨步最小割分割器留在草稿纸上；当你需要证明一段任意代码在多卡下不会跨分片串味时，别急着去写几万行的静态分析器，试试拿两个不同宽度的假张量把代码跑两遍，让两张计算图自己开口说话。
+回顾整个参数覆盖层的构建过程，最核心的体会其实只有一条：当我们需要把一段干净的“单请求、单块”研究代码搬进高度复杂的分布式推理引擎时，不必急着去手写面面俱到的底层大算子。PyTorch 已经把向量化批处理（`vmap`）、函数式自动求导（`grad`）、算子融合编译（`compile`）、编译器不透明边界（`custom_op`）和符号图追踪（`make_fx`）做成了正交的基础设施。看清每一步的物理约束与浮点脾气，把这几个现成的变换按正确的顺序组合起来，就能用最少的代码把黑板上的公式变成生产引擎里的高速路径。

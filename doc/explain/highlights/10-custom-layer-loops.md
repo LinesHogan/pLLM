@@ -1,101 +1,93 @@
 # 自定义层循环与状态传播
 
-如果你在自己的研究脚本里验证过“自适应深度”（Adaptive Depth）或者“早退”（Early Exit）的想法，你写出来的原型代码大概长这样：
+在大多数推理系统的眼里，一座 Transformer 模型是一条笔直的单行道：第 0 层进去，第 1 层出来，一路走到第 $L-1$ 层，谁也不能插队，谁也不能抄近道。
+
+但在算法研究者的草稿纸上，前向传播的拓扑结构要活跃得多。比如早退（Early Exit，如 CALM、LayerSkip）与跳过中间层：当一个 token 走到第 15 层出口时，如果它的隐藏状态相比第 11 层已经几乎不再变化，说明模型对这个位置的语义已经拿准了，何必再去跑第 16 到 19 层？再比如循环深度（Looped Depth，如 Ouro、Huginn）：把中间几层当成循环体，同一个 token 反复在里面转上三四圈，以参数复用换取计算深度。
+
+如果在单请求、即时执行（Eager）的研究脚本里验证这些想法，写出来的代码无非是一个 `if` 或一个 `for`：
 
 ```python
 # check-docs: skip: illustrative prototype, not pLLM code
 h = embeddings
 for layer in layers[:16]:
     h = layer(h)
-if cosine_similarity(h, previous) > 0.85:  # 已经“想好了”，后面几层不算了
+if cosine_similarity(h, previous) > 0.85:
     h = skip(h)
 else:
     for layer in layers[16:20]:
         h = layer(h)
 ```
 
-不管是 CALM、LayerSkip 这类看到置信度够高就提前交卷的早退算法，还是 Ouro、Huginn 这类把中间几层像陀螺一样反复转好几圈的循环深度（Looped Depth）模型，抑或是 Mixture-of-Depths（MoD）这种按 token 挑层走的路由机制，脱掉论文里的数学外衣，落到代码里其实就是两个最朴素的控制流原语：一个 `if`，或者一个 `for`。
+这几行代码在笔记本里跑得顺畅无比。可一旦你试图把它塞进像 vLLM 这样的连续批处理服务引擎，整个执行管线会立刻卡死。
 
-在单请求、即时执行（Eager）的 Hugging Face 脚本里，这个 `if` 写起来连眼睛都不用眨一下。但当你试图把这个 `if` 搬进像 vLLM 这样的高吞吐服务引擎时，你会发现自己迎头撞上了三堵墙——而且最致命的那堵墙，甚至跟“怎么算”毫无关系。
+表面上看，最先拦路的是控制流与批处理的冲突。那个 `if` 的条件依赖 GPU 张量的实时数值，如果让 CPU 上的 Python 解释器来判断走哪个分支，CPU 就必须停下来等待 GPU 把标量结果跨过 PCIe 传回来——这不仅触发了阻塞式的主机同步，而且在解码阶段，整座模型是要被录进 CUDA Graph 反复回放的（见[《Python 只在录制时活着》](03-whole-algorithm-in-cuda-graphs.md)），回放时 Python 根本不在场，分支会被永远焊死在录制那一刻走过的路径上。就算把分支搬到 GPU 上，连续批处理里穿行的是几十上百个请求拼成的二维矩阵 `[rows, hidden]`（见[《行模型》](04-packed-rows.md)）：走到第 15 层出口时，第 0 行的 token 想跳过第 16 到 19 层，第 1 行的 token 却还得老老实实往下算，同一个批次在层间发生了分流。
 
----
+然而，哪怕你把零同步分支和批次分流都解决了，还有一个更隐蔽的麻烦在下一步等着你。
 
-## 一脚踩空的注意力
+假设第 $t$ 个位置的 token 在第 15 层结束时满足了跳过条件，绕开第 16 到 19 层，直接去第 20 层完成了后续计算并采样出了新词。在这一步里，一切风平浪静。接着，第 $t+1$ 个位置的 token 进场了。它在第 16 层没有跳层，需要照常执行自回归因果注意力（Self-Attention）——按照规矩，它要回头读取从位置 $0$ 到位置 $t$ 所有前序位置在第 16 层的 Key 和 Value。
 
-我们先来看看前两堵比较显眼的墙。
-
-第一堵墙叫 **CUDA Graph**。看看那个条件：`cosine_similarity(h, previous) > 0.85`。余弦相似度的计算结果躺在 GPU 显存里，而 `if` 是由 CPU 上的 Python 解释器执行的。要想让 Python 知道走哪个分支，CPU 就得停下来等 GPU 把这一个布尔值跨过 PCIe 传回来——这是一次阻塞式的主机同步。更糟的是，在 decode 阶段，整个前向计算是要被录进 CUDA graph 反复回放的（见[《Python 只在录制时活着》](03-whole-algorithm-in-cuda-graphs.md)）。回放的时候 Python 早就退场了，你的 `if` 会被永远焊死在录制那一刻走过的分支上。
-
-第二堵墙叫 **连续批处理（Continuous Batching）**。在服务引擎里，穿过模型的张量不是孤零零的一个 token，而是几十上百个请求拼在一起的二维矩阵（见[《行模型》](04-packed-rows.md)）。走到第 15 层出口时，第 0 行的 token 觉得“我已经想清楚了，第 16 到 19 层我要跳过”；第 1 行的 token 还在冥思苦想，必须老老实实算完；第 2 行则是另一个请求的块预填充。Python 的 `if` 是全有或全无的，它没法对一个张量的第 0 行说“跳”，对第 1 行说“算”。
-
-但真正让人后背发凉的，是第三堵墙。它不发生在跳层的那一步，而发生在**下一步**。
-
-假设你是第 $t$ 个位置的 token。你在第 15 层结束时心满意足地拍拍屁股，跳过了第 16 到 19 层，直接空降到了第 20 层，最后顺利生成了下一个词。到此为止，无事发生。
-
-接着，第 $t+1$ 个位置的 token 进场了。它走到第 16 层，没有跳层，准备老老实实做自回归注意力（Self-Attention）。按照因果注意力的规矩，它需要回头去读从位置 $0$ 到位置 $t$ 所有前辈在第 16 层的 Key 和 Value。它伸手去摸位置 $t$ 在第 16 层的 KV 槽位——**一脚踩空了。**
-
-因为你刚才跳过第 16 层的时候，根本没往那儿写过东西！
+当第 $t+1$ 个 token 去第 16 层的 KV 缓存里查找位置 $t$ 的槽位时，它一脚踩空了。因为位置 $t$ 的 token 刚才根本没有进过第 16 层，那个物理槽位里什么都没写。
 
 ```text
-What happens without KV propagation (Layer 16 KV Cache):
-         Pos 0..t-1       Pos t (Skipped L16!)     Pos t+1 (Computing L16)
+Layer 16 KV Cache without state propagation:
+
+         Pos 0..t-1       Pos t (Skipped L16)      Pos t+1 (Computes L16)
         ┌──────────────┬────────────────────────┬────────────────────────┐
 Layer 15│  Valid K/V   │       Valid K/V        │       Valid K/V        │
         ├──────────────┼────────────────────────┼────────────────────────┤
-Layer 16│  Valid K/V   │  [ ??? Uninitialized ] │  Attends to Pos 0..t   │
+Layer 16│  Valid K/V   │  [ Uninitialized ! ]   │  Attends to Pos 0..t   │
         └──────────────┴───────────▲────────────┴───────────┬────────────┘
-                                   └────── Crash / Garbage! ┘
+                                   └───── Reads garbage ────┘
 ```
 
-在 vLLM 的世界里，分页 KV 缓存、FlashAttention 内核、前缀缓存（Prefix Caching）以及抢占后的重算，全都建立在一条不可动摇的假设之上：**每一层、每一个已经算过的位置，都必须整整齐齐地躺着一份合法的 K 和 V**（我们在[《可编程注意力与 KV 布局》](08-programmable-attention-kv.md)里会详细解剖这本账）。如果你在第 16 层的物理块里留下一个未初始化的空洞，第 $t+1$ 个 token 读出来的就是显存里残留的垃圾数据，甚至是上一个已经退房的客户留下的私密对话。
+在现代推理引擎里，分页 KV 缓存、FlashAttention 内核、前缀缓存（Prefix Caching）以及抢占后的重算，全都建立在一条底层记账不变量之上：每一层、每一个已经算过的逻辑位置，都必须存有一份合法的 K 和 V（详见[《可编程注意力与 KV 布局》](08-programmable-attention-kv.md)）。如果在第 16 层的物理块里留下一个未初始化的空洞，第 $t+1$ 个 token 读出来的就是显存里残留的旧数据，甚至是上一个已退场请求留下的私密上下文。
 
-所以，要在推理引擎里改写前向拓扑，我们真正要回答的第一个问题不是“怎么跳过去”，而是：**当你跳过一层时，怎么向这一层的 KV 缓存交代？**
+因此，要在服务引擎里改写层间控制流，真正需要先回答的不是“怎么把几层跳过去”，而是：当一个 token 跳过了某一层时，怎么向这一层的 KV 缓存交账？
 
 ---
 
-## 站台上的登记簿：为什么状态传播能大一统
+## 为什么选状态传播：几种补救思路的取舍
 
-面对这个窟窿，学术界其实试过好几种不同的补救方案。我们在设计 pLLM 的时候把它们挨个摆在桌面上推演了一遍：
+面对被跳过层留下的 KV 空洞，文献里有过几种截然不同的处理思路。把它们放进分页推理引擎的约束下逐一推演，很快就能看清各自的边界。
 
-1. **干脆留个洞（原版 Mixture-of-Depths 的做法）**：既然第 $t$ 个 token 没进第 16 层，那就让后面的 token 在第 16 层做注意力时彻底无视位置 $t$。这听起来很干脆，但在系统上有两个死穴：第一，只有从头按这种“注意力缺斤少两”的方式训练出来的模型才能适应它；第二，这意味着同一个请求在第 15 层有 100 个 KV，在第 16 层可能只有 63 个 KV——每一层都得维护自己独立的块表和序列长度。而 vLLM 的调度器对每个请求只记一个标量进度，底层根本容不下这种参差不齐的账本。
-2. **把上一层的 K/V 抄过来**：既然第 15 层算出了 K 和 V，直接顺手拷进第 16 层的缓存行不行？绝对不行。Transformer 每一层的注意力权重都是独立训练的，第 15 层的 $W_K, W_V$ 把隐藏状态投影到的线性子空间，跟第 16 层的 $W_Q$ 压根不在一个频道上。拿第 16 层的 Query 去跟第 15 层的 Key 做内积，算出来的注意力分数纯属胡言乱语。
-3. **先欠着，以后需要时再补算（FREE 一类方法的做法）**：先把第 16 到 19 层跳过去，等下一步发现在深层确实需要它的 K/V 时，再把前一个位置漏掉的深层跟当前 token 绑在一起补算。这在单请求脚本里很聪明，但在服务引擎里，这意味着每个请求在每一步要喂给模型的 token 数量变成了捉摸不定的随机数，跟要求形状死板的 CUDA graph 直接迎头相撞。
+第一种思路是“干脆留空洞”，也就是原版 Mixture-of-Depths（MoD）的做法：既然位置 $t$ 没进第 16 层，那就让后续所有 token 在第 16 层做注意力时彻底跳过位置 $t$。这要求模型从预训练开始就适应“注意力历史缺斤少两”的分布；更棘手的是系统账本——这意味着同一个请求在第 15 层有 100 个 KV 条目，在第 16 层可能只有 63 个条目。每一层都得维护自己独立的块表和序列长度，而 vLLM 的调度器对每个请求只维护单一的标量进度 `num_computed_tokens`，底层数据结构根本无法表达这种参差不齐的稀疏度。
 
-排查完一圈，唯一在数学语义和系统工程两边都站得住脚的幸存者，是 CALM 论文提出的**状态传播（State Propagation）**。
+第二种思路是“拿上一层的 K/V 充数”：既然第 15 层刚刚算出了合法的 K 和 V，顺手拷一份塞进第 16 层的缓存槽位行不行？在数学上行不通。Transformer 每一层的注意力投影矩阵都是独立训练的，第 15 层的 $W_K, W_V$ 把隐藏状态映射到的线性子空间，与第 16 层的 $W_Q$ 并不对齐。用第 16 层的 Query 去和第 15 层的 Key 做内积，算出来的注意力权重是没有意义的。
 
-你可以用一个坐火车的比喻来理解它。把一个 28 层的模型想象成一趟有 28 个车站的列车。第 $t$ 个 token 是一位乘客，车开到第 15 站时，他觉得自己的事情已经办妥了，决定在第 16 到 19 站不下车办事，坐在座位上闭目养神——也就是说，他的残差流（Residual Stream）原封不动地穿过这四层，等价于把第 16 到 19 层当成了恒等映射 $f(x) = x$。
+第三种思路是“先欠着，等下一步需要时再补算”，比如 FREE 一类早退算法：当位置 $t$ 提前退出后，如果发现位置 $t+1$ 没有早退、确实需要读位置 $t$ 在深层的 K/V，就在跑位置 $t+1$ 的时候把位置 $t$ 漏掉的深层计算捆在一起补上。在单请求脚本里这很巧妙，但在服务引擎里，这意味着每个解码请求在每一步实际要送进深层的 token 数变成了依赖历史路径的动态变量，直接与要求静态张量形状的 CUDA Graph 产生冲突。
 
-但是，每一站的站台登记簿（也就是那一层的 KV Cache）上，规矩是死的：**只要这趟车上有这名乘客，登记簿上就必须有他的一行记录，否则下一班车的乘客来查账时会直接报错。** 既然他没下车，登记簿上填什么呢？
+排除掉这三条路后，剩下的就是 CALM（Confident Adaptive Language Modeling）提出的**状态传播（State Propagation）**。
 
-答案是：**按他坐在车窗边路过这一站时的样子登记。**
+状态传播的逻辑非常直接：当某一行在某一段层上 `active=False` 时，它的残差流（Residual Stream）原封不动地穿过这段层——也就是说，我们把这段被跳过的层近似看作了恒等映射 $f(x) = x$。既然假设这一层的隐藏状态没有变，那么这一层本该产出的 K 和 V 是什么？就是拿它停下时的隐藏状态，经过被跳过层**自己的**输入归一化（`input_layernorm`）、**自己的** K/V 线性投影和旋转位置编码（RoPE），算出来的那份 K 和 V。
 
 ```text
-State Propagation at Skipped Layer 16 (Active = False):
-  h15 (Frozen Residual) ───────────────────────────────► h16 = h15 (Unchanged!)
+State Propagation at Skipped Layer 16 (active = False):
+
+  h15 (Frozen Residual) ───────────────────────────────► h16 = h15 (Unchanged)
           │
           └──► [ Layer 16 Norm ] ──► [ Layer 16 K/V Proj & RoPE ] ──► Write Layer 16 KV Cache
-               ( ~7% of a layer's FLOPs; skips Attention & MLP! )
+               ( ~7% of a layer's compute; omits Attention & MLP )
 ```
 
-具体来说，我们拿这名乘客停在第 15 层末尾的隐藏状态 `h15`，送进第 16 层**自己的**输入归一化（`input_layernorm`）、第 16 层**自己的** K/V 投影矩阵和旋转位置编码（RoPE），算出属于第 16 层子空间的 Key 和 Value，恭恭敬敬地写进第 16 层的 KV 缓存里。写完之后，既不做注意力读取，也不跑庞大的 MLP，直接把原来的 `h15` 当作第 16 层的输出往下传。（按 `pllm.explain` 的成本估算，这套“只做归一化 + QKV 投影 + RoPE”的登记手续，大约只占 Qwen2.5 完整一层计算量的 **7%**；而且如果是在循环里多次经过同一层，只有第一次跳过时需要补写，后续再跳过直接保留已写入的值即可。）
+我们在第一次跳过该层时把这份 K/V 补写进缓存（按 Qwen2.5 的结构核算，做完归一化、QKV 投影与 RoPE 大约只占完整一层计算量的 7%；如果是在层循环里后续再次跳过同一层，直接保留上一次已提交的 K/V 即可）。
 
-仔细品味一下这个设计，你会发现它美得让人叹服。
+把状态传播作为统一默认机制，一下子解开了引擎里的几个死结：
 
-首先，如果第 16 层的真实效果真的如早退假设所说的那样接近恒等映射（即经过这一层后隐藏状态几乎没变），那么拿 `h15` 通过第 16 层自己的投影算出来的 K/V，**在数学上恰恰就是这一层本该产出的 K/V**！近似误差被严格关在了被跳过的那个 token 自己的深层状态里，子空间完全对齐。
+首先是**下游机制完全无感**。每一层、每一个位置的物理槽位里都按时填入了子空间对齐的 K/V。分页 KV 管理、原生的 FlashAttention 内核、前缀缓存以及抢占重算，全都照常工作，不需要感知前面有谁跳了层。
 
-其次，对底层的 vLLM 引擎来说，世界一点都没变。每一层、每一个位置依然整整齐齐地存着合法的 K/V。分页块表、原生 FlashAttention、前缀缓存、抢占后的重算，所有机制连一行代码都不用改，全都照常运转。
+其次是**把“怎么决定跳”与“怎么执行跳”彻底解耦**。无论是像上面那样比对余弦相似度阈值、用训练出来的线性退出头、看词表分布的熵，还是在循环深度模型里每转一圈检查哪些行已经收敛可以提前停下，所有五花八门的算法在进入模型切片时，都归结为同一个形状为 `[rows, 1]` 的布尔掩码 `active`。
 
-更重要的是，它把五花八门的算法统一成了一个最干净的原语。引擎根本不需要关心你是用余弦相似度、用训练出来的退出分类头、用词表熵，还是在循环深度模型里转了三圈后决定提前停下——所有这些算法，最后都坍缩成交给模型切片的一个布尔张量 `active`。而且，补写 K/V 只用到了当前这一行自己的隐藏状态，跟同一个 batch 里拼在一起的其他租户毫无瓜葛。这意味着请求之间严格隔离，天然能塞进 CUDA graph。
+再者是**天然满足多租户隔离与零同步**。补写 K/V 只用到当前行自己停下时的隐藏状态，与同一批次里的其他请求没有任何数据交叉（相比之下，像 Mixture-of-Recursions 中那种在整个 batch 内按分数做 top-$k$ 竞争的 expert-choice 路由，会让张三的 token 算不算这一层取决于今天刚好和哪个李四拼在同一个 batch 里，破坏了请求隔离，因此被 pLLM 明确排除）。
 
-不过，读懂了这个机制的代价，我们也在 pLLM 里立下了一条看似专断、实则救命的规矩：**`active=` 动态跳层只允许用在解码生成的 token 上（`tokens="decode"`），绝不允许用在处理 prompt 的 prefill 阶段。**
+不过，理解了状态传播是一份“基于恒等假设的近似 K/V”，也就立刻能看懂一条至关重要的工程边界：**动态跳层掩码 `active=` 只应该用在解码生成的 token 上（`tokens="decode"`），而不应该用在处理提示词的预填充（prefill）阶段。**
 
-为什么？想想看，状态传播写进去的 K/V 终究是一份“没跑过当前层 MLP 和注意力”的近似品。在 decode 阶段，某个生成 token 跳了层，它留下的近似 K/V 只会影响当前请求接下来生成的寥寥几个词，况且它敢跳层的前提本来就是“特征已经收敛了”。但 prompt 里的 token 完全是另一码事！Prompt token 自己并不需要采样输出任何词，**它活在世界上的唯一使命，就是算出高质量的 K/V，作为整篇对话的基石供后面几百个生成 token 反复查阅。** 如果你在 prefill 阶段偷懒跳了层，整段上下文在深层的 K/V 全都变成了近似值，还会顺着 prefix cache 和 `n` 路采样污染所有的下游分支。Ouro 论文做过一个非常扎心的实验：在 decode 阶段用近似 K/V 几乎不掉点，但在 prefill 阶段一旦换用近似 K/V，GSM8K 数学准确率当场暴跌 10 个百分点以上。更别提 prefill 本来是整段连续位置一起喂给 FlashAttention 高效并行的，一旦你在中间挑出几个 token 跳层压紧，位置不再连续，省下的那点矩阵乘还不够赔给注意力拆包重排的开销。把这道门直接焊死在框架入口，能帮用户省下无数个怀疑人生的夜晚。
+为什么？在 decode 阶段，某个新生成的 token 跳过深层，它留下的近似 K/V 只会影响同一请求接下来生成的几个词，而且它敢跳层的前提本来就是当前特征已经趋于稳定。但 prompt 里的 token 完全不同：prompt token 自己不需要采样输出任何词，它存在的唯一目的，就是算出精确的 K/V 缓存，作为整段对话的基石供后续所有生成步反复读取。如果在 prefill 阶段跳层，整段上下文在深层的 K/V 都会变成近似值，误差不仅会贯穿整个回答，还会顺着 prefix cache 和并行采样扩散出去。Ouro 论文里的实测也印证了这一点：在 prefill 阶段使用近似 K/V 会让 GSM8K 数学评测掉点超过 10 个百分点，而在 decode 阶段使用则几乎没有损失。此外，prefill 本来是把连续的序列位置整块喂给 FlashAttention 高效计算的，一旦在中间抽出一部分位置跳层压紧，序列位置不再连续，省下的一点矩阵乘往往还抵不上注意力拆包重排的额外开销。因此，在 pLLM 中，prompt 默认总是跑完完整的模型深度；如果你尝试在 prefill 方法上传入 `active=`，构建期会直接报错拦下。
 
 ---
 
-## 单 Token 的程序，整批的躯体
+## 单位置的程序，整批次的执行
 
-想通了“用状态传播守住 KV 满格不变量”，我们来看看用户手里的代码长什么样。在 pLLM 里，文章开头那个简陋的 notebook 原型，写出来是这样一段干净的声明：
+确定了底层语义，我们来看算法作者手里的代码接口。在 pLLM 中，开头那个跳过第 16 到 19 层的想法可以写成下面这个 `SkipMiddle` 负载：
 
 ```python
 # check-docs: skip: excerpt from doc/explain/performance.md
@@ -112,9 +104,7 @@ class SkipMiddle(pllm.Workload):
         return layers(20, hidden=h20)[-1]  # 第 20–23 层
 ```
 
-注意看这段代码的视角：你写的是**一个位置（单 token）的思维过程**。先跑 `0..12` 层拿到第 11 层的输出 `h12`，再跑 `12..16` 层拿到第 15 层的输出 `h16`；然后比一比 `h16` 和 `h12` 的方向变了多少——如果余弦相似度小于等于阈值（说明隐藏状态还在剧烈变化，`moved` 为 `True`），就在 `layers(16, 20, hidden=h16, active=moved)` 里继续算这四层；如果相似度已经大于 `0.85`（`moved` 为 `False`），这四层就自动走状态传播跳过。
-
-所有的玄机都浓缩在 `Layers.__call__`（位于 `pllm/execution/token_program.py`）的签名与契约里：
+方法接收一个 `layers: pllm.model.Layers` 对象。调用 `layers(start, stop, ...)` 就代表运行模型从 `start` 到 `stop` 的左闭右开层切片，并用正负下标（如 `[15]` 或 `[-1]`）取出对应层之后的残差流。在 `pllm/execution/token_program.py` 中，`Layers.__call__` 的签名定义了全部操作原语：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/token_program.py
@@ -131,35 +121,32 @@ def __call__(
     return LayerOutputs(tuple(_layers(value, start, stop, kv, active)), start, self.layer_count)
 ```
 
-除了 `active` 掩码，这里还有一个精巧的参数 `kv`，它只有两个合法值：`"commit"`（默认）和 `"peek"`。`"commit"` 就是正常的因果写入，算完把 K/V 提交进缓存；而 `"peek"` 则像是一次不留痕迹的侦察——它允许当前层读取前面所有位置已经提交的 K/V 外加自己这一下新算出的 K/V，但**绝不往缓存里写任何东西**。当你想写一个循环深度模型（比如先试着往深层跑一圈看看置信度，如果不满意再退回来重跑），`"peek"` 和跨位置的 `PositionState`（通过 `layers.load` / `layers.save` 读写）就能让你像搭积木一样拼出各种循环拓扑。
+除了控制哪些行参与计算的 `active` 掩码，这里还有个 `kv` 参数，支持 `"commit"`（默认）与 `"peek"` 两种模式。`"commit"` 会把算出来的因果 K/V 正式写入当前位置的缓存；而 `"peek"` 则允许当前层在注意力计算时读取此前所有已提交位置的 K/V 外加自己刚算出的 K/V，但**不改动缓存里的任何内容**。当你想写一个循环深度模型——比如先用 `"commit"` 跑过一段层，再在循环里用 `"peek"` 反复迭代修正隐藏状态，或者配合 `PositionState`（通过 `layers.load(name, offset=-1)` 读取上一 token 保存的快照、用 `layers.save(name, value)` 写入当前快照）做跨位置的状态传递——这两个参数就能组合出各种前向拓扑。
 
-那么，一段按“单个 token”视角写的 Python 函数，是怎么在底层变成整批高速执行的呢？
+要注意的是，作者在 `forward` 里写下的张量算术（如 `F.cosine_similarity`），在心智模型上是针对**单个 token** 编写的，但在运行期必须面对一整个 batch 的并发请求。怎么把这两件事统一起来？
 
-当引擎加载 `SkipMiddle` 时，`TokenProgram.trace` 会用没有实际显存的假张量（FakeTensor）把你的 `forward` 跑一遍（如果你在里面写了依赖张量数值的 Python `if`，PyTorch 在追踪期就会当场报错拦住你，见[《在 serving 引擎里信任一段用户程序》](02-trusting-user-programs.md)）。追踪出来的计算图会被刀起刀落切成两类交替执行的积木：
-* **模型切片（`Segment`）**：也就是每一次 `layers(start, stop, ...)` 调用。在运行时，它们依然作为一个完整的二维 batch `[B, H]`，直接喂给 vLLM 原生的 C++/CUDA 层去整批跑。
-* **函数式算子片段（`Cell`）**：也就是夹在两次 `layers(...)` 之间的那些张量运算（比如算余弦相似度、线性插值、求范数）。框架会自动用 `torch.vmap` 把每个 `Cell` 沿着行维度映射开。这样一来，你在代码里写一个标量规约或形状变换，语义上严丝合缝地局限在“当前这一个 token”内部，绝不会失手把别人的请求混进来；而在物理执行时，它又是彻头彻尾的矢量化批处理。
+如果用逐 token 的解释器在运行期一个位置接一个位置地去调模型层，GPU 的并行算力会被彻底切碎。我们在 RTX 4090 上用 Qwen2.5-0.5B 做过对比测量（FlashAttention-2，MRv2 runner，batch 大小 8，256 预填充 + 256 解码，贪心采样，外层模型 eager 模式）：如果按逐 token 的区域解释器执行层循环，`recirculation` 负载的 prefill 耗时高达 6,689.69 ms，decode 每步要 26.23 ms；而一旦改为按整批波次（wave）直接调用 vLLM 原生的 `[B, H]` 层，prefill 耗时立刻降到 863.52 ms，decode 降到 3.26 ms/步（同类测试中 `layer_loop` 的 decode 从 16.36 ms/步降到 1.93 ms/步，`step_loop` 从 14.04 ms/步降到 1.73 ms/步）。
 
-说起来，这套“切分成模型段与 `vmap` 算子段、整批调用原生层”的架构，是我们交过一笔昂贵的学费才换来的。在早期版本里，我们曾走过一条弯路：为了支持极度灵活的循环深度（比如 recirculation、layer_loop、step_loop），我们写了一套基于 Region IR 的逐 token 解释器，在运行期一个 token 一个 token 地解释执行层循环。结果呢？GPU 最恨的就是碎片化的小调用。后来我们在一次大清理中痛下决心，删掉了包括 `tokenwise_region.py` 和 `region_layers.py` 在内的四个解释器模块，全面改成了今天这套“按活跃波次（wave）整批调用 vLLM 原生层”的机制。
+为了既保留作者“按单位置写算术”的直觉，又让模型层始终跑在整批原生路径上，`TokenProgram.trace` 在加载阶段用 FakeTensor 对 `forward` 做了一次符号追踪（任何依赖张量数值的 Python `if/while` 都会在此时被拦截报错，见[《在 serving 引擎里信任一段用户程序》](02-trusting-user-programs.md)），将整个方法拆解成两类交替排列的步骤：
 
-在一张 RTX 4090 上用 Qwen2.5-0.5B 做重构前后的对照（FlashAttention-2，MRv2 runner，batch 8，256 预填充 + 256 解码，外层模型 eager 模式的历史测量）：`recirculation` 的 prefill 耗时直接从 **6,689.69 ms 暴跌到 863.52 ms**，decode 从每步 **26.23 ms 降到 3.26 ms**；`layer_loop` 的 decode 从 **16.36 ms/步降到 1.93 ms/步**；`step_loop` 从 **14.04 ms/步降到 1.73 ms/步**——整整快了七八倍！这个教训刻骨铭心：在 GPU 上，任何试图绕开原生批处理层、自己逐个 token 搞解释执行的聪明主意，在硬件吞吐面前都会撞得粉碎。这个发现也为我们后来在[《自动放置与重叠》](11-automatic-placement-overlap.md)里彻底删掉庞大的多面体编译器埋下了伏笔。
+1. **模型层切片（`Segment`）**：即每次 `layers(start, stop, ...)` 调用。在运行期，它们保持完整的 `[B, H]` 批次形态，直接交给 vLLM 原生层一次性执行。
+2. **函数式张量片段（`Cell`）**：即夹在两个层切片之间的普通 PyTorch 运算（如求余弦相似度、范数、门控插值）。框架自动用 `torch.vmap` 将每个 `Cell` 沿着第 0 维（行维度）包装起来。
+
+因为 `Cell` 被 `vmap` 隔离在了单行语义内，作者在里面写任何归约或变形操作都只作用于当前 token 自身，不可能误把同一批里其他租户的数据混进来；而一旦跨过 `Cell` 进入 `Segment`，所有的行又重新合流成紧凑的二维矩阵冲进原生层。
 
 ---
 
-## 借壳上市：一行 Kernel 不写的状态传播
+## 状态传播的实现：不写新算子，只拆装两个函数指针
 
-现在，让我们卷起袖子，深入到本文最有趣的一处代码细节里去。
+现在来看最关键的工程细节：当执行流进入一个带 `active` 掩码的 `Segment`，且其中一部分行的 `active` 为 `False` 时，状态传播（只算 `input_layernorm`、QKV 投影、QK-norm 和 RoPE 并写入 KV 缓存，跳过注意力读取和 `o_proj`）在代码里是怎么实现的？
 
-前面说了，当一批请求走到第 16 层，其中一部分行的 `active` 是 `False` 时，我们要为这些“坐在车上不下车”的行做状态传播：用它们停下时的 `hidden`，跑一遍第 16 层**自己的** `input_layernorm`、QKV 投影、可能存在的 QK-norm 以及 RoPE 旋转，把算出来的 K 和 V 塞进这一层的 KV cache 里，但**略过真正的注意力计算和输出投影 `o_proj`**。
+最容易想到的做法是自己写一个专门的 `propagate_kv` 函数或 Triton 内核：把该层的归一化权重和 QKV 权重取出来，自己调线性层、自己算 RoPE、自己往分页缓存里写。
 
-听到这个需求，你的手指是不是已经放在键盘上，准备新建一个 `propagate_kv_kernel.py`，把模型层里的权重偷出来，自己调 `F.linear` 和 `rotary_emb` 了？
+但只要你翻开 vLLM 的模型库看一眼，就会打消这个念头。在不同的模型家族（Qwen2、Qwen2.5、Qwen3、Llama、DeepSeek）之间，注意力前半截的细节千差万别：QKV 是合并成一个 `qkv_proj` 还是拆成三个矩阵？有没有偏置？有没有像 Qwen3 那样的逐头 QK-norm？RoPE 是哪个变体？如果自己另写一套投影逻辑，就等于要把所有模型家族的前半截全部复制维护一遍，但凡有一处细节没对齐，补写进去的 K/V 就会和正常层算出来的发生数值偏离。
 
-千万别。如果你去翻翻 vLLM 里的模型实现，你会发现不同模型家族（Qwen2、Qwen3、Llama、DeepSeek）的注意力前半截简直是五花八门：QKV 是合并成一个大矩阵还是拆成三个？有没有偏置项（bias）？有没有 QK-norm？是在重塑形状前做还是重塑后做？RoPE 是标准版还是 Neox 风格？如果你自己写一套状态传播，你就得把所有模型家族的注意力前半截全抄一遍，而且只要上游改一行代码，你的状态传播就会跟真实层产生微妙的数值漂移。
+换个角度看：vLLM 原生的 `layer.self_attn` 模块本来就站在那里，它自己最清楚怎么把这一层的 QKV 投影、QK-norm、RoPE 以及任何挂载在 Value 上的自定义改写一丝不差地跑完。它唯一多做的事情，是在算完 `q, k, v` 之后继续调用了 `attention.attn.forward`（执行注意力并写缓存）和 `attention.o_proj.forward`（执行输出投影）。
 
-慢着——vLLM 原生的 `self_attn` 模块本来就站在那儿啊！它天生就知道怎么把这一层的 `input_layernorm`、QKV 投影、QK-norm 和 RoPE 一丝不差地跑完。它唯一的毛病是“太勤快了”：跑完这些之后，它还会接着去调 `attn.forward` 算注意力，接着去调 `o_proj.forward` 乘输出矩阵。
-
-既然它只是太勤快，那我们在叫它干活之前，**临时把它的后半截拆掉换成两个空壳，等它帮我们把 K/V 写进缓存了，再把原装零件给它装回去**，不就完了吗？
-
-来看看 `pllm/backends/vllm/adaptive_depth.py` 顶部那短短十几行的两个替身函数：
+既然如此，我们根本不需要写任何新算子，只需要在调用原生 `self_attn` 之前，把后面这两个步骤临时替换掉。`pllm/backends/vllm/adaptive_depth.py` 顶部的十来行代码定义了两个极简的替身函数：
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/adaptive_depth.py
@@ -177,9 +164,9 @@ def _omit_projection(hidden: torch.Tensor) -> tuple[torch.Tensor, None]:
     return hidden, None
 ```
 
-看到 `_store` 了吗？当原生的 `self_attn` 费尽千辛万苦算好了 `q, k, v`（连 RoPE 旋转都替我们做好了！），满怀期待地把它们交给底层的 `attention.attn.forward` 去跑 FlashAttention 时，半路接球的是我们的 `_store`。`_store` 根本不去读历史缓存算注意力，它只调了一句 vLLM 原生的 `do_kv_cache_update`，把新鲜出炉的 `k` 和 `v` 塞进分页缓存槽位 `slots` 里，然后随手把 `q` 原样退回去充数。紧接着，`self_attn` 准备把结果拿去乘输出投影矩阵 `o_proj`，接球的又是我们的 `_omit_projection`——它连矩阵乘都不做，直接把张量原样奉还！
+`_store` 接住原生前半截算好的 `q, k, v`，不去跑 FlashAttention，而是直接调用 vLLM 原生的 `do_kv_cache_update` 把 `k` 和 `v` 写进指定的缓存槽位 `slots`，然后随手把 `q` 原样返回；紧接着 `_omit_projection` 接住返回值，跳过 `o_proj` 矩阵乘直接返回。
 
-有了这两个替身，真正执行状态传播的 `propagate` 方法就像一场行云流水的外科手术：
+有了这两个替身，`AdaptiveSlice.propagate` 的主体就非常清楚了：
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/adaptive_depth.py
@@ -207,66 +194,61 @@ def propagate(self, step: Segment, hidden: torch.Tensor, active: torch.Tensor) -
             attention.attn.forward, attention.o_proj.forward = endpoint, projection
 ```
 
-这里有两个让人会心一笑的小细节。
+这里有两处值得留意的配合：
 
-第一，盯住 `slot_mapping.masked_fill(active.flatten(), -1)` 那一行。此时传进 `propagate` 的 `hidden` 是整批所有的行（既包含要跳层的 `active=False` 行，也包含一会儿要正常计算的 `active=True` 行）。我们怎么防止状态传播去污染那些活跃行的 KV 槽位呢？答案是利用 vLLM 底层缓存写入内核的一个原生约定：**只要槽位号（slot index）是 `-1`，写入内核就会自动跳过这一行（把 `-1` 当作 padding 处理）。** 所以我们只需要用 `masked_fill` 把所有活跃行的槽位涂成 `-1`，只有不活跃行的真实槽位号留着，就能直接把整批张量喂进去！
+第一处是 `slot_mapping.masked_fill(active.flatten(), -1)`。传进 `propagate` 的 `hidden` 是整批张量，既包含 `active=False` 的跳层行，也包含 `active=True` 的活跃行（活跃行一会儿还要去跑真正的模型层）。为了只写跳层行的 KV 而不覆盖活跃行的槽位，这里直接利用了 vLLM 缓存写入内核的一个原生约定：凡是槽位号为 `-1` 的行，内核都会当作填充行自动跳过写入。因此，把所有 `active=True` 的位置掩码成 `-1`，就能直接把整批张量原样送进去。
 
-第二，看那个 `try ... finally` 块。把 `attention.attn.forward` 和 `attention.o_proj.forward` 临时换成 `_store` 和 `_omit_projection`，调完原生归一化与 `attention(self.wave.positions, normal)`，立刻在 `finally` 里原封不动地换回来。
+第二处是 `try ... finally` 块：在调用 `attention(self.wave.positions, normal)` 前把 `attn.forward` 和 `o_proj.forward` 换成 `_store` 与 `_omit_projection`，调用结束立刻恢复原状。
 
 ```text
-Native self_attn during propagate() (Monkey-Patched in try/finally):
+Native self_attn during propagate():
+
   hidden ──► [ Native input_layernorm ] ──► [ Native QKV + QK-norm + RoPE ]
                                                            │
              ┌─────────────────────────────────────────────┘
              ▼
-     [ _store (replaces attn.forward) ] ──► do_kv_cache_update (active rows masked to slot -1!)
+     [ _store (replaces attn.forward) ] ──► do_kv_cache_update (active rows masked to -1)
              │
              ▼
-     [ _omit_projection (replaces o_proj) ] ──► return (Zero attention FLOPs, zero o_proj!)
+     [ _omit_projection (replaces o_proj) ] ──► return (skips attention read & o_proj GEMM)
 ```
 
-一行新的 CUDA 或 Triton kernel 都没写。原生的层自己帮我们跑完了归一化、投影、旋转、甚至任何挂在 Value 上的自定义改写 hook，把不活跃行的 K/V 妥妥当当地存进了分页缓存。我每次读到这个 `try/finally`，都忍不住想给它鼓掌：最高明的系统代码，往往不是你新写了多少行算子，而是你怎么四两拨千斤地让现有的代码只干你想让它干的那一半活。
+没有写一行新的算子内核，也没有复制任何模型家族的投影代码，仅仅通过临时替换两个函数属性，就借用上游模块自己的手把状态传播干干净净地做完了。
 
 ---
 
-## 在自动钢琴里装道岔：CUDA 条件节点与 2 的幂次桶
+## 图内分叉：CUDA 条件节点与 2 的幂次压紧桶
 
-状态传播解决了“不活跃的行怎么交代”，接下来我们要解决那个棘手的执行问题：**在不能回 CPU 同步、形状必须固定的 CUDA graph 里，怎么根据 GPU 上实时算出来的 `active` 掩码，去跑那些活跃的行？**
+补齐了不活跃行的 KV，接下来轮到那些 `active=True` 的活跃行真正执行模型层了。
 
-如果我们用的是早几年的 CUDA，这题基本无解——那时候的 CUDA graph 就像一架死板的自动钢琴，录制好什么琴谱，回放时就只能一个音符不差地从头砸到尾。但从 **CUDA 12** 的较新版本开始，NVIDIA 给这架自动钢琴装上了“道岔”：**条件节点（Conditional / IF Node）**。
+难点在于：在录制好的 CUDA Graph 内部，CPU 并不参与每一步的控制流，而且图里的算子要求固定的输入张量形状。如果当前批次总共有 32 行，这一步有 17 行需要算，下一步只有 5 行需要算，怎么在不通知 CPU、也不重录图的前提下动态执行？
 
-在录制 CUDA graph 时，你可以创建一个 `IF` 节点，把它绑定到 GPU 显存里的一个布尔标量（predicate）上，然后往这个节点里面录制一段子图。到了回放的时候，GPU 的硬件调度器会自己在设备端看一眼那个布尔标量的值是 `0` 还是 `1`，直接决定要不要执行这段子图——全程不需要 CPU 插一句话！
-
-我们在 `pllm/execution/cuda_graph.py` 里把这个能力包装成了一个极简的上下文管理器 `device_branch`：
+在较新的 CUDA 12 版本里，CUDA Graph 引入了设备端**条件节点（Conditional / IF Node）**。在录制图时，我们可以将一个 `IF` 节点绑定到显存里的一个单元素布尔张量（predicate）上，并在节点内部录制一段子图；到了回放阶段，GPU 硬件调度器会自己在设备端读取那个布尔值，决定是否执行子图。`pllm/execution/cuda_graph.py` 里的 `device_branch` 封装了这一机制：
 
 ```python
 # check-docs: skip: excerpt from pllm/execution/cuda_graph.py
 @contextmanager
 def device_branch(predicate: torch.Tensor) -> Generator[None]:
+    """Capture a CUDA IF node; cold warmup runs every branch without reading its predicate."""
     graph = (
         torch.cuda.CUDAGraph.get_currently_capturing_graph()
         if predicate.is_cuda and torch.cuda.is_current_stream_capturing()
         else None
     )
     if graph is not None:
-        graph.begin_capture_to_if_node(predicate)
+        graph.begin_capture_to_if_node(predicate)  # pyright: ignore[reportUnknownMemberType]
         _release_scope()
     try:
         yield
     finally:
         if graph is not None:
-            graph.end_capture_to_conditional_node()
+            graph.end_capture_to_conditional_node()  # pyright: ignore[reportUnknownMemberType]
             _release_scope()
 ```
 
-> **旁注：那两个不起眼的 `_release_scope()` 是干嘛的？**
-> 如果你去翻 `cuda_graph.py` 的源码，你会发现 `_release_scope()` 上面写着三行无奈的注释。这是只有真正把 PyTorch 条件节点搬上生产的人才会踩到的暗坑：PyTorch 的 C++ 底层在调用 `begin_capture_to_if_node` 和 `end_capture_to_conditional_node` 时，会各自重新打开一次同一个 CUDA 显存池（graph pool），导致这个池子的内部引用计数平白无故加了两次；然而当你销毁图调用 `CUDAGraph.reset()` 时，它却只释放第一次捕获时的那一个引用！如果不在这里手动调两次底层接口把多出来的引用计数平衡掉，只要你的图里用了一次条件节点，整块显存池就会像幽灵一样永远驻留在显卡里，再也释放不掉。
+（在非捕获的预热阶段，`graph` 为 `None`，代码会直接顺序跑过每一个分支以完成算子初始化，完全不去读取 `predicate` 的值，从而避免触发主机同步。代码里的两次 `_release_scope()` 则是为了填平 PyTorch 底层的一个引用计数缺口：PyTorch 的 `begin_capture_to_if_node` 和 `end_capture_to_conditional_node` 每次都会重新打开同一个图显存池并递增其使用计数，但 `CUDAGraph.reset` 销毁图时只释放最初的那个引用；如果不手动释放多出来的两次作用域引用，用过条件节点的图显存池就会发生泄漏。）
 
-有了 `device_branch`，我们可以在图里分叉了。但别忘了，条件节点只解决了“走哪条路”，没解决“张量形状必须固定”的问题。假设当前 batch 的总宽度 `width` 是 32 行：这一步可能有 17 行需要算，下一步可能只有 5 行需要算。总不能为 `1..32` 的每一种可能人数都录一张子图吧？
-
-我们的解法是搭一座两层的小梯子：**先看是不是全员到齐；如果不是，就把活跃行排个队压紧（compact）到最前面，然后装进按 2 的幂次（`1, 2, 4, 8, 16, ...`）预备好的固定尺寸桶（bucket）里去执行。**
-
-`AdaptiveSlice.__call__`（位于 `pllm/backends/vllm/adaptive_depth.py`）把这三条路写得一目了然（`sites_rows` 是给残差挂载点用的辅助上下文，可以先略过）：
+有了 `device_branch`，我们还需要解决“活跃行数每步变化”与“图内形状固定”的矛盾。`AdaptiveSlice.__call__` 的做法是预先为当前波次宽度准备一组 2 的幂次桶（如 `1, 2, 4, 8, 16, ...`，每个桶配有固定形状的注意力元数据缓冲区），然后在设备端按活跃行数 `count = active.sum()` 走三条分支：
 
 ```python
 # check-docs: skip: excerpt from pllm/backends/vllm/adaptive_depth.py
@@ -294,98 +276,80 @@ def __call__(self, step: Segment, hidden: torch.Tensor, active: torch.Tensor) ->
     return output
 ```
 
-顺着 `count = active.sum()`（注意，这也是一个留在 GPU 上的标量张量！）往下读，GPU 在回放时会根据当场的活跃人数，自动扳动道岔走下面三条路之一：
+把这段嵌套的条件分支画成执行流图，逻辑就一目了然了：
 
 ```text
-AdaptiveSlice Execution Branches (Width = 32, Zero Host Syncs):
+AdaptiveSlice device-side branching (width = 32, zero host sync):
 
-                    ┌── [ IF count == 32 ] ──► Run full batch [32, H] directly (no gather/scatter)
+                    ┌── [ IF count == 32 ] ──► Run full batch [32, H] directly
                     │
-  count = sum(active)
+  count = active.sum()
                     │                          1. propagate() K/V for inactive rows
-                    └── [ IF count < 32  ] ──► 2. if count == 0: no bucket fires, segment skipped!
-                                               3. [ IF count > 0  ] ──► argsort(~active) & compact into
-                                                                        power-of-two bucket (1, 2, 4, 8, 16, 32)
+                    └── [ IF count < 32  ] ──► 2. if count == 0: no bucket fires (segment skipped!)
+                                               3. [ IF count > 0  ] ──► argsort(~active) -> compact into
+                                                                        bucket size in {1, 2, 4, 8, 16}
 ```
 
-1. **全员活跃（`count == width`）**：没有任何一行跳层。直接跳过状态传播和排序搬运，按原装宽度把整批 `hidden` 喂给模型层跑完。
-2. **部分活跃（`0 < count < width`）**：先调我们刚才写的 `self.propagate` 为不活跃的行补齐 KV；然后用 `torch.argsort(~active.flatten(), stable=True)` 做一次稳定排序——因为 `~active` 对活跃行是 `0`、对不活跃行是 `1`，排序后所有活跃行的下标就整整齐齐地聚拢到了 `order` 数组的最前头！接着看 `count` 落在哪个 2 的幂次区间 `(lower, size]` 里（比如 5 行活跃就落进容量为 8 的桶），触发对应的 `device_branch`，把前 `size` 行抽出来（`compact`）跑一遍模型层（桶里多出来的凑数行同样把 KV 槽位涂成 `-1` 屏蔽掉），算完再按原下标写回 `output`。
-3. **全员跳过（`count == 0`）**：跑完 `self.propagate` 补齐那 7% 的 K/V 之后，`count > 0` 的条件为假，里面所有的桶分支统统不走——**整段模型层的注意力和 MLP 算子被条件节点直接短路跳过！**
-
-全程没有一次 `.item()`，没有一次主机同步，每一个桶在录制时都有着钉死的张量形状和预先建好的注意力元数据缓冲区。
-
-当然，天下没有白吃的午餐。一旦你用上了 `@pllm.custom_forward`，vLLM 原本那张从第 0 层一气呵成录到最后一层的整模型 CUDA graph 就不能用了——因为我们要在层段之间插手控制流，模型的层改由 pLLM 按切片、按活跃宽度（`ProgramWave`）分段捕获。而条件节点里的每一个桶分支，在录制预热时都得实打实地跑一遍并分配各自的图内中间缓冲区。
-
-这笔账最后会体现在 **CUDA Graph 捕获池（Capture Pool）** 的显存开销上。在 Qwen2.5-7B、32 个并发请求下，上面那个 `SkipMiddle` 负载的分段图捕获池需要大约 **143 MiB** 显存，超过了 pLLM 默认给单个任务划拨的 64 MiB 预算（早先在 Qwen2.5-0.5B 上测得的另一组数字是：32 并发约需 748 MiB，128 并发约需 1,392 MiB）。目前 CPU 侧的 `pllm.explain` 还估算不出这部分由 CUDA 驱动在捕获期动态吃掉的池子大小；不过当预算不够时，运行期会立刻抛出明确的异常，把精确到字节的所需大小（`custom-forward CUDA graphs need ... bytes; raise ExecutionOptions.cuda_graph_pool_budget_bytes above ...`）直接报给你。
-
-与此同时，改写前向拓扑还会带来几条自然的语义边界：既然一层可能被跳过、也可能在循环里被绕好几圈，“第 $L$ 层的唯一输出”这个概念就不再成立了。所以在同一个 Workload 里，你不能再混用读取固定层唯一输出的 `pllm.hidden` / `pllm.final_hidden`（要改读基于残差流的 `pllm.residual` 或 `pllm.layer_logits`），也不能混用 `pllm.model.Adapter`。至于像 Mixture-of-Recursions 里那种“在整个 batch 内部按分数搞 top-$k$ 竞争（Expert-Choice）”的路由写法，因为会让张三的 token 跳不跳层取决于今天跟他拼在同一个 batch 里的李四考了多少分，直接违反了多租户请求隔离铁律，pLLM 的契约检查器会毫不留情地将它拒之门外。
+* 当 `count == width`（全员活跃，没有一行跳层）时，直接按原批次跑完模型切片，不做状态传播，也不做排序搬运。
+* 当 `0 < count < width`（部分行跳层）时，先调用 `self.propagate` 为不活跃行补齐 K/V；随后通过 `torch.argsort(~active.flatten(), stable=True)` 在设备端将所有 `active=True` 的行排到数组最前端，并根据 `count` 落入的 `(lower, size]` 区间激活唯一对应的那个 2 的幂次桶。`self.compact` 抽出前 `size` 行跑完模型层（桶内凑数的非活跃行同样把 `slot_mapping` 设为 `-1` 屏蔽写入），再把结果散射写回 `output`。
+* 当 `count == 0`（整批所有行全都跳层）时，跑完轻量级的 `self.propagate` 后，`count > 0` 条件为假，内部所有桶全部跳过——整段模型层的注意力和 MLP 算子根本不会发射。
 
 ---
 
-## 反直觉的账单：为什么跳过 23% 的 Token 一点也不快？
+## 带宽的账单：为什么跳过 23% 的行不会让解码变快？
 
-机制搭好了，零同步也做到了，现在到了最刺激的环节：把这个跳层程序放到真实的显卡上跑一跑，看看它到底能给我们省下多少时间。
+整套机制在设备端闭环了。现在我们把它放到真实的硬件上量一量：在解码阶段跳过一部分 token，到底能省下多少时间？
 
-> **本篇实验环境声明**：除非另有说明，以下吞吐与分布数据均在单张 NVIDIA RTX 4090（24 GiB）、vLLM 0.32.0、PyTorch 2.13（CUDA 12.9）、`Qwen/Qwen2.5-7B-Instruct`（BF16，共 28 层，隐藏维 3584）下测得。吞吐测试使用 `pllm.benchmark.throughput`：32 个并发请求（8 条 prompt $\times$ 每条采样 $n=4$），每条生成 256 个 token，预热 1 轮后取 3 轮完整生成（含 prefill）的中位数。
+我们在单张 NVIDIA RTX 4090（24 GiB，vLLM 0.32.0，PyTorch 2.13，开启 CUDA Graph 与 FlashInfer 采样器）上，用 28 层的 `Qwen/Qwen2.5-7B-Instruct`（BF16，隐藏维 3584）运行示例 12 的 `SkipMiddle` 负载：根据第 12 到 15 层前后的余弦相似度，决定是否跳过第 16 到 19 层（共 4 层，占全模型层数的 $1/7$）。测试并发为 32 条序列（8 条 prompt $\times$ 每条采样 $n=4$），每条生成 256 个 token，取预热 1 轮后的 3 轮中位数。
 
-在示例 12（`doc/examples/12_adaptive_depth.ipynb`）里，我们让 `SkipMiddle` 在第 15 层出口检查第 12 到 15 层前后的余弦相似度，决定要不要跳过第 16 到 19 层（共 4 层，占 28 层的 $1/7$）。我们先用 `@pllm.export` 统计了 504 个 decode token 的余弦相似度分布，发现中位数在 `0.824` 左右：当阈值设为 `0.90` 时，没有任何 token 跳层；当阈值设为 **`0.85`** 时，大约有 **23% 的 token** 会跳过这 4 层；当阈值降到 `0.80` 时，有 72% 的 token 跳层。
+先用 `@pllm.export` 看一眼 504 个解码 token 上余弦相似度的真实分布：中位数在 `0.824` 附近。当阈值设为 `0.90` 时，没有 token 跳过；当阈值设为 `0.85` 时，约有 **23% 的 token** 跳过了第 16 到 19 层；当阈值降到 `0.80` 时，约有 72% 的 token 跳层。
 
-凭直觉想：既然在阈值 `0.85` 下有将近四分之一的 token 跳过了这 4 层，而且我们又用 2 的幂次桶把活跃行压紧了，吞吐怎么着也该往上涨一点吧？
+然而，端到端的吞吐数字初看之下却相当反直觉：
 
-看看实测出来的成绩单：
-
-| 运行配置（Qwen2.5-7B，32 并发，第 16–19 层可跳） | 实际吞吐 (tok/s) | 相对原生 CUDA Graph |
-|---|---:|---:|
-| 原生 vLLM，CUDA graph | 1,727 | 100% |
-| 原生 vLLM，eager（关闭 CUDA graph） | 1,703 | 99% |
+| 运行配置（Qwen2.5-7B，32 并发，第 16–19 层可跳） | 实测吞吐 (tok/s) | 相对原生 CUDA Graph |
+| :--- | ---: | ---: |
+| 原生 vLLM，CUDA Graph | 1,727 | 100% |
+| 原生 vLLM，Eager（关闭 CUDA Graph） | 1,703 | 99% |
 | `SkipMiddle`，从不跳（`threshold=2.0`） | 1,703 | 99% |
-| `SkipMiddle`，阈值 `0.85`（**约 23% 的 token 跳过**） | **1,692** | **98%** |
-| `SkipMiddle`，总是跳（`threshold=-2.0`，100% 跳过） | **1,928** | **112%** |
+| `SkipMiddle`，阈值 `0.85`（约 23% 的 token 跳过） | 1,692 | 98% |
+| `SkipMiddle`，总是跳（`threshold=-2.0`，100% 跳过） | 1,928 | 112% |
 
-盯住倒数第二行：**23% 的 token 跳过了 4 层，总吞吐不仅没涨，反而从 1,703 tok/s 微跌到了 1,692 tok/s（98%）！** 只有当我们把阈值设成 `-2.0`、强行让 batch 里的**所有 token 100% 一起跳过**这 4 层时，吞吐才猛地蹿升到 **1,928 tok/s（112%）**。
+看表格的第四行：明明有 23% 的 token 跳过了 4 层计算，而且活跃行已经被压紧到了更小的桶里，为什么总吞吐不仅没涨，反而从 1,703 tok/s 微跌到了 1,692 tok/s（98%），直到让整批 100% 全部跳过时才涨到 1,928 tok/s（112%）？在 `Qwen2.5-0.5B` 小模型上（较早在 vLLM 0.27.1 上的一次测量，第 16–19 层可跳）也能观察到完全一致的现象：从不跳为原生图吞吐的 93%，约 14% 的 token 跳过时为 90%，只有整批全跳时才升至 102%（0.5B 单步极短，原生关闭 CUDA Graph 退回 eager 会直接掉到 45%；而 7B 在 32 并发下每步耗时约 19 ms，CPU 发射开销被长算子掩盖，原生 eager 仍能保持 99%）。
 
-（顺便一提，早先在 0.5B 小模型上跑同样的实验，趋势一模一样：从不跳是原生的 93%，约 14% 的 token 跳过时降到 90%，总是跳才升到 102%——只不过在 0.5B 上一步 decode 只有两三毫秒，如果不开图退回 eager 模式，吞吐会暴跌到 45%；而在 7B 上一步 decode 长达约 19 ms，CPU 发射开销被庞大的矩阵乘掩盖了，所以原生 eager 也能跑出 99%。）
+原因不在于分支或桶的代码不够快，而在于短上下文解码阶段的物理瓶颈：**此时决定一层跑多快的不是算力（FLOPs），而是把模型权重从显存读进计算单元的内存带宽。**
 
-为什么会这样？难道我们的压紧桶白写了？
-
-一点也没白写，只是我们在跟一条冷酷的硬件物理定律掰手腕：**在短上下文的 decode 阶段，GPU 的瓶颈根本不是算力（FLOPs），而是把模型权重从显存搬进寄存器的内存带宽（Memory Bandwidth）！**
-
-让我们算一笔简单的账。Qwen2.5-7B 总共有 28 层，BF16 权重约 15 GiB，除去词表嵌入和 LM head，平均下来**每一层的权重就有大约 466 MB**。当 32 个并发请求（32 行）走到第 16 层时，假设有 8 行（25%）决定跳层，剩下的 24 行决定继续算。我们把这 24 行压紧到了容量为 32（或者当有 16 行跳层时压紧到容量为 16）的桶里去调第 16 层。
-
-这时候，GPU 的 Tensor Core 确实少做了 8 行的浮点乘加运算。可是，为了给剩下的那 24 行——**哪怕只剩下孤零零的 1 行！**——计算矩阵乘法，GPU 依然必须老老实实地把这一层重达 **466 MB** 的权重矩阵，从 HBM 显存里一个字节不落地完整读进 SM 一遍！
+算一笔简单的账就清楚了。`Qwen2.5-7B` 的 BF16 权重一共约 15 GiB；除去词嵌入和 LM head，28 层里每一层的注意力与 MLP 权重加起来大约有 **466 MB**。在 32 个并发请求的解码步里，激活张量只有薄薄的 32 行。假设在某一步，32 行里有 8 行（25%）满足条件跳过了第 16 层，剩下 24 行需要继续计算。
 
 ```text
-Why Partial Skipping Doesn't Speed Up Short-Context Decode:
+Short-context decode is weight-bandwidth bound (466 MB of weights per 7B layer):
 
-  Case A: 24 of 32 rows active (23% skipped)
+  Partial skip (24 of 32 rows active):
   ┌─────────────────────────┬───────────┐
-  │ 24 Active Rows (Compute)│ 8 Skipped │ ──► Still must read 100% of Layer Weights (466 MB / layer)!
-  └─────────────────────────┴───────────┘     + Extra cost: ~7% propagation + argsort/gather/scatter
+  │ 24 Active Rows (Compute)│ 8 Skipped │ ──► Must still read 100% of layer weights (466 MB/layer)
+  └─────────────────────────┴───────────┘     + pays ~7% KV propagation + argsort/gather/scatter
 
-  Case B: 0 of 32 rows active (100% skipped -> Bucket 0)
+  Full batch skip (0 of 32 rows active -> Bucket 0):
   ┌─────────────────────────────────────┐
-  │          All 32 Rows Skipped        │ ──► Conditional IF node skips the whole segment!
-  └─────────────────────────────────────┘     Saves 4 / 28 layers of weight reads (~1.86 GB) -> 112% tok/s!
+  │          All 32 Rows Skipped        │ ──► Conditional IF node skips the whole 4-layer slice
+  └─────────────────────────────────────┘     Saves 4 / 28 layers of weight reads (~1.86 GB) -> 112%
 ```
 
-在每次只喂几十行的瘦长矩阵乘（Skinny GEMM）里，把 466 MB 权重从显存搬过来的时间占了绝对大头，而多算几行或少算几行激活值的时间几乎可以忽略不计。部分跳层时，466 MB 的权重读取一分钱没省下，反而还要额外掏腰包付一笔约占单层 7% 的状态传播费，外加一次 `argsort` 和 `index_select` / `index_copy_` 的搬运费。一进一出，自然就从 99% 微跌到了 98%。
+为了给剩下的那 24 行——哪怕压紧后桶里只剩下孤零零的 **1 行**——执行矩阵乘法，GPU 依然必须把第 16 层到第 19 层每层 466 MB、四层合计 **1.86 GB** 的权重矩阵，一个字节不落地从显存完整读进芯片一遍！部分跳层一分钱的权重读取带宽都没省下来，反而额外付出了约占单层 7% 的状态传播开销，以及 `argsort`、压紧与散射写回的搬运成本，吞吐自然就从 99% 微降到了 98%。只有当整批 32 行全部跳过（`count == 0`）、条件节点把这 4 层的算子整体短路掉时，那 1.86 GB 的权重读取才真正被省了下来，兑现成 112% 的加速（与少读 $4/28 \approx 14.3\%$ 的层权重大致相符）。
 
-反过来，当整批 32 行全部决定跳层（落进桶 0）时，奇迹发生了：条件节点 `device_branch(count > 0)` 直接把第 16 到 19 层的整个执行段短路掉了。GPU 完完全全省下了 4 层、合计约 **1.86 GB** 的权重读取流量！28 层里少读了 4 层（$4/28 \approx 14.3\%$），扣掉一点点状态传播的开销，实测吞吐提升到 **112%**，跟物理带宽账相符。
+那么，按行的部分跳过与压紧桶在什么条件下才能真正省下时间？有两个场景：
+一是**超长上下文解码**。当历史序列长达几万个 token 时，每一行在注意力层需要读取的历史 KV 缓存体积会反超单层权重；此时被跳过的行因为省去了 `attn.forward` 的历史 KV 扫描，就能按跳过行数的比例实打实地省下显存带宽（原理如此，长上下文下的这一交叉点我们尚未做专门的基准实测）。
+二是**算力受限（Compute-bound）的大批次场景**。当并发批次大到矩阵乘法不再受限于读权重、而是受限于 Tensor Core 算力时，把活跃行压紧到小一号的 2 的幂次桶里，就能直接按比例减少浮点运算时间。
 
-那么，按行的部分跳过与压紧桶，在什么场景下才能真正显出威力呢？有两个地方：
-1. **当上下文变得极长（几千到几万 token）时**：那时候每一步 decode 不仅要读一层 466 MB 的权重，每一行还要去扫自己长达几万个位置的全部历史 KV 缓存。当历史 KV 的读取量反超层权重时，被跳过的行因为直接略过了 `attn.forward`，就能按跳过的行数实打实地省下大块的历史 KV 带宽（原理如此，我们尚未在长上下文基准上专门实测这一交叉点）。
-2. **当 batch 极大、计算进入算力受限（Compute-bound）区时**：一旦矩阵乘不再被权重读取卡脖子，把 128 行压紧成 64 行，就能真金白银地省下一半的 Tensor Core 算力时间。
-
-最后，别忘了看一眼生成质量。在同一个实验里，我们用 `pllm.testing.check_distribution`（通过 Teacher Forcing 逐位置对比跳层模型与原模型的下一词概率分布）测量了分布偏移：在阈值 `0.85`（23% 跳过）时，平均 KL 散度就已经到了 **0.131**（TV 距离 **0.07**）；阈值降到 `0.80`（72% 跳过）时，KL 升到 **0.562**（TV **0.18**）；而全部跳过时，KL 高达 **0.868**（TV **0.25**）。虽然生成的英文句子读起来依然通顺，但概率分布其实已经漂移得很远了——因为原装的 `Qwen2.5-7B-Instruct` 在预训练时压根没见过“中间四层突然消失”的场面。系统底座能保证的是让“跳层”这件事在工程上跑得正确、隔离且零同步；但到底能不能跳、跳完之后模型考多少分，永远得靠专门训练过的权重（如 LayerSkip、CALM 或 Ouro 检查点）和你的任务评测来说话。
+在关心速度的同时，也别忘了检查跳层对模型输出分布的实际影响。用 `pllm.testing.check_distribution`（通过 Teacher Forcing 逐位置比对跳层模型与原模型的下一词概率分布）在同一个 7B 实验上测量：在阈值 `0.85`（23% 跳过）时，平均 KL 散度为 `0.131`（总变差距离 TV 为 `0.07`）；阈值设为 `0.80`（72% 跳过）时，KL 升至 `0.562`（TV `0.18`）；全部跳过时，KL 达到 `0.868`（TV `0.25`）。因为原生的 `Qwen2.5-7B-Instruct` 在预训练时从未见过“中间四层被当作恒等映射跳过”的情况，尽管生成的文本表面通顺，分布其实已经发生了明显偏移。系统机制能保证跳层在工程上不踩空 KV、不阻塞流水线，但算法上能不能跳、在哪几层跳，必须搭配专门经过层丢弃或早退训练的检查点（如 LayerSkip、CALM、Ouro）并用下游评测来把关。
 
 ---
 
-## 回头看那张登记簿
+## 工程边界与代价
 
-每次回顾 `@pllm.custom_forward` 的演进，我都会想起我们最初面对“跳层之后 KV 缓存少了一块”时的抓耳挠腮。
+最后，把 `@pllm.custom_forward` 在系统里的几条硬边界交代清楚。
 
-在系统设计里，当你面对一种动态性（比如有的 token 走 24 层，有的走 28 层），最容易掉进去的陷阱就是顺着动态性去改底层的数据结构——去搞变长的每层页表、去改注意力的掩码内核、去写逐 token 的解释器。一旦走上那条路，你会发现整个引擎里所有假设了“规整形状”的部件都在跟你作对。
+第一是 **CUDA Graph 捕获池的显存账单**。一旦使用 `@pllm.custom_forward` 接管了层间控制流，vLLM 默认那张从头录到尾的整模型图就会被替换为 pLLM 按层切片、按活跃波次宽度录制的一组图；而条件节点里的每一个 2 的幂次桶分支，在预热捕获时都会在图显存池里分配自己的中间激活缓冲。在 7B、32 并发下，`SkipMiddle` 的图捕获池大约需要 **143 MiB** 显存，超过了默认给单任务配置的 64 MiB 上限（较早的一版实现在 0.5B 模型上，32 并发与 128 并发下测得的捕获池需求分别约为 748 MiB 与 1,392 MiB）。CPU 侧的静态规划器 `pllm.explain` 不会预先估算这部分由 CUDA 驱动在捕获期动态决定的池大小；当预算不足时，运行期会直接报错并给出所需的精确字节数，提示调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`。
 
-状态传播教会我们的是另一种哲学：**不要让上层的动态控制流泄漏成底层数据结构的形状碎片；相反，在动态与静态交界的边界上花 7% 的代价把账补齐，让底层的存储与算子看到的永远是一个满格、规整、风平浪静的世界。**
+第二是 **状态显存与组合约束**。状态传播的本质是把被跳过层的 KV 槽位填满，因此跳层**不会释放或节省任何 KV 显存**。此外，因为一层可能被跳过、也可能在循环里被执行多次，“第 $L$ 层的唯一隐藏状态”不再有明确定义，所以在同一个 Workload 内，`@pllm.custom_forward` 不能与读取固定层输出的 `pllm.hidden` / `pllm.final_hidden` 混用（需改用基于残差流的 `pllm.residual` 或 `pllm.layer_logits`），也不能与静态 KV 布局或带状态的残差记忆子层同时开启（`pllm.model.Adapter` 倒是可以同时使用：增量跟随每一次实际发生的投影调用生效）。
 
-而当我们需要补上那 7% 的 K/V 时，甚至连一行新算子都不用写——轻轻拧下原生 Attention 模块后半截的两个螺丝，借它的手把活干完，再在 `finally` 里把螺丝拧回去。有时候，最好的代码，确实是你克制住冲动、最终没有写出来的那一行。
+回过头看，处理层间动态控制流最容易掉进去的陷阱，就是顺着算法的动态性去拆改底层的存储结构——试图维护每层不同长度的块表，或者退回逐 token 的解释循环。状态传播与条件压紧桶提供的是另一种解法：**在动态控制流与静态底座的交界处，花 7% 的单层代价通过原生模块把 KV 账本补齐，让底层的块表、注意力内核与 CUDA Graph 看到的依然是一个满格、规整的世界。**
