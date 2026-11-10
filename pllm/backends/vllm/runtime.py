@@ -41,7 +41,7 @@ from pllm.backends.vllm.overlay_graph import (
     graph_options,
 )
 from pllm.backends.vllm.training import CausalTraining
-from pllm.config import ExecutionOptions, ModelConfig, ModelDType
+from pllm.config import ModelConfig, ModelDType
 from pllm.contracts.backend_attachment import (
     BackendAttachment,
 )
@@ -104,14 +104,6 @@ class BackendCommand(StrEnum):
     PROFILE = "profile_tasks"
     SELECT_TRACE = "select_trace"
     DETACH = "detach"
-
-
-@dataclass(frozen=True, slots=True)
-class BackendProbe:
-    """What the driver asks the worker to probe; the publish lag sizes page capacity."""
-
-    requirements: BackendRequirements
-    publish_lag: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,7 +752,7 @@ def create_vllm_llm(
                 timeout=30.0,
                 args=(
                     BackendCommand.PROBE.value,
-                    encode_boundary(BackendProbe(requirements, config.execution.publish_lag)),
+                    encode_boundary(requirements),
                 ),
             )
             probes = [decode_boundary(reply, BackendCompileFacts) for reply in replies]
@@ -780,7 +772,7 @@ def create_vllm_llm(
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
             facts, declaration = workload.specialize(
-                probe_backend(requirements, runner, publish_lag=config.execution.publish_lag),
+                probe_backend(requirements, runner),
                 config.execution,
                 causal=partial(CausalTraining, runner.decoder),
             )
@@ -806,12 +798,7 @@ def create_vllm_llm(
         return handle
 
 
-def probe_backend(
-    requirements: BackendRequirements,
-    runner: WorkloadModelRunner | Mrv1Runner,
-    *,
-    publish_lag: int = 1,
-) -> BackendCompileFacts:
+def probe_backend(requirements: BackendRequirements, runner: WorkloadModelRunner | Mrv1Runner) -> BackendCompileFacts:
     shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     dtypes: dict[torch.dtype, ModelDType] = {
@@ -829,7 +816,6 @@ def probe_backend(
         seed=runner.model_config.seed,
         runner=runner.runner_kind,
         tensor_parallel_size=runner.parallel_config.tensor_parallel_size,
-        execution=ExecutionOptions(publish_lag=publish_lag),
     )
     return compile_facts(
         shape,

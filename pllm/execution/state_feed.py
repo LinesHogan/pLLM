@@ -18,7 +18,7 @@ import torch
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
-from pllm.contracts.state_feed import FeedBinding, FeedOrder
+from pllm.contracts.state_feed import FEED_SLOTS, FeedBinding, FeedOrder
 from pllm.contracts.state_ref import StateRef
 from pllm.execution.ptts.page_borrow import BorrowedPage, BorrowedStateRoot, receive_field
 from pllm.execution.ptts.page_bundle import PageBundleArena, PageRelease
@@ -44,9 +44,6 @@ class ReadonlyStepEnd:
 
 
 Channels = tuple[tuple[Connection, ...], ...]
-
-# Versions in flight per feed: the engine reads one, one waits in the queue, and the producer writes the next.
-FEED_SLOTS = 3
 
 
 class FeedEvent(StrEnum):

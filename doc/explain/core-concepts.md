@@ -79,7 +79,7 @@ member  effect  anchor / lane / graph  state reads (origin, distance)
 loss  train  token.commit / side / captured  distiller (latest, 0)
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
 state  scope  roots  bytes/root  reserved bytes [exact]
-distiller  request  34  129104  4389596  field 0: float32, field 1: float32, ...
+distiller  request  24  129104  3098556  field 0: float32, field 1: float32, ...
 host     0 syncs in traced workload math; exports: none
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
 ```
@@ -244,7 +244,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 - 如果要求第 $n+1$ 步的 `predict` 立刻读到第 $n$ 步训练出的新权重（即 `publish_lag=0`），主流上的第 $n+1$ 步就必须停下来干等第 $n$ 步的训练全部算完，训练和推理被迫串行。
 - pLLM 默认设置 **`publish_lag=1`**：第 $n$ 步算出的更新在第 **$n+2$** 步才对其他读取者可见。这样，当第 $n$ 步的训练在 `side` 流上运行时，第 $n+1$ 步的主流可以直接读取第 $n-1$ 步已发布的版本（`boundary, 1`，距离最新差 1 步），完全不用等待；与此同时，训练任务自己始终基于最新版本迭代（`latest, 0`，距离为 0），不会丢失任何一步梯度（详见 [在线训练](../guides/training.md)）。
-- 因为 `side` 流正在写的新版本和 `main` 流正在读的旧版本必须同时留在显存里，pLLM 为每个状态预留的份数比并发请求数多（`explain` 里 `state` 行的 `roots`：`max_num_seqs=8` 时 `Distill` 预留 34 份）。`publish_lag` 越大，同时存在的版本越多，预留的份数也越多。
+- 因为 `side` 流正在写的新版本和 `main` 流正在读的旧版本必须同时留在显存里，pLLM 为每个状态预留的份数比并发请求数多（`explain` 里 `state` 行的 `roots`：`max_num_seqs=8` 时 `Distill` 预留 24 份）。`publish_lag` 越大，同时存在的版本越多，预留的份数也越多。
 
 ### 对你写代码的直接影响
 

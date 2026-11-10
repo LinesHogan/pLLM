@@ -54,7 +54,7 @@ def overlay_facts():
     facts = BackendCompileFacts(
         probe,
         model_timeline(torch.device("cpu"), ("state/dense_page_cpu@1", "transition/full_root@1")),
-        (PageBundleProviderFacts("test.attachment@1", 4),),
+        (PageBundleProviderFacts("test.attachment@1"),),
         2,
         4096,
         7,

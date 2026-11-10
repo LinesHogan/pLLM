@@ -1,11 +1,13 @@
 """Cold physical capacity facts for the shared CPU/CUDA PageBundle arena."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from math import prod
 from pathlib import Path
 
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.semantic_graph import SchedulerTimeline, SemanticGraph, StateScope
+from pllm.contracts.state_feed import FEED_SLOTS
 from pllm.contracts.state_representation import (
     StateDeviceKind,
     StateProviderPlan,
@@ -14,6 +16,7 @@ from pllm.contracts.state_representation import (
 from pllm.contracts.tensor_layout import (
     TensorFieldSpec,
     TensorLayoutBinding,
+    TensorLayoutDecision,
     TensorLayoutRequest,
     TensorLayoutSpec,
 )
@@ -27,9 +30,31 @@ def compile_page_bundle_plan(
     max_admitted_lineages: int,
     state_page_budget_bytes: int,
 ) -> PlanBundle:
-    """Compile original declarations once; all choices remain Rust-owned."""
+    """Compile original declarations once; all choices remain Rust-owned.
+
+    How many old versions the post-sample overlap retains is a schedule fact (its largest read
+    distance) that does not depend on reservations or budgets. A first plan without budgets finds it;
+    the second plan reserves it and checks the budgets.
+    """
     graph, layouts = declaration
     layout_decision = intern_tensor_layouts(layouts)
+    request = partial(_state_request, graph, layouts, layout_decision, providers, max_admitted_lineages)
+    _, unbudgeted = compile_state_schedule(graph, replace(timeline, execution_peak_budget_bytes=None), request(0, 0))
+    history = max((task.read_distance for task in unbudgeted.tasks), default=0)
+    states, schedule = compile_state_schedule(graph, timeline, request(history, state_page_budget_bytes))
+    return PlanBundle(graph, timeline, schedule, states, layouts, layout_decision)
+
+
+def _state_request(
+    graph: SemanticGraph,
+    layouts: TensorLayoutRequest,
+    layout_decision: TensorLayoutDecision,
+    providers: tuple["PageBundleProviderFacts", ...],
+    max_admitted_lineages: int,
+    history: int,
+    state_page_budget_bytes: int,
+) -> StateRepresentationRequest:
+    """Every provider's reservation for every state, after checking host tables fit host memory."""
     candidates = tuple(
         provider.materialize_plan(
             resource=entry.resource,
@@ -37,7 +62,7 @@ def compile_page_bundle_plan(
             binding=binding,
             max_admitted_lineages=max_admitted_lineages,
             graph=graph,
-            timeline=timeline,
+            history=history,
         )
         for entry, binding in zip(layouts.layouts, layout_decision.bindings, strict=True)
         for provider in providers
@@ -56,11 +81,9 @@ def compile_page_bundle_plan(
             raise ValueError(
                 'host tables do not fit available host memory; reduce the tables or declare placement="device"'
             )
-    request = StateRepresentationRequest(
+    return StateRepresentationRequest(
         state_page_budget_bytes, tuple(binding.resource for binding in layout_decision.bindings), candidates
     )
-    states, schedule = compile_state_schedule(graph, timeline, request)
-    return PlanBundle(graph, timeline, schedule, states, layouts, layout_decision)
 
 
 def page_stride_bytes(field: TensorFieldSpec) -> int:
@@ -68,20 +91,28 @@ def page_stride_bytes(field: TensorFieldSpec) -> int:
     return (size + field.alignment_bytes - 1) // field.alignment_bytes * field.alignment_bytes
 
 
-def version_capacity(lineages: int, publish_lag: int, *, exact_decode: bool = False) -> int:
-    """Current/private roots, retained readers and history, plus two rollover slots.
+def version_capacity(lineages: int, history: int, *, written: bool) -> int:
+    """Pages per field that the admitted lineages of one state can hold at the same time.
 
-    Exact in-forward transitions retain no post-sampler history. GPU completion
-    fences govern reuse, so outstanding GPU work needs no further reserved roots.
+    Each admitted lineage holds:
+    - 1, the version its step reads, pinned until the step commits;
+    - `history`, the older versions the post-sample overlap keeps for lagged readers. Its newest pin is
+      the latest published version, which therefore needs no root of its own. A retired lineage still
+      pinned there shares its seat with the lineage admitted next, which has no history yet;
+    - 1 if a task writes the state, the private version a transition fills before it publishes.
+
+    Released pages are reused behind GPU completion fences, so in-flight GPU reads reserve nothing.
     """
-    return (2 if exact_decode else 3 + publish_lag) * lineages + 2
+    return (1 + history + written) * lineages
 
 
 @dataclass(frozen=True, slots=True)
 class PageBundleProviderFacts:
+    """Where state pages live. Test harnesses that hold extra pins set aside `minimum_pages` per state."""
+
     provider_id: str
-    page_capacity: int
     device_kind: StateDeviceKind = StateDeviceKind.CPU
+    minimum_pages: int = 0
 
     def materialize_plan(
         self,
@@ -91,15 +122,22 @@ class PageBundleProviderFacts:
         binding: TensorLayoutBinding,
         max_admitted_lineages: int,
         graph: SemanticGraph,
-        timeline: SchedulerTimeline,
+        history: int,
     ) -> StateProviderPlan:
-        """Reserve versions of one instance lineage, or the provider's request capacity."""
+        """Reserve every version one state can hold at once, so a transition never waits for a page."""
         state = next(state for state in graph.states if state.resource == resource)
         instance = state.scope is StateScope.INSTANCE
-        lag = 0 if timeline.visibility is None else timeline.visibility.lag
-        capacity = min(self.page_capacity, version_capacity(1, lag)) if instance else self.page_capacity
-        if instance and state.immutable:
+        if any(state.resource in group.borrowed_resources for group in graph.input_groups):
+            capacity = FEED_SLOTS
+        elif instance and state.immutable:
             capacity = 1
+        elif instance:
+            # Requests admitted before the latest write keep reading the version they pinned at admission.
+            capacity = max(self.minimum_pages, version_capacity(1, history, written=True) + 1)
+        else:
+            capacity = max(
+                self.minimum_pages, version_capacity(max_admitted_lineages, history, written=not state.immutable)
+            )
         reserved_bytes = sum(
             capacity * page_stride_bytes(field) + max(field.alignment_bytes - field.dtype.itemsize, 0)
             for field in layout.fields

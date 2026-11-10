@@ -362,15 +362,15 @@ def test_check_versions_follow_lag_and_detect_wrong_history(lag, model_config):
     config = replace(model_config, execution=pllm.ExecutionOptions(publish_lag=lag))
     assert "publish_lag" in testing.check(workload, config).passed
     if lag == 1:
+        # A deeper history than planned has no reserved pages; a shallower one reads the wrong version.
         initialize = PostSampleOverlap.__init__
-        for wrong_lag in (0, 2):
 
-            def wrong_history(self, arena, directory, lag, stream, anchor):
-                initialize(self, arena, directory, wrong_lag, stream, anchor)
+        def wrong_history(self, arena, directory, lag, stream, anchor):
+            initialize(self, arena, directory, 0, stream, anchor)
 
-            with patch.object(PostSampleOverlap, "__init__", wrong_history):
-                with pytest.raises(testing.ContractError, match=r"\[publish_lag / visibility\].*read version"):
-                    testing.check(workload, config)
+        with patch.object(PostSampleOverlap, "__init__", wrong_history):
+            with pytest.raises(testing.ContractError, match=r"\[publish_lag / visibility\].*read version"):
+                testing.check(workload, config)
 
 
 def test_check_reports_unsupported_replay_with_actionable_visibility(model_config):

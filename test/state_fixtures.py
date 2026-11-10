@@ -88,7 +88,7 @@ def page_arena(*, heterogeneous: bool = False) -> PageBundleArena:
 def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
     """Plan a changed state set through the ordinary Rust state scheduler."""
     bindings = intern_tensor_layouts(layouts)
-    provider = PageBundleProviderFacts("test.page_bundle@1", 6)
+    provider = PageBundleProviderFacts("test.page_bundle@1", minimum_pages=6)
     candidates = tuple(
         provider.materialize_plan(
             resource=entry.resource,
@@ -96,7 +96,7 @@ def replan_states(plan, graph, layouts: TensorLayoutRequest, memory_bytes: int):
             binding=binding,
             max_admitted_lineages=2,
             graph=graph,
-            timeline=plan.timeline,
+            history=0,
         )
         for entry, binding in zip(layouts.layouts, bindings.bindings, strict=True)
     )

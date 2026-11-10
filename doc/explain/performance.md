@@ -115,9 +115,9 @@ loss  train  token.commit / side / captured  distiller (latest, 0)
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
 tap      model.layers.0[0], decode: 1837056 bytes shared by loss, predict
 state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  514  516176  265314524  field 0: float32, field 1: float32, ...
-memory   peak 1512728864 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
-         below 1512728864 bytes tasks run inline; below 1333743904 bytes planning fails
+distiller  request  384  516176  198211644  field 0: float32, field 1: float32, ...
+memory   peak 1445625984 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
+         below 1445625984 bytes tasks run inline; below 1266641024 bytes planning fails
 host     0 syncs in traced workload math
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
 ```
@@ -274,15 +274,22 @@ print(pllm.explain(Distill(), strict_config))
 
 ### 4.1 分页状态池与版本槽位公式（`roots`）
 
-当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，pLLM 用一个分页的状态池管理显存。当状态更新时，框架执行**字段级写时复制（COW）**：只为被修改的字段分配新物理页，未修改字段直接与旧版本共享物理槽位。
+当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，pLLM 用一个分页的状态池管理显存：每个字段一个池，池里每页放这个字段的一份值；`roots` 是每个池预留的页数，也就是这个状态最多能同时存在多少个版本。状态更新时，框架执行**字段级写时复制（COW）**：只为这次更新改写的字段分配新页，没改的字段继续与旧版本共用同一页。
 
-为什么在 `pllm.explain` 里看到的 `roots`（预留槽位数）比 `max_num_seqs` 大得多？
-因为为了支持 `publish_lag` 跨步重叠，当旁路流正在写入新版本时，主干流还在读取旧版本，多个版本必须同时驻留在显存里。精确槽位公式如下（其中“副本数”为并发请求槽位数，即 `max_num_seqs`）：
+COW 省的是“同一次更新里没改的字段”。`Distill` 和 `ESamp` 的训练每步都改写全部字段（参数和 AdamW 的一阶、二阶矩打包在同一个字段里），所以训练产生的每个新版本都要一整份新页。为什么 `roots` 会比 `max_num_seqs` 大？因为每个请求槽位在同一时刻可能要留住下面几份版本，每一份都有它的用处：
 
-* **普通可写 `RequestState`**：$\text{roots} = (3 + \text{publish\_lag}) \times \text{副本数} + 2$
-  * 例如第 2 节的 `Distill`（7B，hidden 3584）：`max_num_seqs=128`、默认 `publish_lag=1` 时，$\text{roots} = 4 \times 128 + 2 = \mathbf{514}$，每份 $516,176\text{ B}$，总预留 $265,314,524\text{ B} \approx \mathbf{253\text{ MiB}}$。改成 `publish_lag=0` 后为 $3 \times 128 + 2 = 386$ 份（约 190 MiB）。
-* **前向内精确更新（`@pllm.train_in_forward(visibility="exact")` decode）**：$\text{roots} = 2 \times \text{副本数} + 2$
-* **`InstanceState`**：可写实例状态按一份副本计算（默认 `publish_lag=1` 时 $\text{roots} = 6$）；只读（不可变）实例状态只需 **`1` 个 root**。
+| 份数 | 什么时候需要 |
+| :--- | :--- |
+| 1 | 这一步读的版本：从这一步开始一直留到这一步提交，主干流和旁路流都在读它。 |
+| $H$ | 落后读者要读的旧版本。只有当某个方法读落后的版本时才需要，`explain` 的 `state reads` 里会出现 `(boundary, H)`，$H$ 等于 `publish_lag`；例如第 n 步的训练还在旁路流写新版本时，第 n+1 步的 `predict` 读的是更早的版本。这几份里最新的一份就是当前已发布的版本，所以“最新版本”不用再单独占一份。 |
+| 1 | 这一步训练正在写的新版本；没有方法写这个状态时不需要。 |
+
+所以请求级状态的公式是 $\text{roots} = (1 + H + W) \times \text{max\_num\_seqs}$，其中 $W$ 在有方法写这个状态时为 1、否则为 0。请求结束后，它留在落后读者那里的旧版本和接替它槽位的新请求共用这几份：新请求还没有旧版本可留。还在 GPU 上运行的读操作不需要额外的份数：一页被释放后，下一次写它会先在 GPU 上等前面的读完成，而不是另占一页。
+
+* **读落后版本的可写 `RequestState`**：例如第 2 节的 `Distill`（7B，hidden 3584，`predict` 读 `(boundary, 1)`）：`max_num_seqs=128`、默认 `publish_lag=1` 时，$\text{roots} = 3 \times 128 = \mathbf{384}$，每份 $516,176\text{ B}$，总预留 $198,211,644\text{ B} \approx \mathbf{189\text{ MiB}}$。改成 `publish_lag=0` 后为 $2 \times 128 = 256$ 份（约 126 MiB）。
+* **只读最新版本的可写 `RequestState`**：例如 `ESamp`（$\beta=0$，只有 `loss` 读 `(latest, 0)`）、前向内精确更新（`@pllm.train_in_forward(visibility="exact")`），以及模型前向里读状态的适配器：$H=0$，$\text{roots} = 2 \times \text{max\_num\_seqs}$，与 `publish_lag` 无关。
+* **只读 `RequestState`**：$\text{roots} = (1 + H) \times \text{max\_num\_seqs}$。
+* **`InstanceState`**：可写实例状态按一个槽位计算，再加 1 份：在最近一次写之前接纳的请求会一直读它接纳时的版本，即 $\text{roots} = 1 + H + 1 + 1$（例如 `OverRIDE` 在 `publish_lag=1` 时为 4）；只读实例状态只需 **1 个 root**；由 `pllm.Fed` 供给的状态固定 3 个 root（引擎读一份、一份排队、生产者写下一份）。
 
 ### 4.2 自动精度选择：什么时候用 BF16，什么时候必须用 FP32？
 

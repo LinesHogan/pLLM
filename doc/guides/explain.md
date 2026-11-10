@@ -82,9 +82,9 @@ predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1
 tap      model.layers.0[0], decode: 1837056 bytes shared by loss, predict
 tap      model.layers.27[0], decode: 1837056 bytes shared by loss
 state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  514  458768  235806812  field 0: float32, field 1: float32, field 2: float32, field 3: float32, field 4: float32; source: module init; placement: device; host bytes: 0; logical transfer bytes/row: 0; decode bytes/step: 0
-memory   peak 1463980640 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
-         below 1463980640 bytes tasks run inline; below 1301602400 bytes planning fails
+distiller  request  384  458768  176166972  field 0: float32, field 1: float32, field 2: float32, field 3: float32, field 4: float32; source: module init; placement: device; host bytes: 0; logical transfer bytes/row: 0; decode bytes/step: 0
+memory   peak 1404340800 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
+         below 1404340800 bytes tasks run inline; below 1241962560 bytes planning fails
 preempt  state keep; replay rejection: not applicable to kept state
 host     0 syncs in traced workload math
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
@@ -102,8 +102,8 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
   - `CUDA-graph pool reservation`：为这段计算捕获 CUDA graph 要预留的私有显存池；这部分显存要从 KV cache 那里分走，所以列出来。
   - `estimate / step`：这段计算每步（按 `max_num_seqs` 行算）的 FLOP、状态读写字节和采样器字节估计。`predict` 的 `projection FLOP` 与 `sampler` 字节来自用 LM head 投影预测并引导采样。
 - **`tap`**：从模型里取出的 hidden（第 0 层、第 27 层）和预留的缓冲大小（各 1837056 字节）；第 0 层的那份由 `loss` 和 `predict` 共用。
-- **`state`**：`distiller` 是请求级状态，预留 514 份（`roots`），每份 458768 字节，共 235806812 字节（约 225 MiB）；`[exact]` 表示这是精确值。514 是为 128 个并发请求和在途的版本预留的份数——比并发数多，因为训练中的新版本和正在被读的旧版本要同时存在。
-- **`memory`**：由 `execution_peak_budget_bytes` 约束的 pLLM 执行峰值（含状态页、任务工作区与结果、图池和 anchor 预留），为 1463980640 字节（约 1396 MiB）。第二行说明：预算低于 1463980640 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 1301602400 字节时规划失败。
+- **`state`**：`distiller` 是请求级状态，预留 384 份（`roots`），每份 458768 字节，共 176166972 字节（约 168 MiB）；`[exact]` 表示这是精确值。384 = 3 × 128：每个并发请求要同时留住这一步读的版本、`predict` 落后一步要读的旧版本和训练正在写的新版本（见[性能说明 4.1 节](../explain/performance.md#41-分页状态池与版本槽位公式roots)）。
+- **`memory`**：由 `execution_peak_budget_bytes` 约束的 pLLM 执行峰值（含状态页、任务工作区与结果、图池和 anchor 预留），为 1404340800 字节（约 1339 MiB）。第二行说明：预算低于 1404340800 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 1241962560 字节时规划失败。
 - **`host`**：负载的张量数学里没有 GPU 到 CPU 的同步（`0 syncs`）。
 - **`timing`**：时机设置及其后果；`(default)` 表示你没改过默认值。
 - **`note`**：这份报告不知道的事（见下文的限制说明）。
@@ -167,7 +167,7 @@ print(pllm.explain(MiniESamp(beta=0.5), small).budget_errors)
 输出如下：
 
 ```text
-('pLLM execution needs 1301602400 bytes at its peak but only 67108864 fit; lower max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; reduce device tables or explicitly declare placement="host" for read-only lookup tables',)
+('pLLM execution needs 1241962560 bytes at its peak but only 67108864 fit; lower max_num_batched_tokens or raise ExecutionOptions.execution_peak_budget_bytes; reduce device tables or explicitly declare placement="host" for read-only lookup tables',)
 ```
 
 `budget_errors` 为空表示声明的预算装得下；不为空时，报告仍会给出不带这个限制的计划，并附上和 `make_llm` 相同的报错信息。如果是其他准入错误（例如不支持的组合），`pllm.explain` 会直接抛出异常，报错信息与创建引擎时相同。

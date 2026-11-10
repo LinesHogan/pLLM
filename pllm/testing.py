@@ -85,7 +85,7 @@ def backend_facts(
     *,
     device: str = "cpu",
     capabilities: tuple[str, ...] = SIMULATED_CAPABILITIES,
-    pages: int = 16,
+    pages: int = 0,
     max_lineages: int = 2,
     memory_bytes: int = 10000,
     max_rows: int | None = None,
@@ -97,8 +97,9 @@ def backend_facts(
     """Facts for an eager in-process model, in place of what the vLLM runner probes.
 
     `hidden` lists the taps the workload reads (see `hidden_binding`). `device` ("cpu" or "cuda") holds the
-    state pages, `pages` versions per state. `capabilities` are the backend features plans may use; the default
-    is everything a CPU simulation runs (overlays, AdamW, custom forwards, token capture). `max_lineages` bounds
+    state pages; each state gets the versions its plan needs, or `pages` if a test holds more. `capabilities`
+    are the backend features plans may use; the default is everything a CPU simulation runs (overlays, AdamW,
+    custom forwards, token capture). `max_lineages` bounds
     admitted requests, `memory_bytes` the state budget, and `max_rows` the packed rows per step (twice
     `max_lineages` by default). `targets` maps overlay targets to their (input, output) widths; `vocab_size`
     and `layer_count` are needed by workloads that read logits or layers.
@@ -120,7 +121,7 @@ def backend_facts(
             targets=tuple(ProjectionShape(target, *widths) for target, widths in targets.items()),
         ),
         model_timeline(torch.device(device), capabilities),
-        (PageBundleProviderFacts(f"testing.{kind}@1", pages, kind),),
+        (PageBundleProviderFacts(f"testing.{kind}@1", kind, pages),),
         max_lineages,
         memory_bytes,
         7,

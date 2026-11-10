@@ -45,13 +45,7 @@ def bind_host(
 ) -> StateExecution[InputT, DataT, ResultT]:
     """Plan a host graph against `timeline` and bind its math to a page arena on `config.device`."""
     providers = (
-        (
-            PageBundleProviderFacts(
-                f"page_bundle_{config.device.type}@1",
-                3,
-                StateDeviceKind(config.device.type),
-            ),
-        )
+        (PageBundleProviderFacts(f"page_bundle_{config.device.type}@1", StateDeviceKind(config.device.type)),)
         if layouts.layouts
         else ()
     )

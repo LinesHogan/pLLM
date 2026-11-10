@@ -15,7 +15,6 @@ from pllm.contracts.parameter_overlay import (
     ProjectionShape,
 )
 from pllm.contracts.semantic_graph import AnchorId
-from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
@@ -28,7 +27,7 @@ ROUTE_FACTS = replace(
     FACTS,
     probe=replace(FACTS.probe, capabilities=CAPABILITIES, targets=(ProjectionShape(TARGET, 4, 4),)),
     timeline=model_timeline(torch.device("cpu"), CAPABILITIES),
-    providers=(PageBundleProviderFacts("test.route@1", 16, StateDeviceKind.CPU),),
+    providers=(PageBundleProviderFacts("test.route@1"),),
     state_page_budget_bytes=1 << 20,
 )
 

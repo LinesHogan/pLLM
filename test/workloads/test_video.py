@@ -109,7 +109,7 @@ def binding_case(*, alias=False, write_failure=False, runtime=False, missing=Non
         buffers = attachment_buffer_bytes(facts.probe, b.graph, b.layouts, b.effects)
         timeline = replace(timeline, reserved_bytes=(buffers,) * len(timeline.anchors))
     plan = compile_page_bundle_plan(
-        (b.graph, b.layouts), timeline, (PageBundleProviderFacts("video.binding@1", 3),), 1, 65536
+        (b.graph, b.layouts), timeline, (PageBundleProviderFacts("video.binding@1"),), 1, 65536
     )
     math = FunctionMath(
         {"inject": lambda roots, keys: None},

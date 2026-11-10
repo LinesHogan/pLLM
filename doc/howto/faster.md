@@ -79,7 +79,7 @@ assert report.eager_reason == ""
 
 ### 代价是什么
 
-将共享 `InstanceState` 改为每请求 `RequestState` 会使适配器权重的显存预留随最大并发请求数线性扩展（每个请求槽位多存一份状态副本；上例在 7B、128 并发下 `explain` 报 514 份 × 88 KiB ≈ 44 MiB），改写后模型的 CUDA graph 也要更大的捕获池（不够时启动报错并给出需要的字节数），但换来的是前向完全进图。图模式能挽回多少吞吐取决于步长：7B 上 eager 本来只慢约 2%，0.5B 上 eager 只有图模式的一半。设置 `cuda_graphs=True` 没有任何运行时性能开销。
+将共享 `InstanceState` 改为每请求 `RequestState` 会使适配器权重的显存预留随最大并发请求数线性扩展（每个请求槽位多存一份状态副本；上例在 7B、128 并发下 `explain` 报 256 份 × 88 KiB ≈ 22 MiB），改写后模型的 CUDA graph 也要更大的捕获池（不够时启动报错并给出需要的字节数），但换来的是前向完全进图。图模式能挽回多少吞吐取决于步长：7B 上 eager 本来只慢约 2%，0.5B 上 eager 只有图模式的一半。设置 `cuda_graphs=True` 没有任何运行时性能开销。
 
 ---
 
@@ -172,7 +172,7 @@ overlap_config = pllm.ModelConfig(
 * **7B**：纯在线训练（$\beta=0$）时，`publish_lag=1` 为原生 vLLM 吞吐的 **97.4%**，`publish_lag=0` 为 **97.2%**；训练 + 引导采样（$\beta=0.1$）时为 **96.4%** 和 **96.1%**。每步训练只有约 0.6 ms GPU 时间，相对 21.7 ms 的一步，串行等待的代价在噪声附近。
 * **0.5B（同样设置，只换模型）**：纯在线训练时 `publish_lag=1` 为 **91.9%**，`publish_lag=0` 为 **89.8%**。步越短，重叠越值钱。
 
-代价是显存预留增加：`publish_lag=1` 下每个可写请求状态需要预留更多版本槽位（槽位公式为 $\text{roots} = (3 + \text{publish\_lag}) \times \text{副本数} + 2$，128 并发下从 386 份增至 514 份）；对 7B 上的 `Distill`，状态预留从约 190 MiB 增至约 253 MiB。
+代价是显存预留增加，但只落在读落后版本的状态上：有方法读落后 `publish_lag` 步的版本时，每个请求槽位要多留 `publish_lag` 份旧版本（公式见 [4.1 节](../explain/performance.md#41-分页状态池与版本槽位公式roots)）。对 7B 上的 `Distill`（`predict` 读落后的版本），128 并发下从 256 份增至 384 份，状态预留从约 126 MiB 增至约 189 MiB；`ESamp`（$\beta=0$）没有落后读者，两种设置都是 256 份。
 
 ---
 

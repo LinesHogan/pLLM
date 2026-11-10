@@ -17,13 +17,13 @@ from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
     BackendCommand,
     BackendInstall,
-    BackendProbe,
     BackendStage,
     probe_backend,
 )
 from pllm.backends.vllm.training import CausalTraining
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.semantic_graph import TaskId
+from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.trace import TraceSelection
 from pllm.workload_transport import decode_workload
 
@@ -82,8 +82,7 @@ class GPUWorker(compat.Worker):
         with torch.inference_mode(False):
             match operation:
                 case BackendCommand.PROBE:
-                    probe = decode_boundary(payload, BackendProbe)
-                    return encode_boundary(probe_backend(probe.requirements, runner, publish_lag=probe.publish_lag))
+                    return encode_boundary(probe_backend(decode_boundary(payload, BackendRequirements), runner))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
                     self.install_workload(decode_workload(install.definition), install)

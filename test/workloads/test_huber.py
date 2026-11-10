@@ -39,7 +39,6 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
         hidden,
         bindings,
         device=device.type,
-        pages=12,
         # A step packs up to five rows of three requests; captured steps are sized by admitted lineages.
         max_lineages=5,
         memory_bytes=100000,
@@ -156,4 +155,4 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
     assert diagnostics.loss_count == diagnostics.update_count == updates
     assert diagnostics.trained_rows == trained_rows
     assert diagnostics.active_states == diagnostics.pending_state_releases == 0
-    assert execution.arena.free_pages == 12
+    assert execution.arena.free_pages == 15  # 5 lineages x (read, lagged history, private write)

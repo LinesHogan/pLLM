@@ -22,7 +22,7 @@ from pllm.contracts.semantic_graph import SchedulerTimeline
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
-from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, version_capacity
+from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
 from pllm.execution.runtime_facts import model_timeline
 
 _REQUEST_CAPABILITIES = (
@@ -58,7 +58,6 @@ def compile_facts(
     blas_workspace_bytes: int = 0,
 ) -> BackendCompileFacts:
     """Derive reservations and capabilities without allocating tensors or querying a device."""
-    publish_lag = config.execution.publish_lag
     feature = "a PositionState" if requirements.position_states else "a @pllm.custom_forward"
     if requirements.position_states or requirements.custom_forward:
         if rejection := shape.read_only_reason or kv_rejection(shape.architecture):
@@ -150,19 +149,10 @@ def compile_facts(
         requirements.sampler_stages,
         requirements.sampler_feedback,
     )
-    capacity = version_capacity(
-        config.max_num_seqs, publish_lag, exact_decode=HiddenPhase.DECODE in requirements.exact_phases
-    )
     facts = BackendCompileFacts(
         replace(probe, targets=shape.targets, position_states=requirements.position_states),
         replace(observed, reserved_bytes=required),
-        (
-            PageBundleProviderFacts(
-                "page_bundle_cuda@1",
-                capacity,
-                probe.device_kind,
-            ),
-        ),
+        (PageBundleProviderFacts("page_bundle_cuda@1", probe.device_kind),),
         config.max_num_seqs,
         memory_bytes,
         config.seed,

@@ -54,7 +54,7 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
     runner = handle.runner
     requirements = workload.backend_requirements()
     shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
-    facts = probe_backend(requirements, runner, publish_lag=config.execution.publish_lag)
+    facts = probe_backend(requirements, runner)
     # The installed state already consumed memory; replay planning against its load-time capacity.
     assert handle.compile_facts is not None
     facts = replace(facts, state_page_budget_bytes=handle.compile_facts.state_page_budget_bytes)
