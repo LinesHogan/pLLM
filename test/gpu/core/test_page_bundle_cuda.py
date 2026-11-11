@@ -72,7 +72,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     borrowed = arena.borrow_field(pin, admitted.after_refs[0], LayoutFieldId(0))
     original = arena.snapshot(pin, admitted.after_refs[0])
     update = arena.prepare_transition(admitted.after_refs, writer)
-    fields = AdamWFields(*(LayoutFieldId(index) for index in range(5)))
+    fields = AdamWFields(*(LayoutFieldId(index) for index in range(4)))
     with torch.cuda.stream(writer):
         gradients = tuple(
             torch.full_like(value, gradient) for value, gradient in zip(initial, (0.25, -0.5), strict=True)
@@ -97,7 +97,7 @@ def test_cuda_ptts_waits_for_exact_fence_before_reclaim() -> None:
     torch.testing.assert_close(original[0], initial[0])
     torch.testing.assert_close(consumed, initial[0])
     torch.testing.assert_close(result[0], initial[0] - 0.01)
-    assert result[2].item() == 1
+    assert result[1].item() == 1
     arena.retire(pressure.after_refs)
     replacement = arena.publish(arena.prepare_admission(("distiller",) * 2, writer))
     torch.testing.assert_close(arena.snapshot(updated, publication.after_refs[0])[0], result[0])

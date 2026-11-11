@@ -22,8 +22,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from pllm.execution.tensor_program import apply_adamw_or_reserve
 from pllm.kernels.adamw import AdamWConfig, AdamWFields
 with patch.object(torch.cuda, '_lazy_init', forbidden):
-    roots = ((torch.empty(32, device='meta'),) * 2 + (torch.empty((), device='meta'),) + (torch.empty(32, device='meta'),) * 2,)
-    measure(lambda: apply_adamw_or_reserve(roots, AdamWFields(0, 1, 2, 3, 4), AdamWConfig(.01), (torch.empty(32, device='meta'),)))
+    roots = ((torch.empty(32, device='meta'), torch.empty((), device='meta')) + (torch.empty(32, device='meta'),) * 2,)
+    measure(lambda: apply_adamw_or_reserve(roots, AdamWFields(0, 1, 2, 3), AdamWConfig(.01), (torch.empty(32, device='meta'),)))
     scan(lambda carry, x: (carry + x.sum(0), x + carry), carry=torch.empty(3, device="meta"), over=(torch.empty(4, 3, device="meta"),), chunk=2)
     with FakeTensorMode():
         examples = (

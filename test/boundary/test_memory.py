@@ -53,7 +53,6 @@ def test_direct_adamw_workspace_bounds_cuda_peak():
     roots = tuple(
         (
             torch.ones(shape, device="cuda"),
-            torch.zeros(shape, device="cuda"),
             torch.zeros((), device="cuda"),
             torch.zeros(shape, device="cuda"),
             torch.zeros(shape, device="cuda"),

@@ -19,14 +19,13 @@ from pllm.kernels.page_copy import no_allocation
 @dataclass(frozen=True, slots=True)
 class AdamWFields:
     parameter: LayoutFieldId
-    gradient: LayoutFieldId
     step: LayoutFieldId
     exp_avg: LayoutFieldId
     exp_avg_sq: LayoutFieldId
 
     def __post_init__(self) -> None:
-        field_ids = {self.parameter, self.gradient, self.step, self.exp_avg, self.exp_avg_sq}
-        assert len(field_ids) == 5 and min(field_ids) >= 0
+        field_ids = {self.parameter, self.step, self.exp_avg, self.exp_avg_sq}
+        assert len(field_ids) == 4 and min(field_ids) >= 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,13 +63,11 @@ def apply_adamw(
         for root, gradient in zip(roots, gradients, strict=True)
     )
     with torch.no_grad():
-        for root, gradient in zip(roots, gradients, strict=True):
-            root[fields.gradient].copy_(gradient)
         cuda = roots[0][fields.parameter].is_cuda
         parameters = [root[fields.parameter].to(root[fields.exp_avg].dtype) for root in roots]
         adamw(
             params=parameters,
-            grads=[root[fields.gradient] for root in roots],
+            grads=list(gradients),
             exp_avgs=[root[fields.exp_avg] for root in roots],
             exp_avg_sqs=[root[fields.exp_avg_sq] for root in roots],
             max_exp_avg_sqs=[],
@@ -106,8 +103,8 @@ def _advance_steps(
     alpha2: float,
 ) -> None:
     state = tl.program_id(0)
-    slot = tl.load(slots + 2 * count + state)
-    source = tl.load(sources + 2 * count + state)
+    slot = tl.load(slots + count + state)
+    source = tl.load(sources + count + state)
     value = tl.load(steps + source * stride, slot >= 0, 0) + 1
     tl.store(steps + slot * stride, value, slot >= 0)
     # The bias corrections 1 - beta**step, in FP64 from alpha = 1 - beta: an FP32 beta near 1 (0.999 rounds by
@@ -122,7 +119,6 @@ def _advance_steps(
 @triton.jit
 def _paged_adamw(
     parameter: torch.Tensor,
-    gradient: torch.Tensor,
     exp_avg: torch.Tensor,
     exp_avg_sq: torch.Tensor,
     slots: torch.Tensor,
@@ -132,7 +128,6 @@ def _paged_adamw(
     count: tl.constexpr,
     width: tl.constexpr,
     p_stride: tl.constexpr,
-    g_stride: tl.constexpr,
     m_stride: tl.constexpr,
     v_stride: tl.constexpr,
     beta2: float,
@@ -144,14 +139,13 @@ def _paged_adamw(
     state = tl.program_id(0) // tl.cdiv(width, 256)
     column = (tl.program_id(0) % tl.cdiv(width, 256)) * 256 + tl.arange(0, 256)
     p = tl.load(slots + state)
-    g = tl.load(slots + count + state)
-    m = tl.load(slots + 3 * count + state)
-    v = tl.load(slots + 4 * count + state)
+    m = tl.load(slots + 2 * count + state)
+    v = tl.load(slots + 3 * count + state)
     valid = (p >= 0) & (column < width)
     grad = tl.load(values + state * width + column, valid, 0)
     source_p = tl.load(sources + state)
-    source_m = tl.load(sources + 3 * count + state)
-    source_v = tl.load(sources + 4 * count + state)
+    source_m = tl.load(sources + 2 * count + state)
+    source_v = tl.load(sources + 3 * count + state)
     first = tl.load(exp_avg + source_m * m_stride + column, valid, 0)
     second = tl.load(exp_avg_sq + source_v * v_stride + column, valid, 0)
     first = tl.where(alpha1 < 0.5, first + (grad - first) * alpha1, grad - (grad - first) * (1 - alpha1))
@@ -162,7 +156,6 @@ def _paged_adamw(
     value = libdevice.mul_rn(tl.load(parameter + source_p * p_stride + column, valid, 0), decay)
     value = value + tl.div_rn(first, denominator)
     tl.store(parameter + p * p_stride + column, value, valid)
-    tl.store(gradient + g * g_stride + column, grad, valid)
     tl.store(exp_avg + m * m_stride + column, first, valid)
     tl.store(exp_avg_sq + v * v_stride + column, second, valid)
 
@@ -174,7 +167,8 @@ def paged_adamw(
     config: AdamWConfig,
     sources: torch.Tensor | None = None,
 ) -> None:
-    """Five original FP32 fields, authorized slot prefixes, no field packing."""
+    """The four AdamW fields (parameters, step, exp_avg, exp_avg_sq) in FP32 pools, authorized slot prefixes; the
+    fresh gradient comes straight from `gradients`."""
     assert gradients.shape == (slots.shape[1], pools[0][0].numel()) and gradients.dtype == torch.float32
     assert gradients.device == slots.device and gradients.is_contiguous() and not gradients.requires_grad
     sources = slots if sources is None else sources
@@ -193,14 +187,13 @@ def _paged_update(
     corrections: torch.Tensor,
     hyperparameters: list[float],
 ) -> None:
-    parameter, gradient, step, first, second = pools
+    parameter, step, first, second = pools
     lr, beta1, beta2, eps, decay = hyperparameters
     count, width = gradients.shape
     # Increment in a separate launch: no tile may observe another tile's step write.
     _advance_steps[(count,)](step, slots, sources, corrections, count, step.stride(0), lr, 1 - beta1, 1 - beta2)
     _paged_adamw[(count * ((width + 255) // 256),)](
         parameter,
-        gradient,
         first,
         second,
         slots,
@@ -210,7 +203,6 @@ def _paged_update(
         count,
         width,
         parameter.stride(0),
-        gradient.stride(0),
         first.stride(0),
         second.stride(0),
         beta2,

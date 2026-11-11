@@ -29,7 +29,6 @@ from pllm.contracts.tensor_layout import (
 )
 from pllm.execution.tensor_program import (
     ADAM,
-    ADAM_FIELDS,
     PageUpdate,
 )
 from pllm.kernels.adamw import AdamWConfig
@@ -141,12 +140,6 @@ class State:
     def carry_fields(self) -> tuple[LayoutField, ...]:
         """The plain carried fields that follow the AdamW fields."""
         return self.fields[0 if self.optimizer is None else ADAM :]
-
-    @property
-    def copy_fields(self) -> tuple[LayoutFieldId, ...]:
-        """The fields an optimizer update carries into the next version: all but the gradient."""
-        gradient = ADAM_FIELDS.index("gradient")
-        return tuple(LayoutFieldId(i) for i in range(len(self.fields)) if self.optimizer is None or i != gradient)
 
     @property
     def parameter_names(self) -> tuple[str, ...]:

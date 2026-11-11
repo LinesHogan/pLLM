@@ -75,8 +75,7 @@ def test_weighted_causal_loss_and_adamw_match_torch() -> None:
         actual = execution.snapshot(current)
         expected = (
             torch.cat([p.flatten() for p in parameters]),
-            torch.cat([p.grad.flatten() for p in parameters]),
-            optimizer.state[parameters[0]]["step"].to(actual[2]),
+            optimizer.state[parameters[0]]["step"].to(actual[1]),
             torch.cat([optimizer.state[p]["exp_avg"].flatten() for p in parameters]),
             torch.cat([optimizer.state[p]["exp_avg_sq"].flatten() for p in parameters]),
         )

@@ -127,7 +127,6 @@ def test_reward_head_matches_reward_update_retry_and_control_quorum(
             stream.synchronize()
         expected = (
             torch.cat((down.flatten(), up.flatten())),
-            torch.cat((down.grad.flatten(), up.grad.flatten())),
             optimizer.state[down]["step"].to(device),
             torch.cat((optimizer.state[down]["exp_avg"].flatten(), optimizer.state[up]["exp_avg"].flatten())),
             torch.cat((optimizer.state[down]["exp_avg_sq"].flatten(), optimizer.state[up]["exp_avg_sq"].flatten())),
@@ -189,9 +188,9 @@ def test_reward_head_matches_reward_update_retry_and_control_quorum(
     before = execution.snapshot(initial)
     zeros = torch.zeros(6, 4)
     result = execution.step(StepInput.of_batch(WeightedRowBatch(zeros, zeros[:, 0], torch.ones(6))))
-    # A zero loss still publishes: the step count advances with zero gradients and unchanged weights.
+    # A zero loss still publishes: the step count advances, the first moment stays zero and the weights are unchanged.
     assert result.loss.item() == 0 and result.publication is not None
     after = execution.snapshot(result.publication.after_refs[0])
     torch.testing.assert_close(after[0], before[0], rtol=0, atol=0)
-    assert after[2].item() == 1 and torch.count_nonzero(after[1]) == 0
+    assert after[1].item() == 1 and torch.count_nonzero(after[2]) == 0
     execution.retire(())

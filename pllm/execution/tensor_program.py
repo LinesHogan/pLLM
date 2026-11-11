@@ -52,7 +52,7 @@ R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
 ProducedVersions = tuple[tuple[StateResource, Literal["private", "published"]], ...]
 # An AdamW state's leading fields, in layout order: one flat parameter field and its optimizer fields.
-ADAM_FIELDS = ("parameters", "gradient", "step", "exp_avg", "exp_avg_sq")
+ADAM_FIELDS = ("parameters", "step", "exp_avg", "exp_avg_sq")
 ADAM = len(ADAM_FIELDS)
 
 
@@ -398,7 +398,7 @@ class PageUpdate:
             self.tensors(roots, gradients)
             return
         fields = tuple(slots(i) for i in range(ADAM))
-        pools = tuple(pool.reshape(len(pool), -1) if index != 2 else pool for index, (pool, _) in enumerate(fields))
+        pools = tuple(pool.reshape(len(pool), -1) if index != 1 else pool for index, (pool, _) in enumerate(fields))
         table = upload([rows for _, rows in fields], parameter.device)
         paged_adamw(pools, table, torch.stack(gradients).reshape(len(gradients), -1), self.config)
 

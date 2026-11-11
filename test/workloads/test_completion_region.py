@@ -98,7 +98,6 @@ def test_default_completion_region_keeps_multigroup_adamw_and_publication(device
 
         expected = (
             torch.cat([parameter.flatten() for parameter in parameters]),
-            torch.cat([parameter.grad.flatten() for parameter in parameters]),
             states[0]["step"],
             torch.cat([state["exp_avg"].flatten() for state in states]),
             torch.cat([state["exp_avg_sq"].flatten() for state in states]),

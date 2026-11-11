@@ -66,9 +66,9 @@ def assert_roots(actual, expected, **tolerance):
 
 
 def adamw_roots(optimizer, parameter):
-    """The published root layout: parameter, gradient, step, exp_avg, exp_avg_sq."""
+    """The published root layout: parameter, step, exp_avg, exp_avg_sq."""
     state = optimizer.state[parameter]
-    return parameter, parameter.grad, state["step"].to(parameter.device), state["exp_avg"], state["exp_avg_sq"]
+    return parameter, state["step"].to(parameter.device), state["exp_avg"], state["exp_avg_sq"]
 
 
 def reference(source, parameters, hidden=4, rank=2, normalized=True):
@@ -320,8 +320,7 @@ def _ordinary_request_distillation(device_name) -> None:
             torch.testing.assert_close(loss, oracle.detach())
             # Each lineage's memory receives its last selected row's captured source.
             carries[owner] = source[selected[-1]].clone()
-            weight, gradient, step, exp_avg, exp_avg_sq = adamw_roots(optimizers[owner], weights[owner])
-            expected_roots = (weight, gradient, step, exp_avg, exp_avg_sq)
+            expected_roots = adamw_roots(optimizers[owner], weights[owner])
             expected_roots = (*(t.flatten() if t.dim() else t for t in expected_roots), carries[owner])
             assert_roots(execution.snapshot(after, stream), expected_roots)
             latest[owner] = after

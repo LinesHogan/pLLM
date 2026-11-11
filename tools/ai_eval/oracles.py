@@ -185,7 +185,6 @@ def esamp_state(submission: ModuleType) -> None:
             assert down.grad is not None and up.grad is not None
             expected = (
                 torch.cat((down.flatten(), up.flatten())),
-                torch.cat((down.grad.flatten(), up.grad.flatten())),
                 optimizer.state[down]["step"],
                 torch.cat((optimizer.state[down]["exp_avg"].flatten(), optimizer.state[up]["exp_avg"].flatten())),
                 torch.cat((optimizer.state[down]["exp_avg_sq"].flatten(), optimizer.state[up]["exp_avg_sq"].flatten())),

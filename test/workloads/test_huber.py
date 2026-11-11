@@ -134,7 +134,6 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             state_a, state_b = (optimizer.state[p] for p in pair)
             expected_fields = (
                 torch.cat([p.flatten() for p in pair]),
-                gradient,
                 state_a["step"].to(device),
                 torch.cat([state_a["exp_avg"].flatten(), state_b["exp_avg"].flatten()]),
                 torch.cat([state_a["exp_avg_sq"].flatten(), state_b["exp_avg_sq"].flatten()]),

@@ -137,12 +137,12 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
         actual = execution.snapshot(current)
         for index, parameter in enumerate(reference):
             fields = tuple(
-                value if field == 2 else value[index * 6 : (index + 1) * 6].reshape(parameter.shape)
+                value if field == 1 else value[index * 6 : (index + 1) * 6].reshape(parameter.shape)
                 for field, value in enumerate(actual)
             )
             state = optimizer.state[parameter]
             for value, expected in zip(
-                fields, (parameter, parameter.grad, state["step"], state["exp_avg"], state["exp_avg_sq"]), strict=True
+                fields, (parameter, state["step"], state["exp_avg"], state["exp_avg_sq"]), strict=True
             ):
                 torch.testing.assert_close(value, expected)
         torch.testing.assert_close(result.loss, loss.detach())

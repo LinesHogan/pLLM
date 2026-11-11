@@ -557,7 +557,6 @@ class TensorDeclaration:
                 ),
             ),
             optimizer=optimizer,
-            copy_fields=None if state is None else state.copy_fields,
             capture_resident=executor.resident,
             resource=StateResource("") if state is None else state.declaration.resource,
         )
@@ -820,9 +819,7 @@ class TensorDeclaration:
         )
         self.graph = replace(self.graph, tasks=tuple(sorted((*self.graph.tasks, task), key=lambda item: item.symbol)))
         if function is not None:
-            optimizer, copy_fields = None, None
-            if changes is not None and changes.optimizer is not None:
-                optimizer, copy_fields = changes.page_update(), changes.copy_fields
+            optimizer = None if changes is None or changes.optimizer is None else changes.page_update()
             self.operations[task.symbol] = operation_type(
                 implementations[0].implementation_id,
                 partial(native_body, function),
@@ -833,7 +830,6 @@ class TensorDeclaration:
                 ),
                 select=select,
                 optimizer=optimizer,
-                copy_fields=copy_fields,
                 resource=StateResource("") if changes is None else changes.declaration.resource,
             )
         return Call(task.symbol, outputs)

@@ -63,13 +63,12 @@ def run(execution, value, base=BASE, tokens=TOKENS, stream=None):
 
 
 def adam_roots(optimizer, *parameters):
-    """The published root layout: parameters, gradients, step, exp_avg, exp_avg_sq."""
+    """The published root layout: parameters, step, exp_avg, exp_avg_sq."""
     states = [optimizer.state[parameter] for parameter in parameters]
     flat = lambda tensors: torch.cat([tensor.flatten() for tensor in tensors])
     step = states[0]["step"].to(parameters[0].device)
     return (
         flat(parameters),
-        flat(p.grad for p in parameters),
         step,
         flat(s["exp_avg"] for s in states),
         flat(s["exp_avg_sq"] for s in states),

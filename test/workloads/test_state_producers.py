@@ -177,7 +177,7 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
     latest = execution.arena.latest(refs[0].lineage_id)
     actual = execution.snapshot(latest, stream=stream)
     for tensor, expected in zip(
-        (actual[0], actual[2], actual[3], actual[4]),
+        actual,
         (flat, optimizer.state[flat]["step"], optimizer.state[flat]["exp_avg"], optimizer.state[flat]["exp_avg_sq"]),
         strict=True,
     ):
