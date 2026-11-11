@@ -253,7 +253,7 @@ python -m tools.benchmark_esamp --model Qwen/Qwen2.5-7B-Instruct --gpu-memory-ut
 - **`round_rates`**：每轮实测速率的元组。
   - *排查提示*：如果各轮速率波动超过 5%，通常表明 GPU 受到宿主内存交换、显存颠簸或多进程竞争干扰。
 - **`vanilla_tokens_per_second`**：在完全相同硬件、Prompts 与采样配置下原生 vLLM 的中位数速率。
-- **`vs_vanilla`**：即 `tokens_per_second / vanilla_tokens_per_second`，直观反映挂载算法后的吞吐保留百分比（例如 0.92 代表吞吐为原生的 92%，开销为 8%）。
+- **`vs_vanilla`**：即 `tokens_per_second / vanilla_tokens_per_second`，直观反映挂载算法后的吞吐保留百分比（例如 0.92 代表吞吐为原生的 92%，开销为 8%）。 <!-- check-docs: not measured -->
 
 ### 5.2 显存口径对比：规划上限与分配器实测不可互换
 

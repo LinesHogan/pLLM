@@ -64,6 +64,7 @@ pLLM 的文档按用途分成五类，每一页只做一件事：**教程**带�
 - [explain 报告与运行时诊断字段](reference/diagnostics.md)
 - [报错目录](reference/errors.md)：报错原文、原因与改法
 - [术语表](reference/glossary.md)
+- [实测记录](reference/measurements.toml)：文档里每个吞吐与耗时数字来自哪次测量、在什么设置下测得
 - API 签名：[agent 参考的签名列表](agent/reference.md#all-signatures)（由代码生成）
 
 ## 解释

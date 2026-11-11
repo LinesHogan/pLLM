@@ -12,7 +12,7 @@
 
 在单请求实验代码里，读取或修改第 12 层的激活只需要五行 `register_forward_hook`。但把同样的逻辑放进 vLLM 服务引擎时，会立刻撞上两堵墙：
 
-1. **CUDA Graph 回放期根本不执行 Python 代码**：在自回归解码（decode）阶段，GPU 每步只为每个并发请求生成 1 个 token，算子本身耗时极短。为了消除逐个从 Python 发射算子的 CPU 开销，vLLM 会把整个模型前向录制成一张 CUDA Graph，后续每步只向 GPU 发射一次图回放指令（关掉 CUDA Graph 退回 eager 模式后，发射开销的代价取决于一步有多长：在 RTX 4090、128 并发下，一步约 3 ms 的 0.5B 掉到图模式的 49%，一步约 22 ms 的 7B 仍有 98%，见 [性能与显存](performance.md)）。图回放期间，Python 解释器完全不参与层的执行，挂在模块上的 Python hook 根本不会被调用。
+1. **CUDA Graph 回放期根本不执行 Python 代码**：在自回归解码（decode）阶段，GPU 每步只为每个并发请求生成 1 个 token，算子本身耗时极短。为了消除逐个从 Python 发射算子的 CPU 开销，vLLM 会把整个模型前向录制成一张 CUDA Graph，后续每步只向 GPU 发射一次图回放指令（关掉 CUDA Graph 退回 eager 模式后，发射开销的代价取决于一步有多长：在 RTX 4090、128 并发下，一步约 3 ms 的 0.5B 掉到图模式的 49%，一步约 21.7 ms 的 7B 仍有 98%，见 [性能与显存](performance.md)）。图回放期间，Python 解释器完全不参与层的执行，挂在模块上的 Python hook 根本不会被调用。
 2. **打包张量没有请求身份，且 Python 分支会触发主机同步**：即便退回 eager 模式，连续批处理也会把几十个并发请求的 token 拼进同一个二维张量。普通模块 hook 只拿到这块拼好的张量，不知道哪一行属于哪个请求、哪一行是刚算完的 prompt 末尾。更糟的是，如果 hook 里写了 `if h.norm() > 1:` 或 `print(h.item())`，CPU 就必须停下来等待 GPU 把前面的算子全部算完並把数值拷回主机内存（host sync），直接打断 GPU 流水线，也让 CUDA Graph 无法录制。
 
 ### pLLM 的做法：一次声明、静态追踪、整图捕获

@@ -257,7 +257,7 @@ class FastHostLookup(pllm.Workload):
 * 引导采样容量（`ESamp`，$\beta=0.5$）：默认 `guidance_capacity=4096` 吞吐为 5,678 tok/s（96.3%），256 和 1024 与它相差在噪声内；精确 dense 路径（`guidance_capacity=None`）为 5,533 tok/s（93.9%）。
 
 <details>
-<summary>自测：为什么主机查表混读了 final_hidden 之后每步多出了 1–2 ms？</summary>
+<summary>自测：为什么主机查表混读了 final_hidden 之后每步多出了 1–2 ms？</summary> <!-- check-docs: not measured -->
 因为同一个方法读取了 <code>final_hidden</code>，该方法必须等待模型前向全部计算完毕才能启动（anchor 是 <code>state.publish / main</code>），无法在步首的 <code>request.prepare / side</code> 发射。结果约 1.6 ms 的 PCIe 传输完全暴露在前向之外。解决办法是将只依赖 <code>input_tokens</code> 的查表拆成独立方法，通过 <code>pllm.result</code> 传递给效果方法。
 </details>
 
@@ -358,7 +358,7 @@ precision_report = pllm.explain(PrecisionAwareWorkload(), config)
 
 ### 意味着什么
 
-在模型层内（`@pllm.custom_residual`）或注意力（`@pllm.custom_attention`）中直接用 PyTorch 编写多步张量操作，每次调用都会产生算子发射开销与显存往返写入。[自定义 attention 教程](../examples/10_custom_attention.ipynb) 中的 Quest 算法用 PyTorch 编写每页打分和 gather，在 7B 上吞吐仅有原生的 **14%**。
+在模型层内（`@pllm.custom_residual`）或注意力（`@pllm.custom_attention`）中直接用 PyTorch 编写多步张量操作，每次调用都会产生算子发射开销与显存往返写入。[自定义 attention 教程](../examples/10_custom_attention.ipynb) 中的 Quest 算法用 PyTorch 编写每页打分和 gather，在 7B 上吞吐仅有原生的 **13%**。
 
 ### 怎么改
 
@@ -383,7 +383,7 @@ def _fused_step_fake(x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 在 RTX 4090 基准测试中：
 * 示例 09 在第 12 层挂一个注册为 `custom_op` 的 Triton 算子，吞吐为原生 vLLM 的 **98%**（$5,760$ 对 $5,872\text{ tok/s}$）；
 * 同样数学的 PyTorch 写法也是 **98%**（$5,755\text{ tok/s}$）：一次逐行加法本来就不是瓶颈；
-* 编写算子需要额外手写 Triton 或 CUDA kernel 并维护 fake 形状函数。值得这样做的是 PyTorch 写起来太慢的步骤，例如示例 10 里用 PyTorch 写的 Quest 页打分，吞吐只有原生的 14%。
+* 编写算子需要额外手写 Triton 或 CUDA kernel 并维护 fake 形状函数。值得这样做的是 PyTorch 写起来太慢的步骤，例如示例 10 里用 PyTorch 写的 Quest 页打分，吞吐只有原生的 13%。
 
 ---
 

@@ -11,13 +11,17 @@ Checks over README.md, doc/ and examples/:
    list equals the code's (`--write-signatures` regenerates it);
 6. error messages quoted in backticks in the first table column of a section about rejections or errors still
    exist in pllm's Python or Rust sources: every piece between `...` markers (which stand for text that
-   depends on the user's code) must appear in one string literal.
+   depends on the user's code) must appear in one string literal;
+7. every throughput (tok/s), time in ms, and percentage on a line that compares with native vLLM, stated in the
+   prose of README.md and doc/ (outside doc/dev/), appears in a result of doc/reference/measurements.toml, so each
+   measured number has one source; a line whose numbers are not measurements ends with
+   `<!-- check-docs: not measured -->`.
 
 Warnings, which do not fail the run: README.md and doc/ outside doc/dev/ are written for users, so contributor
 vocabulary (PTTS, receipts, evidence numbers, milestones, local paths, commit hashes) found there is listed per file.
 
 The essays in doc/explain/highlights/ are dated articles: each names the commit and setup it was written against
-and is not kept current, so their code does not run and their vocabulary is not checked.
+and is not kept current, so their code does not run and their vocabulary and numbers are not checked.
 
 Notebooks without any "cpu-check" cell are pending a rewrite and are skipped unless `--all` is given;
 the report lists them. Exit status is 1 when any check fails.
@@ -34,6 +38,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -67,6 +72,16 @@ CONTRIBUTOR_WORDS = re.compile(
 )
 DEV_DOCS = ROOT / "doc" / "dev"
 ESSAYS = ROOT / "doc" / "explain" / "highlights"
+MEASUREMENTS = ROOT / "doc" / "reference" / "measurements.toml"
+FIGURE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(?:\\text\{\s*)?(\\?%|tok/s|tokens?/s|ms)(?![\w/])")
+NATIVE = re.compile(r"原生|native|vanilla", re.I)
+NOT_MEASURED = "<!-- check-docs: not measured -->"
+
+
+class Run(TypedDict):
+    """The part of a measurements.toml run this tool reads: result name to stated figures."""
+
+    results: dict[str, str]
 
 
 class CellMetadata(TypedDict, total=False):
@@ -310,6 +325,40 @@ def stale_messages(text: str) -> list[str]:
     ]
 
 
+def figures(text: str) -> set[tuple[float, str]]:
+    """The (value, unit) of each throughput, ms time and percentage in `text`; `5,894 tok/s` equals `5894 token/s`."""
+    return {
+        (float(number.replace(",", "")), "tok/s" if unit.endswith("/s") else unit.lstrip("\\"))
+        for number, unit in FIGURE.findall(text)
+    }
+
+
+@cache
+def measured_figures() -> frozenset[tuple[float, str]]:
+    """Every figure some result of measurements.toml states."""
+    runs: list[Run] = tomllib.loads(MEASUREMENTS.read_text())["run"]
+    return frozenset(figure for run in runs for value in run["results"].values() for figure in figures(value))
+
+
+def unmeasured_figures(text: str) -> list[str]:
+    """Figures stated in the prose of `text` that no recorded run holds; a percentage counts only on a line that
+    compares with native vLLM, since other percentages (shares of a step, thresholds) are not measurements."""
+    failures: list[str] = []
+    fenced = False
+    for number, line in enumerate(text.splitlines(), start=1):
+        fenced ^= line.lstrip().startswith("```")
+        if fenced or NOT_MEASURED in line:
+            continue
+        stated = figures(line) - measured_figures()
+        failures.extend(
+            f"line {number}: {value:g} {unit} is not a result in doc/reference/measurements.toml; "
+            f"quote a recorded run, or end the line with {NOT_MEASURED}"
+            for value, unit in sorted(stated)
+            if unit != "%" or NATIVE.search(line)
+        )
+    return failures
+
+
 def user_document(path: Path) -> bool:
     """Whether `path` is prose for users that must stay true: not doc/dev/, not a dated essay, not example code."""
     return path.suffix != ".py" and not path.is_relative_to(DEV_DOCS) and not path.is_relative_to(ESSAYS)
@@ -449,6 +498,8 @@ def check_file(path: Path, include_untagged: bool, gpu: bool, anchors: dict[Path
         text = path.read_text()
         blocks = markdown_blocks(text)
         failures = missing_symbols(blocks) + broken_links(path, [text], anchors) + stale_messages(text)
+        if user_document(path):
+            failures += unmeasured_figures(text)
         if path.parent in EXECUTED_DOCS:
             use_gpu = gpu and path.parent == AGENT_DOCS
             failures += run_cells(
@@ -467,6 +518,11 @@ def check_file(path: Path, include_untagged: bool, gpu: bool, anchors: dict[Path
         return failures, True
     notebook = read_notebook(path)
     failures = broken_links(path, notebook.markdown, anchors)
+    failures += [
+        f"markdown cell {index} {failure}"
+        for index, text in enumerate(notebook.markdown)
+        for failure in unmeasured_figures(text)
+    ]
     if not notebook.cpu_cells and not include_untagged:
         return failures, False
     failures += missing_symbols(notebook.code)

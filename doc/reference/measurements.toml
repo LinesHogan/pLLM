@@ -1,0 +1,302 @@
+# pLLM 文档里的实测数字，每次测量一条记录。
+#
+# README.md 和 doc/（doc/dev/ 与有日期的技术杂谈除外）的正文里出现的吞吐（tok/s）、耗时（ms）和相对原生 vLLM
+# 的百分比，都必须出现在某条记录的 results 里；tools/check_docs.py 会检查。重测时改这里，再改引用它的页面。
+# 正文里不是测量的数字（门槛、举例、算式）在所在行末尾写 <!-- check-docs: not measured -->。
+#
+# 除非结果名另有说明，百分比都相对同一设置下的原生 vLLM（开启 CUDA graph）；每步耗时按“行数 ÷ 吞吐”折算。
+# 共同的设置：ignore EOS、temperature 0.8 / top-p 0.95、bf16、VLLM_USE_FLASHINFER_SAMPLER=1，
+# 吞吐用 pllm.benchmark.throughput（每轮一次完整的 generate，含 prefill）。
+# rows 是并发的序列（“prompt 数 × 每个 prompt 的样本数”或总数）；date 是这次测量写进文档的日期；不知道的写“未记录”。
+
+[[run]]
+what = "原生 vLLM 与 ESamp（rank 4）"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "5,894 tok/s，一步 21.7 ms"
+"原生 vLLM，eager" = "5,773 tok/s，图模式的 98%"
+"ESamp beta=0，publish_lag=1" = "5,738 tok/s，97.4%"
+"ESamp beta=0，publish_lag=0" = "5,731 tok/s，97.2%"
+"ESamp beta=0.1，publish_lag=1" = "5,681 tok/s，96.4%"
+"ESamp beta=0.1，publish_lag=0" = "5,663 tok/s，96.1%"
+"ESamp beta=0.5，guidance_capacity=4096（默认）" = "5,678 tok/s，96.3%"
+"ESamp beta=0.5，guidance_capacity=1024 或 256" = "5,684 tok/s，96.4%"
+"ESamp beta=0.5，guidance_capacity=None（精确 dense）" = "5,533 tok/s，93.9%"
+"恒等 custom_residual，只挂第 12 层 / 挂每层 MLP" = "5,722 / 5,721 tok/s，都是 97%"
+
+[[run]]
+what = "原生 vLLM 与 ESamp（rank 4），0.5B 对照"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-0.5B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "42,355 tok/s，一步 3.0 ms"
+"原生 vLLM，eager" = "20,926 tok/s，图模式的 49%"
+"ESamp beta=0，publish_lag=1" = "38,936 tok/s，91.9%"
+"ESamp beta=0，publish_lag=0" = "38,047 tok/s，89.8%"
+
+[[run]]
+what = "ESamp（rank 4，beta=0）每步的 GPU 时间，torch profiler"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "稳态 decode 步"
+[run.results]
+"原生采样器：temperature / top-k 与 top-p / Gumbel 抽样" = "125 / 283 / 78 µs，合计约一步的 2%"
+"旁路流上的训练" = "616 µs（0.6 ms），约一步的 2.8%"
+"其中分页 AdamW" = "191 µs"
+
+[[run]]
+what = "LM Head 投影微基准：128 行一次全词表投影"
+date = "2026-11-09"
+model = "Qwen2.5-7B-Instruct / Qwen2.5-0.5B-Instruct 的 LM Head"
+gpu = "RTX 4090 24 GiB"
+vllm = "不涉及"
+rows = "128"
+tokens = "不涉及"
+rounds = "微基准"
+[run.results]
+"7B（3584 × 152064，1.09 GB）" = "1,349 µs（1.35 ms），约 7B 一步的 6%"
+"0.5B（896 × 151936，272 MB）" = "359 µs（0.36 ms），约 0.5B 一步的 12%"
+
+[[run]]
+what = "经 PCIe 读主机内存里的行，与矩阵乘“前向”并发（tools/toy_host_gather.py）"
+date = "2026-11-09"
+model = "不涉及"
+gpu = "RTX 4090 24 GiB，PCIe 4.0 x16"
+vllm = "不涉及"
+rows = "37.1 MiB 的行"
+tokens = "不涉及"
+rounds = "玩具实验"
+[run.results]
+"32 个线程块读 37.1 MiB" = "1.64 ms，23.7 GB/s"
+"单独跑矩阵乘“前向”" = "3.9 ms"
+"32 个线程块的读法与矩阵乘并发时，比单独跑矩阵乘多出" = "0.12 ms"
+"不限线程块的读法与矩阵乘并发时藏住的时间" = "0.07 ms"
+"按 23.7 GB/s 折算：128 行词表宽的查表搬 38.9 MB" = "1.6 ms"
+
+[[run]]
+what = "示例 06：DoLa（读 9 层）"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 4"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "1727 tok/s"
+"DoLa" = "1140 tok/s，66%"
+
+[[run]]
+what = "示例 07：改写残差连接"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "32 个并发请求（记忆子层 8 个）"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "1728 tok/s，一步约 19 ms"
+"原生 vLLM，eager" = "1703 tok/s，图模式的 99%"
+"value residual（27 层）" = "1703 tok/s，99%"
+"超连接 n=4（56 个子层）" = "1610 tok/s，93%"
+"原生 vLLM，8 个并发请求" = "484 tok/s"
+"记忆子层，8 个并发请求" = "362 tok/s，75%"
+
+[[run]]
+what = "示例 08：In-Place TTT（社区 4B 检查点）与官方 Hugging Face 实现，贪心生成"
+date = "2026-11-09"
+model = "In-Place TTT 4B 检查点"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "1 个请求（另测 4 个请求）"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"pLLM float32，prompt 4096" = "59.64 tok/s"
+"pLLM float32，prompt 16384" = "42.27 tok/s"
+"pLLM bfloat16，prompt 4096" = "57.12 tok/s"
+"pLLM bfloat16，prompt 16384" = "40.64 tok/s"
+"pLLM float32，4 个请求，prompt 4096" = "111.38 tok/s"
+"官方实现，prompt 4096" = "54.79 tok/s"
+"官方实现，prompt 16384" = "34.89 tok/s"
+
+[[run]]
+what = "示例 09：第 12 层的逐行加法写成 Triton 算子或 PyTorch"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "5872 tok/s"
+"Triton 算子" = "5760 tok/s，98%"
+"PyTorch 算子" = "5755 tok/s，98%"
+
+[[run]]
+what = "示例 10：自定义 attention 与 KV 布局"
+date = "2026-11-10"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "4855 tok/s，100%"
+"NativeRead" = "4817 tok/s，99%"
+"LocalGlobal" = "4804 tok/s，99%"
+"CrossLayerShared" = "4798 tok/s，99%"
+"QuestRead（PyTorch 打分）" = "649 tok/s，13%"
+
+[[run]]
+what = "示例 11：n-gram 先验的表放显存或主机内存"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "5877 tok/s，一步约 21.8 ms，100%"
+"表在 device" = "5742 tok/s，一步约 22.3 ms，98%"
+"表在 host" = "5615 tok/s，一步约 22.8 ms，96%；比 device 每步多约 0.5 ms"
+
+[[run]]
+what = "示例 12：按 token 跳过第 16–19 层"
+date = "2026-11-09"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "32 个并发请求"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"原生 vLLM" = "1727 tok/s，一步约 19 ms"
+"原生 vLLM，eager" = "1703 tok/s，图模式的 99%"
+"从不跳" = "1703 tok/s，99%"
+"阈值 0.85" = "1692 tok/s，98%；约 23% 的 token 跳层"
+"总是跳" = "1928 tok/s，112%"
+
+[[run]]
+what = "示例 13：agent 搜索记录的重放"
+date = "2026-11-04"
+model = "Qwen/Qwen2.5-0.5B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.27.1"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"六条记录重放" = "38162 / 6072 / 34767 / 35369 / 35618 / 35666 tok/s"
+"六条记录原值" = "38243 / 6032 / 34992 / 35545 / 35448 / 35409 tok/s"
+
+[[run]]
+what = "张量并行下的 ESamp（beta=0，rank 4），错峰前后"
+date = "2026-11-01"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "A100-SXM4-80GB × 1 / 2 / 4"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数"
+[run.results]
+"错峰前，TP = 1 / 2 / 4" = "93.79% / 89.09% / 87.07%"
+"错峰后，TP = 1 / 2 / 4" = "95.84% / 95.63% / 97.60%"
+
+[[run]]
+what = "旧版剖析（0.5B，vLLM 0.27.1）：每步的 CPU 准备工作"
+date = "2026-11-05"
+model = "Qwen/Qwen2.5-0.5B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.27.1"
+rows = "128 个并发序列"
+tokens = "未记录"
+rounds = "稳态 decode 步"
+[run.results]
+"一步的 GPU 前向" = "3.3 ms"
+"CPU 准备工作 / int64 表上传 / 步间 GPU 空闲" = "约 700 µs / 6.24 µs / 4–6 µs"
+
+[[run]]
+what = "旧版测量（0.5B）：在线训练进图前后，以及 ESamp 的两次实验"
+date = "2026-11-05"
+model = "Qwen/Qwen2.5-0.5B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "未记录"
+rows = "128 个并发序列"
+tokens = "未记录"
+rounds = "未记录"
+[run.results]
+"训练不进图 / 进图，每步" = "6.73 ms / 5.25 ms"
+"ESamp beta=0，方法套 torch.compile" = "92.77%"
+"ESamp beta=0，去掉采样器前的等待之前 / 之后" = "94.49% / 92.73%"
+"改写残差不进图（value residual / 超连接 / 记忆子层），相对图模式" = "34% / 19% / 12%"
+
+[[run]]
+what = "旧版测量（0.5B）：稠密状态的精度"
+date = "2026-11-05"
+model = "Qwen/Qwen2.5-0.5B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.27.1"
+rows = "未记录"
+tokens = "未记录"
+rounds = "未记录"
+[run.results]
+"9.00 MiB/请求的稠密状态用 bf16" = "3,156 tok/s"
+"同一状态强制 FP32" = "2,724 tok/s"
+
+[[run]]
+what = "旧版行为：模型 CUDA graph 一直录到 8192 token 的批量"
+date = "2026-11-05"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB，gpu_memory_utilization=0.85"
+vllm = "0.32.0"
+rows = "128 个并发序列"
+tokens = "未记录"
+rounds = "未记录"
+[run.results]
+"可用 KV cache 从 76,144 降到 3,872 个 token 后的吞吐" = "约 21%"
+
+[[run]]
+what = "GPTQ 量化底座上的在线训练（14B）"
+date = "2026-11-05"
+model = "14B GPTQ 量化检查点"
+gpu = "A100-SXM4-80GB；RTX 4090 24 GiB"
+vllm = "未记录"
+rows = "未记录"
+tokens = "未记录"
+rounds = "未记录"
+[run.results]
+"A100 上每个训练步：瞬态反量化 / 预先缓存" = "0.193 s / 0.176 s"
+"4090 上 QKV 反量化" = "0.104 ms"
+
+[[run]]
+what = "pllm.scan 微基准（只测扫描本身）"
+date = "2026-11-05"
+model = "不涉及"
+gpu = "未记录"
+vllm = "不涉及"
+rows = "单头或 14 头，64 × 64 状态"
+tokens = "不涉及"
+rounds = "微基准"
+[run.results]
+"单头：串行 / 并行前缀扫描" = "1.439 ms / 0.219 ms"
+"完整状态转移：串行 / 并行前缀扫描" = "5.879 ms / 1.759 ms"
