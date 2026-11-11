@@ -304,7 +304,18 @@ def test_schedule_contracts(workload, neutral, error, model_config):
         return
     result = testing.check(workload, model_config, neutral=neutral)
     assert torch.cuda.is_initialized() == cuda_initialized
-    assert result.passed or result.skipped
+    # Model-site and causal/host-feed workloads skip the CPU schedules with a reason; every other one runs them.
+    unscheduled = (
+        Residual,
+        PositionStack,
+        JacobiRecirculationWorkload,
+        StepLoopWorkload,
+        FTTTWorkload,
+        RewardHeadWorkload,
+        TLMWorkload,
+        VideoWorkload,
+    )
+    assert ("row permutation" in result.passed) != isinstance(workload, unscheduled), result
     json.dumps(asdict(result))
     if neutral is not None:
         assert "neutral" in result.passed
