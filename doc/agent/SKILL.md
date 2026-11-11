@@ -199,9 +199,9 @@ forward  CUDA graphs: no effect needs eager
 member  effect  anchor / lane / graph  state reads (origin, distance)
 loss  train  token.commit / side / captured  distiller (latest, 0); one AdamW step per state per engine step; prompt rows train once per prefill chunk
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
-state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  34  129104  4389596  field 0: float32, ...; source: module init; placement: device; ...
-memory   peak 63063648 bytes funded by pLLM [per-rank tensor reservations; ...]
+state  scope  bytes/root  reserved bytes [exact; state_page_budget_bytes]
+distiller  request  96832  1807536  field 0: float32 x 24 pages, field 1: float32 x 16 pages, ...; source: module init; ...
+memory   peak 60451428 bytes funded by pLLM [per-rank tensor reservations; ...]
 preempt  state keep; replay rejection: not applicable to kept state
 host     0 syncs in traced workload math
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
@@ -209,7 +209,8 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 Read: `forward` says whether the model keeps CUDA graphs and, if not, which member makes it eager; each
 `member` row is one piece of a method with its anchor (when), lane (`side` overlaps the next forward) and
-whether it is captured; `state` is what pLLM reserves; `memory` is pLLM's own peak (weights and KV
+whether it is captured; `state` is what pLLM reserves (pages per field: older versions keep only the fields readers read, so AdamW's
+step and moments need fewer pages than the parameters); `memory` is pLLM's own peak (weights and KV
 excluded); `preempt` says what happens when vLLM evicts a request ([pitfalls.md](pitfalls.md#preemption-and-recompute));
 `host` counts GPU-to-CPU syncs in your math (must be 0); `timing` lists settings that change when values
 become visible. Budget problems are in `report.budget_errors`. `explain` does not estimate throughput or

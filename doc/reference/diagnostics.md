@@ -40,7 +40,7 @@ print(report.eager_reason == "", report.workload_host_syncs, [export.rows for ex
 | `estimate / step (N rows)` | 按 `max_num_seqs` 行估计的每步 matmul 与投影 FLOP、状态读写字节（含优化器字段）、采样器字节 |
 | `kernels` | 每步发射的算子数估计（融合前），`graph` 表示在 graph 里重放 |
 | `tap` | 从模型里取出的 hidden 位置、哪些 token（decode / prefill / all）、缓冲字节和共用它的方法 |
-| `state` 表头之后的每一行 | `状态名  作用域  roots  bytes/root  reserved bytes`，再列出每个字段的存储精度、初值来源（`source`）、放置位置（`placement`）、主机内存字节、每行和每步跨 PCIe 的字节。`roots` 是预留的份数，比并发请求多，因为新旧版本要同时存在 |
+| `state` 表头之后的每一行 | `状态名  作用域  bytes/root  reserved bytes`，再列出每个字段的存储精度和预留页数（`x N pages`）、初值来源（`source`）、放置位置（`placement`）、主机内存字节、每行和每步跨 PCIe 的字节。页数比并发请求多，因为新旧版本要同时存在；AdamW 的步数和矩只有优化器读，旧版本不保留，页数比参数字段少 |
 | `memory` | pLLM 自己要的显存峰值（状态页、任务工作区、CUDA graph 池等，不含权重和 KV）；第二行给出两个阈值：低于第一个，旁路任务改成主 stream 内联；低于第二个，规划失败 |
 | `budget` | 你设的预算装不下时的报错原文（与 `make_llm` 相同）；报告仍给出不受预算限制的计划 |
 | `preempt` | 请求被抢占后状态保留（`keep`）还是重置（`reset`），以及重置时为什么不能重算 |
@@ -60,7 +60,7 @@ print(report.eager_reason == "", report.workload_host_syncs, [export.rows for ex
 | --- | --- |
 | `eager_reason` | 模型 forward 为什么不在 CUDA graph 里；空字符串表示在 |
 | `members` | 每个方法的效果、各段计算的锚点、lane、是否捕获、读的状态、估计 |
-| `states` | 每个状态的作用域、`roots`、每份字节数、`reserved_bytes`、字段精度、初值来源、放置位置 |
+| `states` | 每个状态的作用域、每个字段的页数（`pages`）、每份字节数、`reserved_bytes`、字段精度、初值来源、放置位置 |
 | `taps` | 取出的 hidden 位置和缓冲字节 |
 | `peak_memory_bytes`、`overlap_threshold_bytes`、`inline_peak_memory_bytes` | `memory` 行的三个数 |
 | `budget_errors` | 预算装不下时的报错，空元组表示装得下 |

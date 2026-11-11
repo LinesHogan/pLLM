@@ -99,15 +99,15 @@ member  effect  anchor / lane / graph  state reads (origin, distance)
 loss  train  token.commit / side / captured  distiller (latest, 0); one AdamW step per state per engine step; prompt rows train once per prefill chunk
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
 tap      model.layers.0[0], decode: 1837056 bytes shared by loss, predict
-state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  384  516176  198211644  field 0: float32, field 1: float32, ...
-memory   peak 1445662928 bytes funded by pLLM [per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace; execution_peak_budget_bytes]
-         below 1445662928 bytes tasks run inline; below 1266677968 bytes planning fails
+state  scope  bytes/root  reserved bytes [exact; state_page_budget_bytes]
+distiller  request  387136  115623984  field 0: float32 x 384 pages, field 1: float32 x 256 pages, ...
+memory   peak 1362921636 bytes funded by pLLM [per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace; execution_peak_budget_bytes]
+         below 1362921636 bytes tasks run inline; below 1183942820 bytes planning fails
 host     0 syncs in traced workload math
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
 ```
 
-账单把系统的底牌全部亮在了明面上：在 7B、128 并发下，为了支撑 `publish_lag=1` 的无锁双流流水线，`distiller` 状态池需要预留 $(1 + 1 + 1) \times 128 = 384$ 个版本根（每个请求一份本步正在读的版本、一份留给滞后读者的旧版本、一份训练正在写的私有版本；每个根 516,176 字节，共约 189 MiB）；如果显存预算压到约 1.45 GB（`1,445,662,928` 字节）以下，旁路训练会自动退回主流串行执行；压到约 1.27 GB（`1,266,677,968` 字节）以下，规划期直接报错拒绝启动。pLLM 遵循严格的 **Fail-Closed（闭合失败）** 原则：绝不悄悄帮你把塞不下的表溢写到慢速主机内存，也绝不无声无息地关掉 CUDA Graph 退回慢路径。
+账单把系统的底牌全部亮在了明面上：在 7B、128 并发下，为了支撑 `publish_lag=1` 的无锁双流流水线，`distiller` 的参数字段需要预留 $(1 + 1 + 1) \times 128 = 384$ 页（每个请求一份本步正在读的版本、一份留给滞后读者的旧版本、一份训练正在写的私有版本）；`AdamW` 的步数与一阶、二阶动量只有优化器自己读，旧版本不必保留，只需 $2 \times 128 = 256$ 页（一个版本的四个字段共 387,136 字节，总计约 110 MiB）；如果显存预算压到约 1.36 GB（`1,362,921,636` 字节）以下，旁路训练会自动退回主流串行执行；压到约 1.18 GB（`1,183,942,820` 字节）以下，规划期直接报错拒绝启动。pLLM 遵循严格的 **Fail-Closed（闭合失败）** 原则：绝不悄悄帮你把塞不下的表溢写到慢速主机内存，也绝不无声无息地关掉 CUDA Graph 退回慢路径。
 
 这套机制的固定成本有多大？每一步在 CPU 上算行标签、维护版本页表、上传一张 `int64` 小表并运行少许收集内核，共有几十到几百微秒的固定底噪。
 * 在一步耗时 **21.7 ms** 的 **Qwen2.5-7B**（原生图模式 5,894 tok/s）上，这点底噪与 616 µs 的旁路训练几乎完全被主干矩阵乘掩盖：跑在线蒸馏只训练不引导（$\beta=0$）时吞吐为 **5,738 tok/s（原生的 97.4%）**，开启训练与采样引导（$\beta=0.5$）时为 **5,678 tok/s（原生的 96.3%）**；在 4 张 A100-SXM4-80GB 上跑 7B $\beta=0$，TP=1/2/4 下也分别保持在原生的 **95.84%、95.63% 和 97.60%**。

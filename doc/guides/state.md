@@ -207,8 +207,8 @@ state = pllm.InstanceState({
 
 状态虽然按需分配，但必须在引擎启动前完成显存预留规划：
 
-- **为什么预留槽位数（`roots`）大于并发请求数？**
-  在 [`pllm.explain`](explain.md) 的报告中，状态的 `roots` 数量通常显著大于 `max_num_seqs`。这是因为在默认的跨步重叠模式（`publish_lag=1`）下，旁路流正在写出第 $n+1$ 步的新版本，而主干流还在并发读取第 $n$ 步的旧版本，新旧多个版本必须在显存中同时并存。
+- **为什么预留的页数大于并发请求数？**
+  在 [`pllm.explain`](explain.md) 的报告中，状态每个字段的页数（`x N pages`）通常显著大于 `max_num_seqs`。这是因为在默认的跨步重叠模式（`publish_lag=1`）下，旁路流正在写出第 $n+1$ 步的新版本，而主干流还在并发读取第 $n$ 步的旧版本，新旧多个版本必须在显存中同时并存。旧版本只保留读者会读的字段：AdamW 的步数和一、二阶矩只有优化器读，它们只为最新版本和正在写的版本预留。
 - **预算控制旋钮**：
   `ExecutionOptions.state_page_budget_bytes` 约束状态池的总显存上限，超出可用空间时会在编译期抛出 `ValueError`。`ExecutionOptions.execution_peak_budget_bytes` 约束包括状态、方法工作区和 CUDA Graph 预留在内的整体执行峰值，并在显存吃紧时自动将旁路任务退回主流内联执行以防止 OOM。运行时的具体物理开销与数值健康状态可通过 `llm.diagnostics().state_usage` 和 `numeric_health` 查询，详见 [配置项](../reference/config.md) 与 [explain 与 diagnostics 字段](../reference/diagnostics.md)。
 

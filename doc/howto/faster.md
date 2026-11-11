@@ -79,7 +79,7 @@ assert report.eager_reason == ""
 
 ### 代价是什么
 
-将共享 `InstanceState` 改为每请求 `RequestState` 会增加适配器权重的显存预留（每个请求槽位要留住自己的副本和正在写的新版本；上例在 7B、128 并发下 `explain` 报 256 份 × 88 KiB ≈ 22 MiB，共享时为 130 份 ≈ 11 MiB，因为每个请求只留住它准入时的版本），改写后模型的 CUDA graph 也要更大的捕获池（不够时启动报错并给出需要的字节数），但换来的是前向完全进图。图模式能挽回多少吞吐取决于步长：7B 上 eager 本来只慢约 2%，0.5B 上 eager 只有图模式的一半。设置 `cuda_graphs=True` 没有任何运行时性能开销。
+将共享 `InstanceState` 改为每请求 `RequestState` 会增加适配器权重的显存预留（每个请求槽位要留住自己的副本和正在写的新版本；上例在 7B、128 并发下 `explain` 报每个字段 256 页，一个版本 88 KiB，共约 22 MiB；共享时每个字段只有 2 页（约 176 KiB），因为导入只在每次 `generate` 的第一步写，请求只会留住写之前或之后的版本），改写后模型的 CUDA graph 也要更大的捕获池（不够时启动报错并给出需要的字节数），但换来的是前向完全进图。图模式能挽回多少吞吐取决于步长：7B 上 eager 本来只慢约 2%，0.5B 上 eager 只有图模式的一半。设置 `cuda_graphs=True` 没有任何运行时性能开销。
 
 ---
 
@@ -172,7 +172,7 @@ overlap_config = pllm.ModelConfig(
 * **7B**：纯在线训练（$\beta=0$）时，`publish_lag=1` 为原生 vLLM 吞吐的 **97.4%**，`publish_lag=0` 为 **97.2%**；训练 + 引导采样（$\beta=0.1$）时为 **96.4%** 和 **96.1%**。每步训练只有约 0.6 ms GPU 时间，相对 21.7 ms 的一步，串行等待的代价在噪声附近。
 * **0.5B（同样设置，只换模型）**：纯在线训练时 `publish_lag=1` 为 **91.9%**，`publish_lag=0` 为 **89.8%**。步越短，重叠越值钱。
 
-代价是显存预留增加，但只落在读落后版本的状态上：有方法读落后 `publish_lag` 步的版本时，每个请求槽位要多留 `publish_lag` 份旧版本（公式见 [4.1 节](../explain/performance.md#41-分页状态池与版本槽位公式roots)）。对 7B 上的 `Distill`（`predict` 读落后的版本），128 并发下从 256 份增至 384 份，状态预留从约 126 MiB 增至约 189 MiB；`ESamp`（$\beta=0$）没有落后读者，两种设置都是 256 份。
+代价是显存预留增加，但只落在读落后版本的状态上：有方法读落后 `publish_lag` 步的版本时，每个请求槽位要多留 `publish_lag` 份旧版本的参数（优化器字段不随旧版本保留；公式见 [4.1 节](../explain/performance.md#41-分页状态池与每字段页数公式pages)）。对 7B 上的 `Distill`（`predict` 读落后的版本），128 并发下参数字段从 256 页增至 384 页，状态预留从约 95 MiB 增至约 110 MiB；`ESamp`（$\beta=0$）没有落后读者，两种设置都是每个字段 256 页。
 
 ---
 
@@ -300,8 +300,8 @@ attn_report = pllm.explain(LocalGlobalAttention(), config)
 
 在[示例 10](../examples/10_custom_attention.ipynb) 的测试中（RTX 4090，7B，`max_model_len=2048`，128 token 分块 prefill；KV 上限来自 `explain`）：
 * **单请求 KV 显存上限**：全量 112.0 MiB；偶数层窗口 256 降至 **70.4 MiB**；奇数层跨层共享降至 **56.0 MiB**（同样的 KV 池能装下的请求数翻倍）。
-* **吞吐表现**：128 并发、每个序列约 270 token 时，原样读取为原生 vLLM 的 99%，偶数层窗口 100%，跨层共享 98%（设置见示例 10）。
-* **动态稀疏读取对比**：[自定义 attention 教程](../examples/10_custom_attention.ipynb) 中的 `QuestRead`（纯 PyTorch 实现）显存依然为 112.0 MiB，吞吐断崖式下跌至原生的 **14%**（697 tok/s），因为未融合的 PyTorch 打分与 gather 开销远超节省的读取量。
+* **吞吐表现**：128 并发、每个序列约 270 token 时，原样读取、偶数层窗口和跨层共享都为原生 vLLM 的 99%（设置见示例 10）。
+* **动态稀疏读取对比**：[自定义 attention 教程](../examples/10_custom_attention.ipynb) 中的 `QuestRead`（纯 PyTorch 实现）显存依然为 112.0 MiB，吞吐断崖式下跌至原生的 **13%**（649 tok/s），因为未融合的 PyTorch 打分与 gather 开销远超节省的读取量。
 
 ---
 

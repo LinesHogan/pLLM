@@ -678,7 +678,7 @@ requests fit, per TP rank).
 
 
 `ExplainResult` fields, for programmatic checks: `eager_reason`; `members` (per method: `name`, `effect`,
-`tasks` with `anchor`, `lane`, `captured`, `reads`, and `training`); `states` (`name`, `scope`, `roots`,
+`tasks` with `anchor`, `lane`, `captured`, `reads`, and `training`); `states` (`name`, `scope`, `pages` per field,
 `bytes_per_root`, `reserved_bytes`, `fields`, `source`, `placement`, `host_bytes`, `transfer_bytes_per_row`);
 `exports` (`name`, `rows`, `source_rows`, `columns`, `bytes`, `events`, `overflow`); `peak_memory_bytes`;
 `budget_errors`; `preemption` (`"keep"` or `"reset"`) and `recompute_rejection`; `workload_host_syncs`;

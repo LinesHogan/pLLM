@@ -114,10 +114,10 @@ member  effect  anchor / lane / graph  state reads (origin, distance)
 loss  train  token.commit / side / captured  distiller (latest, 0)
 predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
 tap      model.layers.0[0], decode: 1837056 bytes shared by loss, predict
-state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  384  516176  198211644  field 0: float32, field 1: float32, ...
-memory   peak 1445625984 bytes funded by pLLM [per-rank tensor reservations; excludes GPU-dependent BLAS workspace; execution_peak_budget_bytes]
-         below 1445625984 bytes tasks run inline; below 1266641024 bytes planning fails
+state  scope  bytes/root  reserved bytes [exact; state_page_budget_bytes]
+distiller  request  387136  115623984  field 0: float32 x 384 pages, field 1: float32 x 256 pages, ...
+memory   peak 1362921636 bytes funded by pLLM [per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace; execution_peak_budget_bytes]
+         below 1362921636 bytes tasks run inline; below 1183942820 bytes planning fails
 host     0 syncs in traced workload math
 timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
 ```
@@ -133,7 +133,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
   * `anchor` 说明触发时机：`request.prepare` 在一步最开头（模型前向之前），`model.execute` 在模型前向时，`state.publish` 在前向结束、状态发布新版本时，`token.commit` 在这一步的 token 确定之后。
 * **`tap`**：从模型层取出的激活缓冲大小。如果多个方法读同一层同一阶段（如 `loss` 和 `predict` 都读 `pllm.hidden(0)`），pLLM 只建一份缓冲供它们共享（`1837056 bytes shared by loss, predict`）。
 * **`state` 与 `memory`**：
-  * `state` 显示每个状态预留了多少份（`roots`）、每份多少字节、总预留多少字节，以及每个字段解析出的 `dtype`。
+  * `state` 显示每个状态一个版本（全部字段）多少字节、总预留多少字节，以及每个字段解析出的 `dtype` 和预留的页数（`x N pages`）。
   * `memory` 显示 pLLM 为任务计算预留的峰值字节数，以及两个关键阈值：`below X bytes tasks run inline; below Y bytes planning fails`（预算低于 X 时旁路任务失去重叠、退回主 stream 内联执行；低于 Y 时无法运行）。
 * **`host`**：正常应显示 `0 syncs in traced workload math`。如果你在方法里写了 `.item()` 一类会触发 GPU 到 CPU 同步的操作，`explain` 根本不会走到这一行，而是在形状追踪时直接报错（见 [3.1 节](#31-零主机同步为什么一行-item-会拖垮吞吐)）。
 
@@ -248,7 +248,7 @@ strict_config = pllm.ModelConfig(
 print(pllm.explain(Distill(), strict_config))
 ```
 
-此时 `explain` 中 `loss` 的 lane 从 `side` 变为 `main`，`timing` 行写着 `publish_lag=0 (you set): updates at step n become readable at n + 1; updates serialize before the next forward`；状态的 `roots` 也随之变少（见 [4.1 节](#41-分页状态池与版本槽位公式roots)）。
+此时 `explain` 中 `loss` 的 lane 从 `side` 变为 `main`，`timing` 行写着 `publish_lag=0 (you set): updates at step n become readable at n + 1; updates serialize before the next forward`；状态参数字段的页数也随之变少（见 [4.1 节](#41-分页状态池与每字段页数公式pages)）。
 
 > **实用建议与避坑**
 > * **不要对 workload 方法手动套 `@torch.compile`**：pLLM 已经在内部需要的地方（如词表重加权、只读查表的整图融合）使用了编译，并依靠 `StepCapture` 消除发射开销。在一次较早的 0.5B 实验里，直接编译 `ESamp`（$\beta=0$）手写的 loss 前向与反向，吞吐（92.77%）与不编译相比没有可测收益。
@@ -272,11 +272,11 @@ print(pllm.explain(Distill(), strict_config))
 
 在 vLLM 中，显存分配的顺序是：**模型权重 + CUDA Graph 捕获池 + pLLM 状态与任务工作区 $\rightarrow$ 剩下的才分给 KV Cache**。一个真实的例子（早期版本的一次实测，vLLM 0.32）：在 RTX 4090（24 GiB，`gpu_memory_utilization=0.85`）上跑 7B 模型，当时 pLLM 把模型的 CUDA Graph 一直录到 8192 个 token 的批量，捕获池占掉的显存让可用 KV Cache 从 76,144 个 token 降到 3,872 个，吞吐只剩原生的约 21%。现在 pLLM 按 vLLM 的常规尺寸录制模型图，并让下面每一字节预留都可见、可控。
 
-### 4.1 分页状态池与版本槽位公式（`roots`）
+### 4.1 分页状态池与每字段页数公式（`pages`）
 
-当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，pLLM 用一个分页的状态池管理显存：每个字段一个池，池里每页放这个字段的一份值；`roots` 是每个池预留的页数，也就是这个状态最多能同时存在多少个版本。状态更新时，框架执行**字段级写时复制（COW）**：只为这次更新改写的字段分配新页，没改的字段继续与旧版本共用同一页。
+当你声明 `pllm.RequestState` 或 `pllm.InstanceState` 时，pLLM 用一个分页的状态池管理显存：每个字段一个池，池里每页放这个字段的一份值；`explain` 的 `state` 行里 `x N pages` 是每个池预留的页数。状态更新时，框架执行**字段级写时复制（COW）**：只为这次更新改写的字段分配新页，没改的字段继续与旧版本共用同一页。
 
-COW 省的是“同一次更新里没改的字段”。`Distill` 和 `ESamp` 的训练每步都改写全部字段（参数和 AdamW 的一阶、二阶矩打包在同一个字段里），所以训练产生的每个新版本都要一整份新页。为什么 `roots` 会比 `max_num_seqs` 大？因为每个请求槽位在同一时刻可能要留住下面几份版本，每一份都有它的用处：
+带 `optimizer=pllm.AdamW(...)` 的状态有四个字段：展平的参数 `parameters`、步数 `step`、一阶矩 `exp_avg`、二阶矩 `exp_avg_sq`（梯度不存成字段，优化器直接用这一步算出的梯度）。`Distill` 和 `ESamp` 的训练每步都改写这四个字段，所以训练产生的每个新版本都要四个字段各一页新页。为什么参数字段的页数会比 `max_num_seqs` 大？因为每个请求槽位在同一时刻可能要留住下面几份版本，每一份都有它的用处：
 
 | 份数 | 什么时候需要 |
 | :--- | :--- |
@@ -284,12 +284,14 @@ COW 省的是“同一次更新里没改的字段”。`Distill` 和 `ESamp` 的
 | $H$ | 落后读者要读的旧版本。只有当某个方法读落后的版本时才需要，`explain` 的 `state reads` 里会出现 `(boundary, H)`，$H$ 等于 `publish_lag`；例如第 n 步的训练还在旁路流写新版本时，第 n+1 步的 `predict` 读的是更早的版本。这几份里最新的一份就是当前已发布的版本，所以“最新版本”不用再单独占一份。 |
 | 1 | 这一步训练正在写的新版本；没有方法写这个状态时不需要。 |
 
-所以请求级状态的公式是 $\text{roots} = (1 + H + W) \times \text{max\_num\_seqs}$，其中 $W$ 在有方法写这个状态时为 1、否则为 0。请求结束后，它留在落后读者那里的旧版本和接替它槽位的新请求共用这几份：新请求还没有旧版本可留。还在 GPU 上运行的读操作不需要额外的份数：一页被释放后，下一次写它会先在 GPU 上等前面的读完成，而不是另占一页。
+所以请求级状态被读者读的字段（参数、carry 字段）的公式是 $\text{pages} = (1 + H + W) \times \text{max\_num\_seqs}$，其中 $W$ 在有方法写这个状态时为 1、否则为 0。请求结束后，它留在落后读者那里的旧版本和接替它槽位的新请求共用这几份：新请求还没有旧版本可留。还在 GPU 上运行的读操作不需要额外的份数：一页被释放后，下一次写它会先在 GPU 上等前面的读完成，而不是另占一页。
 
-* **读落后版本的可写 `RequestState`**：例如第 2 节的 `Distill`（7B，hidden 3584，`predict` 读 `(boundary, 1)`）：`max_num_seqs=128`、默认 `publish_lag=1` 时，$\text{roots} = 3 \times 128 = \mathbf{384}$，每份 $516,176\text{ B}$，总预留 $198,211,644\text{ B} \approx \mathbf{189\text{ MiB}}$。改成 `publish_lag=0` 后为 $2 \times 128 = 256$ 份（约 126 MiB）。
-* **只读最新版本的可写 `RequestState`**：例如 `ESamp`（$\beta=0$，只有 `loss` 读 `(latest, 0)`）、前向内精确更新（`@pllm.train_in_forward(visibility="exact")`），以及模型前向里读状态的适配器：$H=0$，$\text{roots} = 2 \times \text{max\_num\_seqs}$，与 `publish_lag` 无关。
-* **只读 `RequestState`**：$\text{roots} = (1 + H) \times \text{max\_num\_seqs}$。
-* **`InstanceState`**：可写实例状态按一个槽位计算，即 $\text{roots} = 1 + H + 1$（例如 `OverRIDE` 在 `publish_lag=1` 时为 3）。如果 `pllm.model.Adapter` 或 `pllm.model.ActivationPatch` 读它，每个请求一直读自己准入时的版本，而请求先后准入、中间每步都有写，每个请求留住的版本可能各不相同，所以再加 `max_num_seqs` 份：$\text{roots} = 1 + H + 1 + \text{max\_num\_seqs}$（例如 [explain 指南](../guides/explain.md#一个会退回-eager-的负载共享的-lora) 里的共享 LoRA 在 `max_num_seqs=128` 时为 130）；只读实例状态只需 **1 个 root**；由 `pllm.Fed` 供给的状态固定 3 个 root（引擎读一份、一份排队、生产者写下一份）。
+AdamW 的 `step`、`exp_avg`、`exp_avg_sq` 只有优化器自己读，而且只读它正在更新的最新版本；旧版本（落后读者或请求准入时留住的版本）不保留这三个字段。所以它们只需要最新版本和正在写的新版本：$\text{pages} = 2 \times \text{max\_num\_seqs}$（实例状态为 2）。
+
+* **读落后版本的可写 `RequestState`**：例如第 2 节的 `Distill`（7B，hidden 3584，`predict` 读 `(boundary, 1)`）：`max_num_seqs=128`、默认 `publish_lag=1` 时，参数字段 $3 \times 128 = \mathbf{384}$ 页，三个优化器字段各 $2 \times 128 = 256$ 页，一个版本 $387,136\text{ B}$，总预留 $115,623,984\text{ B} \approx \mathbf{110\text{ MiB}}$。改成 `publish_lag=0` 后四个字段都是 256 页（约 95 MiB）。
+* **只读最新版本的可写 `RequestState`**：例如 `ESamp`（$\beta=0$，只有 `loss` 读 `(latest, 0)`）、前向内精确更新（`@pllm.train_in_forward(visibility="exact")`），以及模型前向里读状态的适配器：$H=0$，每个字段 $2 \times \text{max\_num\_seqs}$ 页，与 `publish_lag` 无关。
+* **只读 `RequestState`**：$\text{pages} = (1 + H) \times \text{max\_num\_seqs}$。
+* **`InstanceState`**：可写实例状态按一个槽位计算，即参数字段 $1 + H + 1$ 页（例如 `OverRIDE` 在 `publish_lag=1` 时为 3，优化器字段各 2 页）。如果 `pllm.model.Adapter` 或 `pllm.model.ActivationPatch` 读它，每个请求一直读自己准入时的版本；当有方法在请求运行期间每步都写它时，请求先后准入、留住的版本可能各不相同，所以参数字段再加 `max_num_seqs` 页：$1 + H + 1 + \text{max\_num\_seqs}$。只由主机批次（`generate(batch=...)` 传入的 `CausalTrainBatch`、`WeightedRowBatch`、`StateImport` 等）写的实例状态不加：这样的写在每次 `generate` 的第一步发生，同一次调用里的请求只会留住写之前或写之后的版本（例如 [explain 指南](../guides/explain.md#一个会退回-eager-的负载共享的-lora) 里导入的共享 LoRA 每个字段 2 页）。只读实例状态只需 **1 页**；由 `pllm.Fed` 供给的状态固定 3 页（引擎读一份、一份排队、生产者写下一份）。
 
 ### 4.2 自动精度选择：什么时候用 BF16，什么时候必须用 FP32？
 
@@ -346,7 +348,7 @@ config = pllm.ModelConfig("Qwen/Qwen2.5-7B-Instruct", execution=exec_opts)
 1. **`execution_peak_budget_bytes`（两级优雅降级）**：包含状态页、任务工作区与存活结果、anchor 缓冲和捕获池预留；不含模型权重与 KV 池。旁路重叠（`side` lane）需要同时保留两步缓冲，因此峰值更高。以 7B、128 并发的 `ESamp`（rank 4，$\beta=0.5$）为例，旁路重叠计划峰值约为 **$1,775\text{ MiB}$**，内联（inline）下限约为 **$1,525\text{ MiB}$**。
    * 如果你设置的 `execution_peak_budget_bytes` 介于两者之间，规划器**不会报错，而是自动把旁路任务退回主 stream 内联执行**（`explain` 里该任务的 lane 从 `side` 变为 `main`），用一点重叠吞吐换取显存装得下。
    * 如果低于内联下限，规划失败，`explain(...).budget_errors` 会写明峰值需要多少字节、预算只有多少，并建议调小 `max_num_batched_tokens`、调大 `execution_peak_budget_bytes`，或把只读大表声明为 `placement="host"`。
-2. **`state_page_budget_bytes`**：状态总预留（`roots × bytes/root`）超过该值时，`explain` 把缺口写进 `budget_errors`（建议调小 `max_num_seqs` 或调大预算），`make_llm` 在绑定阶段抛出 `ValueError`。默认 `0` 表示用后端实际可用的显存。
+2. **`state_page_budget_bytes`**：状态总预留（各字段页数 × 每页字节之和）超过该值时，`explain` 把缺口写进 `budget_errors`（建议调小 `max_num_seqs` 或调大预算），`make_llm` 在绑定阶段抛出 `ValueError`。默认 `0` 表示用后端实际可用的显存。
 3. **`cuda_graph_pool_budget_bytes`**：控制每个任务/模型的 CUDA Graph 私有内存池预算，不是所有池的合计上限。默认 `None` 按负载追踪任务预留（模型图默认池为 **$64\text{ MiB}$**，exact decode overlay 另按形状计入工作区）。模型越大，改写后的模型图越大：7B 上哪怕只在一层挂一个 `@pllm.custom_residual`，模型图也要约 $84\text{ MiB}$，超过默认值；状态化 `@pllm.custom_residual` 子层（示例 07，8 并发）约 $1.9\text{ GiB}$，示例 12 的 `@pllm.custom_forward`（32 并发）约 $143\text{ MiB}$。这份预算会计入 pLLM 的显存峰值，按报错给出的字节数留一点余量即可。**捕获预算不足时会直接报错并给出所需字节数，绝不静默退回 eager。**
 4. **`max_host_training_rows`**：只用于主机批训练（`llm.generate(..., batch=...)` 传入的 `WeightedCEBatch`、`CausalTrainBatch`），表示每个状态每步最多训练多少行，训练工作区按它规划；默认 `1`，批次超过时会报错提示调大。它不限制 decode 时 `@pllm.train` 在请求行上的训练。
 
@@ -557,7 +559,7 @@ class TopPages(pllm.Workload):
 | **省 KV 显存容量吗？** | **真省容量**：直接映射为 vLLM 原生 `SlidingWindowSpec`、`SinkSpec` 和跨层共享组，滑出窗口的物理块会被真正回收给池子 | **不省容量**：所有历史 token 的 KV 仍必须保留在显存中供打分和挑选 |
 | **省读取带宽吗？** | **真省带宽**：直接调用原生 FA2 / FlashInfer 内核 | **省逻辑读取字节**（`explain` 中示例 10 的 `QuestRead` 在 7B 上每层每 token 最多读 $1,835,008\text{ B}$，全量为 $4,194,304\text{ B}$），但打分和 gather 走 PyTorch 算子 |
 | **单请求 KV 显存上限**（`explain`）<br>（7B，示例 10：`max_model_len=2048`，128 token 分块 prefill） | 全量 **$112.0\text{ MiB}$** $\rightarrow$ 偶数层窗口 256 降至 **$70.4\text{ MiB}$**；共享一半层降至 **$56.0\text{ MiB}$**（0.5B 上为 24.0 $\rightarrow$ 16.6 / 12.0 MiB，可同时容纳的 2048-token 请求从 358 个增至 518 / 716 个）。`sink=True` 保留整个 prompt，上限不变，实际节省取决于生成长度 | 不变（7B 仍为 **$112.0\text{ MiB}$**） |
-| **实测吞吐**<br>（示例 10：RTX 4090，7B，128 并发，每步最多 128 token） | 原生读取（`NativeRead`）**99%**；偶数层窗口（`LocalGlobal`）**100%**；跨层共享（`CrossLayerShared`）**98%** | 示例 10 中 `QuestRead` 仅为原生的 **14%**（$697$ 对 $5,165\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
+| **实测吞吐**<br>（示例 10：RTX 4090，7B，128 并发，每步最多 128 token） | 原生读取（`NativeRead`）、偶数层窗口（`LocalGlobal`）、跨层共享（`CrossLayerShared`）均为原生的 **99%** | 示例 10 中 `QuestRead` 仅为原生的 **13%**（$649$ 对 $4,855\text{ tok/s}$），因为 PyTorch 级打分与 gather 开销远大于省下的读取 |
 
 #### 窗口布局：先看 GQA 内核，再看少读了多少 KV
 
@@ -744,7 +746,7 @@ class Monitor(pllm.Workload):
 
 | 你遇到的症状或问题 | 第一步：看 `pllm.explain(workload, config)` | 第二步：可调的配置开关或代码改动 | 第三步：运行时查 `llm.diagnostics()` / `llm.trace_snapshot()` |
 | :--- | :--- | :--- | :--- |
-| **启动时报显存不足，或可用 KV 并发太低** | 看 `state` 行（`roots`、`bytes/root`、`dtype`）；看 `memory peak`；看 `budget_errors` | 大只读表改 `placement="host"`；注意力改静态 `keep="window"` 或 `source=k`；只读字段让 `dtype="auto"` 自动选 BF16；调 `state_page_budget_bytes` / `execution_peak_budget_bytes` / `cuda_graph_pool_budget_bytes`；主机批训练时调小 `max_host_training_rows` | 查 `state_usage`（对比逻辑存活字节与物理分配字节，以及 `admission_capacity_failures`）、`kv_cache_blocks`、`kv_cache_max_concurrency` |
+| **启动时报显存不足，或可用 KV 并发太低** | 看 `state` 行（`bytes/root`、每个字段的 `dtype` 和页数）；看 `memory peak`；看 `budget_errors` | 大只读表改 `placement="host"`；注意力改静态 `keep="window"` 或 `source=k`；只读字段让 `dtype="auto"` 自动选 BF16；调 `state_page_budget_bytes` / `execution_peak_budget_bytes` / `cuda_graph_pool_budget_bytes`；主机批训练时调小 `max_host_training_rows` | 查 `state_usage`（对比逻辑存活字节与物理分配字节，以及 `admission_capacity_failures`）、`kv_cache_blocks`、`kv_cache_max_concurrency` |
 | **步时明显变慢，怀疑退回了 eager 或有 CPU 同步** | 看 `forward` 行是否显示 `eager: ...`；看 `member` 行是否 `captured`；看 `host` 行是 `0 syncs` 还是 `unverified` | 方法里的 `.item()` / `if tensor:` 改用 `torch.where`；设 `ModelConfig(cuda_graphs=True)` 让任何 eager 原因直接报错；跑 `testing.check_on_gpu` 抓模型层内的隐式同步 | 查 `eager_reason`（为空字符串表示运行在整图模式） |
 | **加了引导采样或额外计算后吞吐下降明显** | 看 `member` 行在哪个阶段运行；看每个方法的 `projection FLOP`、`sampler ... bytes`；检查是否声明了多层 `pllm.layer_logits` | 用 `@pllm.guide_sampling` 替代独立读多层 `layer_logits`（共用 LM Head GEMM）；用 `rows=` 选择器缩小 `@pllm.add_logits` 或 `@pllm.guide_sampling` 的作用行数 | 查 `trace_snapshot()` 中的任务耗时 |
 | **大表设了 `placement="host"` 但吞吐依然很低** | 看查表方法的 `anchor / lane` 是否为 `request.prepare / side`；看 `logical transfer bytes/row` | 把查表写成只读 `pllm.input_tokens` 和不可变状态的独立方法，经 `pllm.result` 交给效果方法（不要混读 `pllm.hidden`，否则无法提前到步首与前向重叠）；检查每步总传输字节除以 $22\text{ GB/s}$ 是否已经超过了模型单步前向时间 | — |
