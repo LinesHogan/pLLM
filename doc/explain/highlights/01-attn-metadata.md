@@ -259,7 +259,7 @@ def prepare_attn(self, input_batch: InputBatch) -> tuple[tuple[torch.Tensor, ...
 
 虽然我们通过退回上游的 `prepare_attn` 避开了直接解析 `attn_metadata`，但在很多深入定制注意力内核或调试 vLLM V1 引擎的场景里，你依然免不了要和 `attn_metadata` 打交道。偏偏这个结构体的运行态行为极少有公开文档说明。
 
-为此，我们写了一段轻量探针脚本包住 MRv2 runner 的 `model_state.prepare_attn`，在 **vLLM 0.27.1 与 0.32.0** 两个版本、**FlashAttention 与 FlashInfer** 两个注意力后端、以及单卡 RTX 4090 与双卡 A100（TP = 2）上实测了它的每一个字段，整理成这份速查图鉴。
+为此，我们写了一段轻量探针脚本包住 MRv2 runner 的 `model_state.prepare_attn`，在 **vLLM 0.27.1 与 0.32.0** 两个版本、**FlashAttention 与 FlashInfer** 两个注意力后端、以及单卡 RTX 4090 与双卡 A100（TP = 2）上实测了它的每一个字段，整理成这份速查图鉴。下面的快照和速查表都由仓库里的 `tools/probe_attention_metadata.py` 打印的结果整理而来；升级 vLLM 之后，用 `python tools/probe_attention_metadata.py --backend FLASH_ATTN`（换成 `--backend FLASHINFER` 看另一个后端，双卡加 `--tp 2`）重跑一遍，就能核对这些字段含义是否仍然成立。
 
 ### 1. 探针实验设置
 

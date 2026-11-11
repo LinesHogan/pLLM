@@ -8,7 +8,9 @@
     "examples",
     "test/gpu/vllm_esamp_smoke.py",
     "test/gpu/fttt_cuda_smoke.py",
-    "tools/verify_groups.py"
+    "tools/verify_groups.py",
+    "tools/probe_attention_metadata.py",
+    "tools/toy_host_gather.py"
   ],
   "exclude": [
     "**/__pycache__"

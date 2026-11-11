@@ -76,7 +76,7 @@ $$\frac{38.9\text{ MB}}{23.7\text{ GB/s}} \approx 1.64\text{ ms}$$
 
 ## 三、 百行复现实验：9,600 个线程块是怎么把前向饿死的？
 
-为了把问题剥离得干干净净，我们写了一个不依赖整个推理引擎、只有一百多行的独立复现脚本 `toy_host_gather.py`。
+为了把问题剥离得干干净净，我们写了一个不依赖整个推理引擎、只有一百多行的独立复现脚本 `tools/toy_host_gather.py`，在任何一台有 CUDA GPU 的机器上用 `python tools/toy_host_gather.py` 就能自己跑一遍。
 
 实验的设置完全复刻了真实场景的尺寸：
 * 在锁页主机内存里放一张 `2048 × 151936` 的 BF16 大表（约 594 MiB，对应 0.5B 词表宽度），用 `get_accelerator_view_from_cpu_tensor` 取其 UVA 视图，并断言 `view.data_ptr() == table.data_ptr()`；
@@ -87,9 +87,11 @@ $$\frac{38.9\text{ MB}}{23.7\text{ GB/s}} \approx 1.64\text{ ms}$$
 按照任何一本 GPU 编程教材的写法，从二维表里按行读取数据的 `naive_rows` 内核会写成这样：
 
 ```python
-# check-docs: skip: excerpt from toy_host_gather.py
+# check-docs: skip: excerpt from tools/toy_host_gather.py
 @triton.jit
-def naive_rows(source, rows, output, width: tl.constexpr, block: tl.constexpr):
+def naive_rows(
+    source: torch.Tensor, rows: torch.Tensor, output: torch.Tensor, width: tl.constexpr, block: tl.constexpr
+) -> None:
     # 每个 program 只负责一个 (行, 列 tile)；grid 跟数据量成正比。
     tiles = tl.cdiv(width, block)
     row = tl.program_id(0) // tiles
@@ -104,9 +106,16 @@ def naive_rows(source, rows, output, width: tl.constexpr, block: tl.constexpr):
 现在，我们在它旁边写第二个版本 `bounded_rows`。里面的算术与读写指令一行不改，唯一的区别是：**不管外面要读多少行，启动网格的大小死死固定为 GPU SM 总数的四分之一**（在 128 个 SM 的 RTX 4090 上，只启动 **32 个** 线程块），让这 32 个常驻的线程块用 `tl.range` 循环跨步领取那 9,600 个列分块——即持久化内核（Persistent Kernel）：
 
 ```python
-# check-docs: skip: excerpt from toy_host_gather.py
+# check-docs: skip: excerpt from tools/toy_host_gather.py
 @triton.jit
-def bounded_rows(source, rows, output, count, width: tl.constexpr, block: tl.constexpr):
+def bounded_rows(
+    source: torch.Tensor,
+    rows: torch.Tensor,
+    output: torch.Tensor,
+    count: int,
+    width: tl.constexpr,
+    block: tl.constexpr,
+) -> None:
     # 同样的循环体，但 grid 固定；program 以 num_programs 为步长跨步领取 tile。
     tiles = tl.cdiv(width, block)
     for tile in tl.range(tl.program_id(0), count * tiles, tl.num_programs(0)):
