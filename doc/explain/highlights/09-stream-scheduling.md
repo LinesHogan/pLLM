@@ -1,5 +1,8 @@
 # You Probably Don't Need a Compiler IR：用 40 行最长路自动调度 CUDA Stream
 
+> 2026-11-11 · pLLM 提交 `1f9e03d6` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 当你只写一个十几行的单请求 PyTorch 脚本时，“哪段代码在什么时候跑、跑在哪条 CUDA Stream 上”根本算不上一个问题。Python 解释器从上往下走，你在第 5 行写查表，它就在第 5 行查表；你在第 12 行写 `loss.backward()`，它就在第 12 行求导。
 
 但只要你试着把这些推理期算法放进像 vLLM 这样的连续批处理服务引擎，让它们跟着每一个解码步（decode step）一起运转，三个系统调度问题就会立刻找上门来：
@@ -216,7 +219,6 @@ fn place(
 这套分析器一共只认四种线性算子形态，在 `scan_analysis.py` 里定义得一目了然：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/scan_analysis.py
 Kind = Literal["scalar", "diagonal", "left", "right"]
 # ……
 @dataclass(frozen=True)
@@ -312,7 +314,6 @@ Hardware:                             (Main waits on cross-GPU link; Side uses l
 怎么把旁路训练塞进跨卡通信的空隙里，同时绝不让它挡住集合通信的路？我们在 `pllm/worker.py` 里加上了短短几行流优先级纪律：
 
 ```python
-# check-docs: skip: excerpt from pllm/worker.py
 class GPUWorker(compat.Worker):
     def _make_model_runner(self) -> WorkloadModelRunner:
         if self.parallel_config.tensor_parallel_size > 1:

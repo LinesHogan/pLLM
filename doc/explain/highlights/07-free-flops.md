@@ -1,5 +1,8 @@
 # Free FLOPs and Where to Find Them：利用 Memory-Bound 解码尾声顺手做完采样引导
 
+> 2026-11-11 · pLLM 提交 `1f9e03d6` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 如果你想在自回归解码阶段用一个小网络（比如在线蒸馏器 distiller）去修正大模型的采样分布——把大模型和小网络都觉得好的平庸词往下压一点，把只有大模型深层才看准的词往上抬一点——它的数学公式只有一行：
 
 ```text
@@ -11,7 +14,6 @@ new_logit = (1 + beta) * llm_logit - beta * distiller_logit
 在单请求的 PyTorch 脚本里，把这个公式写出来大概只需要两分钟：先调一次 `model.lm_head(hidden)` 算出大模型的词表得分，再调一次 `model.lm_head(distiller_hidden)` 算出小网络的词表得分；等采样器的过滤器把淘汰词涂成 `-inf` 变成 `survivors` 之后，写一行张量算术：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/sampler.py
 def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     # ……
     return torch.where(
@@ -44,7 +46,6 @@ def _reweight_unfused(survivors: torch.Tensor, prediction: torch.Tensor, beta: t
 回头看开头那行看似无害的 `_reweight_unfused`：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/sampler.py
 return torch.where(
     torch.isfinite(survivors), (1.0 + beta) * survivors - beta * prediction.to(survivors.dtype), survivors
 )
@@ -88,7 +89,6 @@ return torch.where(
 在 pLLM 的 vLLM 会话后端（`pllm/backends/vllm/session.py`）里，这个拼车动作只有两行代码：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/session.py
 projected = lm_head(torch.cat((hidden, guidance.values.to(hidden.dtype))))
 assert projected is not None
 logits, predicted = projected[: len(hidden)], projected[len(hidden) :]
@@ -115,7 +115,6 @@ logits, predicted = projected[: len(hidden)], projected[len(hidden) :]
 遗憾的是，vLLM 自己的温度、过滤和拷贝算子接口都没有留“顺手加几个稠密张量”的参数槽位，而它提供的稀疏 `logit_bias` 又是给个别固定 token 准备的。既然上游没有这个旋钮，我们在 `pllm/backends/vllm/sampler_epilogue.py` 里写了一个极简的 Triton 内核 `_copy_additions`，精准替换掉那一次 BF16 到 FP32 的拷贝：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/sampler_epilogue.py
 loaded = tl.load(Logits + row * LS + tokens * VS, valid, other=0)
 dtype = loaded.dtype
 value = loaded.to(tl.float32)
@@ -145,7 +144,6 @@ tl.store(Output + row * VOCAB + tokens, value, valid)
 请盯住循环里的最后一行：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/sampler_epilogue.py
 value = tl.where(selected >= 0, (value + prediction).to(dtype).to(tl.float32), value)
 ```
 
@@ -166,7 +164,6 @@ value = tl.where(selected >= 0, (value + prediction).to(dtype).to(tl.float32), v
 病根写在 `sampler_epilogue.py` 改用 `@torch.library.custom_op` 的注释里：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/sampler_epilogue.py
 @torch.library.custom_op("pllm::sampler_additions", mutates_args=())
 def _copy(
     logits: torch.Tensor,
@@ -226,7 +223,6 @@ def _copy(
 在这个 Triton 内核里，每一个待采样的请求行分配一个线程块（program）。它先调用 `_scan_survivors` 扫一遍上游刚刚过滤好的 `Logits`，把有限值压紧写进一块固定容量为 `K` 的暂存区 `Scratch`；紧接着，只为 `Scratch` 里的这几个幸存者去 `lm_head`（即代码中的 `Weight`）里按行号捞权重：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/guided_sampling.py
 # Only finite selected survivors fetch embedding rows. No overflow ever projects the vocabulary.
 for group in tl.range(tl.cdiv(count, DOT_ROWS)):
     slot = group * DOT_ROWS + tl.arange(0, DOT_ROWS)
@@ -272,7 +268,6 @@ for group in tl.range(tl.cdiv(count, DOT_ROWS)):
 来看看 `guided_sampling.py` 顶部那 5 行 `_keys` 与对称的 `_decode`：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/guided_sampling.py
 @triton.jit
 def _keys(logits: tl.tensor, tokens: tl.tensor, finite: tl.tensor) -> tl.tensor:
     logits = tl.where(logits == 0, 0.0, logits)

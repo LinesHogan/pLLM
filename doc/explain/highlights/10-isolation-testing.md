@@ -1,9 +1,11 @@
 # `h - h.mean(dim=0)` 不会报错，但会让张三看见李四的提示词：连续批处理的隔离测试
 
+> 2026-11-10 · pLLM 提交 `cff7c196` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 在单请求的研究脚本里调试一个“激活中心化”钩子时，你很容易随手写下这一行代码：
 
 ```python
-# check-docs: skip: a one-line method body, not a complete program
 return h - h.mean(dim=0, keepdim=True)
 ```
 
@@ -16,7 +18,6 @@ return h - h.mean(dim=0, keepdim=True)
 除了跨行串味，还有两类同样安静的陷阱。第一类是调试在线学习算法时顺手写下的防御性断言：
 
 ```python
-# check-docs: skip: a one-line method body, not a complete program
 assert not torch.isnan(loss).any()
 ```
 
@@ -65,7 +66,6 @@ User Workload (Python class)
 在 pLLM 中，我们用声明式签名替掉了开放式回调。一个方法需要读什么模型激活、读写哪份状态、在什么时机生效，全部写在函数参数的默认值与装饰器上。以在线蒸馏负载 `Distill` 为例：
 
 ```python
-# check-docs: skip: excerpt from doc/explain/performance.md
 @dataclass(frozen=True)
 class Distill(pllm.Workload):
     beta: float = 0.5
@@ -112,7 +112,6 @@ class Distill(pllm.Workload):
 我们在 `pllm/execution/torch_private.py` 里唯一多做的，是把这个晦涩的内部异常拦下来，翻译成直接告诉用户怎么改代码的报错信息：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/torch_private.py
 @contextmanager
 def fixed_shapes() -> Generator[None]:
     """Explain why data-dependent control flow and custom-op outputs cannot be planned or captured."""
@@ -145,7 +144,6 @@ def fixed_shapes() -> Generator[None]:
 但是，回头看看文章开头那行真正的罪魁祸首：
 
 ```python
-# check-docs: skip: a one-line method body, not a complete program
 return h - h.mean(dim=0, keepdim=True)
 ```
 
@@ -181,7 +179,6 @@ return h - h.mean(dim=0, keepdim=True)
 因此，合成激活值必须是**关于 `（请求编号 index, token 在该请求内的位置 offset, 特征通道 channel）` 的确定性纯函数**。来看看 `pllm/testing_contracts.py` 里的 `_token_values`，一共只有寥寥数行：
 
 ```python
-# check-docs: skip: excerpt from pllm/testing_contracts.py
 def _random(shape: tuple[int, ...], seed: int) -> torch.Tensor:
     return torch.randn(shape, generator=torch.Generator().manual_seed(seed))
 
@@ -196,7 +193,6 @@ def _token_values(index: int, offsets: range, width: int, channel: int, perturbe
 现在，盯住上面那一行：
 
 ```python
-# check-docs: skip: excerpt from pllm/testing_contracts.py
 salt = 1_000_000 if perturbed is not None and index != perturbed else 0
 ```
 
@@ -228,7 +224,6 @@ Run 2 (Perturb neighbors of Req 1, perturbed = 1):
 更进一步，一旦抓到 `Out 1` 变了，到底是用户写的某个方法把行混在了一起，还是底层的框架自己在路由行号时出了 bug？因为测试器在每个方法调用前后都记录了按请求拆开的输入与输出切片，`_fault` 函数只需做一次极其简单的比对就能精准定责（`pllm/testing_contracts.py`）：
 
 ```python
-# check-docs: skip: excerpt from pllm/testing_contracts.py
 if changed and equal_inputs:
     return (
         f"method `{key[2]}` mixes rows: equal inputs for this request produced different outputs. "
@@ -256,7 +251,6 @@ if changed:
 来看看 `pllm/testing_contracts.py` 里测试“分块预填充与解码混排”的那张调度表。测试里固定有三个请求：请求 `0`（提示词长 5）、请求 `1`（提示词长 1）、请求 `2`（提示词长 9）。代码里的 `_schedule` 是这样写的：
 
 ```python
-# check-docs: skip: excerpt from pllm/testing_contracts.py
 if mixed:
     return (
         ((0, 4, 0), (1, 1, 0)),
@@ -327,7 +321,6 @@ SKIP    model-site execution: CPU decoder does not execute residual hooks, overl
 怎么让一个正常的短测试百分百撞上一次真实的 KV 驱逐？去改 vLLM 的调度器源码太重了，而把显卡显存故意塞到只剩几兆又极不稳定。来看看 `pllm/testing_gpu.py` 里的 `_Eviction` 是怎么用十行代码四两拨千斤的：
 
 ```python
-# check-docs: skip: excerpt from pllm/testing_gpu.py
 class _Eviction:
     """Make the real KV allocator fail once, then let vLLM evict and recompute normally."""
 

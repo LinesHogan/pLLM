@@ -1,11 +1,13 @@
 # 为什么 32 个线程块比 9,600 个更快？一次把 GPU 前向饿死的跨 PCIe 查表
 
+> 2026-11-10 · pLLM 提交 `4d571723` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 有一类推理期算法长得越来越像数据库查询：模型一边往前生成 token，一边拿当前 token 和前几个历史 token 算一个哈希，去一张巨大的外部静态表里捞出几行向量，经过门控加进某层的残差流，或者直接作为先验偏置加到词表 logits 上。DeepSeek 的 Engram 记忆层是这个路数，经典的 kNN-LM 与 n-gram 先验也是这个路数。
 
 单看算法本身，代码干净得只有一行。在 `examples/engram_lite.py` 里，从表里取两行二元组与三元组记忆向量的逻辑是这样的：
 
 ```python
-# check-docs: skip: excerpt from examples/engram_lite.py
 def lookup(
     self,
     ids: torch.Tensor = pllm.input_tokens(history=2),
@@ -87,7 +89,6 @@ $$\frac{38.9\text{ MB}}{23.7\text{ GB/s}} \approx 1.64\text{ ms}$$
 按照任何一本 GPU 编程教材的写法，从二维表里按行读取数据的 `naive_rows` 内核会写成这样：
 
 ```python
-# check-docs: skip: excerpt from tools/toy_host_gather.py
 @triton.jit
 def naive_rows(
     source: torch.Tensor, rows: torch.Tensor, output: torch.Tensor, width: tl.constexpr, block: tl.constexpr
@@ -106,7 +107,6 @@ def naive_rows(
 现在，我们在它旁边写第二个版本 `bounded_rows`。里面的算术与读写指令一行不改，唯一的区别是：**不管外面要读多少行，启动网格的大小死死固定为 GPU SM 总数的四分之一**（在 128 个 SM 的 RTX 4090 上，只启动 **32 个** 线程块），让这 32 个常驻的线程块用 `tl.range` 循环跨步领取那 9,600 个列分块——即持久化内核（Persistent Kernel）：
 
 ```python
-# check-docs: skip: excerpt from tools/toy_host_gather.py
 @triton.jit
 def bounded_rows(
     source: torch.Tensor,
@@ -198,7 +198,6 @@ CUDA 的硬件块调度器是非抢占式的（non-preemptive）。当旁路流�
 首先是位于 `pllm/kernels/page_copy.py` 的生产级算子 `_host_rows` 与 `pllm::host_rows`。相比刚才的玩具代码，它只多处理了两件真实世界里的小事——把 Python 允许的负数行下标绕回正数（`index + height`），以及把视图步长（`stride0`, `stride1`）和行数（`count`）作为运行时整数传入，使得对表做任意切片视图或不同批次大小都能复用同一个编译好的 Triton 内核：
 
 ```python
-# check-docs: skip: excerpt from pllm/kernels/page_copy.py
 @triton.jit
 def _host_rows(
     source: torch.Tensor,

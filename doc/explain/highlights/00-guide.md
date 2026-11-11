@@ -1,5 +1,8 @@
 # 给 vLLM 装一个“eBPF”：在不拆引擎的前提下运行推理期算法
 
+> 2026-11-10 · pLLM 提交 `be3569b0` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 在研究脚本里验证一个推理期算法，通常只需要十几行 PyTorch。
 
 以在线蒸馏引导采样（ESamp）为例：在生成的每一步，都为当前请求在线训练一个极小的秩-4（rank-4）双层网络，用第 0 层的隐藏状态去拟合最后一层的隐藏状态；到了采样前，再把这个小网络的浅层预测从词表 logits 里对减一部分，压低那些“浅层就能猜到”的 token。
@@ -7,7 +10,6 @@
 在 Hugging Face 的 `generate` 循环里，挂两个 `register_forward_hook`、每步调一次 `loss.backward()` 和 `optimizer.step()`，十几行代码就能跑通。在 pLLM 中，它的声明同样只有十几行：
 
 ```python
-# check-docs: skip: excerpt from README.md
 class ESampLite(pllm.Workload):
     distiller = pllm.RequestState(
         init=pllm.FromModule(
@@ -65,57 +67,11 @@ Linux 走出这个二选一困境的方案是 **eBPF**。eBPF 没有给用户开
 2. **计算体量不同**：eBPF 程序通常短小；而推理期负载可以在旁路流上跑完整的反向传播与 `AdamW`，或从数百兆的主机查找表里跨 PCIe 预取行。
 3. **宿主 ABI 的演化速度不同**：vLLM 内部结构演进极快，pLLM 选择将 vLLM 0.27.1 与 0.32.0 的内部差异集中关在 `pllm/backends/vllm/compat.py` 这一个隔离层内（另有少数几处按它导出的版本开关分支），向上提供稳定的声明接口。
 
----
-
-## 二、 一步解码的时空全景与 `int64` 路由表
-
-在具体机制上，pLLM 靠两样东西把“动态的多租户算法”装进“静态的底层引擎”：一是在启动前用无数据的 PyTorch `meta` 张量把声明方法空跑一遍，一次性推导出形状、显存生命周期并交给约 4,300 行 Rust 编写的规划器生成签名物理计划；二是在运行时通过**一张固定显存地址的 `int64` 整数表（`TableLayout`）** 做间接寻址。
-
-CUDA Graph 要求算子读写的显存地址永远不变，而连续批处理里的请求行号、每个请求当前读写的参数版本页槽、乃至外部张量的内存指针每一步都在变。解法是把所有会变的“结构与路由”编码成固定表里的 `int64` 整数数据：每一步开始前，CPU 在锁页内存（Pinned Memory）里算出各行对应的请求号、源页槽 `sources`、目标写槽 `destinations` 以及外部张量的 64 位裸地址，通过一次几微秒的异步拷贝推上 GPU；录在图里的内核只认这张表的固定地址，按表索骥去固定池子里读写对应槽位（未满批次的空余行则指向一个权重为零、不写回的“哑状态槽”）。
-
-配合这张路由表，引擎的每一个解码步在时间轴上被切分为 **8 个严格有序的锚点（Anchors）**，并在主计算流（`main`）与旁路流（`side`）之间协同推进：
-
-```text
-时间轴锚点:  0:request    1:model      2:state      3:sampler    4:sampler    5:token     6:request   7:next
-             .prepare     .execute     .publish     .pre_draw    .complete    .commit     .finish     .prepare
-                 │            │            │            │            │            │           │           │
-第 n 步   main:  ├─[算行标签]─┼─[图内改残差]┼─[predict]──┼─[采样尾声]─┼─[抽样完成]─┤           │           │
-(主流)           │ (填表上传) │ [参数覆盖层]│ (读lag=1版)│ (融合重加权│            │           │           │
-                 │            │ [自定义跳层]│            │  与抽样)   │            │           │           │
-                 │            │ [自定义KV] │            │            │            │           │           │
-          side:  ├─[主机查表]─┼────────────┘            │            │            ├─[整步训练:反向+AdamW]─┼──────┐
-(旁路流)         │ (1/4 SM限流│                         │            │            │ (写新页槽,与n+1步重叠)│      │
-                 │  与前向重叠│                         │            │            │                       │      │
-第 n+1 步 main:  │                                                                ├─[退役回收]─┴─[准备n+1]─┴─[前向n+1]►
-```
-
-在这条流水线上，为什么第 $n$ 步在 `5: token.commit` 启动的旁路训练，不会阻塞紧接着开始的第 $n+1$ 步模型前向？因为系统默认采用 **`publish_lag=1`**：第 $n$ 步训练产生的新权重版本，在第 $n+2$ 步才对主流上的 `predict` 可见；第 $n+1$ 步的主流直接读取第 $n-1$ 步早已发布好的不可变版本（而旁路训练自身始终在最新参数上迭代，不丢任何一步梯度）。
-
-这一切调度与显存代价在触碰 GPU 之前就是完全透明的。只需在 CPU 上调用 `pllm.explain(workload, config)`（只读取 `Qwen2.5-7B-Instruct` 的 `config.json`，不碰 GPU），就能拿到一份精确到字节的物理执行账单：
-
-```text
-forward  CUDA graphs: no effect needs eager
-member  effect  anchor / lane / graph  state reads (origin, distance)
-loss  train  token.commit / side / captured  distiller (latest, 0); one AdamW step per state per engine step; prompt rows train once per prefill chunk
-predict  guide_sampling  state.publish / main / captured  distiller (boundary, 1)
-tap      model.layers.0[0], decode: 1837056 bytes shared by loss, predict
-state  scope  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-distiller  request  387136  115623984  field 0: float32 x 384 pages, field 1: float32 x 256 pages, ...
-memory   peak 1362921636 bytes funded by pLLM [per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace; execution_peak_budget_bytes]
-         below 1362921636 bytes tasks run inline; below 1183942820 bytes planning fails
-host     0 syncs in traced workload math
-timing   publish_lag=1 (default): updates at step n become readable at n + 2; training may overlap later forwards
-```
-
-账单把系统的底牌全部亮在了明面上：在 7B、128 并发下，为了支撑 `publish_lag=1` 的无锁双流流水线，`distiller` 的参数字段需要预留 $(1 + 1 + 1) \times 128 = 384$ 页（每个请求一份本步正在读的版本、一份留给滞后读者的旧版本、一份训练正在写的私有版本）；`AdamW` 的步数与一阶、二阶动量只有优化器自己读，旧版本不必保留，只需 $2 \times 128 = 256$ 页（一个版本的四个字段共 387,136 字节，总计约 110 MiB）；如果显存预算压到约 1.36 GB（`1,362,921,636` 字节）以下，旁路训练会自动退回主流串行执行；压到约 1.18 GB（`1,183,942,820` 字节）以下，规划期直接报错拒绝启动。pLLM 遵循严格的 **Fail-Closed（闭合失败）** 原则：绝不悄悄帮你把塞不下的表溢写到慢速主机内存，也绝不无声无息地关掉 CUDA Graph 退回慢路径。
-
-这套机制的固定成本有多大？每一步在 CPU 上算行标签、维护版本页表、上传一张 `int64` 小表并运行少许收集内核，共有几十到几百微秒的固定底噪。
-* 在一步耗时 **21.7 ms** 的 **Qwen2.5-7B**（原生图模式 5,894 tok/s）上，这点底噪与 616 µs 的旁路训练几乎完全被主干矩阵乘掩盖：跑在线蒸馏只训练不引导（$\beta=0$）时吞吐为 **5,738 tok/s（原生的 97.4%）**，开启训练与采样引导（$\beta=0.5$）时为 **5,678 tok/s（原生的 96.3%）**；在 4 张 A100-SXM4-80GB 上跑 7B $\beta=0$，TP=1/2/4 下也分别保持在原生的 **95.84%、95.63% 和 97.60%**。
-* 但在一步只有 **3.0 ms** 的 **Qwen2.5-0.5B** 小模型上，固定底噪占比凸显，同配置下 $\beta=0$ 的吞吐为 **38,936 tok/s（原生的 91.9%）**（早先在 vLLM 0.27.1 上做的 20 轮交叉测量中，$\beta=0$ 为 92.45%，$\beta=0.5$ 为 83.38%）。模型越小，固定调度税越显眼；到 7B 规模时则收敛在 3%–4% 左右。
+一步 decode 怎样切成有序的锚点、工作怎样分到主流与旁路流、`publish_lag` 为什么让训练能与下一步前向重叠，见[核心概念](../core-concepts.md#3-时间线锚点阶段窗口与主旁路流)的第 3、4 节；固定 `int64` 路由表见[第 2 篇](02-tensor-colors.md)，这套机制的固定开销见[性能与显存](../performance.md)。
 
 ---
 
-## 三、 系列导读：十个独立的系统问题
+## 二、 系列导读：十个独立的系统问题
 
 本系列的后续十篇文章，每一篇都围绕一个在改造 vLLM 或编写高性能推理扩展时会撞上的具体技术问题展开。它们各自独立成篇，你可以按顺序通读，也可以直接挑最关心的痛点切入：
 

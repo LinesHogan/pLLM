@@ -1,5 +1,8 @@
 # 稀疏注意力在 vLLM 里省不下显存（以及为什么调 `window_size` 反而慢了 5 倍）
 
+> 2026-11-10 · pLLM 提交 `cff7c196` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 如果你把过去两年顶会上的长上下文推理论文摊在桌子上，相当一部分在打注意力（Attention）和 KV Cache 的主意。
 
 这些论文的逻辑听起来无懈可击：在自回归生成时，KV Cache 随着序列长度线性膨胀，但真正分到注意力权重的往往只有最近的局部窗口和少数关键历史位置。既然绝大多数历史 token 都没人看，那我们少读一点、或者把不重要的 token 从缓存里删掉，不就能既省带宽又省显存了吗？
@@ -158,7 +161,6 @@ Block Table:  │  null_block  │ Physical #2  │ Physical #9  │  (table len
 在 pLLM 的 `pllm/backends/vllm/kv_layout.py` 里，这三种布局的挂载核心只有十来行代码：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/kv_layout.py
 for layout in layouts:
     attention = model.model.layers[layout.layer].self_attn.attn
     storage = storage_layout(layouts, layout.layer)
@@ -189,7 +191,6 @@ for layout in layouts:
 看穿了这个潜规则，解法在 `pllm/backends/vllm/kv_layout.py` 里只需要十行代码：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/kv_layout.py
 class SinkSpec(RSWASpec):
     """Keep R-SWA allocation separate from full attention; the native RSWAManager owns blocks."""
 
@@ -294,7 +295,6 @@ FA2 全量读取是怎么贴住物理极限的？靠的是 **GQA 打包（Packed
 vLLM 自己的 `vllm.v1.attention.backends.flashinfer` 模块里，本来就有一整套现成的 `FlashInferMetadataBuilder` 和 `FlashInferImpl`，页索引、split 规划和图缓冲区的生命周期早就安排得妥妥当当。在 `pllm/backends/vllm/flashinfer_attention.py` 里，我们只需写一个十来行的 `WindowMetadataBuilder` 继承它：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/flashinfer_attention.py
 class WindowMetadataBuilder(FlashInferMetadataBuilder):
     """Let both upstream builders consume the same native page mappings."""
 
@@ -331,7 +331,6 @@ class WindowMetadataBuilder(FlashInferMetadataBuilder):
 2. **用“带便签的补丁”应对上游缺口**：在 Prompt + 窗口（R-SWA）布局下，vLLM 使用的是它的 Triton `unified_attention` 启动器。它算出的输出完全正确，但它的 2-D 分支（含所有 prefill）直接丢弃了中间的最大值 `M` 与分母和 `L`，3-D 分支在分段归约后同样不返回 LSE。为了不把上游几百行的巨型 Triton 内核复制进自己仓库维护，我们在 `pllm/backends/vllm/rswa_attention.py` 里选择先调原装的 `unified_attention` 拿输出，紧接着用不分段模式再调一次上游同一个 `kernel_unified_attention`（`_lse_statistics`）把丢掉的统计量捞回来：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/rswa_attention.py
 unified_attention(
     q=q,
     k=kv.key_cache,

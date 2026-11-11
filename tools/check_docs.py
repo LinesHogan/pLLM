@@ -4,9 +4,9 @@ Checks over README.md, doc/ and examples/:
 1. every `pllm.X` name and `from pllm... import X` in Python code resolves against the importable package;
 2. every relative markdown link points at an existing file and heading (including notebook markdown);
 3. notebook code cells tagged "cpu-check" (cell metadata `tags`) run in order on CPU, one process per notebook;
-4. the Python blocks of doc/{agent,guides,howto,reference,explain,explain/highlights}/*.md run in order, one process
-   per file: on CPU, or with `--gpu` also the agent blocks fenced ```python gpu, on the GPU. Intentionally partial
-   blocks must contain `# check-docs: skip: <reason>`; each opt-out is reported in the summary;
+4. the Python blocks of doc/{agent,guides,howto,reference,explain}/*.md run in order, one process per file: on CPU,
+   or with `--gpu` also the agent blocks fenced ```python gpu, on the GPU. Intentionally partial blocks must
+   contain `# check-docs: skip: <reason>`; each opt-out is reported in the summary;
 5. doc/agent/reference.md names every public pllm name in its task sections, and its generated signature
    list equals the code's (`--write-signatures` regenerates it);
 6. error messages quoted in backticks in the first table column of a section about rejections or errors still
@@ -14,8 +14,10 @@ Checks over README.md, doc/ and examples/:
    depends on the user's code) must appear in one string literal.
 
 Warnings, which do not fail the run: README.md and doc/ outside doc/dev/ are written for users, so contributor
-vocabulary (PTTS, receipts, evidence numbers, milestones, local paths, commit hashes) found there is listed per file;
-the highlight essays in doc/explain/highlights/ explain PTTS by name, so that one word is allowed there.
+vocabulary (PTTS, receipts, evidence numbers, milestones, local paths, commit hashes) found there is listed per file.
+
+The essays in doc/explain/highlights/ are dated articles: each names the commit and setup it was written against
+and is not kept current, so their code does not run and their vocabulary is not checked.
 
 Notebooks without any "cpu-check" cell are pending a rewrite and are skipped unless `--all` is given;
 the report lists them. Exit status is 1 when any check fails.
@@ -51,7 +53,7 @@ MARKDOWN = MarkdownIt(options_update={"inline_definitions": True})
 AGENT_DOCS = ROOT / "doc" / "agent"
 EXECUTED_DOCS = (
     AGENT_DOCS,
-    *(ROOT / "doc" / name for name in ("guides", "howto", "reference", "explain", "explain/highlights")),
+    *(ROOT / "doc" / name for name in ("guides", "howto", "reference", "explain")),
 )
 REFERENCE = AGENT_DOCS / "reference.md"
 PUBLIC_NAMESPACES = ("pllm", "pllm.model", "pllm.host", "pllm.io", "pllm.testing", "pllm.benchmark")
@@ -64,9 +66,7 @@ CONTRIBUTOR_WORDS = re.compile(
     r"|(?<![A-Za-z0-9_])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,12}(?![A-Za-z0-9_])"
 )
 DEV_DOCS = ROOT / "doc" / "dev"
-# The essays tell how PTTS came about, so they name it; the rest of the vocabulary still warns there.
 ESSAYS = ROOT / "doc" / "explain" / "highlights"
-ESSAY_WORDS = frozenset({"PTTS"})
 
 
 class CellMetadata(TypedDict, total=False):
@@ -310,6 +310,11 @@ def stale_messages(text: str) -> list[str]:
     ]
 
 
+def user_document(path: Path) -> bool:
+    """Whether `path` is prose for users that must stay true: not doc/dev/, not a dated essay, not example code."""
+    return path.suffix != ".py" and not path.is_relative_to(DEV_DOCS) and not path.is_relative_to(ESSAYS)
+
+
 def contributor_words(path: Path) -> str:
     """A one-line summary of the contributor vocabulary in a user document, or an empty string."""
     hits: dict[str, list[str]] = {}
@@ -317,8 +322,6 @@ def contributor_words(path: Path) -> str:
         where = f"cell {index} line " if path.suffix == ".ipynb" else ""
         for number, line in enumerate(text.splitlines(), start=1):
             for match in CONTRIBUTOR_WORDS.finditer(line):
-                if path.is_relative_to(ESSAYS) and match.group() in ESSAY_WORDS:
-                    continue
                 hits.setdefault(match.group(), []).append(f"{where}{number}")
     return "; ".join(f"{word} ({', '.join(places)})" for word, places in sorted(hits.items()))
 
@@ -505,7 +508,7 @@ def main() -> int:
             )
         if not checked:
             skipped.append(name)
-        if path.suffix != ".py" and not path.is_relative_to(DEV_DOCS) and (words := contributor_words(path)):
+        if user_document(path) and (words := contributor_words(path)):
             warnings.append(f"  {name}: {words}")
         for failure in failures:
             print(f"{name}: {failure}")

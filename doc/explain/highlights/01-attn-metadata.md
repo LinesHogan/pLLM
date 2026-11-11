@@ -1,5 +1,8 @@
 # 你其实不需要读 `attn_metadata`：用三个整数算清 vLLM 的打包行布局
 
+> 2026-11-10 · pLLM 提交 `4d571723` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 如果你在单卡研究脚本里写过 PyTorch 模型钩子（hook），你眼里的 batch 一定是个规规矩矩的三维盒子：`[batch_size, seq_len, hidden_size]`。`x[0]` 永远属于第一个请求，`x[1]` 永远属于第二个请求，门牌号清清楚楚。
 
 但当你把同样的钩子挂进 vLLM 的第 0 层，打印出传进来的 `hidden` 张量形状时，那个三维盒子不见了。你手里只有一个拍扁的二维张量：`[64, 896]`（下文探针用的是隐藏维 896 的 `Qwen2.5-0.5B-Instruct`）。
@@ -46,7 +49,6 @@
 要验证拆包逻辑到底对不对，最可靠的办法是建立一套不依赖任何内部假设的“金标准对照协议”（出自验证脚本 `tllm/legacy/verify_v1_decode_rows_runtime.py` 的文档字符串）：
 
 ```python
-# check-docs: skip: excerpt from tllm/legacy/verify_v1_decode_rows_runtime.py in the old tLLM repository
 """Verify vLLM v1 decode-row localization using first-layer hidden MSE.
 
 Gold standard:
@@ -171,7 +173,6 @@ $$\text{offset} = \text{computed} + \text{token}$$
 在 vLLM 的新版模型执行器（MRv2 `GPUModelRunner`）里，每一步当 `prepare_inputs` 刚刚在 CPU 上组装好 `InputBatch`、但**还没有**开始构建 `attn_metadata` 和发射模型前向之前，都会调用一次 `prepare_attn(self, input_batch: InputBatch)`。在 pLLM 支持的两个 vLLM 版本（0.27.1 与 0.32.0）上，它的函数签名分毫不差。在我们的开源扩展框架 pLLM 中，行标签的计算就挂在这里（`pllm/backends/vllm/runner.py`）：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/runner.py
 def prepare_attn(self, input_batch: InputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     # ……
     session = self.workload_session

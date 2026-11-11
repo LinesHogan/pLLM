@@ -1,5 +1,8 @@
 # 给 GPU 显存加上 MVCC：当每个并发请求都有一份会变的权重
 
+> 2026-11-10 · pLLM 提交 `be3569b0` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 现代大模型推理引擎之所以能把吞吐推到极致，很大程度上仰赖于一个隐含的前提：除了不断向后追加的 KV Cache 之外，模型本身对每个请求是无状态的。成百上千个并发请求共用同一份只读的模型权重，每算完一步就丢掉中间激活，彼此之间没有任何可变数据的牵连。
 
 但只要你试着往推理过程里引入一点“跨步演化”的算法——比如在生成每个 token 的同时，在线为当前请求微调一个轻量级的预测网络来引导采样（如在线蒸馏 ESamp），或者随着上下文推进实时更新每个请求专属的“快权重”（如 Test-Time Training），又或者在生成中途动态注入外部的引导向量——这个平静的无状态假设就瞬间瓦解了。你突然需要在高速运转的推理引擎内部，为上百个并发请求维护可读可写、每一步都在变化的状态张量。
@@ -67,7 +70,6 @@
 这一点在“操作中途取消（`abort`）”时表现得尤为明显。来看看 `pllm/execution/ptts/page_bundle.py` 里发布新版本与中止私有写的实现：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/ptts/page_bundle.py
 def publish(self, token: PageWrite) -> PagePublication:
     self._issued_write(token)
     completion = self._record(token.stream)
@@ -80,7 +82,6 @@ def publish(self, token: PageWrite) -> PagePublication:
 紧挨着它的 `abort` 与 `publish` 的函数体几乎一字不差，只差传给底层账本 `self._ledger.publish(...)` 的最后一个布尔参数（`False` 代表正常发布，`True` 代表作废）：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/ptts/page_bundle.py
 def abort(self, token: PageWrite) -> None:
     """End logical ownership now; future physical reuse waits for the queued writes."""
     self._issued_write(token)
@@ -138,7 +139,6 @@ Simultaneously Held Versions per Lineage (history = 1, written = True -> 3 pages
 在 `pllm/execution/ptts/page_bundle_planning.py` 里，这个容量规划被浓缩成了一行极其干净的算术：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/ptts/page_bundle_planning.py
 def version_capacity(lineages: int, history: int, *, written: bool) -> int:
     # ……
     return (1 + history + written) * lineages
@@ -168,7 +168,6 @@ def version_capacity(lineages: int, history: int, *, written: bool) -> int:
 来看看 `pllm/execution/preemption.py` 里的判定函数，全篇只有寥寥数行：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/preemption.py
 def preemption_policy(attachment: BackendAttachment, sites: tuple[ResidualRewrite, ...]) -> Literal["keep", "reset"]:
     # ……
     graph = attachment.plan.semantic_graph

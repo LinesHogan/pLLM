@@ -1,5 +1,8 @@
 # What Color is Your Tensor? —— 当 Python 只在录制时活着，怎么在 CUDA Graph 里跑动态算法
 
+> 2026-11-10 · pLLM 提交 `cff7c196` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 如果你写过一段时间的 PyTorch 研究代码，你脑子里大概住着一个非常舒服的世界观：Python 是站在指挥台上的乐队指挥。
 
 你写下一句 `hidden = layer(x)`，GPU 就拉一小节小提琴；你写下一句 `loss.backward()`，GPU 就吹一段圆号；要是演出中途你想确认声音对不对，随手塞一句 `if loss.item() < 0.01:`，或者往模型的第 0 层挂一个 `register_forward_hook`，整个乐队就会乖乖停下脚步，把刚算出来的数字递到你手里，等你看完再决定下一小节怎么演。
@@ -66,7 +69,6 @@
 > 就算你一个 `.item()` 都没写，在把 CPU 算好的索引传给 GPU 时，如果你随手写下 `torch.tensor(values, device="cuda")` 或者从普通 Python 列表做 `copy_(..., non_blocking=True)`，你的红色代码依然会偷偷触发同步等待！
 > `pllm/execution/cuda_stream.py` 里的 `upload` 函数道破了这个很多 PyTorch 老手都会踩的暗坑：普通的 CPU 张量分配在操作系统的**可分页内存（Pageable Memory）**里。由于操作系统随时可能把这页内存换出到磁盘，GPU 的硬件 DMA 引擎根本不敢在后台直接去读它——CUDA 驱动为了安全，会在底层把拷贝变成同步等待主机流。真正的非阻塞上传，必须先踏进**锁页内存（Pinned Memory）**：
 > ```python
-> # check-docs: skip: excerpt from pllm/execution/cuda_stream.py
 > def upload(
 >     values: Sequence[float] | Sequence[Sequence[float]] | npt.NDArray[np.int64],
 >     device: torch.device,
@@ -163,7 +165,6 @@
 真正的筛选，100% 留在蓝色的 GPU 图内部完成。来看看 `pllm/execution/tensor_executor.py` 里的 `_selection`：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/tensor_executor.py
 def _selection(self, rows: FixedRows) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     # ……
     policy, states = self.task.policy, rows.index.states
@@ -203,7 +204,6 @@ def _selection(self, rows: FixedRows) -> tuple[torch.Tensor, torch.Tensor | None
 来看看 `pllm/kernels/page_copy.py` 里的 `_gather_rows`。这是整套机制里把“红转蓝”玩得最彻底的十行代码：
 
 ```python
-# check-docs: skip: excerpt from pllm/kernels/page_copy.py
 @triton.jit
 def _gather_rows(
     descriptor: torch.Tensor,
@@ -249,7 +249,6 @@ CPU 每一步把外部张量的首地址 `data_ptr()` 连同它的两个维度�
 现在，把这四件红事的解法拼在一起，你就看懂了 `pllm/execution/tensor_executor.py` 里那张统领全局的蓝色转换表 `TableLayout`：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/tensor_executor.py
 @dataclass(frozen=True, slots=True)
 class TableLayout:
     """One resource's segments in the shared int64 table, uploaded in one copy per step.
@@ -282,7 +281,6 @@ class TableLayout:
 看看 `StepCapture._capture` 是怎么用一行代码化解危机的：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/step_capture.py
 def _capture(
     self,
     body: Callable[[], None],
@@ -305,7 +303,6 @@ def _capture(
 第二个细节，藏在 `capture_graph` 录制窗口的前后：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/step_capture.py
 collecting = gc.isenabled()
 gc.disable()
 try:

@@ -1,5 +1,8 @@
 # How to Lose 61,440 Kernels in 10 Lines：在 `torch.compile` 图里改残差与训权重
 
+> 2026-11-10 · pLLM 提交 `cff7c196` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 在单请求的研究脚本里，往 Transformer 中间塞一点自定义计算几乎没有门槛。
 
 如果你想做激活引导（Activation Steering，如 CAA 或 ActAdd），在第 12 层的输出上加一个方向向量 $h \leftarrow h + \alpha \cdot v$，挂一个 `register_forward_hook` 写三行代码就够了；如果你想研究架构变体——比如把第 0 层的注意力 Value 掺进后续各层（Value Residual）、把单条残差流拓宽成 $n$ 条并行车道（Hyper-Connections），或者像 In-Place TTT（*In-Place Test-Time Training*）那样把选定层 MLP 的 `down_proj` 当作可写的“快权重（fast weights）”，每读入一个固定大小的块（chunk）就当场做一次外积更新 $\Delta W = \eta \cdot V^\top Z$——在 Hugging Face 的 `generate` 循环里，权重和激活就摆在明面上，你想读就读，想改就改。
@@ -23,7 +26,6 @@
 翻开任何一本深度学习教材，Transformer 层的残差连接都长这样：
 
 ```python
-# check-docs: skip: textbook pseudo-code, not vLLM's implementation
 x = x + attention(norm1(x))
 x = x + mlp(norm2(x))
 ```
@@ -68,7 +70,6 @@ vLLM Reality (and where the boundary hook sits):
 每个会话在初始化时，本来就要分配一张持久的 GPU 张量表（例如记录每行归属的 `_requests_of` 表，或参数覆盖层的索引表 `table`）。只要会话还活着，它就一直持有这张张量的所有权，显存分配器绝不会把这个物理地址分给别人。于是，我们把这张张量放在算子只读参数的第一位 `reads[0]` 传进去，在算子内部直接拿它的显存门牌号当身份证：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/model_sites.py
 _SITES: dict[int, "ModelSites"] = {}
 
 
@@ -89,7 +90,6 @@ def model_site(
 通过 `pllm::model_site` 钻进 vLLM 的 CUDA Graph 后，我们写了一个在数学上什么都不做的恒等改写（`identity`），用来检验这套挂载机制的纯框架底噪：
 
 ```python
-# check-docs: skip: illustrative identity rewrite, shaped like the benchmark workload
 @pllm.custom_residual(site="mlp")
 def identity(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return x + y
@@ -122,7 +122,6 @@ def identity(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 既然不能盲目硬塞，唯一的正道就是让编译器先看懂用户写了什么。在 `pllm/backends/vllm/site_body.py` 的 `SiteBody._trace_math` 与 `_store` 中，总共只需要十来行代码就能完成这场显微手术：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/site_body.py
 body = make_fx(trace, tracing_mode="fake", _allow_non_fake_inputs=True)(samples, arguments)
 output = next(node for node in body.graph.nodes if node.op == "output")
 (add,) = output.args[0]
@@ -172,7 +171,6 @@ After make_fx Surgery (Terminal add snipped & handed back to upstream):
 看看在 pLLM 里，作者写的 In-Place TTT 核心更新函数 `step`（`pllm/workloads/inplace_ttt.py`）长什么样：
 
 ```python
-# check-docs: skip: excerpt from pllm/workloads/inplace_ttt.py
 @pllm.train_in_forward(
     visibility="exact",
     state="dense_fast_weights",
@@ -221,7 +219,6 @@ Author's Code:  step(delta, inputs, targets)  or  loss(x, target, base, a, b)
 再看更核心的前向内自动求导。当作者只写了逐行的重构误差 `loss` 时，反向传播和批处理在 `pllm/execution/overlay_task.py` 的 `overlay_gradient` 里只有十来行代码：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/overlay_task.py
 def overlay_gradient(function: Callable[..., torch.Tensor], *, batched: bool = False) -> Gradient:
     """Compose request mapping with differentiation before compiling; broadcast frozen weights."""
 
@@ -287,7 +284,6 @@ Case B: Reconstruction Error / Feature Norm (REJECTED)
 我们根本不需要教编译器什么是外积、什么是内积，只需要比较两张图里对应节点输出张量的形状就够了：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/overlay_parallel.py
 def _axis(whole: torch.Tensor, local: torch.Tensor, size: int) -> int | None:
     axes = tuple(i for i, (a, b) in enumerate(zip(whole.shape, local.shape, strict=True)) if a != b)
     if not axes:

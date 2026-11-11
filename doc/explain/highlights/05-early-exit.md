@@ -1,11 +1,13 @@
 # Falsehoods Programmers Believe About Early Exit：为什么在 vLLM 里跳过 23% 的 Token 一点也不快
 
+> 2026-11-10 · pLLM 提交 `cff7c196` · 测量环境：除文中另注外为单张 RTX 4090（24 GiB）、vLLM 0.32.0、Qwen2.5-7B-Instruct，8 条 prompt × 16 个样本、生成 256 token。
+> 这是一篇有日期的文章，不随代码更新；当前的用法以[用户指南](../../README.md#用户指南)为准，当前的实测数字以[性能与显存](../performance.md)为准。
+
 如果把关于“早退（Early Exit）”、“自适应深度（Adaptive Depth）”或者“跳层（Layer Skipping）”的论文摊在桌子上，它们背后的直觉几乎让人无法拒绝：生成一句话的时候，并不是每个词都需要动用整座 28 层或 80 层的大模型去深思熟虑。像句号、`the`、`of` 这样毫无悬念的词，跑到第十几层时隐藏状态的方向就已经基本定型了；让它们提前交卷、跳过后面的几层，岂不是白捡的加速？
 
 在单请求、即时执行（Eager）的研究脚本里，验证这个想法只需要五分钟。你写一个 `for` 循环跑前 16 层，算一下余弦相似度或退出分类头的置信度，然后写一行最朴素的 Python 条件判断：
 
 ```python
-# check-docs: skip: illustrative prototype, not pLLM code
 if cosine_similarity(h16, h12) > 0.85:
     h20 = h16  # 方向几乎没变，直接跳过第 16..19 层！
 else:
@@ -80,7 +82,6 @@ State Propagation at Skipped Layer 16 (active = False):
 在 pLLM 的 `pllm/backends/vllm/adaptive_depth.py` 中，这两个替身函数加起来只有十来行：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/adaptive_depth.py
 def _store(
     attention: Attention, slots: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
@@ -100,7 +101,6 @@ def _omit_projection(hidden: torch.Tensor) -> tuple[torch.Tensor, None]:
 有了这两个替身，真正执行状态传播的 `propagate` 方法写出来干脆利落：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/adaptive_depth.py
 def propagate(self, step: Segment, hidden: torch.Tensor, active: torch.Tensor) -> None:
     """Use native QKV/QK-norm/RoPE and value rewrites, omitting attention and the output projection."""
     owner = self.wave.custom_forward
@@ -156,7 +156,6 @@ Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens wou
 回到文章开头那段研究代码。在 pLLM 里，同样逻辑的 `SkipMiddle` 负载（比较第 11 层和第 15 层输出的余弦相似度，若方向变化不大则跳过第 16–19 层）写出来是这样的：
 
 ```python
-# check-docs: skip: excerpt from doc/explain/performance.md
 @dataclass(frozen=True)
 class SkipMiddle(pllm.Workload):
     threshold: float = 0.85  # 余弦相似度大于它就跳过第 16–19 层
@@ -185,7 +184,6 @@ class SkipMiddle(pllm.Workload):
 在录制 CUDA Graph 时，现代 CUDA 支持往图里插入一个绑定在设备端布尔标量上的 `IF` 节点。回放时，GPU 硬件调度器会自己在显存里看一眼那个布尔值是 `0` 还是 `1`，当场决定要不要执行里面的子图，全程不需要通知 CPU。我们在 `pllm/execution/cuda_graph.py` 中将其封装成了 `device_branch`：
 
 ```python
-# check-docs: skip: excerpt from pllm/execution/cuda_graph.py
 @contextmanager
 def device_branch(predicate: torch.Tensor) -> Generator[None]:
     """Capture a CUDA IF node; cold warmup runs every branch without reading its predicate."""
@@ -210,7 +208,6 @@ def device_branch(predicate: torch.Tensor) -> Generator[None]:
 有了 `device_branch`，`AdaptiveSlice.__call__`（位于 `pllm/backends/vllm/adaptive_depth.py`）就在设备端搭起了一座完全不需要 CPU 参与的三路道岔：
 
 ```python
-# check-docs: skip: excerpt from pllm/backends/vllm/adaptive_depth.py
 def __call__(self, step: Segment, hidden: torch.Tensor, active: torch.Tensor) -> tuple[torch.Tensor, ...]:
     output = tuple(hidden.clone() for _ in step.taps)
     count = active.sum()

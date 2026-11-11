@@ -310,5 +310,5 @@ pLLM 把负载编译当成一次静态校验（详见 [组合规则](../referenc
 - 在 CPU 与 GPU 上验证正确性契约：[检查正确性](../guides/checking.md)
 - 了解各项机制的实测吞吐与显存数字：[性能与显存](performance.md)
 - 了解为什么某些算法结构不在支持范围内：[设计取舍](design-tradeoffs.md)
-- 了解这些机制背后的系统问题、解法与代价：[技术杂谈](highlights/00-guide.md)
+- 延伸阅读：[技术杂谈](highlights/00-guide.md)是一组有日期的工程文章，讲这些机制背后的系统问题、解法与代价
 - 查阅所有术语的精确定义：[术语表](../reference/glossary.md)
