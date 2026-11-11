@@ -29,9 +29,7 @@ class ProjectionState(pllm.Workload):
                 "b": pllm.Field(lambda inputs, outputs: (outputs, 4)),
             }
         )
-        return pllm.RequestState(
-            fields, dtype=torch.float32, init=pllm.Computed(self.initialize), optimizer=self.optimizer
-        )
+        return pllm.RequestState(fields, init=pllm.Computed(self.initialize), optimizer=self.optimizer)
 
     def initialize(self, fields, generator):
         """Consume the same global random stream in TP1 and TP2."""

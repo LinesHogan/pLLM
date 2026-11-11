@@ -306,7 +306,8 @@ class PrecisionRoles(pllm.Workload):
 
     @property
     def values(self) -> pllm.InstanceState:
-        return pllm.InstanceState({name: (8,) for name in ("read", "update", "write")}, dtype=self.dtype)
+        fields = {name: (8,) for name in ("read", "update", "write")}
+        return pllm.InstanceState({**fields, "field": pllm.Field((8,))}, dtype=self.dtype)
 
     @property
     def imported(self) -> pllm.InstanceState:
@@ -343,6 +344,7 @@ def test_storage_precision_follows_declared_role(dtype, model_dtype, model_confi
         ("values", "read"): model_dtype,
         ("values", "update"): "float32",
         ("values", "write"): model_dtype,
+        ("values", "field"): model_dtype,
         ("imported", "w"): model_dtype,
         ("trained", "w"): "float32",
         ("memory", "carry"): "float32",

@@ -30,8 +30,8 @@ class SGD:
 @dataclass(frozen=True)
 class Field:
     """A state field with an explicit dtype, or a shape computed from a projection's (in_features, out_features);
-    a field read by an adapter gets one copy per target projection. Storage follows its declared role by default:
-    accumulators use FP32, other fields use model precision. An explicit dtype overrides this."""
+    a field read by an adapter gets one copy per target projection. Without a dtype it takes its state's dtype=;
+    with neither, storage follows the declared role: accumulators use FP32, other fields use model precision."""
 
     shape: tuple[int, ...] | Callable[[int, int], tuple[int, ...]]
     dtype: torch.dtype | Literal["auto"] = "auto"

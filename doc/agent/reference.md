@@ -857,7 +857,7 @@ pllm.SGD(lr: 'float')
 pllm.Dimensions(hidden_size: 'int', vocab_size: 'int', targets: 'tuple[ProjectionShape, ...]' = (), dtype: 'TensorDType' = <TensorDType.FLOAT32: 'float32'>, layer_count: 'int' = 0, tensor_parallel_size: 'int' = 1)
     Global model widths for workload declarations, and the probed shape of every projection the workload's adapters and @pllm.train_in_forward target.
 pllm.Field(shape: 'tuple[int, ...] | Callable[[int, int], tuple[int, ...]]', dtype: "torch.dtype | Literal['auto']" = 'auto')
-    A state field with an explicit dtype, or a shape computed from a projection's (in_features, out_features); a field read by an adapter gets one copy per target projection. Storage follows its declared role by default: accumulators use FP32, other fields use model precision. An explicit dtype overrides this.
+    A state field with an explicit dtype, or a shape computed from a projection's (in_features, out_features); a field read by an adapter gets one copy per target projection. Without a dtype it takes its state's dtype=; with neither, storage follows the declared role: accumulators use FP32, other fields use model precision.
 pllm.UpdateOutput(output: 'torch.Tensor', changed: 'torch.Tensor', update_count: 'torch.Tensor', trained_rows: 'torch.Tensor', metrics: 'Mapping[str, torch.Tensor]' = <factory>)
     What a training or overlay method returns: its output and 0-d device counters.
 ```

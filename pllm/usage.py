@@ -7,7 +7,7 @@ Workload class and pllm.execution lowers them. Re-exported by pllm and pllm.mode
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import KW_ONLY, dataclass, field
+from dataclasses import KW_ONLY, dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, get_args
 
@@ -294,7 +294,12 @@ class InstanceState:
             raise ValueError("layers needs sorted unique nonnegative indices on an InstanceState")
         if self.shape is not None:
             object.__setattr__(self, "fields", {"value": self.shape})
-        object.__setattr__(self, "fields", self.init.fields(self.fields))
+        # A pllm.Field without its own dtype is stored in the state's dtype, like a plain shape.
+        fields = {
+            key: replace(value, dtype=self.dtype) if isinstance(value, Field) and value.dtype == "auto" else value
+            for key, value in self.init.fields(self.fields).items()
+        }
+        object.__setattr__(self, "fields", fields)
         self.init.check(self)
         if self.carry and self.optimizer is None:
             raise ValueError("carry fields ride on the training transition; give the state an optimizer")
