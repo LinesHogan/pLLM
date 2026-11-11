@@ -162,7 +162,7 @@ print(testing.check(LocalGlobal(), CONFIG).passed)
 ```
 
 ```text
-True
+('tensor_parallel_size=1: admission', 'compile', ...)
 ```
 
 ```python
@@ -188,7 +188,7 @@ print(testing.check(RecentMass(), CONFIG).passed)
 ```
 
 ```text
-True
+('tensor_parallel_size=1: admission', 'compile', ...)
 ```
 
 ### 方法签名与 `PagedKV`
@@ -265,7 +265,7 @@ print(testing.check(LatentLoop(), CONFIG).passed)
 ```
 
 ```text
-True
+('tensor_parallel_size=1: admission', 'compile', ...)
 ```
 
 ### `layers(...)` 调用、`LayerOutputs` 索引与 KV 机制
@@ -313,7 +313,7 @@ print(testing.check(StepLoopWorkload(), CONFIG).passed)
 ```
 
 ```text
-True
+('tensor_parallel_size=1: admission', 'compile')
 ```
 
 - **调用规则**：`layers.load("history", offset=-1)` 读取前一个位置保存的向量（即使当前步骤已先调用过 `save`，它依然返回上一个 token 的快照）；`layers.save("history", value)` 提交当前位置的快照（多次调用以最后一次为准）。

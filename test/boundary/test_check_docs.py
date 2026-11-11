@@ -36,14 +36,14 @@ def test_heading_links_across_markdown_and_notebooks(tmp_path: Path) -> None:
         )
         == []
     )
-    failures, checked = check_file(notebook, False, False, {})
+    failures, checked = check_file(notebook, False, False, {}, write_outputs=False)
     assert not checked and not failures
     notebook.write_text(
         json.dumps(
             {"cells": [{"cell_type": "markdown", "source": "[bad](README.md#支持的模型与限制)", "metadata": {}}]}
         )
     )
-    failures, checked = check_file(notebook, False, False, {})
+    failures, checked = check_file(notebook, False, False, {}, write_outputs=False)
     assert not checked and len(failures) == 1
 
 

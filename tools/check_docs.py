@@ -3,10 +3,14 @@
 Checks over README.md, doc/ and examples/:
 1. every `pllm.X` name and `from pllm... import X` in Python code resolves against the importable package;
 2. every relative markdown link points at an existing file and heading (including notebook markdown);
-3. notebook code cells tagged "cpu-check" (cell metadata `tags`) run in order on CPU, one process per notebook;
-4. the Python blocks of doc/{agent,guides,howto,reference,explain}/*.md run in order, one process per file: on CPU,
-   or with `--gpu` also the agent blocks fenced ```python gpu, on the GPU. Intentionally partial blocks must
-   contain `# check-docs: skip: <reason>`; each opt-out is reported in the summary;
+3. notebook code cells tagged "cpu-check" (cell metadata `tags`) run in order on CPU, one process per notebook,
+   and print their stored output, compared as in 4 (`--write-outputs` stores what they print instead);
+4. the Python blocks of README.md and doc/{agent,guides,howto,reference,explain}/*.md run in order, one process per
+   file: on CPU, or with `--gpu` also the agent blocks fenced ```python gpu, on the GPU. Intentionally partial
+   blocks must contain `# check-docs: skip: <reason>`; each opt-out is reported in the summary. A ```text block
+   right after an executed block shows its output and must match what it prints, where a line `...` stands for
+   any number of lines, `...` within a line for any text, and memory addresses and times in s or ms always match;
+   a text block that is not that output is fenced ```text not-output;
 5. doc/agent/reference.md names every public pllm name in its task sections, and its generated signature
    list equals the code's (`--write-signatures` regenerates it);
 6. error messages quoted in backticks in the first table column of a section about rejections or errors still
@@ -45,7 +49,7 @@ from enum import Enum
 from functools import cache
 from pathlib import Path
 from types import ModuleType
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from urllib.parse import unquote, urlsplit
 
 from github_slugger import GithubSlugger
@@ -76,6 +80,8 @@ MEASUREMENTS = ROOT / "doc" / "reference" / "measurements.toml"
 FIGURE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(?:\\text\{\s*)?(\\?%|tok/s|tokens?/s|ms)(?![\w/])")
 NATIVE = re.compile(r"原生|native|vanilla", re.I)
 NOT_MEASURED = "<!-- check-docs: not measured -->"
+# Printed text that changes from run to run, compared as `…`: memory addresses and wall-clock times.
+VOLATILE = re.compile(r"0x[0-9a-f]{4,}|\b\d+(?:\.\d+)? ?(?:ms|s)\b")
 
 
 class Run(TypedDict):
@@ -88,12 +94,19 @@ class CellMetadata(TypedDict, total=False):
     tags: list[str]
 
 
+class Output(TypedDict, total=False):
+    output_type: str
+    name: str
+    text: str | list[str]
+
+
 class Cell(TypedDict):
     """The fields of an nbformat 4 cell this tool reads."""
 
     cell_type: str
     source: str | list[str]
     metadata: CellMetadata
+    outputs: NotRequired[list[Output]]
 
 
 @dataclass(frozen=True)
@@ -103,6 +116,7 @@ class Block:
     where: str
     source: str
     gpu: bool = False
+    output: str | None = None  # what the document shows it printing, if it shows anything
 
     @property
     def skip_reason(self) -> str:
@@ -121,32 +135,43 @@ class Notebook:
     cpu_cells: list[Block]
 
 
+def joined(text: str | list[str]) -> str:
+    """nbformat stores text as one string or as a list of lines."""
+    return text if isinstance(text, str) else "".join(text)
+
+
 def read_notebook(path: Path) -> Notebook:
     cells: list[Cell] = json.loads(path.read_text())["cells"]
     code: list[Block] = []
     markdown: list[str] = []
     cpu: list[Block] = []
     for index, cell in enumerate(cells):
-        lines = cell["source"]  # nbformat allows one string or a list of lines
-        source = lines if isinstance(lines, str) else "".join(lines)
+        source = joined(cell["source"])
         if cell["cell_type"] == "markdown":
             markdown.append(source)
             code.extend(markdown_blocks(source, f"cell {index} "))
         elif cell["cell_type"] == "code":
             code.append(Block(f"cell {index}", source))
             if CPU_TAG in cell["metadata"].get("tags", []):
-                cpu.append(Block(f"cell {index}", source))
+                outputs = cell.get("outputs", [])
+                stdout = "".join(joined(output.get("text", "")) for output in outputs if output.get("name") == "stdout")
+                cpu.append(Block(f"cell {index}", source, output=stdout))
     return Notebook(path, code, markdown, cpu)
 
 
 def markdown_blocks(text: str, prefix: str = "") -> list[Block]:
-    """The fenced Python blocks of a markdown text, each named by the line of its opening fence."""
+    """The fenced Python blocks of a markdown text, each named by the line of its opening fence and carrying the
+    ```text block right after it as its output."""
     blocks: list[Block] = []
-    for token in MARKDOWN.parse(text):
+    tokens = MARKDOWN.parse(text)
+    for token, after in zip(tokens, [*tokens[1:], None]):
         info = token.info.split()
         if token.type == "fence" and info and info[0] in ("python", "py"):
             assert token.map is not None
-            blocks.append(Block(f"{prefix}line {token.map[0] + 1}", token.content, gpu="gpu" in info[1:]))
+            output = (
+                after.content if after is not None and after.type == "fence" and after.info.strip() == "text" else None
+            )
+            blocks.append(Block(f"{prefix}line {token.map[0] + 1}", token.content, "gpu" in info[1:], output))
     return blocks
 
 
@@ -375,24 +400,31 @@ def contributor_words(path: Path) -> str:
     return "; ".join(f"{word} ({', '.join(places)})" for word, places in sorted(hits.items()))
 
 
-# Runs each cell in one shared namespace under its own file name, so a traceback names the failing cell.
+# Runs each cell in one shared namespace under its own file name, so a traceback names the failing cell, and
+# prints what each cell printed as one JSON object on the last line.
 # Cells are registered in linecache, as Jupyter does, so inspect.getsource works (Triton's @jit needs it).
-CELL_RUNNER = """import json, linecache, sys
+CELL_RUNNER = """import contextlib, io, json, linecache, sys
 namespace = {"__name__": "__main__"}
+printed = {}
 for where, source in json.load(sys.stdin):
     name = f"<{where}>"
     linecache.cache[name] = (len(source), None, source.splitlines(True), name)
-    exec(compile(source, name, "exec"), namespace)
+    with contextlib.redirect_stdout(io.StringIO()) as stdout:
+        exec(compile(source, name, "exec"), namespace)
+    printed[where] = stdout.getvalue()
+print(json.dumps(printed))
 """
 CELL_FRAME = re.compile(r'File "<((?:cell|line) \d+)>", line (\d+)')
 
 
-def run_cells(directory: Path, blocks: list[Block], *, gpu: bool = False) -> list[str]:
-    """Run `blocks` in order in one fresh process in `directory`; without `gpu` CUDA is hidden."""
+def run_cells(directory: Path, blocks: list[Block], *, gpu: bool = False) -> tuple[list[str], dict[str, str]]:
+    """Run `blocks` in order in one fresh process in `directory`; without `gpu` CUDA is hidden.
+    Returns the failure, if any, and what each block printed when all of them ran."""
     if not blocks:
-        return []
+        return [], {}
     cells = json.dumps([(block.where, block.source) for block in blocks])
-    environment = {**os.environ, "PYTHONPATH": str(ROOT)}
+    # vLLM's log handler would otherwise write into whichever cell's stdout is captured when it is configured.
+    environment = {**os.environ, "PYTHONPATH": str(ROOT), "VLLM_CONFIGURE_LOGGING": "0"}
     if not gpu:
         environment["CUDA_VISIBLE_DEVICES"] = ""
     completed = subprocess.run(
@@ -405,11 +437,57 @@ def run_cells(directory: Path, blocks: list[Block], *, gpu: bool = False) -> lis
         timeout=1800,
     )
     if completed.returncode == 0:
-        return []
+        return [], json.loads(completed.stdout.splitlines()[-1])
     error = (completed.stderr.strip().splitlines() or ["no output"])[-1]
     frames = CELL_FRAME.findall(completed.stderr)
     where = f"{frames[-1][0]} (+{frames[-1][1]})" if frames else "setup"
-    return [f"{where}: code fails {'on GPU' if gpu else 'on CPU'}: {error}"]
+    return [f"{where}: code fails {'on GPU' if gpu else 'on CPU'}: {error}"], {}
+
+
+def normalized(text: str) -> list[str]:
+    """The lines of printed text without trailing spaces, with the parts that change between runs as `…`."""
+    return [VOLATILE.sub("…", line.rstrip()) for line in text.strip("\n").splitlines()]
+
+
+def output_mismatches(blocks: list[Block], printed: dict[str, str]) -> list[str]:
+    """Blocks whose shown output differs from what they printed. A shown line `...` stands for any number of lines,
+    and `...` within a line for any text, as in quoted error messages."""
+    failures: list[str] = []
+    for block in blocks:
+        if block.output is None or block.where not in printed:
+            continue
+        shown, actual = normalized(block.output), normalized(printed[block.where])
+        pattern = "".join("(?:.*\n)*" if line == "..." else f"{line_pattern(line)}\n" for line in shown)
+        if not re.fullmatch(pattern, "".join(f"{line}\n" for line in actual)):
+            failures.append(f"{block.where}: the output shown for it is stale: {first_difference(shown, actual)}")
+    return failures
+
+
+def line_pattern(line: str) -> str:
+    """A shown output line as a regular expression in which `...` stands for any text."""
+    return ".*".join(map(re.escape, line.split("...")))
+
+
+def first_difference(shown: list[str], actual: list[str]) -> str:
+    """The first shown line no longer printed, or else the first printed line not shown, for the report."""
+    patterns = [line_pattern(line) for line in shown]
+    for line, pattern in zip(shown, patterns):
+        if not any(re.fullmatch(pattern, printed) for printed in actual):
+            return f"{line!r} is no longer printed"
+    for printed in actual:
+        if not any(re.fullmatch(pattern, printed) for pattern in patterns):
+            return f"{printed!r} is printed but not shown"
+    return "the lines are printed in another order"
+
+
+def store_outputs(path: Path, printed: dict[str, str]) -> None:
+    """Make what each executed notebook cell printed its only stored output (`--write-outputs`)."""
+    document = json.loads(path.read_text())
+    for index, cell in enumerate(document["cells"]):
+        if (text := printed.get(f"cell {index}")) is not None:
+            stream = {"output_type": "stream", "name": "stdout", "text": text.splitlines(keepends=True)}
+            cell["outputs"] = [stream] if text else []
+    path.write_text(json.dumps(document, indent=1, ensure_ascii=False, sort_keys=True) + "\n")  # as Jupyter writes
 
 
 class _Default:
@@ -490,7 +568,14 @@ def reference_failures(text: str) -> list[str]:
     return failures
 
 
-def check_file(path: Path, include_untagged: bool, gpu: bool, anchors: dict[Path, set[str]]) -> tuple[list[str], bool]:
+def runs_code(path: Path) -> bool:
+    """Whether the Python blocks of a markdown document are executed."""
+    return path == ROOT / "README.md" or path.parent in EXECUTED_DOCS
+
+
+def check_file(
+    path: Path, include_untagged: bool, gpu: bool, anchors: dict[Path, set[str]], *, write_outputs: bool
+) -> tuple[list[str], bool]:
     """Failures in one document, and whether it was checked at all."""
     if path.suffix == ".py":
         return missing_symbols([Block("file", path.read_text())]), True
@@ -500,13 +585,11 @@ def check_file(path: Path, include_untagged: bool, gpu: bool, anchors: dict[Path
         failures = missing_symbols(blocks) + broken_links(path, [text], anchors) + stale_messages(text)
         if user_document(path):
             failures += unmeasured_figures(text)
-        if path.parent in EXECUTED_DOCS:
+        if runs_code(path):
             use_gpu = gpu and path.parent == AGENT_DOCS
-            failures += run_cells(
-                path.parent,
-                [block for block in blocks if not block.skip_reason and (use_gpu or not block.gpu)],
-                gpu=use_gpu,
-            )
+            executed = [block for block in blocks if not block.skip_reason and (use_gpu or not block.gpu)]
+            run_failures, printed = run_cells(path.parent, executed, gpu=use_gpu)
+            failures += run_failures + output_mismatches(executed, printed)
             if path.parent != AGENT_DOCS:
                 failures += [
                     f"{block.where}: use a check-docs: skip reason for GPU examples"
@@ -526,8 +609,15 @@ def check_file(path: Path, include_untagged: bool, gpu: bool, anchors: dict[Path
     if not notebook.cpu_cells and not include_untagged:
         return failures, False
     failures += missing_symbols(notebook.code)
-    if notebook.cpu_cells:
-        failures += run_cells(notebook.path.parent, notebook.cpu_cells)
+    run_failures, printed = run_cells(notebook.path.parent, notebook.cpu_cells)
+    failures += run_failures
+    if write_outputs and printed:
+        store_outputs(path, printed)
+    else:
+        failures += [
+            f"{failure}; store the new output with --write-outputs"
+            for failure in output_mismatches(notebook.cpu_cells, printed)
+        ]
     return failures, True
 
 
@@ -542,6 +632,7 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="also check notebooks that have no cpu-check cell")
     parser.add_argument("--gpu", action="store_true", help="also run the doc/agent blocks fenced ```python gpu")
     parser.add_argument("--write-signatures", action="store_true", help="regenerate reference.md's signature list")
+    parser.add_argument("--write-outputs", action="store_true", help="store what cpu-check notebook cells print")
     arguments = parser.parse_args()
     sys.path.insert(0, str(ROOT))
     if arguments.write_signatures:
@@ -554,9 +645,11 @@ def main() -> int:
     anchors: dict[Path, set[str]] = {}
     paths = documents()
     for path in paths:
-        failures, checked = check_file(path, arguments.all, arguments.gpu, anchors)
+        failures, checked = check_file(
+            path, arguments.all, arguments.gpu, anchors, write_outputs=arguments.write_outputs
+        )
         name = str(path.relative_to(ROOT))
-        if path.suffix == ".md" and path.parent in EXECUTED_DOCS:
+        if path.suffix == ".md" and runs_code(path):
             opt_outs.extend(
                 f"{name}:{block.where}: {block.skip_reason}"
                 for block in markdown_blocks(path.read_text())

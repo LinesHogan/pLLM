@@ -132,6 +132,7 @@ print(testing.check(Distill(), CONFIG, neutral=Distill(beta=0.0)))
 
 ```text
 status  contract / reason
+PASS    tensor_parallel_size=1: admission
 PASS    compile
 PASS    row permutation
 PASS    request isolation
@@ -140,6 +141,7 @@ PASS    chunking / tokens=
 PASS    publish_lag
 PASS    preempted
 PASS    neutral
+SKIP    timing-dependent values: publish_lag counts engine steps: ...
 ```
 
 只要某一个请求的结果在打乱行顺序（`row permutation`）、改变其他请求输入（`request isolation`）、混合 prefill 与 decode（`mixed prefill/decode`）、切分 prompt（`chunking / tokens=`）或抢占重放（`preempted`）时发生变化，`testing.check` 就会抛出 `ContractError` 并指出是哪个方法混了行。
