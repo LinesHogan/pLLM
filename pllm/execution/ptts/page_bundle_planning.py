@@ -6,7 +6,15 @@ from math import prod
 from pathlib import Path
 
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.semantic_graph import SchedulerTimeline, SemanticGraph, StateScope
+from pllm.contracts.host_batch import HOST_BATCH_SCHEMAS
+from pllm.contracts.semantic_graph import (
+    HostServiceInputSource,
+    SchedulerTimeline,
+    SemanticGraph,
+    StateEffectKind,
+    StateResource,
+    StateScope,
+)
 from pllm.contracts.state_feed import FEED_SLOTS
 from pllm.contracts.state_representation import (
     StateDeviceKind,
@@ -106,6 +114,24 @@ def version_capacity(lineages: int, history: int, *, written: bool) -> int:
     return (1 + history + written) * lineages
 
 
+def written_while_requests_run(graph: SemanticGraph, resource: StateResource) -> bool:
+    """Whether a task may write `resource` in a step whose requests already pinned it.
+
+    A writer fed by a host batch runs only in the first step of a generate call: VllmSession consumes the batch
+    there for instance states, and stage_input stages it only after the previous call retired every request.
+    """
+    return any(
+        effect.resource == resource
+        and effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
+        and not any(
+            isinstance(port.source, HostServiceInputSource) and port.source.schema in HOST_BATCH_SCHEMAS
+            for port in task.inputs
+        )
+        for task in graph.tasks
+        for effect in task.effects
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PageBundleProviderFacts:
     """Where state pages live. Test harnesses that hold extra pins set aside `minimum_pages` per state."""
@@ -133,9 +159,12 @@ class PageBundleProviderFacts:
             capacity = 1
         elif instance:
             # One lineage, plus the version each admitted request pins when an Adapter or ActivationPatch reads it
-            # (requests keep their admission version). Admitting one request per written step pins distinct
-            # versions; after 1 + history more writes all of them are older than the lineage's own versions.
-            pins = max_admitted_lineages if state.resource in graph.admission_reads else 0
+            # (requests keep their admission version) and a task writes the state while they run. Admitting one
+            # request per written step pins distinct versions; after 1 + history more writes all of them are older
+            # than the lineage's own versions. A state written only from host batches changes once per generate
+            # call: its requests pin the version before or after that write, both within the lineage's own.
+            pinned = state.resource in graph.admission_reads and written_while_requests_run(graph, state.resource)
+            pins = max_admitted_lineages if pinned else 0
             capacity = max(self.minimum_pages, version_capacity(1, history, written=True) + pins)
         else:
             capacity = max(

@@ -229,6 +229,8 @@ class VllmSession(Generic[DataT, ResultT]):
     ) -> None:
         """Stage request inputs, already validated by generate, and their optional completion destination."""
         self._require_input_live()
+        # Planning reserves no admission pins for states written only from host batches: no request may hold one.
+        assert not self.request_identities, "generate stages a call's inputs after the previous call retired"
         self.completion_rows = None if completion is None else CompletionRows(identities, completion)
         self._host_batch = batch
         self._import_rows = prompt_rows(identities, samples_per_prompt)

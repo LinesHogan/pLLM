@@ -96,6 +96,10 @@ class WeightedCEBatch(Generic[T]):
 
 
 HostBatch = CausalTrainBatch[T] | StateImport[T] | WeightedCEBatch[T] | WeightedRowBatch[T]
+# generate() stages one host batch per call, before the call's requests are admitted.
+HOST_BATCH_SCHEMAS = frozenset(
+    kind.schema for kind in (CausalTrainBatch, StateImport, WeightedCEBatch, WeightedRowBatch)
+)
 
 
 def validate_host_batch(
