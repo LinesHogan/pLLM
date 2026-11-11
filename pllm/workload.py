@@ -11,7 +11,7 @@ from graphlib import CycleError, TopologicalSorter
 from inspect import Parameter as SignatureParameter, signature
 from itertools import pairwise
 from types import FunctionType, MethodType
-from typing import ClassVar, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 import torch
 
@@ -74,6 +74,19 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     """
 
     required_publish_lag: ClassVar[int | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Reject members that would silently replace pLLM's own Workload methods; on_export and
+        required_publish_lag are the ones an author overrides."""
+        super().__init_subclass__(**kwargs)
+        framework = {name for base in (Workload, BackendWorkload) for name in vars(base) if not name.startswith("_")}
+        reserved = framework - {"on_export", "required_publish_lag"}
+        for name in (*vars(cls), *vars(cls).get("__annotations__", {})):
+            if name in reserved:
+                raise TypeError(
+                    f"{cls.__name__}.{name}: pLLM's Workload uses the name {name!r}; rename it "
+                    f"(reserved: {', '.join(sorted(reserved))})"
+                )
 
     def specialize(
         self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None

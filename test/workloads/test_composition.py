@@ -360,6 +360,8 @@ def test_component_boundaries_and_base_collisions() -> None:
         with pytest.raises(ValueError, match=message):
             facts, declaration = workload.specialize(FACTS, pllm.ExecutionOptions())
             workload.plan_backend(facts, declaration)
+    with pytest.raises(TypeError, match="Shadow.build: .*rename it"):
+        type("Shadow", (pllm.Workload,), {"build": lambda self, h: h})
     facts, declaration = Lag().specialize(FACTS, pllm.ExecutionOptions(publish_lag=0))
     Lag().plan_backend(facts, declaration)
 
