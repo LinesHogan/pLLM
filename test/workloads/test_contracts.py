@@ -212,6 +212,14 @@ class SelectedTrainer(PrefillTrainer):
         return (w - x).square().mean(-1)
 
 
+class ObservedSelectedTrainer(SelectedTrainer):
+    """An unrelated export does not make standalone training selectable."""
+
+    @pllm.export()
+    def observe(self, h=pllm.hidden(0)):
+        return h
+
+
 class PromptMask(pllm.Workload):
     """Adaptive masks must leave prompt layers unmasked."""
 
@@ -285,6 +293,7 @@ class PromptMask(pllm.Workload):
             ),
             (ResultCycle(), r"(first|second) reads pllm.result\('(second|first)'\) and .*remove one of the reads"),
             (SelectedTrainer(), "rows=.*require a model effect without sampler guidance, or @pllm.add_logits"),
+            (ObservedSelectedTrainer(), "rows=.*require a model effect without sampler guidance"),
             (
                 PromptMask(),
                 "Use @pllm.custom_forward.*decode.*active=.*approximate K/V.*every later token reads.*"

@@ -178,7 +178,6 @@ class Export(Effect):
     overflow: Literal["drop", "block"]
 
     phase: ClassVar[When | None] = When.AFTER_FORWARD
-    model_effect: ClassVar[bool] = True
 
     def declare(self, operation: Operation) -> None:
         """Publish bounded tensor observations to the host."""
