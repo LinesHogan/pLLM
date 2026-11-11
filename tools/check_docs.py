@@ -5,6 +5,7 @@ Checks over README.md, doc/ and examples/:
 2. every relative markdown link points at an existing file and heading (including notebook markdown);
 3. notebook code cells tagged "cpu-check" (cell metadata `tags`) run in order on CPU, one process per notebook,
    and print their stored output, compared as in 4 (`--write-outputs` stores what they print instead);
+   untagged cells (loading a model, generating, CUDA) are only symbol-checked and counted per notebook in the summary;
 4. the Python blocks of README.md and doc/{agent,guides,howto,reference,explain}/*.md run in order, one process per
    file: on CPU, or with `--gpu` also the agent blocks fenced ```python gpu, on the GPU. Intentionally partial
    blocks must contain `# check-docs: skip: <reason>`; each opt-out is reported in the summary. A ```text block
@@ -133,6 +134,7 @@ class Notebook:
     code: list[Block]
     markdown: list[str]
     cpu_cells: list[Block]
+    untagged_cells: list[Block]
 
 
 def joined(text: str | list[str]) -> str:
@@ -145,6 +147,7 @@ def read_notebook(path: Path) -> Notebook:
     code: list[Block] = []
     markdown: list[str] = []
     cpu: list[Block] = []
+    untagged: list[Block] = []
     for index, cell in enumerate(cells):
         source = joined(cell["source"])
         if cell["cell_type"] == "markdown":
@@ -156,7 +159,9 @@ def read_notebook(path: Path) -> Notebook:
                 outputs = cell.get("outputs", [])
                 stdout = "".join(joined(output.get("text", "")) for output in outputs if output.get("name") == "stdout")
                 cpu.append(Block(f"cell {index}", source, output=stdout))
-    return Notebook(path, code, markdown, cpu)
+            else:
+                untagged.append(Block(f"cell {index}", source))
+    return Notebook(path, code, markdown, cpu, untagged)
 
 
 def markdown_blocks(text: str, prefix: str = "") -> list[Block]:
@@ -641,6 +646,7 @@ def main() -> int:
     failed = 0
     skipped: list[str] = []
     opt_outs: list[str] = []
+    unexecuted: dict[str, Notebook] = {}
     warnings: list[str] = []
     anchors: dict[Path, set[str]] = {}
     paths = documents()
@@ -655,6 +661,8 @@ def main() -> int:
                 for block in markdown_blocks(path.read_text())
                 if block.skip_reason
             )
+        if path.suffix == ".ipynb" and (notebook := read_notebook(path)).untagged_cells:
+            unexecuted[name] = notebook
         if not checked:
             skipped.append(name)
         if user_document(path) and (words := contributor_words(path)):
@@ -664,6 +672,11 @@ def main() -> int:
         failed += bool(failures)
     if skipped:
         print(f"skipped {len(skipped)} notebooks without {CPU_TAG} cells (pending rewrite): {', '.join(skipped)}")
+    untagged = sum(len(notebook.untagged_cells) for notebook in unexecuted.values())
+    print(f"notebook cells not executed (untagged: they load a model or need a GPU): {untagged}")
+    for name, notebook in unexecuted.items():
+        cells = len(notebook.untagged_cells) + len(notebook.cpu_cells)
+        print(f"  {name}: {len(notebook.untagged_cells)} of {cells} code cells")
     print(f"execution opt-outs: {len(opt_outs)}")
     for opt_out in opt_outs:
         print(f"  {opt_out}")
