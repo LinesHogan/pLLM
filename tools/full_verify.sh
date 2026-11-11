@@ -14,11 +14,12 @@ while [ "$#" -gt 0 ]; do
 Usage: ROOT=<checkout> PY=<venv/bin/python> bash tools/full_verify.sh [options] [cpu|gpu|stage...]
 Default: static checks + tier 0 CPU + tier 1 GPU core + affected tier 2 groups.
 --base REF  Compare changed paths with merge-base(REF, HEAD); default main, including dirty paths.
---all       Run every feature group for scheduled/release sweeps (TP needs two GPUs and vLLM 0.32).
+--all       Run every feature group for scheduled/release sweeps.
 --explain   Print selected feature groups and the changed paths requiring them; do not run tests.
 --list cpu|gpu|all  Print the selected stages, suitable for cluster_verify.
 Stages: ruff format pyright typing layers docs cpu gpu-core graph-replay enginecore-capture enginecore-io,
         plus feature group names from tools/verify_groups.py. Explicit stages run only those stages.
+TP stages are selected only under vLLM 0.32; with fewer than two visible GPUs they record exit=NOT_RUN (a failure).
 CPU tests hide CUDA. Local GPU work holds /tmp/pllm-gpu.lock, affinity 0-15; Slurm owns remote affinity.
 Logs, exit codes and per-stage wall seconds go to LOGS (default docs/cleanup/verify). No test retries.
 HELP
@@ -32,13 +33,15 @@ HELP
 done
 [ "$explain" = no ] || exec "$PY" tools/verify_groups.py "${options[@]}" --explain
 selection=$("$PY" tools/verify_groups.py "${options[@]}" --explain) || exit 1
+vllm032=no
+if "$PY" -c "import importlib.metadata as m; assert m.version('vllm').startswith('0.32')" 2>/dev/null; then vllm032=yes; fi
 features=(); while IFS=$'\t' read -r group reason; do [ -z "$group" ] || features+=("$group"); done <<< "$selection"
 CPU_STAGES=(ruff format pyright typing layers docs cpu)
 GPU_STAGES=(gpu-core graph-replay enginecore-capture enginecore-io)
 for group in "${features[@]}"; do
   case "$group" in
     release) CPU_STAGES+=(release) ;;
-    tp) GPU_STAGES+=(tp tp-step-loop) ;;
+    tp) [ "$vllm032" = no ] || GPU_STAGES+=(tp tp-step-loop) ;;
     *) GPU_STAGES+=("$group") ;;
   esac
 done
@@ -70,7 +73,7 @@ else
   head -1 "$ROOT/verification.txt" > "$LOGS/verification.txt"
 fi
 PROJECT=()
-if [ -f pyrightconfig.vllm032.json ] && "$PY" -c "import importlib.metadata as m; assert m.version('vllm').startswith('0.32')" 2>/dev/null; then PROJECT=(-p pyrightconfig.vllm032.json); fi
+if [ -f pyrightconfig.vllm032.json ] && [ "$vllm032" = yes ]; then PROJECT=(-p pyrightconfig.vllm032.json); fi
 CPU=(); GPU=()
 if [ -z "${SLURM_JOB_ID:-}" ]; then CPU=(taskset -c 0-15);  fi
 pytest_cpu() { env CUDA_VISIBLE_DEVICES='' "${CPU[@]}" "$PY" -m pytest -q -p no:cacheprovider --durations=0 "$@"; }
@@ -118,6 +121,13 @@ run_stage() {
     *) echo "Unknown stage: $1; use --help" >&2; return 2 ;;
   esac
 }
+# TP tests skip themselves without two GPUs and vLLM 0.32; a vacuous pass must not read as verified.
+host_lacks_tp() {
+  case "$1" in
+    tp|tp-step-loop) [ "$vllm032" = no ] || [ "$("$PY" -c 'import torch; print(torch.cuda.device_count())')" -lt 2 ] ;;
+    *) return 1 ;;
+  esac
+}
 gpu_lock_held() {
   [ -z "${PLLM_GPU_LEASE:-}" ] || return 0
   local descriptor
@@ -129,6 +139,12 @@ gpu_lock_held() {
 }
 failed=0
 for stage in "${stages[@]}"; do
+  if host_lacks_tp "$stage"; then
+    echo "$stage exit=NOT_RUN: TP needs two visible GPUs and vLLM 0.32" | tee "$LOGS/$stage.log"
+    echo NOT_RUN > "$LOGS/$stage.exit"
+    failed=1
+    continue
+  fi
   gpu_lock=''
   if [ -z "${SLURM_JOB_ID:-}" ] && ! gpu_lock_held; then
     case "$stage" in
