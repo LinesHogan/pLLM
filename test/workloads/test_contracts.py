@@ -371,7 +371,7 @@ def model_config(tmp_path):
 
 @pytest.mark.parametrize("workload", (PrefillTrainer(), ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))))
 def test_check_detects_duplicate_updates_on_split_replay(workload, model_config):
-    with patch("pllm.testing_contracts.retained_rows", side_effect=lambda rows, frontiers: rows):
+    with patch("pllm.testing_contracts.retained_rows", side_effect=lambda labeler, value, counts, script: value):
         with pytest.raises(testing.ContractError, match=r"\[preempted\].*state"):
             testing.check(workload, model_config)
 

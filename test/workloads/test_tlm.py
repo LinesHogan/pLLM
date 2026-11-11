@@ -11,7 +11,6 @@ from torch.nn import functional as F
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.host_batch import validate_host_batch
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import Projection, ProjectionShape
 from pllm.contracts.semantic_graph import TaskResourceFact, TaskSymbol
 from pllm.contracts.tensor_layout import TensorDType
@@ -79,12 +78,6 @@ def _compile(model, config: TLMConfig):
     return TLMWorkload(config, 2, 2).compile_backend(causal_facts(model), causal=model.bind).execution
 
 
-def batch_input(batch):
-    """Wrap a host training batch in a rowless step input."""
-    rows = PackedPhaseRowBatch.from_rows(0, 0, ())
-    return StepInput(rows, PackedSamplerRowBatch.from_links(rows, ()), batch=batch)
-
-
 def _reference(model, parameters, batch, config):
     hidden = model.embedding[batch.input_ids]
     q = model.base[0] + parameters[1] @ parameters[0]
@@ -127,7 +120,7 @@ def test_global_multifactor_adamw_matches_oracle_and_publishes_one_version() -> 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        result = execution.step(batch_input(batch))
+        result = execution.step(StepInput.of_batch(batch))
         (current,) = result.publication.after_refs
         assert current.version_id == version and result.metrics["selected_count"] == 2
         if version == 1:
@@ -194,13 +187,13 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
             batch,
             config,
         )
-        result = execution.step(batch_input(batch))
+        result = execution.step(StepInput.of_batch(batch))
         torch.testing.assert_close(result.loss, expected)
         assert result.publication is not None and result.metrics["selected_count"] == 1
         execution.retire(())
         skipped = _compile(model, replace(config, threshold=1e6))
         (initial,) = skipped.admit(())
-        result = skipped.step(batch_input(batch))
+        result = skipped.step(StepInput.of_batch(batch))
         assert result.publication is not None and result.metrics["selected_count"] == 0
         assert skipped.arena.latest(initial.lineage_id).version_id == initial.version_id + 1
         skipped.retire(())

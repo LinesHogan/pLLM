@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import pllm
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
+from pllm.contracts.packed_rows import label_rows
 from pllm.execution.ptts.page_borrow import BorrowedPage
 from pllm.execution.state_feed import FeedReceiver, ReadonlyStepEnd, receive_field
 from pllm.execution.step_input import StepInput
@@ -50,8 +50,7 @@ def setup_feed(workload):
 
 
 def step_rows(step):
-    rows = PackedPhaseRowBatch.from_rows(step, 0, ())
-    return PackedSamplerRowBatch.from_links(rows, ())
+    return label_rows((), [], [], [], step)
 
 
 def join_producer(process, receiver, execution):

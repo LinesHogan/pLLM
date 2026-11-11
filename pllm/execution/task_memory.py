@@ -20,7 +20,7 @@ from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHiddenResourceBinding
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.packed_rows import PackedSamplerRowBatch, label_rows
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.request_state import RequestStateKey
@@ -118,14 +118,13 @@ def example(
         if (binding.graph.states or facts.probe.hidden_resources) and not tokens
         else facts.probe.max_packed_rows
     )
-    rows = tuple(
-        PackedPhaseRow(i, i, 0, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0, str(i))) for i in range(count)
+    # One decode token per request; sampler rows run in reverse packed order.
+    labeled = label_rows(
+        tuple(RequestIdentity(str(i), i, 0, str(i)) for i in range(count)), [1] * count, [0] * count, [0] * count, 0
     )
-    packed = PackedPhaseRowBatch.from_rows(0, count, rows)
+    packed = labeled.row_batch
     rows = packed.rows
-    sampler = PackedSamplerRowBatch.from_links(
-        packed, tuple(PackedSamplerRowLink(i, count - i - 1) for i in range(count))
-    )
+    sampler = PackedSamplerRowBatch(packed, labeled.packed_indices[::-1].copy())
     # Trace hidden_port's model-dtype gather and FP32 conversion, including their
     # overlapping lifetimes, along with each executor's consumer index table.
     hidden = (
@@ -282,11 +281,11 @@ def task_example(data: TensorFrame, phase: HiddenPhase | None) -> TensorFrame:
     so every-token readers keep them all."""
     if phase in (None, HiddenPhase.ALL):
         return data
-    packed = PackedPhaseRowBatch.from_rows(
-        data.step.rows.step_id,
-        data.step.rows.total_rows,
-        tuple(replace(row, phase=phase, prompt_length=1) for row in data.step.rows.rows),
-    )
+    # Each example row is its own request with a one-token prompt: its prompt ending, or its first decode token.
+    rows = data.step.rows
+    count = rows.total_rows
+    done = 0 if phase is HiddenPhase.PREFILL else 1
+    packed = label_rows(rows.identities, [1] * count, [1] * count, [done] * count, rows.step_id).row_batch
     sampler = replace(data.step.sampler_rows, row_batch=packed)
     hidden = None if data.step.hidden is None else replace(data.step.hidden, row_batch=packed)
     return replace(
@@ -462,7 +461,7 @@ def derive_host_resources(binding: TensorDeclaration, config: HostConfig) -> Sch
     (layout,) = binding.layouts.layouts
     refs = StateRefs.of((StateRef(LayoutId(1), LineageId(1), VersionId(1)),))
     selection = RequestStateSelection(
-        PackedPhaseRowBatch.from_rows(0, 0, ()).rows,
+        StepInput.of_batch(host_batch).rows.rows,
         (
             ResourceSelection(
                 StateResource(layout.resource), {int(refs.lineages[0]): None}, refs, np.empty(0, dtype=np.int64)
@@ -477,7 +476,8 @@ def derive_host_resources(binding: TensorDeclaration, config: HostConfig) -> Sch
         None,
         field_slots=lambda field: (pools[field], (0,)),
     )
-    data = TensorFrame(StepInput.of_batch(host_batch), PackedPhaseRowBatch.from_rows(0, 0, ()).rows)
+    step = StepInput.of_batch(host_batch)
+    data = TensorFrame(step, step.rows.rows)
     operations: dict[TaskSymbol, MemoryOperation] = {
         **binding.executables(None, ()),
         **binding.publications,

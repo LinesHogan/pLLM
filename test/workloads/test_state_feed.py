@@ -11,7 +11,7 @@ import pllm
 from pllm.contracts.semantic_graph import StateEffectKind
 from pllm.contracts.state_feed import FeedOrder
 from pllm.execution.state_feed import FeedEvent, FeedRecord, select_publications
-from pllm.testing import backend_facts
+from pllm.testing import backend_facts, step_input
 
 SOURCE = pllm.parameter("source", "value")
 TARGET = pllm.parameter("target", "value")
@@ -122,8 +122,6 @@ def test_write_validates_result_shape_during_specialization():
 
 
 def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
-    from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-    from pllm.execution.step_input import StepInput
 
     @dataclass(frozen=True)
     class LocalWorkload(FeedWorkload):
@@ -142,8 +140,7 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
     workload = LocalWorkload()
     execution = workload.compile_backend(facts_for(), pllm.ExecutionOptions()).execution
     execution.admit(())
-    rows = PackedPhaseRowBatch.from_rows(0, 0, ())
-    execution.step(StepInput(rows, PackedSamplerRowBatch.from_links(rows, ())))
+    execution.step(step_input(()))
     refs = execution.latest(())
     assert [ref.version_id for ref in refs] == [0, 1, 0]
     torch.testing.assert_close(execution.snapshot(refs[1])[0], torch.ones(2))

@@ -13,8 +13,7 @@ import torch
 from vllm import RequestOutput, SamplingParams
 
 import pllm
-from pllm.contracts.packed_rows import PackedRows
-from pllm.testing import check_on_gpu
+from pllm.testing import check_on_gpu, step_input
 from test.workloads.grpo_workload import GRPO
 
 
@@ -45,7 +44,7 @@ def main() -> None:
     print(result)
     with pllm.make_llm(config, workload=workload) as handle:
         execution = handle.runner.require_session().deployment.execution
-        (initial,) = execution.directory.select(PackedRows.from_rows(())).refs
+        (initial,) = execution.directory.select(step_input(()).rows.rows).refs
         before = execution.snapshot(initial, torch.cuda.current_stream())[0].cpu()
         batches = workload.run(
             handle,
@@ -61,7 +60,7 @@ def main() -> None:
             assert batch.weights.min() < 0 < batch.weights.max()
         diagnostics = handle.diagnostics()
         assert diagnostics.update_count == diagnostics.loss_count == 2
-        (current,) = execution.directory.select(PackedRows.from_rows(())).refs
+        (current,) = execution.directory.select(step_input(()).rows.rows).refs
         assert current.version_id == initial.version_id + 2
         after = execution.snapshot(current, torch.cuda.current_stream())[0].cpu()
         assert not torch.equal(after, before)

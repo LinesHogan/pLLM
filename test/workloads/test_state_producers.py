@@ -10,7 +10,7 @@ import pllm
 from pllm import testing
 from pllm.backends.vllm.architecture import hidden_binding
 from pllm.contracts.backend_attachment import AttachmentHiddenResource
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.packed_rows import label_rows
 from pllm.contracts.semantic_graph import AnchorId, StateResource
 from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.state_producers import (
@@ -58,15 +58,10 @@ def deployment(workload, device=torch.device("cpu")):
     return assert_finite_resources(workload, facts, main_fallback=True)
 
 
-def packed(identities, hidden, phases, lengths=(1, 1), *, offset=0, stream=None):
-    value = testing.step_input(
-        identities, hidden, tokens=phases, sampler_order=(1, 0), token_offset=offset, stream=stream
-    )
-    rows = type(value.rows).from_rows(
-        value.rows.step_id,
-        value.rows.total_rows,
-        tuple(replace(row, prompt_length=length) for row, length in zip(value.rows.rows, lengths, strict=True)),
-    )
+def packed(identities, hidden, lengths, *, offset=0, stream=None):
+    # One token per request at `offset`: a prompt token while `offset` lies within that request's prompt.
+    value = testing.step_input(identities, hidden, sampler_order=(1, 0), token_offset=offset, stream=stream)
+    rows = label_rows(identities, [1, 1], list(lengths), [offset, offset], 0).row_batch
     return replace(
         value,
         rows=rows,
@@ -93,7 +88,6 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
             packed(
                 identities,
                 {tap: context},
-                (HiddenPhase.PREFILL, HiddenPhase.PREFILL),
                 (length, length + 1),
                 offset=offset,
                 stream=stream,
@@ -104,7 +98,6 @@ def test_prompt_producers_publish_only_completed_requests(workload, device, leng
     value = packed(
         identities,
         {tap: context},
-        (HiddenPhase.PREFILL, HiddenPhase.PREFILL),
         (length, length + 1),
         offset=length - 1,
         stream=stream,
@@ -170,9 +163,7 @@ def test_decode_adam_matches_independent_optimizer_and_keeps_entry_pin(device):
         testing.hidden_binding(0, layer_count=10): x.expand(2, -1),
         testing.hidden_binding(9, layer_count=10): target.expand(2, -1),
     }
-    result = testing.run_step(
-        execution, packed(ids, hidden, (HiddenPhase.DECODE, HiddenPhase.PREFILL), stream=stream), stream=stream
-    )
+    result = testing.run_step(execution, packed(ids, hidden, (0, 1), stream=stream), stream=stream)
     assert tuple(result.publication.before_refs) == (refs[0],)
     latest = execution.arena.latest(refs[0].lineage_id)
     actual = execution.snapshot(latest, stream=stream)

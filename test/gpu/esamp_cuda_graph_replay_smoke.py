@@ -15,9 +15,9 @@ import numpy as np
 import torch
 
 import pllm
-from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHiddenResourceBinding
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.packed_rows import label_rows
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback
 from pllm.contracts.semantic_graph import AnchorId
@@ -82,12 +82,9 @@ def mean_capture(publish_lag: int = 0) -> None:
     token_buffer = torch.empty(3, device=device, dtype=torch.long)
     for step, count in enumerate((1, 3, 2)):
         hidden.copy_(torch.arange(12, device=device, dtype=torch.float32).view(3, 4) / 10)
-        rows = PackedPhaseRowBatch.from_rows(
-            step,
-            count,
-            tuple(PackedPhaseRow(i, i, step, HiddenPhase.DECODE, RequestIdentity(str(i), i, 0)) for i in range(count)),
-        )
-        sampler = PackedSamplerRowBatch.from_links(rows, tuple(PackedSamplerRowLink(i, i) for i in range(count)))
+        identities = tuple(RequestIdentity(str(i), i, 0) for i in range(count))
+        sampler = label_rows(identities, [1] * count, [0] * count, [step] * count, step)
+        rows = sampler.row_batch
         value = StepInput(
             rows,
             sampler,

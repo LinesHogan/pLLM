@@ -13,7 +13,7 @@ from pllm.contracts.backend_attachment import (
     ModelProbe,
 )
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.packed_rows import label_rows
 from pllm.contracts.semantic_graph import (
     AnchorId,
 )
@@ -46,24 +46,10 @@ FACTS = BackendCompileFacts(
 )
 WORKLOAD = RecirculationWorkload(alpha=0.7, ramp_tokens=2)
 IDENTITIES = (RequestIdentity("prefill", 0, 0), RequestIdentity("decode", 1, 0))
-ROWS = PackedPhaseRowBatch.from_rows(
-    1,
-    4,
-    tuple(
-        PackedPhaseRow(
-            i,
-            int(i == 3),
-            i if i < 3 else 0,
-            HiddenPhase.PREFILL if i < 3 else HiddenPhase.DECODE,
-            IDENTITIES[int(i == 3)],
-            prompt_length=3 if i < 3 else 0,
-        )
-        for i in range(4)
-    ),
-)
-VALUE = StepInput(
-    ROWS, PackedSamplerRowBatch.from_links(ROWS, (PackedSamplerRowLink(0, 2), PackedSamplerRowLink(1, 3)))
-)
+# A three-token prompt completes while the other request decodes its first token.
+SAMPLER = label_rows(IDENTITIES, [3, 1], [3, 0], [0, 0], 1)
+ROWS = SAMPLER.row_batch
+VALUE = StepInput(ROWS, SAMPLER)
 INPUTS = torch.tensor([[0.4, -0.1, 0.3, 0.7], [0.2, 0.9, -0.3, 0.8], [-0.2, 0.1, 0.8, 0.4], [0.7, 0.2, -0.1, 0.3]])
 
 

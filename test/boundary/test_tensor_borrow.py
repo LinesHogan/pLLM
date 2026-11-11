@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.semantic_graph import TaskResultInputSource, TaskSymbol
 from pllm.contracts.tensor_borrow import BorrowedResource
 from pllm.execution.ptts.request_state import RequestStateSelection
@@ -44,13 +43,14 @@ def test_task_results_live_until_cuda_readers_finish():
     """A released result keeps its values while another stream's read is still queued."""
     producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
     source = TaskResultInputSource(TaskSymbol("lookup"), "value")
-    frame = TensorFrame(step_input(()), PackedRows.from_rows(()))
+    step = step_input(())
+    frame = TensorFrame(step, step.rows.rows)
     with torch.cuda.stream(producer):
         value = torch.ones(65536, device="cuda")
         ready = torch.cuda.Event()
         ready.record()
     batch = TensorBatch(
-        RequestStateSelection(PackedRows.from_rows(()), ()),
+        RequestStateSelection(step.rows.rows, ()),
         (),
         (),
         consumer,

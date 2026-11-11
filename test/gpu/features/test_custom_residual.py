@@ -428,7 +428,7 @@ def test_captured_rewrites_have_no_host_syncs(workload: pllm.Workload) -> None:
 @pytest.mark.parametrize("chunk,shared", ((1, False), (4, False), (16, False), (4, True)))
 def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared: bool) -> None:
     """One graph follows the serial chunk recurrence while PTTS recycles private write slots."""
-    from pllm.contracts.hidden_locator import HiddenPhase
+    from pllm.contracts.packed_rows import label_rows
     from pllm.contracts.request_identity import RequestIdentity
     from pllm.execution.site_memory import SiteMemorySchedule
     from pllm.testing import backend_facts, compile_execution, step_input
@@ -466,20 +466,9 @@ def test_memory_capture_replays_mixed_spans_and_private_slots(chunk: int, shared
         for step, counts in enumerate(((5, 1, 0), (1, 0, 7), (1, 1, 1), (0, 9, 1), (13, 1, 1))):
             packed = tuple(identity for identity, count in zip(identities, counts, strict=True) for _ in range(count))
             value = step_input(packed, step_id=step, sampler_order=())
-            offsets = [0, 0, 0]
-            rows = []
-            for row in value.rows.rows:
-                request = int(row.identity.request_id)
-                rows.append(
-                    replace(
-                        row,
-                        request_ordinal=request,
-                        token_offset=frontiers[request] + offsets[request],
-                        phase=HiddenPhase.PREFILL if counts[request] > 1 else HiddenPhase.DECODE,
-                    )
-                )
-                offsets[request] += 1
-            row_batch = type(value.rows).from_rows(value.rows.step_id, value.rows.total_rows, tuple(rows))
+            # A request scheduling several tokens is still in its prompt; a single token decodes.
+            prompts = [frontier + count if count > 1 else 0 for frontier, count in zip(frontiers, counts, strict=True)]
+            row_batch = label_rows(identities, list(counts), prompts, list(frontiers), step).row_batch
             value = replace(value, rows=row_batch, sampler_rows=replace(value.sampler_rows, row_batch=row_batch))
             context = execution.start_step(value, stream)
             execution.advance_to(context, "model.execute")

@@ -23,8 +23,7 @@ from pllm.contracts.backend_attachment import (
     MissingPolicy,
 )
 from pllm.contracts.codec import encode_boundary
-from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.packed_rows import label_rows
 from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, StateResource
 from pllm.contracts.state_feed import FeedBinding, FeedOrder
 from pllm.contracts.state_ref import LineageId, StateRef, VersionId
@@ -41,7 +40,6 @@ from pllm.execution.row_task_binding import (
 )
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import MathBinding, PartialCommitError
-from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
@@ -226,33 +224,8 @@ def _scheduler(session, *identities):
 
 
 def _step_rows(step, identities):
-    a, b = identities
-    cells = (
-        (
-            (a, 0, HiddenPhase.PREFILL),
-            (a, 1, HiddenPhase.PREFILL),
-            (a, 2, HiddenPhase.PREFILL),
-            (b, 0, HiddenPhase.PREFILL),
-        )
-        if step == 0
-        else (
-            (a, 3, HiddenPhase.DECODE),
-            (b, 1, HiddenPhase.PREFILL),
-            (b, 2, HiddenPhase.PREFILL),
-            (b, 3, HiddenPhase.PREFILL),
-        )
-    )
-    rows = PackedPhaseRowBatch.from_rows(
-        step,
-        4,
-        tuple(
-            PackedPhaseRow(i, int(identity == b), offset, phase, identity)
-            for i, (identity, offset, phase) in enumerate(cells)
-        ),
-    )
-    return PackedSamplerRowBatch.from_links(
-        rows, (PackedSamplerRowLink(0, 2 if step == 0 else 0), PackedSamplerRowLink(1, 3))
-    )
+    """Prompts of 3 (a) and 4 (b) tokens: a prefills 0-2 and b 0, then a decodes 3 while b prefills 1-3."""
+    return label_rows(identities, [3, 1] if step == 0 else [1, 3], [3, 4], [0, 0] if step == 0 else [3, 1], step)
 
 
 def _decode_steps_keep_exact_publications_and_ack_order():
@@ -309,12 +282,7 @@ def _hold_steps_reuse_the_settled_injection():
     identity = RequestIdentity("hold", 0, 0)
 
     def rows(step):
-        batch = PackedPhaseRowBatch.from_rows(
-            step,
-            1,
-            (PackedPhaseRow(0, 0, step, HiddenPhase.PREFILL if step == 0 else HiddenPhase.DECODE, identity),),
-        )
-        return PackedSamplerRowBatch.from_links(batch, (PackedSamplerRowLink(0, 0),))
+        return label_rows((identity,), [1], [1], [step], step)
 
     with (
         binding_case(runtime=True, missing=MissingPolicy.HOLD) as (b, _, _, binding, execution, first, peers),
@@ -392,8 +360,7 @@ def test_video_real_frame_math_and_signed_composition():
             pages.append(BorrowedPage(descriptor, value, receiver))
         execution.admit(())
         execution.stage_readonly((BorrowedStateRoot(execution.arena, "features", ref, tuple(pages)),))
-        rows = PackedPhaseRowBatch.from_rows(0, 0, ())
-        result = execution.step(StepInput(rows, PackedSamplerRowBatch.from_links(rows, ())))
+        result = execution.step(step_input(()))
         signal = torch.cat(
             (
                 values[0].flatten() / 63,

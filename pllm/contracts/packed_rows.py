@@ -37,7 +37,8 @@ def tap_selection(phases: Collection[HiddenPhase]) -> TapRows:
 
 @dataclass(frozen=True, slots=True)
 class PackedPhaseRow:
-    """One packed row with its stable request identity."""
+    """One packed row with its stable request identity, read from a PackedPhaseRowBatch; batches come only from
+    the native RowLabeler (label_rows for explicit scheduler counts)."""
 
     packed_row_index: int
     request_ordinal: int
@@ -69,11 +70,6 @@ class PackedRows(Sequence[PackedPhaseRow]):
 
     batch: PackedPhaseRowBatch
     indices: Slots
-
-    @classmethod
-    def from_rows(cls, rows: Sequence[PackedPhaseRow]) -> PackedRows:
-        """Import explicit records at a diagnostic or shape-tracing boundary."""
-        return PackedPhaseRowBatch.from_rows(0, len(rows), tuple(rows)).rows
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -139,61 +135,6 @@ class PackedPhaseRowBatch:
     tap_ranks: tuple[Slots, ...]
     identity_data: Slots
     identity_offsets: Slots
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, PackedPhaseRowBatch) and self.step_id == other.step_id and self.rows == other.rows
-
-    def __hash__(self) -> int:
-        return hash((self.step_id, self.total_rows, tuple(self.rows)))
-
-    @classmethod
-    def from_rows(cls, step_id: int, total_rows: int, rows: tuple[PackedPhaseRow, ...]) -> PackedPhaseRowBatch:
-        """Import explicit records for diagnostics and shape tracing."""
-        assert total_rows == len(rows)
-        identities = tuple(dict.fromkeys(row.identity for row in rows))
-        lookup = {identity: index for index, identity in enumerate(identities)}
-        columns = (
-            np.array(
-                [
-                    (
-                        r.packed_row_index,
-                        r.request_ordinal,
-                        r.token_offset,
-                        {HiddenPhase.DECODE: 0, HiddenPhase.PREFILL: 1, HiddenPhase.NONE: -1}[r.phase],
-                        lookup[r.identity],
-                        r.prompt_length,
-                        int(r.recomputed),
-                    )
-                    for r in rows
-                ],
-                dtype=np.int64,
-            )
-            .reshape(-1, 7)
-            .T.copy()
-        )
-        last = {r.identity: index for index, r in enumerate(rows)}
-        requests = np.fromiter(last.values(), dtype=np.int64)
-        ordinal_last = np.fromiter({r.request_ordinal: index for index, r in enumerate(rows)}.values(), dtype=np.int64)
-        _, _, offsets, phases, _, prompt_lengths, recomputed = columns
-        fresh = recomputed == 0
-        prefill = np.flatnonzero((phases == 1) & (offsets == prompt_lengths - 1) & fresh)
-        decode = np.sort(ordinal_last[(phases[ordinal_last] == 0) & fresh[ordinal_last]])
-        selected = (decode, prefill, np.concatenate((decode, prefill)), np.flatnonzero(fresh))
-        ranks = tuple(np.zeros(total_rows, dtype=np.int64) for _ in selected)
-        for indices, mapping in zip(selected, ranks, strict=True):
-            mapping[indices] = np.arange(len(indices))
-        words = tuple(identity_words(identity) for identity in identities)
-        offsets = np.cumsum([0, *(len(word) for word in words)], dtype=np.int64)
-        return cls(
-            step_id,
-            columns,
-            identities,
-            requests,
-            selected,
-            ranks,
-            np.concatenate(words) if words else np.empty(0, dtype=np.int64),
-            offsets,
-        )
 
     @property
     def total_rows(self) -> int:
@@ -275,43 +216,12 @@ class PackedPhaseRowBatch:
         return PackedRows(self, self.tap_selected[TapRows.LATEST_DECODE])
 
 
-@dataclass(frozen=True, slots=True)
-class PackedSamplerRowLink:
-    """One exact sampler-row to packed-model-row relation."""
-
-    sampler_row_index: int
-    packed_row_index: int
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class PackedSamplerRowBatch:
     """Ordered sampler indices into one exact numeric packed row batch."""
 
     row_batch: PackedPhaseRowBatch
     packed_indices: Slots
-
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, PackedSamplerRowBatch) and self.row_batch == other.row_batch and self.links == other.links
-        )
-
-    def __hash__(self) -> int:
-        return hash((self.row_batch, self.links))
-
-    @classmethod
-    def from_links(
-        cls, row_batch: PackedPhaseRowBatch, links: tuple[PackedSamplerRowLink, ...]
-    ) -> PackedSamplerRowBatch:
-        """Import explicit sampler links for diagnostics and shape tracing."""
-        indices = np.empty(len(links), dtype=np.int64)
-        for link in links:
-            indices[link.sampler_row_index] = link.packed_row_index
-        return cls(row_batch, indices)
-
-    @property
-    def links(self) -> tuple[PackedSamplerRowLink, ...]:
-        """Materialize sampler links for explicit inspection."""
-        return tuple(PackedSamplerRowLink(index, packed) for index, packed in enumerate(self.packed_indices.tolist()))
 
     @property
     def step_id(self) -> int:
@@ -404,5 +314,4 @@ __all__ = [
     "PackedPhaseRow",
     "PackedPhaseRowBatch",
     "PackedSamplerRowBatch",
-    "PackedSamplerRowLink",
 ]

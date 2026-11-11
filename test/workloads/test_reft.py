@@ -3,6 +3,7 @@
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 
+import numpy as np
 import pytest
 import torch
 
@@ -12,13 +13,12 @@ from pllm.contracts.backend_attachment import (
     DecodeRefresh,
     DecodeWindow,
 )
-from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch
+from pllm.contracts.packed_rows import PackedSamplerRowBatch, label_rows
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import StepInput
 from pllm.io import StateImport
-from pllm.testing import RequestIdentity, backend_facts
+from pllm.testing import RequestIdentity, backend_facts, step_input
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload, load_loreft_interventions
 
 
@@ -29,8 +29,7 @@ def test_reft_matches_loreft_math_and_publish_skip_semantics(tmp_path) -> None:
     deployment = workload.compile_backend(facts)
     execution = deployment.execution
     _decode_declarations_are_checked(facts)
-    rows = PackedPhaseRowBatch.from_rows(0, 0, ())
-    value = StepInput(rows, PackedSamplerRowBatch.from_links(rows, ()))
+    value = step_input(())
     (initial,) = execution.admit(())
     assert execution.step(value).publication is None
     identity = RequestIdentity("old", 0, 0)
@@ -88,9 +87,7 @@ def _decode_low_rank_keeps_parameters_and_recomputes_delta(
     adapter = VllmActivationPatch(
         (replace(binding, decode=DecodeWindow.ALL, decode_refresh=DecodeRefresh.STEP),), len(hidden), execution.arena
     )
-    rows = PackedPhaseRowBatch.from_rows(
-        0, len(hidden), tuple(PackedPhaseRow(i, 0, i, HiddenPhase.DECODE, identity) for i in range(len(hidden)))
-    )
+    rows = label_rows((identity,), [len(hidden)], [0], [0], 0).row_batch
     invocation = execution.start_step(replace(value, batch=update))
     execution.execute_anchor(invocation, AnchorId(0))
     try:
@@ -143,17 +140,14 @@ def _request_edits_share_publication_and_exact_prefill_rows(facts) -> None:
     identities = (RequestIdentity("a", 7, 1), RequestIdentity("b", 9, 1))
     initial = execution.admit(identities)
     old_pin = execution.arena.pin_exact(StateRefs.of(initial))
-    rows = PackedPhaseRowBatch.from_rows(
-        0,
-        3,
-        tuple(
-            PackedPhaseRow(index, 0 if index < 2 else 1, index if index < 2 else 0, HiddenPhase.PREFILL, identity)
-            for index, identity in enumerate((identities[0], identities[0], identities[1]))
-        ),
-    )
+    # Both prompts complete in this step: two tokens of a, one of b.
+    rows = label_rows(identities, [2, 1], [2, 1], [0, 0], 0).row_batch
     delta = torch.tensor([[-0.25, 0.5, -1.0, 0.75], [1.0, -2.0, 3.0, -4.0]])
     value = StepInput(
-        rows, PackedSamplerRowBatch.from_links(rows, ()), batch=StateImport((delta,)), import_rows={"b": 0, "a": 1}
+        rows,
+        PackedSamplerRowBatch(rows, np.empty(0, dtype=np.int64)),
+        batch=StateImport((delta,)),
+        import_rows={"b": 0, "a": 1},
     )
     invocation = execution.start_step(value)
     execution.execute_anchor(invocation, AnchorId(0))

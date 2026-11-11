@@ -39,12 +39,7 @@ from pllm.contracts.packed_hidden import (
     HiddenRows,
     PackedHiddenResourceBinding,
 )
-from pllm.contracts.packed_rows import (
-    PackedPhaseRow,
-    PackedPhaseRowBatch,
-    PackedSamplerRowBatch,
-    PackedSamplerRowLink,
-)
+from pllm.contracts.packed_rows import PackedSamplerRowBatch, label_rows
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
@@ -162,30 +157,27 @@ def step_input(
     operands: tuple[ProjectionOperands, ...] = (),
     stream: torch.cuda.Stream | None = None,
 ) -> StepInput:
-    """One packed step: row i belongs to `identities[i]` and decodes unless `tokens` says otherwise.
+    """One packed step: row i is the one token of request `identities[i]` at `token_offset`; it decodes unless
+    `tokens` says "prefill", which makes it the last token of the request's prompt.
 
     `sampler_order` lists the packed row behind each sampler row (identity order by default; `()` for a
     step without sampling). Hidden tensors are given per tap, one row per identity; CUDA tensors need the
     `stream` they were produced on.
     """
     count = len(identities)
-    row_phases = tuple(HiddenPhase(token) for token in tokens) if tokens is not None else (HiddenPhase.DECODE,) * count
-    rows = PackedPhaseRowBatch.from_rows(
-        step_id,
-        count,
-        tuple(
-            PackedPhaseRow(i, i, token_offset, phase, identity)
-            for i, (phase, identity) in enumerate(zip(row_phases, identities, strict=True))
-        ),
-    )
-    order = range(count) if sampler_order is None else sampler_order
+    prompts = [
+        token_offset + 1 if token == "prefill" else 0
+        for token, _ in zip(tokens or ("decode",) * count, identities, strict=True)
+    ]
+    labeled = label_rows(tuple(identities), [1] * count, prompts, [token_offset] * count, step_id)
+    rows = labeled.row_batch
     taps = tuple(
         HiddenRows(binding, tensor, np.arange(count, dtype=np.int64))
         for binding, tensor in sorted((hidden or {}).items(), key=lambda item: item[0].locator_key)
     )
     return StepInput(
         rows,
-        PackedSamplerRowBatch.from_links(rows, tuple(PackedSamplerRowLink(i, row) for i, row in enumerate(order))),
+        labeled if sampler_order is None else PackedSamplerRowBatch(rows, np.asarray(sampler_order, dtype=np.int64)),
         HiddenRowBatch(rows, taps) if taps else None,
         operands=operands,
         batch=batch,

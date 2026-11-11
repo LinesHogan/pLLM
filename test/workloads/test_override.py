@@ -105,21 +105,19 @@ def _reweight_oracle():
     for step_id, indices in enumerate(((0, 1, 2), (1, 0, 2), (2, 2, 2))):
         value = samples(indices, step_id, order=(2, 0, 1) if step_id == 1 else None, prefill=step_id == 1)
         rows = value.rows.rows
-        decode = [link for link in value.sampler_rows.links if rows[link.packed_row_index].phase is HiddenPhase.DECODE]
-        sample = lambda link: indices[link.packed_row_index]
+        links = enumerate(value.sampler_rows.packed_indices.tolist())
+        decode = [(sampler, packed) for sampler, packed in links if rows[packed].phase is HiddenPhase.DECODE]
         expected = torch.stack(
             [
-                config.lambd * head_logits(down, up, link.packed_row_index, sample(link) - 1)
-                if sample(link)
-                else torch.zeros(7)
-                for link in decode
+                config.lambd * head_logits(down, up, packed, indices[packed] - 1) if indices[packed] else torch.zeros(7)
+                for _, packed in decode
             ]
         ).detach()
         before = execution.snapshot(latest)
         result = run(execution, value)
         torch.testing.assert_close(result.guidance[0].values, expected)
-        assert result.guidance[0].affected_row_ids == tuple(link.sampler_row_index for link in decode)
-        selected = [link for link in decode if sample(link) < 2]
+        assert result.guidance[0].affected_row_ids == tuple(sampler for sampler, _ in decode)
+        selected = [(sampler, packed) for sampler, packed in decode if indices[packed] < 2]
         if not selected:
             # No eligible row: the state republishes its exact values.
             (latest,) = result.publication.after_refs
@@ -127,11 +125,8 @@ def _reweight_oracle():
             assert_roots(execution.snapshot(latest), before, exact=True)
             continue
         optimizer.zero_grad()
-        logits = [
-            BASE[link.sampler_row_index] + head_logits(down, up, link.packed_row_index, sample(link))
-            for link in selected
-        ]
-        loss = F.cross_entropy(torch.stack(logits), TOKENS[[link.sampler_row_index for link in selected]])
+        logits = [BASE[sampler] + head_logits(down, up, packed, indices[packed]) for sampler, packed in selected]
+        loss = F.cross_entropy(torch.stack(logits), TOKENS[[sampler for sampler, _ in selected]])
         loss.backward()
         optimizer.step()
         assert tuple(result.publication.before_refs) == (latest,)

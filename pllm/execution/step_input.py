@@ -12,7 +12,7 @@ import triton
 
 from pllm.contracts.host_batch import HostBatch
 from pllm.contracts.packed_hidden import HiddenRowBatch
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
+from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch, label_rows
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.cuda_stream import CudaStreamReadiness
@@ -52,8 +52,8 @@ class StepInput:
     @classmethod
     def of_batch(cls, batch: HostBatch[torch.Tensor]) -> StepInput:
         """A host step without request rows, carrying one host batch ready on the stream the step runs on."""
-        rows = PackedPhaseRowBatch.from_rows(0, 0, ())
-        return cls(rows, PackedSamplerRowBatch.from_links(rows, ()), batch=batch)
+        sampler = label_rows((), [], [], [], 0)
+        return cls(sampler.row_batch, sampler, batch=batch)
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):

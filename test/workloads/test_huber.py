@@ -83,15 +83,13 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
                 for actual, expected in zip(execution.snapshot(ref, stream), snapshot, strict=True):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-        active = tuple(link for link in step.sampler_rows.links if latest[owners[link.packed_row_index]].version_id > 0)
+        links = enumerate(step.sampler_rows.packed_indices.tolist())
+        active = tuple((sampler, packed) for sampler, packed in links if latest[owners[packed]].version_id > 0)
         predicted = (
             torch.cat(
                 [
-                    oracle.predict(
-                        source[link.packed_row_index : link.packed_row_index + 1],
-                        parameters[owners[link.packed_row_index]],
-                    ).detach()
-                    for link in active
+                    oracle.predict(source[packed : packed + 1], parameters[owners[packed]]).detach()
+                    for _, packed in active
                 ]
             )
             if active
@@ -102,7 +100,7 @@ def _huber_lifecycle(hidden: int, rank: int, device_name: str) -> None:
             execution.execute_anchor(handle, AnchorId(anchor))
         guidance = execution.sampler_guidance(handle, stream)
         rows, values = effective(guidance)
-        assert rows == tuple(link.sampler_row_index for link in active)
+        assert rows == tuple(sampler for sampler, _ in active)
         assert guidance[0].beta == 0.2
         torch.testing.assert_close(values, predicted)
         for ref, snapshot in zip(latest, before, strict=True):

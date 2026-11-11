@@ -25,7 +25,7 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedRows, PackedSamplerRowBatch
+from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
 from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, TaskId
@@ -437,7 +437,7 @@ def _sequence_update(handle: VllmLlm, batch: CausalTrainBatch[torch.Tensor]) -> 
     execution = handle.runner.require_session().deployment.execution
     return tuple(
         tensor.detach().cpu()
-        for ref in execution.directory.select(PackedRows.from_rows(())).refs
+        for ref in execution.directory.select(StepInput.of_batch(batch).rows.rows).refs
         for tensor in execution.snapshot(ref, torch.cuda.current_stream())
     )
 

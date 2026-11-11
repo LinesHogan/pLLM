@@ -29,7 +29,10 @@ def projection_input(operands: tuple[ProjectionOperands, ...]) -> StepInput:
     """Build step rows for the requests and phases named by projection operands."""
     selected = tuple(dict.fromkeys((operand.identity, operand.phase) for operand in operands))
     identities, phases = zip(*selected, strict=True) if selected else ((), ())
-    return testing.step_input(identities, tokens=phases, sampler_order=(), operands=operands)
+    value = testing.step_input(identities, tokens=phases, sampler_order=(), operands=operands)
+    # One row stands for an operand of several tokens, so its prompt length (training frontier) is unknown.
+    value.rows.prompt_lengths[:] = 0
+    return value
 
 
 def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:

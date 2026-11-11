@@ -300,13 +300,12 @@ def _ordinary_request_distillation(device_name) -> None:
     carries = [torch.zeros(4, device=device) for _ in identities]
     for step_id, owners in enumerate(((0, 1, 0), (2, 0, 0))):
         value = step_input(tuple(identities[o] for o in owners), source, target, step_id, (2, 0, 1), stream)
-        links = value.sampler_rows.links
-        active = tuple(link for link in links if latest[owners[link.packed_row_index]].version_id > 0)
-        weight_of = lambda link: weights[owners[link.packed_row_index]].detach()
-        expected = [source[link.packed_row_index] @ weight_of(link) for link in active]
+        links = enumerate(value.sampler_rows.packed_indices.tolist())
+        active = tuple((sampler, packed) for sampler, packed in links if latest[owners[packed]].version_id > 0)
+        expected = [source[packed] @ weights[owners[packed]].detach() for _, packed in active]
         result = execution.step(value, stream)
         rows, values = effective(result.guidance[0])
-        assert rows == tuple(link.sampler_row_index for link in active) and result.guidance[0].beta == 0.2
+        assert rows == tuple(sampler for sampler, _ in active) and result.guidance[0].beta == 0.2
         torch.testing.assert_close(values, torch.stack(expected) if expected else source.new_empty((0, 4)))
         for before, after, loss in zip(
             result.publication.before_refs, result.publication.after_refs, result.loss, strict=True

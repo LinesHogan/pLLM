@@ -10,8 +10,7 @@ from torch import nn
 
 import pllm
 from pllm import testing
-from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, PackedSamplerRowBatch, PackedSamplerRowLink
+from pllm.contracts.packed_rows import label_rows
 from pllm.execution.step_input import StepInput
 
 pytest.importorskip("vllm")
@@ -135,19 +134,22 @@ def test_stateful_custom_residual_matches_serial_chunk_oracle(chunk: int) -> Non
     )
     outputs: dict[int, list[torch.Tensor]] = {0: [], 1: []}
     for step_id, spans in enumerate(steps):
-        rows, inputs = [], []
-        for request, begin, end in spans:
-            for offset in range(begin, end):
-                length = len(prompts[request])
-                phase = HiddenPhase.PREFILL if offset < length else HiddenPhase.DECODE
-                rows.append(PackedPhaseRow(len(rows), request, offset, phase, identities[request], length))
-                inputs.append(prompts[request][offset] if offset < length else decoded[offset - length, request])
-        batch = PackedPhaseRowBatch.from_rows(step_id, len(rows), tuple(rows))
-        links = tuple(
-            PackedSamplerRowLink(request, max(row.packed_row_index for row in rows if row.request_ordinal == request))
-            for request in (0, 1)
+        inputs = [
+            prompts[request][offset]
+            if offset < len(prompts[request])
+            else decoded[offset - len(prompts[request]), request]
+            for request, begin, end in spans
+            for offset in range(begin, end)
+        ]
+        sampler = label_rows(
+            identities,
+            [end - begin for _, begin, end in spans],
+            [len(prompt) for prompt in prompts],
+            [begin for _, begin, _ in spans],
+            step_id,
         )
-        context = execution.start_step(StepInput(batch, PackedSamplerRowBatch.from_links(batch, links)))
+        batch = sampler.row_batch
+        context = execution.start_step(StepInput(batch, sampler))
         execution.advance_to(context, "request.prepare")
         sites.prepare(batch, context, execution.directory)
         result = body(torch.stack(inputs))
@@ -156,7 +158,7 @@ def test_stateful_custom_residual_matches_serial_chunk_oracle(chunk: int) -> Non
             if anchor.ordinal == execution.sampler_anchor_id:
                 execution.complete_sampler(context)
         execution.finish_step(context)
-        for row, value in zip(rows, result, strict=True):
+        for row, value in zip(batch.rows, result, strict=True):
             outputs[row.request_ordinal].append(value)
     sites.close()
     for request in (0, 1):

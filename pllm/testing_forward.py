@@ -98,9 +98,7 @@ class CheckAttention:
         """Stage sampled-to-packed indices for the fact snapshot tasks."""
         from pllm.execution.cuda_stream import upload
 
-        mapping = tuple(
-            link.packed_row_index for link in sorted(value.sampler_rows.links, key=lambda link: link.sampler_row_index)
-        )
+        mapping = value.sampler_rows.packed_indices
         if self.program.sample_rows.numel():
             self.program.sample_rows[: len(mapping)].copy_(upload(mapping, torch.device("cpu")))
 

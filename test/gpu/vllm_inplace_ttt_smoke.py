@@ -177,8 +177,7 @@ def _projection_output(reader, hidden):
 
 def _check_cancelled_projection(handle):
     """A captured real projection retains its pinned page through cancellation."""
-    from pllm.contracts.hidden_locator import HiddenPhase
-    from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
+    from pllm.contracts.packed_rows import label_rows
 
     execution = handle.runner.require_session().deployment.execution
     overlay = handle.runner.require_session().parameter_overlay
@@ -186,7 +185,8 @@ def _check_cancelled_projection(handle):
     identity = RequestIdentity("cancelled-projection", 41, 0)
     stream = torch.cuda.current_stream()
     (ref,) = execution.admit((identity,), stream)
-    rows = PackedPhaseRowBatch.from_rows(0, 1, (PackedPhaseRow(0, 0, 0, HiddenPhase.PREFILL, identity),))
+    # The first token of a two-token prompt: a prefill row that does not end the prompt.
+    rows = label_rows((identity,), [1], [2], [0], 0).row_batch
     invocation = execution.begin(rows.rows, stream)
     overlay.reserve()
     overlay.prepare_pinned(rows, invocation, execution.directory, None)

@@ -24,13 +24,7 @@ from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
-from pllm.contracts.packed_rows import (
-    PackedPhaseRow,
-    PackedPhaseRowBatch,
-    PackedRows,
-    PackedSamplerRowBatch,
-    label_rows,
-)
+from pllm.contracts.packed_rows import PackedRows, RowLabeler, label_rows
 from pllm.contracts.parameter_overlay import ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import SamplerFeedback, SamplerStage
@@ -387,7 +381,7 @@ def _input_token_rows(
 
 
 def _feedback(value: StepInput, shape: ModelShape, perturbed: int | None) -> SamplerFeedback:
-    rows = tuple(value.rows.rows[link.packed_row_index] for link in value.sampler_rows.links)
+    rows = value.rows.inspect(value.sampler_rows.packed_indices)
     logits = torch.cat(
         tuple(
             _token_values(
@@ -411,9 +405,9 @@ def _field_name(declaration: TensorDeclaration, resource: str, index: int) -> st
 
 
 def _state_values(
-    execution: StateExecution, row: PackedPhaseRow, declaration: TensorDeclaration
+    execution: StateExecution, rows: PackedRows, declaration: TensorDeclaration
 ) -> dict[str, torch.Tensor]:
-    selection = execution.directory.select(PackedRows.from_rows((row,)))
+    selection = execution.directory.select(rows)
     immutable = {state.resource for state in declaration.graph.states if state.immutable}
     return {
         f"state {group.resource}.{_field_name(declaration, str(group.resource), index)}": value.detach().clone()
@@ -499,7 +493,7 @@ def _execute_step(
             guidance = context.guidance
             for stage in guidance:
                 for index, sampler_index in enumerate(stage.affected_row_ids):
-                    row = value.rows.rows[value.sampler_rows.links[sampler_index].packed_row_index]
+                    row = value.rows.inspect_row(int(value.sampler_rows.packed_indices[sampler_index]))
                     point = row.identity.request_id, row.token_offset
                     run.values[*point, f"sampler {stage.member}"] = stage.values[index].detach().clone()
                     if stage.row_weights is not None:
@@ -634,7 +628,9 @@ def _run(
     execution.admit(identities)
     imports = _imported_batch(declaration, identities, perturbed)
     import_rows = prompt_rows(identities)
-    frontiers: dict[RequestIdentity, int] = {}
+    labeler = RowLabeler()
+    for identity in script:
+        labeler.admit(identity)
     try:
         stride = lcm(*(task.export.every for task in tasks.values() if task.export is not None))
         for step, counts in enumerate(_schedule(order, mixed, preempted)):
@@ -649,13 +645,7 @@ def _run(
                 import_rows=import_rows,
             )
             if policy == "keep":
-                sampler = retained_rows(value.sampler_rows, frontiers)
-                value = replace(
-                    value,
-                    rows=sampler.row_batch,
-                    sampler_rows=sampler,
-                    hidden=None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch),
-                )
+                value = retained_rows(labeler, value, counts, script)
             site_step = None
             if forward is not None or declaration.sites.rewrites or attention is not None:
                 tokens = _embeddings(value, shape.hidden_size, facts.probe.tensor_dtype.torch, perturbed)
@@ -674,17 +664,19 @@ def _run(
                     ((row.identity.request_id, row.token_offset, "custom_forward"), output.detach().clone())
                     for row, output in zip(value.rows.rows, forward.output, strict=True)
                 )
-            for row in value.rows.producer_rows(None):
-                for group in execution.directory.select(PackedRows.from_rows((row,))).groups:
+            producers = value.rows.producer_rows(None)
+            for index, row in enumerate(producers):
+                selected = producers[index : index + 1]
+                for group in execution.directory.select(selected).groups:
                     if str(group.resource) in run.shared_resources and any(ref.version_id > 0 for ref in group.refs):
                         run.shared_values.update(
                             (row.identity.request_id, row.token_offset, name)
-                            for name in _state_values(execution, row, declaration)
+                            for name in _state_values(execution, selected, declaration)
                             if name.startswith(f"state {group.resource}.")
                         )
                 run.values.update(
                     ((row.identity.request_id, row.token_offset, name), tensor)
-                    for name, tensor in _state_values(execution, row, declaration).items()
+                    for name, tensor in _state_values(execution, selected, declaration).items()
                 )
     finally:
         execution.release_history()
@@ -1210,19 +1202,21 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
     return result
 
 
-def retained_rows(rows: PackedSamplerRowBatch, frontiers: dict[RequestIdentity, int]) -> PackedSamplerRowBatch:
-    """CPU reference for retained replay; production uses the native row labeler.
+def retained_rows(
+    labeler: RowLabeler,
+    value: StepInput,
+    counts: tuple[tuple[int, int, int], ...],
+    script: tuple[RequestIdentity, ...],
+) -> StepInput:
+    """Relabel a step as the runner's labeler does when retained state survives preemption: tokens a request
+    already consumed, including partial replay chunks, are marked recomputed.
 
-    Mark previously consumed tokens, including partial replay chunks.
-
-    The checker removes frontiers on retirement. Reset-and-replay workloads do not
-    call this: their model-state transitions must run again.
+    Reset-and-replay workloads do not call this: their model-state transitions must run again.
     """
-    batch = rows.row_batch
-    labeled = tuple(
-        replace(row, recomputed=True) if row.token_offset < frontiers.get(row.identity, 0) else row
-        for row in batch.rows
+    scheduled, prompt, computed = (
+        np.array(column, dtype=np.int32) for column in zip(*((n, _PROMPTS[i], done) for i, n, done in counts))
     )
-    for row in batch.request_rows:
-        frontiers[row.identity] = max(frontiers.get(row.identity, 0), row.token_offset + 1)
-    return replace(rows, row_batch=PackedPhaseRowBatch.from_rows(batch.step_id, batch.total_rows, labeled))
+    ids = np.array([labeler.ids[script[i].request_id] for i, _, _ in counts], dtype=np.int64)
+    sampler = labeler.prepare(scheduled, prompt, computed, ids, value.rows.step_id, True)
+    hidden = None if value.hidden is None else replace(value.hidden, row_batch=sampler.row_batch)
+    return replace(value, rows=sampler.row_batch, sampler_rows=sampler, hidden=hidden)

@@ -964,7 +964,7 @@ pllm.testing.run_guided_step(execution: 'StateExecution', value: 'StepInput', *,
 pllm.testing.run_step(execution: 'StateExecution', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'TensorOutput'
     Execute every anchor of one step, completing the sampler with `feedback` when the workload reads it.
 pllm.testing.step_input(identities: 'Sequence[RequestIdentity]', hidden: 'Mapping[PackedHiddenResourceBinding, torch.Tensor] | None' = None, *, step_id: 'int' = 0, token_offset: 'int' = 0, tokens: "Sequence[Literal['prefill', 'decode']] | None" = None, sampler_order: 'Sequence[int] | None' = None, batch: 'HostBatch[torch.Tensor] | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), stream: 'torch.cuda.Stream | None' = None) -> 'StepInput'
-    One packed step: row i belongs to `identities[i]` and decodes unless `tokens` says otherwise.
+    One packed step: row i is the one token of request `identities[i]` at `token_offset`; it decodes unless `tokens` says "prefill", which makes it the last token of the request's prompt.
 pllm.testing.scheduled_step(identities: 'tuple[RequestIdentity, ...]', scheduled: 'list[int]', prompt: 'list[int]', computed: 'list[int]', hidden: 'Mapping[AttachmentHiddenResource, torch.Tensor]', *, step_id: 'int' = 0, operands: 'tuple[ProjectionOperands, ...]' = ()) -> 'StepInput'
     Build a CPU step from scheduler counts, selecting only the runners' tapped rows.
 ```

@@ -80,13 +80,11 @@ def main() -> None:
             up = parameters[4 * width :].reshape(2, vocab, 2)
             rows = guidance.guidance.sampler_rows
             expected = torch.zeros(logits.shape, device=logits.device, dtype=torch.float32)
-            for link in rows.links:
-                identity = rows.row_batch.rows[link.packed_row_index].identity
+            for sampler, packed in enumerate(rows.packed_indices.tolist()):
+                identity = rows.row_batch.identity(packed)
                 if identity.sample_index:
-                    expected[link.sampler_row_index] = config.lambd * (
-                        hidden[link.packed_row_index]
-                        @ down[identity.sample_index - 1].T
-                        @ up[identity.sample_index - 1].T
+                    expected[sampler] = config.lambd * (
+                        hidden[packed] @ down[identity.sample_index - 1].T @ up[identity.sample_index - 1].T
                     )
             torch.testing.assert_close(guidance.pred_dense_logits, expected, rtol=2e-4, atol=2e-5)
             result = native_add(stages, logits, dtype=dtype)

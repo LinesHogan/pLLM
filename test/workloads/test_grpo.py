@@ -11,8 +11,9 @@ from pllm import AdamW
 from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch, validate_host_batch
 from pllm.contracts.semantic_graph import HostServiceInputSource
 from pllm.execution.shared_tensor import SharedTensor
+from pllm.execution.step_input import StepInput
 from test.workloads.grpo_workload import GRPO
-from test.workloads.test_tlm import TinyCausalPort, batch_input, causal_facts
+from test.workloads.test_tlm import TinyCausalPort, causal_facts
 
 
 def test_weighted_causal_loss_and_adamw_match_torch() -> None:
@@ -67,7 +68,7 @@ def test_weighted_causal_loss_and_adamw_match_torch() -> None:
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        result = execution.step(batch_input(delivered))
+        result = execution.step(StepInput.of_batch(delivered))
         assert result.publication is not None
         (current,) = result.publication.after_refs
         assert current.version_id == version

@@ -34,7 +34,7 @@ def test_bulk_labels_links_and_tap_slots_match_retained_replay_and_slot_reuse():
     """Compare all native facts with the prior record semantics as membership and generations change."""
     import numpy as np
 
-    from pllm.contracts.packed_rows import PackedPhaseRow, PackedSamplerRowLink, RowLabeler
+    from pllm.contracts.packed_rows import PackedPhaseRow, RowLabeler
 
     labeler = RowLabeler()
     identities = tuple(RequestIdentity(key, index, 0) for index, key in enumerate(("a", "b", "c")))
@@ -72,9 +72,9 @@ def test_bulk_labels_links_and_tap_slots_match_retained_replay_and_slot_reuse():
                         offset < frontiers.get(identity, 0),
                     )
                 )
-            links.append(PackedSamplerRowLink(ordinal, len(rows) - 1))
+            links.append(len(rows) - 1)
             frontiers[identity] = max(frontiers.get(identity, 0), start + count)
-        assert actual.row_batch.rows == tuple(rows) and actual.links == tuple(links)
+        assert actual.row_batch.rows == tuple(rows) and actual.packed_indices.tolist() == links
         last = {row.request_ordinal: row for row in rows}
         for phases in (
             (HiddenPhase.DECODE,),
