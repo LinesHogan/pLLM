@@ -14,6 +14,7 @@ while [ "$#" -gt 0 ]; do
 Usage: ROOT=<checkout> PY=<venv/bin/python> bash tools/full_verify.sh [options] [cpu|gpu|stage...]
 Default: static checks + tier 0 CPU + tier 1 GPU core + affected tier 2 groups.
 --base REF  Compare changed paths with merge-base(REF, HEAD); default main, including dirty paths.
+            When HEAD is that merge-base (e.g. on main), every feature group runs.
 --all       Run every feature group for scheduled/release sweeps.
 --explain   Print selected feature groups and the changed paths requiring them; do not run tests.
 --list cpu|gpu|all  Print the selected stages, suitable for cluster_verify.
@@ -65,7 +66,8 @@ if [ "${#requested[@]}" -gt 0 ]; then
 fi
 LOGS=${LOGS:-$ROOT/docs/cleanup/verify}; mkdir -p "$LOGS"
 printf '%s' "$selection" > "$LOGS/selection.tsv"
-[ -z "$selection" ] || printf 'Selected feature groups (group / changed path):\n%s\n' "$selection"
+if [ -n "$selection" ]; then printf 'Selected feature groups (group / reason):\n%s\n' "$selection"
+else echo 'Selected feature groups: none (no changed path maps to a feature group)'; fi
 if git rev-parse --git-dir >/dev/null 2>&1; then
   commit=$(git rev-parse HEAD); dirty=no
   [ -z "$(git status --porcelain)" ] || dirty=yes

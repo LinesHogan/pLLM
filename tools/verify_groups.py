@@ -98,6 +98,9 @@ def selection(base: str, all_groups: bool) -> dict[str, str]:
     if all_groups:
         return dict.fromkeys(GROUPS, "--all")
     merge_base = subprocess.check_output(["git", "merge-base", base, "HEAD"], text=True).strip()
+    # On the base itself there is no branch diff to select from; nothing says which groups the commits need.
+    if merge_base == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip():
+        return dict.fromkeys(GROUPS, f"HEAD is on {base}; no branch diff to select from")
     changed = subprocess.check_output(["git", "diff", "--name-only", "--no-renames", "-z", merge_base], text=True)
     untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], text=True)
     chosen: dict[str, str] = {}
