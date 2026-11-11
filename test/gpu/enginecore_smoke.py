@@ -24,7 +24,7 @@ from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
 from pllm.authoring import CausalTrainBatch, StateImport, WeightedCEBatch
-from pllm.config import ExecutionOptions, ModelConfig, RunnerName
+from pllm.config import ExecutionOptions, ModelConfig
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.host import HostConfig, make_host
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
@@ -238,12 +238,12 @@ def _graph_overlay(*, exact: bool = False) -> None:
     print(f"Multi-target source graphs: exact={exact}; EngineCore replay; parent CUDA=off")
 
 
-def _captured_esamp(runner: RunnerName = "mrv2") -> None:
+def _captured_esamp() -> None:
     assert not torch.cuda.is_initialized()
     options = ExecutionOptions(cuda_graph_pool_budget_bytes=16 * 1024**2)
     handle = pllm.make_llm(
         workload=ESampWorkload(ESampConfig(rank=2)),
-        config=engine(runner=runner, execution=options),
+        config=engine(execution=options),
     )
     try:
         tasks = handle.attachment.plan.schedule.tasks
@@ -268,7 +268,7 @@ def _captured_esamp(runner: RunnerName = "mrv2") -> None:
         assert any(event.kind is TraceEventKind.GRADIENT and event.tensor().abs().sum() > 0 for event in trace.events)
         handle.select_trace(TraceSelection())
         handle.profile_tasks(())
-        print(f"Captured ESamp EngineCore ({runner}): loss/update=8, profiled tasks, parent CUDA=off")
+        print("Captured ESamp EngineCore: loss/update=8, profiled tasks, parent CUDA=off")
     finally:
         handle.close()
 
@@ -561,7 +561,6 @@ MODES = {
     "--captured-only": _captured_esamp,
     "--pinned-graph-only": _graph_overlay,
     "--hybrid-graph-only": lambda: _graph_overlay(exact=True),
-    "--mrv1-captured": lambda: _captured_esamp("mrv1"),
     "--gpu-io-only": _gpu_shared_input,
     "--lora-only": lambda: (_output_lora_shared_input(), _independent_lora_input()),
     "--edit-only": _fttt_activation_retry,

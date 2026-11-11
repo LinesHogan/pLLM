@@ -105,8 +105,7 @@ def test_inplace_neutral_contract(tmp_path):
     print(result)
 
 
-@pytest.mark.parametrize("runner", ("mrv1", "mrv2"))
-def test_distribution_contract(monkeypatch, runner):
+def test_distribution_contract(monkeypatch):
     from pllm.testing import check_distribution
     from pllm.testing_distribution import SamplerObservation
 
@@ -127,7 +126,6 @@ def test_distribution_contract(monkeypatch, runner):
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
-        runner=runner,
     )
     near = check_distribution(
         ESampWorkload(ESampConfig(rank=2, intervention_beta=1e-4)),

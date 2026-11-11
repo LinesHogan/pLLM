@@ -115,7 +115,7 @@ run_stage() {
     reft) smoke vllm_reft_smoke ;;
     inplace) smoke vllm_inplace_ttt_smoke ;;
     tlm) smoke vllm_tlm_smoke ;;
-    enginecore) smoke enginecore_smoke || rc=1; smoke vllm_mrv1_smoke || rc=1; return "$rc" ;;
+    enginecore) smoke enginecore_smoke ;;
     tp) pytest_gpu test/gpu/vllm_tp_smoke.py -k 'not (test_j5_routes and step_loop)' ;;
     tp-step-loop) pytest_gpu test/gpu/vllm_tp_smoke.py -k 'test_j5_routes and step_loop' ;;
     *) echo "Unknown stage: $1; use --help" >&2; return 2 ;;

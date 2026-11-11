@@ -155,7 +155,6 @@ class ExplainResult:
 
     model: ModelShape
     dtype: str
-    runner: str
     tensor_parallel_size: int
     eager_reason: str
     members: tuple[MemberCost, ...]
@@ -492,8 +491,6 @@ def _settings(
         result.extend(_task_settings(task))
     if config.cuda_graphs is False:
         result.append(EscapeHatch("", "cuda_graphs", "False", False, "model forward runs eagerly"))
-    if config.runner == "mrv1":
-        result.append(EscapeHatch("", "runner", "mrv1", False, "workloads run without model CUDA graphs"))
     return tuple(result)
 
 
@@ -518,7 +515,7 @@ def _guidance_setting(config: ModelConfig, facts: BackendCompileFacts) -> Escape
         "peaked full-vocabulary rows use the true one-token nucleus when top-1 probability >= top_p < 1; "
         "choose capacities so the common case never takes the overflow path; "
         "smaller K is slower because overflow rows need top-K selection; "
-        "MRv2, unquantized unscaled TP=1 LM head; FLOP/byte estimates are capacity upper bounds",
+        "unquantized unscaled TP=1 LM head; FLOP/byte estimates are capacity upper bounds",
     )
 
 
@@ -754,7 +751,6 @@ def explain_facts(
     return ExplainResult(
         shape,
         config.dtype,
-        config.runner,
         config.tensor_parallel_size,
         reason,
         _members(

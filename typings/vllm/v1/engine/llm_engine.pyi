@@ -4,14 +4,13 @@ The nested worker is accessed only in in-process mode; EngineCore clients in eit
 mode support shutdown. These declarations describe the configured object graph.
 """
 
-from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runner import WorkloadModelRunner
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.config import VllmConfig
 from vllm.v1.core.sched.scheduler import Scheduler
 
 class _Worker:
-    model_runner: WorkloadModelRunner | Mrv1Runner
+    model_runner: WorkloadModelRunner
 
 class _WorkerWrapper:
     worker: _Worker

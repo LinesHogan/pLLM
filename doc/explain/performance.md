@@ -393,13 +393,13 @@ class SelectiveBias(pllm.Workload):
 
 #### Sampler epilogue：把词表操作放进已有遍历
 
-框架把工作负载的 logits 操作并入 LM Head 和采样阶段，统一称为 **sampler epilogue**。`@pllm.add_logits` 的多个贡献按声明顺序加入，每次仍按输入 logits 的 dtype 舍入；`rows=` 只影响选中行，再照常执行 vLLM 的惩罚、掩码、温度和过滤。MRv2 在需要处理 logits 的步骤中，把这些加法与已有的 FP32 采样输入拷贝合成一次遍历；跳过处理的步骤保留 LM Head 的 dtype，省去每个贡献的 dtype 转换、独立加法和行子集的全量拷贝；随后可继续组合 `@pllm.guide_sampling`。逐步路径不读取设备值到主机。请求 raw logprobs 时仍保留独立原始分布；MRv1 使用同一有序加法内核，但输入已经是 FP32 时没有可省的上游转换遍历。
+框架把工作负载的 logits 操作并入 LM Head 和采样阶段，统一称为 **sampler epilogue**。`@pllm.add_logits` 的多个贡献按声明顺序加入，每次仍按输入 logits 的 dtype 舍入；`rows=` 只影响选中行，再照常执行 vLLM 的惩罚、掩码、温度和过滤。在需要处理 logits 的步骤中，框架把这些加法与已有的 FP32 采样输入拷贝合成一次遍历；跳过处理的步骤保留 LM Head 的 dtype，省去每个贡献的 dtype 转换、独立加法和行子集的全量拷贝；随后可继续组合 `@pllm.guide_sampling`。逐步路径不读取设备值到主机。请求 raw logprobs 时仍保留独立原始分布。
 
 `explain` 将这次共享拷贝的输入读取、FP32 写回和一个内核归到第一个解码加法，后续加法只计各自贡献的读取字节；行选择按最大全批大小估计。这是逻辑流量估计，不是延迟预测。
 
 #### 默认有界融合引导：容量为什么是 4096？
 
-`ExecutionOptions.guidance_capacity` 默认是 **4096**。在支持的 MRv2、TP=1、未量化且未缩放或变换的 LM Head 上，框架在 vLLM 完成过滤后只投影保留下来的 token，并把引导与抽样融合；不支持的 runner 或 LM Head 会自动选择精确的 dense 路径。`guidance_capacity=None` 可显式选择精确 dense，`pllm.explain` 会报告实际路径、回退原因以及相应的 FLOP/字节估计。
+`ExecutionOptions.guidance_capacity` 默认是 **4096**。在 TP=1、未量化且未缩放或变换的 LM Head 上，框架在 vLLM 完成过滤后只投影保留下来的 token，并把引导与抽样融合；其他 LM Head 会自动选择精确的 dense 路径。`guidance_capacity=None` 可显式选择精确 dense，`pllm.explain` 会报告实际路径、回退原因以及相应的 FLOP/字节估计。
 
 **容量应让常见行不进入 overflow 路径，因为 overflow 行还需要 top-K 选择。** 保留下来的有限 logits 不超过 K 时，内核直接压紧、投影、抽样，无需排序。超过 K 时才选出 logits 最高的 K 个 token 进行引导，其余 tail 保持未引导并参与抽样（相同 logit 按 token ID 决胜）。若上游跳过了全词表行的过滤，且 top-1 概率达到 `top_p < 1`，则使用真正的单 token nucleus。
 
@@ -582,7 +582,7 @@ FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2
 > **实用建议与限制**
 > * **布局改的是模型数学**：未经相应训练的模型直接换成窗口或跨层共享布局，回答质量可能明显变差（示例 10 中 `LocalGlobal` 和 `CrossLayerShared` 都答错了长文检索问题，`PromptPlusWindow` 答对）。先在自己的任务上验证质量，再看吞吐。
 > * **不支持按注意力分数动态淘汰物理 KV 块（如 SnapKV / H2O）**：vLLM 对每个请求只维护单一的 `num_computed_tokens` 计数，位置编码与物理槽位均由它线性推导，且块表（block table）只能追加、不能在中间挖洞。如果你的目标是省 KV 显存，请改用静态 `keep="window"`（可加 `sink=True`）或 `keep="none", source=...`；如果只想少读，用 `kv.attend(q, topk=...)`。
-> * **硬件与配置限制**：`@pllm.custom_attention` 要求 `tensor_parallel_size=1`、FlashAttention-2、非量化 KV 且关闭 prefix caching；静态布局还要求 MRv2 runner，且不能与 `pllm.PositionState` 或 `@pllm.custom_forward` 同时使用。
+> * **硬件与配置限制**：`@pllm.custom_attention` 要求 `tensor_parallel_size=1`、FlashAttention-2、非量化 KV 且关闭 prefix caching；静态布局不能与 `pllm.PositionState` 或 `@pllm.custom_forward` 同时使用。
 > * **不要设极小的滑动窗口**：在一次 0.5B 的内核测量中（128 行，FA2），窗口极小（如只有 3 个 token）时处理窗口的耗时（$91.5\ \mu\text{s}$）反而比直接算全量注意力（$16.6\ \mu\text{s}$）慢 5 倍以上。
 > * **复用模型自带的稀疏选择**：读取并复用 DSA 一类模型自带的 top-k 选择（`pllm.attention(layer, "topk")`）需要 vLLM 的 DSA 路径，要求 **SM90+（Hopper 架构，如 H100）**；在 RTX 4090（SM89）和 A100（SM80）上不可用，调用会报错说明尚未支持。
 
@@ -698,7 +698,7 @@ class SkipMiddle(pllm.Workload):
 
 ## 6. 多卡张量并行（TP > 1）
 
-当模型单卡装不下或需要更高带宽时，可以通过 `ModelConfig(tensor_parallel_size=...)` 开启多卡张量并行（需 vLLM 0.32.0 与 `runner="mrv2"`）。
+当模型单卡装不下或需要更高带宽时，可以通过 `ModelConfig(tensor_parallel_size=...)` 开启多卡张量并行（需 vLLM 0.32.0）。
 
 ### 原理与代价：为什么 pLLM 选择“小状态按卡复制 + 流优先级错峰”？
 

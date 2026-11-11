@@ -114,7 +114,7 @@
 
 - `@pllm.custom_residual`、`@pllm.custom_attention` 目前需要 `tensor_parallel_size=1`，并且要关闭前缀缓存。
 - `@pllm.custom_attention` 需要 FlashAttention 2 后端、未量化的 KV，只用于 KV 全部在分页缓存里的模型（稠密 Qwen2/2.5、Llama、Qwen3 和 Qwen3-MoE）。
-- 静态 KV 布局需要 MRv2 runner（默认），不能和 `PositionState` 或 `@pllm.custom_forward` 一起用。
-- 张量并行只在 vLLM 0.32.0 的 MRv2 runner 上，哪些功能可以多卡见[支持矩阵](../reference/support-matrix.md)。
+- 静态 KV 布局不能和 `PositionState` 或 `@pllm.custom_forward` 一起用。
+- 张量并行只在 vLLM 0.32.0 上，哪些功能可以多卡见[支持矩阵](../reference/support-matrix.md)。
 - 一个原则：贵的选择由你显式写出来，pLLM 不替你做——大表放显存还是主机内存、KV 怎么存、训练结果几步后可见（`publish_lag`），都写在你的声明里，`pllm.explain` 把代价列出来。默认值只替你省掉小的决定。
 - 这些能力各自省的是哪种资源（显存容量、显存带宽、PCIe、卡间通信、时间线气泡、SM、host CPU）、实测效果和边界，见[性能与显存](../explain/performance.md)。

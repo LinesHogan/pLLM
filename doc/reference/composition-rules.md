@@ -45,7 +45,6 @@
 | --- | --- | --- |
 | `@pllm.custom_residual`、`@pllm.custom_attention`、overlay、`ActivationPatch` | `enable_prefix_caching=False` | 缓存的 KV 是在别的改写下算出的 |
 | `@pllm.custom_attention` | `tensor_parallel_size=1`、FlashAttention 2、未量化 KV | 每张卡只看到自己的头；定制读法直接读 KV 页 |
-| `pllm.input_tokens`、`PositionState`、`@pllm.custom_forward`、静态 KV 布局 | `runner="mrv2"` | 依赖 MRv2 runner 的输入和 KV 管理 |
 | 给 `@pllm.custom_residual` 喂 `pllm.input_tokens` 的方法 | `tensor_parallel_size=1` | 定制残差还不支持多卡 |
 | `cuda_graphs=True` | 没有需要 eager 的写法 | 见[支持矩阵](support-matrix.md#cuda-graph-与-eager) |
 

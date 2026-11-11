@@ -12,7 +12,6 @@ from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
 from pllm.authoring import BackendWorkload, DataT, ResultT, map_host_batch
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.mrv1 import Mrv1Runner
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
     BackendCommand,
@@ -29,22 +28,18 @@ from pllm.workload_transport import decode_workload
 
 
 class GPUWorker(compat.Worker):
-    def _make_model_runner(self) -> WorkloadModelRunner | Mrv1Runner:
+    def _make_model_runner(self) -> WorkloadModelRunner:
         if self.parallel_config.tensor_parallel_size > 1:
             # Prioritize TP collectives over the replicated training lane, whose stream has priority 0.
             stream = torch.cuda.Stream(device=self.device, priority=-1)
             stream.wait_stream(torch.cuda.current_stream(self.device))
             torch.cuda.set_stream(stream)
-        return (
-            WorkloadModelRunner(self.vllm_config, self.device)
-            if self.use_v2_model_runner
-            else Mrv1Runner(self.vllm_config, self.device)
-        )
+        return WorkloadModelRunner(self.vllm_config, self.device)
 
     @property
-    def workload_runner(self) -> WorkloadModelRunner | Mrv1Runner:
+    def workload_runner(self) -> WorkloadModelRunner:
         runner = self.model_runner
-        assert isinstance(runner, (WorkloadModelRunner, Mrv1Runner))
+        assert isinstance(runner, WorkloadModelRunner)
         return runner
 
     def install_workload(self, workload: BackendWorkload[DataT, ResultT], install: BackendInstall) -> None:

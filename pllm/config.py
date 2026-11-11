@@ -5,8 +5,6 @@ from typing import Literal, get_args
 
 # vLLM's names for the weight dtype; its aliases "half" and "float" are not accepted.
 ModelDType = Literal["bfloat16", "float16", "float32"]
-# vLLM model runner: "mrv2" is the V2 runner with async scheduling, "mrv1" the GPUModelRunner.
-RunnerName = Literal["mrv1", "mrv2"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +73,7 @@ class ExecutionOptions:
     publish_lag: int = 1
     # Guide the K highest-logit post-filter survivors; leave the tail unguided.
     # Peaked full-vocabulary rows use their true nucleus. None opts out to exact dense.
-    # Unsupported runners/heads select exact dense automatically.
+    # LM heads the bounded path cannot read (TP>1, quantized, scaled) select exact dense automatically.
     guidance_capacity: int | None = 4096
 
     def __post_init__(self) -> None:
@@ -115,7 +113,6 @@ class ModelConfig:
     generated_kv: Literal["reuse", "isolate"] = "isolate"
     revision: str | None = None
     multiprocessing: bool = False
-    runner: RunnerName = "mrv2"
     execution: ExecutionOptions = ExecutionOptions()
     # "auto" runs the model through vLLM's CUDA graphs when the workload supports them, else eagerly, with the reason
     # in diagnostics().eager_reason; True requires graphs (an unsupported workload raises), False runs eagerly.
@@ -130,7 +127,5 @@ class ModelConfig:
             raise ValueError("tensor_parallel_size must be an integer >= 1")
         if self.dtype not in get_args(ModelDType):
             raise ValueError(f'dtype must be "bfloat16", "float16" or "float32"; got {self.dtype!r}')
-        if self.runner not in get_args(RunnerName):
-            raise ValueError(f'runner must be "mrv2" or "mrv1"; got {self.runner!r}')
         if self.generated_kv not in ("reuse", "isolate"):
             raise ValueError('generated_kv must be "reuse" or "isolate"')

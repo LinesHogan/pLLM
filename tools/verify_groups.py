@@ -52,7 +52,6 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("test/gpu/vllm_reft_smoke.py", ("reft",)),
     ("test/gpu/vllm_tlm_smoke.py", ("tlm",)),
     ("test/gpu/enginecore_smoke.py", ("enginecore",)),
-    ("test/gpu/vllm_mrv1_smoke.py", ("enginecore",)),
     ("test/gpu/vllm_tp_smoke.py", ("tp",)),
     ("test/tp_overlays.py", ("tp",)),
     ("test/release/*", ("release",)),

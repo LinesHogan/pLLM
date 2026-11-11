@@ -4,13 +4,13 @@
 [能力地图](../guides/capability-map.md) 和 [设计取舍](../explain/design-tradeoffs.md)，换模型的具体步骤见
 [在新模型家族上使用](../howto/new-model-families.md)。
 
-## vLLM 版本与 runner
+## vLLM 版本
 
 | 项目 | 支持 | 说明 |
 | --- | --- | --- |
 | vLLM 版本 | 0.27.1、0.32.0 | 其他版本在导入 `pllm` 时报错：pLLM 接入 vLLM 的模型和调度器内部，只对这两个版本做过对齐 |
-| runner | `"mrv2"`（默认）、`"mrv1"` | `"mrv1"` 下负载一律以 eager 运行；`pllm.input_tokens`、`PositionState`、`@pllm.custom_forward`、静态 KV 布局需要 `"mrv2"` |
-| 张量并行 | vLLM 0.32.0 + `"mrv2"` | 见下文[张量并行](#张量并行) |
+| model runner | vLLM 的 MRv2 | pLLM 自己选定 MRv2（0.27.1 上替你设置 `VLLM_USE_V2_MODEL_RUNNER=1`），不支持 MRv1 |
+| 张量并行 | vLLM 0.32.0 | 见下文[张量并行](#张量并行) |
 | 流水线并行、数据并行 | 不支持 | 必须为 1 |
 
 ## 模型与功能
@@ -52,11 +52,11 @@ Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构测
 | `ActivationPatch`、请求状态上的 `Adapter`、`@pllm.custom_residual`、`@pllm.custom_attention`、按 token 历史查表 | vLLM 的 CUDA graph（vLLM 捕获模型原本的算子，不做 inductor 融合） |
 | `@pllm.custom_forward` | 不用 vLLM 的整模型 graph；pLLM 按层段调度并捕获自己的 graph |
 | 读共享 `InstanceState` 的 `Adapter` | eager |
-| `runner="mrv1"`、`cuda_graphs=False` | eager |
+| `cuda_graphs=False` | eager |
 
 ## 张量并行
 
-需要 vLLM 0.32.0 和 `runner="mrv2"`，设 `ModelConfig(tensor_parallel_size=N)`。
+需要 vLLM 0.32.0，设 `ModelConfig(tensor_parallel_size=N)`。
 
 | 可以多卡 | 需要 `tensor_parallel_size=1` |
 | --- | --- |

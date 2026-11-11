@@ -173,7 +173,7 @@ print(rows.shape)  # torch.Size([6, 896])
 - **返回值**：`torch.int64` 形状为 `[rows, history + 1]`。第 0 列 `ids[:, 0]` 是当前 token ID，后续列依次是向前回溯的 token ID（`ids[:, 1]` 为前一个，以此类推）。
 - **边界填充**：如果请求刚开始生成、回溯位置早于 prompt 第 0 个 token，相应位置填充 `-1`。
 - **行对齐**：当其计算结果被送入 [`@pllm.custom_residual`](forward-structure.md) 时，针对当前步调度的每一个 token 计算；对于其他方法（如 `@pllm.export`、`@pllm.add_logits`），则对应采样的行。
-- **依赖 MRv2 的原因**：`pllm.input_tokens` 要求 `ModelConfig(runner="mrv2")`（默认值）。token 历史取自 MRv2 runner 保存在 GPU 上的请求输入，所以查表不需要从 CPU 搬数据；MRv1 没有提供这份数据。详细用法可参考 [示例 11：查表记忆与 n-gram 先验](../examples/11_lookup_memory.ipynb)。
+- **数据来源**：token 历史取自 vLLM（MRv2 runner）保存在 GPU 上的请求输入，所以查表不需要从 CPU 搬数据。详细用法可参考 [示例 11：查表记忆与 n-gram 先验](../examples/11_lookup_memory.ipynb)。
 
 ```python
 class TokenWatcher(pllm.Workload):
@@ -258,7 +258,6 @@ tap      lm_head[0], prefill,decode: 29171840 bytes shared by top1
 | `... which is available only in Phase.AFTER_SAMPLE. Read feedback in @pllm.train or a read-only ...` | 在采样前的方法中读取了 `pllm.base_logits()` 或 `pllm.sampled_tokens()`。采样前若需读取 logits 请改用 `pllm.layer_logits((-1,))`，若需读取 hidden 请改用 `pllm.final_hidden()`。 |
 | `pllm.residual(after=...): use "layer" or "attention"` | `pllm.residual` 的 `after=` 参数仅支持 `"layer"`（整层之后）或 `"attention"`（注意力之后）。 |
 | `pllm.input_tokens(history=) needs a nonnegative integer` | `history` 必须是非负整数（$\ge 0$）。 |
-| `pllm.input_tokens needs runner="mrv2"` | 使用 `pllm.input_tokens` 时，`ModelConfig` 的 `runner` 必须设为 `"mrv2"`（默认值）。 |
 | `pllm.attention needs a nonnegative layer and fact='aux' or 'lse'` | `pllm.attention` 的层号必须是非负整数，且 `fact` 只能为 `"aux"` 或 `"lse"`。 |
 | `pllm.layer_logits reads the model's LM head; compile this workload with make_llm` | `pllm.layer_logits` 依赖模型运行时的完整 LM head 权重，无法在脱离模型的宿主独立编译（`make_host`）中使用。 |
 

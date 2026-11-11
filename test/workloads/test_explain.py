@@ -225,16 +225,12 @@ def test_declared_flop_estimates(model_config):
     )
     assert "highest 4096 survivors/row" in str(bounded) and "tail unguided" in str(bounded)
     assert "smaller K is slower because overflow rows need top-K selection" in str(bounded)
-    for config, reason in (
-        (replace(model_config, runner="mrv1"), "MRv1"),
-        (replace(model_config, tensor_parallel_size=2), "TP>1"),
-    ):
-        if config.tensor_parallel_size > 1 and compat.VLLM_027:
-            continue
-        fallback = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), config)
+    if not compat.VLLM_027:
+        sharded = replace(model_config, tensor_parallel_size=2)
+        fallback = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), sharded)
         prediction = next(task for member in fallback.members for task in member.tasks if task.name == "predict")
         assert prediction.estimate.projection_flops_estimate == rows * 2 * hidden * padded_vocab
-        assert "exact dense post-filter guidance" in str(fallback) and reason in str(fallback)
+        assert "exact dense post-filter guidance" in str(fallback) and "TP>1" in str(fallback)
     dola = pllm.explain(DoLaWorkload(layers=(0, 2)), model_config)
     contrast = next(task for member in dola.members for task in member.tasks if task.name == "contrast")
     assert contrast.estimate.projection_flops_estimate == rows * 3 * 2 * hidden * padded_vocab

@@ -142,6 +142,8 @@ class _HybridGraphManager(compat.CudaGraphManager):
 class OverlayGraphRunner(compat.ModelRunner):
     """Defer first compilation/capture until the ordinary workload installation completes."""
 
+    overlay_graph_mode: AttachmentGraphMode = AttachmentGraphMode.EAGER
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         super().__init__(vllm_config, device)
         self.projection_model: DecoderBody | None = None

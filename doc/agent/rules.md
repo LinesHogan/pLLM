@@ -67,12 +67,10 @@ Quantized checkpoints (GPTQ, AWQ, FP8) follow their family's rules: adapters cor
 projection's output, and reruns call vLLM's quantized modules. `causal_model` training needs a dense
 Qwen2/Llama/Qwen3 model in bfloat16 whose embedding and LM head are not quantized.
 
-### Engine versions and runners
+### Engine versions
 
 - vLLM 0.27.1 and 0.32.0 (`.venv` and `.venv-vllm032` in this repository); other versions refuse to start.
-- `runner="mrv2"` (default) is required by `pllm.input_tokens`, `PositionState`, `@pllm.custom_forward`,
-  static KV layouts and tensor parallelism. `runner="mrv1"` runs every workload without CUDA graphs and
-  lacks custom forwards.
+- pLLM always runs vLLM's MRv2 model runner (it sets `VLLM_USE_V2_MODEL_RUNNER=1` itself); MRv1 is unsupported.
 
 ### CUDA graphs
 
@@ -87,11 +85,11 @@ Qwen2/Llama/Qwen3 model in bfloat16 whose embedding and LM head are not quantize
 | `pllm.model.Adapter` on a `RequestState` | CUDA graphs |
 | `pllm.model.Adapter` on an `InstanceState` | eager: `CUDA-graph overlays do not support adapters backed by shared InstanceState` |
 | `@pllm.custom_forward` | pLLM captures its own graphs per layer slice: `@pllm.custom_forward schedules model slices and owns their wave graphs` |
-| `runner="mrv1"` or `cuda_graphs=False` | eager |
+| `cuda_graphs=False` | eager |
 
 ### Tensor parallelism (`tensor_parallel_size > 1`)
 
-Needs vLLM 0.32.0 and `runner="mrv2"`; single node; `pipeline_parallel_size` and `data_parallel_size`
+Needs vLLM 0.32.0; single node; `pipeline_parallel_size` and `data_parallel_size`
 stay 1.
 
 | Works with TP | Needs `tensor_parallel_size=1` |

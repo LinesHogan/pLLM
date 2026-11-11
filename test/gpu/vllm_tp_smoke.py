@@ -158,8 +158,6 @@ def test_j1_admission():
             pllm.make_llm(config(), workload=workload)
     with pytest.raises(ValueError, match="not shard-local.*other ranks"):
         pllm.explain(PrefillAdaptersWorkload(), config())
-    with pytest.raises(ValueError, match='runner="mrv2"'):
-        pllm.make_llm(replace(config(), runner="mrv1"), workload=DummyWorkload())
 
 
 def test_j1_reward_head(monkeypatch):

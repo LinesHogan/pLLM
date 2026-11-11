@@ -81,9 +81,7 @@ def compile_facts(
         )
     )
     custom_forward_capabilities = (
-        ("model/custom_forward@1", TOKEN_CAPTURE_CAPABILITY)
-        if config.runner == "mrv2" and overlay_graph_mode is AttachmentGraphMode.EAGER
-        else ()
+        ("model/custom_forward@1", TOKEN_CAPTURE_CAPABILITY) if overlay_graph_mode is AttachmentGraphMode.EAGER else ()
     )
     probe = ModelProbe(
         model_fingerprint=_digest(
@@ -123,7 +121,6 @@ def compile_facts(
                         *_REQUEST_CAPABILITIES,
                         *_OVERLAY_CAPABILITIES,
                         *custom_forward_capabilities,
-                        f"backend/vllm_{config.runner}@1",
                     )
                 )
             )
@@ -159,9 +156,7 @@ def compile_facts(
         shape.vocab_size,
         shape.layer_count,
         checkpoint,
-        guidance_rejection='MRv1 needs exact dense guidance; bounded guidance uses runner="mrv2"'
-        if config.runner != "mrv2"
-        else "TP>1 LM head needs exact dense projection"
+        guidance_rejection="TP>1 LM head needs exact dense projection"
         if config.tensor_parallel_size > 1
         else shape.guidance_rejection,
     )

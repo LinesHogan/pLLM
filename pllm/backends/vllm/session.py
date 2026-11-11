@@ -25,7 +25,7 @@ from pllm.backends.vllm.position_state import PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
 from pllm.backends.vllm.sampler import (
     BoundedSamplerGuidance,
-    SamplerGuidance,
+    GuidedSampler,
     SignedSamplerGuidance,
     SignedSamplerStages,
 )
@@ -73,7 +73,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self,
         deployment: BackendDeployment[DataT, ResultT],
         decoder: Decoder,
-        sampler: SamplerGuidance | None,
+        sampler: GuidedSampler | None,
         max_sampler_rows: int,
         taps: HiddenTaps | None = None,
         position_layers: tuple[PositionCacheLayer, ...] = (),
@@ -87,7 +87,7 @@ class VllmSession(Generic[DataT, ResultT]):
         if capacity is not None and any(
             stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in deployment.attachment.spec.sampler
         ):
-            assert sampler is not None and sampler.bounded_guidance
+            assert sampler is not None
             self._guidance_weight = decoder.model.lm_head.weight
         self.cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
@@ -299,7 +299,6 @@ class VllmSession(Generic[DataT, ResultT]):
         if preemption_policy(self.attachment, execution.math.model_sites) == "reset":
             for request_id in scheduler_output.finished_req_ids:
                 self._pending_identities.pop(request_id, None)
-            # Installed vLLM 0.27.1 emits this set for both runners, despite its MRv2-only field comment.
             self.preempt_requests(scheduler_output.preempted_req_ids or set())
         pending: list[RequestIdentity] = []
         for request in scheduler_output.scheduled_new_reqs:
@@ -309,12 +308,6 @@ class VllmSession(Generic[DataT, ResultT]):
             if params is None or (params.extra_args or {}).get(POLICY_KEY) != self.cache_envelope:
                 raise ValueError("request cache policy differs from installed workload; submit through its handle")
             pending.append(self._pending_identities[request.req_id])
-        # MRv2 sends resumed requests as new; MRv1 retains their cached request data.
-        pending.extend(
-            self._pending_identities[request_id]
-            for request_id in sorted(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
-            if request_id not in self.request_identities
-        )
         if pending:
             if bool(execution.directory.request_states):
                 execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
@@ -516,7 +509,7 @@ class VllmSession(Generic[DataT, ResultT]):
         batch-size sensitivity (0.0625 and 0.5). Steps without guided rows append none, and zero-strength
         guidance declares no sampler. Layer logits need the model's rows before the workload's tasks run,
         so with them the model's rows and the guidance are projected in separate calls. A request for logits
-        means the transformer forward is over on both runner ABIs.
+        means the transformer forward is over.
         """
         lm_head = self._compute_logits
         step = self.step

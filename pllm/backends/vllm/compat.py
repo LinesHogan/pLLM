@@ -38,8 +38,8 @@ def admit_parallel(config: ModelConfig, requirements: BackendRequirements = Back
         raise ValueError("@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads")
     if config.tensor_parallel_size == 1:
         return
-    if VLLM_027 or config.runner != "mrv2":
-        raise ValueError('multi-GPU needs vLLM 0.32.0 and runner="mrv2"; otherwise use tensor_parallel_size=1')
+    if VLLM_027:
+        raise ValueError("multi-GPU needs vLLM 0.32.0; otherwise use tensor_parallel_size=1")
     for used, feature in (
         (requirements.causal_training, "causal_model training"),
         (requirements.feeds, "state feeds"),
@@ -61,7 +61,6 @@ if VLLM_027:
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, flashinfer_sample
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
     from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as Mrv1GPUModelRunner
 
     class Worker(VllmWorker):
         """0.27.1 builds its runner inside init_device; 0.32.0 asks this factory, which pLLM's worker overrides."""
@@ -70,7 +69,7 @@ if VLLM_027:
             super().init_device()
             self.model_runner = self._make_model_runner()
 
-        def _make_model_runner(self) -> GPUModelRunner | Mrv1GPUModelRunner:
+        def _make_model_runner(self) -> GPUModelRunner:
             return self.model_runner
 
     class ModelRunner(GPUModelRunner):

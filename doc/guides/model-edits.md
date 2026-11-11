@@ -170,7 +170,7 @@ pllm.model.Adapter(
 
 ### 张量并行（TP）分片规则
 
-在 `tensor_parallel_size > 1`（vLLM 0.32 MRv2 架构）下，`"dense"` 与 `"low_rank"` 算子严格遵循底座投影的通信切分：
+在 `tensor_parallel_size > 1`（vLLM 0.32）下，`"dense"` 与 `"low_rank"` 算子严格遵循底座投影的通信切分：
 - **列并行投影（q_proj, k_proj, v_proj, gate_proj, up_proj）**：按输出特征切分。稠密权重按行切分；低秩补丁中 $B$ 按输出维度分片，$A$ 在各卡间复制。
 - **行并行投影（down_proj）**：按输入特征切分。稠密权重按列切分；低秩补丁中 $A$ 按输入维度分片，$B$ 在各卡间复制。
 - 状态必须由 `pllm.Zeros` 或 `pllm.Computed` 初始化，且只能由 `@pllm.train_in_forward` 在单卡本地分片上更新（禁止跨卡从列切分输出反向训练复制的 $A$，或从行切分输入反向训练复制的 $B$）。

@@ -1,7 +1,7 @@
-"""vLLM model runners that host one pLLM workload session.
+"""The vLLM model runner that hosts one pLLM workload session.
 
-Runner installs hidden taps and attaches a VllmSession; WorkloadModelRunner is the MRv2 runner class the
-worker instantiates. Used by runtime.py (construction) and pllm.worker.
+WorkloadModelRunner installs hidden taps and attaches a VllmSession; pllm.worker instantiates it and
+runtime.py drives it in process.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.config import CacheConfig, ModelConfig as VllmModelConfig, VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -26,7 +25,6 @@ from pllm.authoring import (
     DataT,
     ResultT,
 )
-from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.checkpoint import CheckpointLoader as CheckpointLoader
 from pllm.backends.vllm.hidden_taps import (
     TAPS_ENV,
@@ -41,10 +39,8 @@ from pllm.backends.vllm.overlay_graph import (
 from pllm.backends.vllm.packed_rows import encode_mrv2_rows
 from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.sampler import GuidedSampler, SamplerGuidance
+from pllm.backends.vllm.sampler import GuidedSampler
 from pllm.backends.vllm.session import VllmSession
-from pllm.config import RunnerName
-from pllm.contracts.backend_attachment import AttachmentGraphMode
 from pllm.contracts.codec import decode_boundary
 from pllm.contracts.kv_layout import KVLayout
 from pllm.execution.position_state import PositionAnnouncement
@@ -52,27 +48,35 @@ from pllm.execution.ptts.slot_pools import SlotPools
 from pllm.execution.state_execution import StateDiagnostics
 
 
-class Runner:
-    """The workload attachment slot and persistent sampling hook shared by both runner ABIs."""
+class WorkloadModelRunner(OverlayGraphRunner):
+    """vLLM's MRv2 runner with the workload attachment slot, hidden taps and the guided sampler."""
 
-    # vLLM's two sampler slot types differ; sessions only need their shared guidance lifecycle.
-    _sampler_guidance: SamplerGuidance
-    model: torch.nn.Module
-    cache_config: CacheConfig
-    model_config: VllmModelConfig
-    vllm_config: VllmConfig
-    device: torch.device
-    max_num_tokens: int
-    runner_kind: RunnerName
-    max_num_reqs: int
-
+    _guided_sampler: GuidedSampler
     hidden_taps: HiddenTaps | None = None
     hidden_layouts: tuple[HiddenTapLayout, ...] = ()
     hidden_pools: dict[tuple[str, int], SlotPools]
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
+    workload_session: VllmSession[Any, Any] | None = None
 
-    decoder: Decoder
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights)
+        assert self.sampler is not None
+        self.sampler = self._guided_sampler = GuidedSampler(self.sampler)
+        self.install_model_hooks()
+        self.position_states = decode_boundary(
+            os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
+        ).states
+        if self.position_states:
+            self.decoder.kv_writable("a PositionState")
+            if self.cache_config.cache_dtype != "auto":
+                raise ValueError("PositionState requires cache_dtype=auto in the model dtype")
+        self.position_layers = tuple(
+            PositionCacheLayer(1, self.model_config.get_hidden_size(), prefix=f"pllm.position.{index}.state")
+            for index, _ in enumerate(
+                self.position_states, self.model_config.get_num_layers(self.vllm_config.parallel_config)
+            )
+        )
 
     def install_model_hooks(self) -> None:
         """Install the logits hook and announced hidden taps before vLLM compiles the model."""
@@ -87,9 +91,6 @@ class Runner:
             return
         self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)
 
-    overlay_graph_mode: AttachmentGraphMode = AttachmentGraphMode.EAGER
-    workload_session: VllmSession[Any, Any] | None = None
-
     def attach_workload(
         self,
         deployment: BackendDeployment[DataT, ResultT],
@@ -98,11 +99,11 @@ class Runner:
         spec = deployment.attachment.spec
         if deployment.attachment.probe.position_states != self.position_states:
             raise ValueError("PositionState schema changed; create a new engine with this workload")
-        adapter = self._sampler_guidance if spec.sampler else None
+        sampler = self._guided_sampler if spec.sampler else None
         session = VllmSession(
             deployment,
             self.decoder,
-            adapter,
+            sampler,
             self.max_num_reqs,
             self.hidden_taps,
             self.position_layers,
@@ -111,14 +112,11 @@ class Runner:
         )
         self.workload_session = session
         try:
-            self._finish_model_binding()
+            self.finish_overlay_graphs(session.attachment)
         except Exception:
             session.close()
             self.workload_session = None
             raise
-
-    def _finish_model_binding(self) -> None:
-        """Finish backend model preparation after the session has installed its effects."""
 
     def detach_workload(self) -> None:
         session = self.require_session()
@@ -136,29 +134,6 @@ class Runner:
         if session is None:
             return self.decoder.compute_logits(hidden_states)
         return session.compute_logits(hidden_states)
-
-
-class WorkloadModelRunner(Runner, OverlayGraphRunner):
-    runner_kind: RunnerName = "mrv2"
-
-    def load_model(self, load_dummy_weights: bool = False) -> None:
-        super().load_model(load_dummy_weights)
-        assert self.sampler is not None
-        self.sampler = self._sampler_guidance = GuidedSampler(self.sampler)
-        self.install_model_hooks()
-        self.position_states = decode_boundary(
-            os.environ.get(POSITION_ENV, '{"states": []}'), PositionAnnouncement
-        ).states
-        if self.position_states:
-            self.decoder.kv_writable("a PositionState")
-            if self.cache_config.cache_dtype != "auto":
-                raise ValueError("PositionState requires cache_dtype=auto in the model dtype")
-        self.position_layers = tuple(
-            PositionCacheLayer(1, self.model_config.get_hidden_size(), prefix=f"pllm.position.{index}.state")
-            for index, _ in enumerate(
-                self.position_states, self.model_config.get_num_layers(self.vllm_config.parallel_config)
-            )
-        )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Keep prompt-sink groups separate so full-attention blocks cannot be reclaimed."""
@@ -186,9 +161,6 @@ class WorkloadModelRunner(Runner, OverlayGraphRunner):
             ):
                 raise ValueError("PositionState requires one KV group with whole allocation-block prefix hits")
         super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context)
-
-    def _finish_model_binding(self) -> None:
-        self.finish_overlay_graphs(self.require_session().attachment)
 
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture and warm up with no hidden-slot destinations, including deferred capture."""

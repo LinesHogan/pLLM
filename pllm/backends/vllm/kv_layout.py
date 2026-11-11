@@ -97,7 +97,8 @@ def layout_capacity(shape: ModelShape, config: ModelConfig, layouts: tuple[KVLay
                 sliding_window=layout.window,
             )
             blocks = spec.max_admission_blocks_per_request(
-                max_in_flight_tokens=(2 if config.runner == "mrv2" else 1) * config.max_num_batched_tokens,
+                # Async scheduling keeps a second step in flight.
+                max_in_flight_tokens=2 * config.max_num_batched_tokens,
                 max_model_len=config.max_model_len,
             )
         result.append(

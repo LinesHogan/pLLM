@@ -54,7 +54,7 @@ token the step computes fresh, prompt chunks included; only `@pllm.export` metho
 inputs) may read these rows, and each event lists the rows' token positions. All four inputs run inside
 CUDA graphs. A reading method needs an effect (usually `@pllm.export`, next section) or nothing schedules it.
 
-`pllm.input_tokens(history=n)` reads int64 `[rows, n + 1]` current and preceding request token IDs, with `-1` before position zero; MRv2 is required. Helpers consumed by `@pllm.custom_residual` use every scheduled row through `pllm.result`; other readers use sampled rows.
+`pllm.input_tokens(history=n)` reads int64 `[rows, n + 1]` current and preceding request token IDs, with `-1` before position zero. Helpers consumed by `@pllm.custom_residual` use every scheduled row through `pllm.result`; other readers use sampled rows.
 
 ```python
 class Lens(pllm.Workload):
@@ -343,7 +343,7 @@ Declare both as class attributes or typed properties. A `pllm.Field` shape calla
 reads receives each target's `(in_features, out_features)`; the state then has one copy of each field per
 target, named `a_0`, `b_0`, `a_1`, ... in target order.
 
-With `tensor_parallel_size > 1` (vLLM 0.32 MRv2), `"dense"` and `"low_rank"` deltas follow each projection's
+With `tensor_parallel_size > 1` (vLLM 0.32), `"dense"` and `"low_rank"` deltas follow each projection's
 shards: q/k/v and gate/up partition dense weights and B by output rows, down partitions dense weights and A by
 input columns; the other factor is replicated. The state starts from `pllm.Zeros` or `pllm.Computed` and only
 `@pllm.train_in_forward` may update it, using the local shard (training replicated A from column-sharded outputs,
@@ -414,7 +414,7 @@ including `topk=`. Top-K selection saves reads, not memory; freeing memory by sc
 `pllm.explain` prints a `KV layer` line per layer with the per-request bound. Methods may read
 `InstanceState` parameters or modules, `pllm.depth()` and earlier `pllm.attention(...)` facts, and call pure
 custom ops. Requirements: `tensor_parallel_size=1`, unquantized KV, plain RoPE attention, prefix caching off,
-dense Qwen2/Llama/Qwen3 or Qwen3-MoE; layouts also need `runner="mrv2"` and exclude `pllm.PositionState` and
+dense Qwen2/Llama/Qwen3 or Qwen3-MoE; layouts also exclude `pllm.PositionState` and
 `@pllm.custom_forward`. Full reads use FlashAttention 2; stored windows use vLLM's FlashInfer plans on
 Ampere/Ada (they keep grouped-query decode, which FA2's window path drops); prompt-sink reads use vLLM's
 Triton path.
@@ -484,7 +484,7 @@ print(pllm.explain(ValueResidual(), CONFIG).eager_reason)
 pLLM schedules a custom forward's layer slices itself and captures its own CUDA graphs for them, so vLLM's
 whole-model graph is not used and `eager_reason` names `@pllm.custom_forward`. Methods reading `pllm.hidden` or
 `pllm.final_hidden` are rejected; `pllm.residual` and `pllm.layer_logits` read each layer's last visited stream.
-A `pllm.model.Adapter` in the same workload applies its delta at every projection call the program makes. Tensor parallelism needs vLLM 0.32.0 with `runner="mrv2"`. The slice graphs may need a larger
+A `pllm.model.Adapter` in the same workload applies its delta at every projection call the program makes. Tensor parallelism needs vLLM 0.32.0. The slice graphs may need a larger
 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)` than the default; explain does not estimate it, and the error names the
 bytes required. Bounded Python `for` loops over workload settings are unrolled when traced.
 
@@ -645,11 +645,10 @@ requests fit, per TP rank).
 | `enable_prefix_caching`, `enable_chunked_prefill` | `False`, `False` | vLLM features; see [rules.md](rules.md#engine-settings-that-interact-with-workloads). |
 | `generated_kv` | `"isolate"` | With prefix caching and a workload that treats prompt and generated tokens differently (patches, adapters, some custom forwards): `"isolate"` keys blocks of generated tokens apart from prompt blocks with the same tokens; `"reuse"` lets them match. |
 | `multiprocessing` | `False` | Run vLLM's EngineCore in its own process; the workload class must be importable. |
-| `runner` | `"mrv2"` | vLLM model runner; `"mrv1"` runs workloads eagerly and lacks several features. |
 | `execution` | `ExecutionOptions()` | pLLM's policy (next table). |
 | `cuda_graphs` | `"auto"` | `"auto"`: graphs when the workload allows; `True`: require them; `False`: eager. |
 | `kv_offload` | `None` | `pllm.KVOffload(...)` to offload complete KV pages to CPU memory. |
-| `tensor_parallel_size` | `1` | Single-node tensor parallelism (vLLM 0.32.0, MRv2); `pipeline_parallel_size` and `data_parallel_size` must stay 1. |
+| `tensor_parallel_size` | `1` | Single-node tensor parallelism (vLLM 0.32.0); `pipeline_parallel_size` and `data_parallel_size` must stay 1. |
 
 | `ExecutionOptions` field | Default | Meaning |
 | --- | --- | --- |
@@ -774,7 +773,7 @@ pllm.depth() -> 'Any'
     Inside a @pllm.custom_residual method, the index of the place it runs at, a Python int: the layer, or 2 * layer (+ 1 for the MLP) with site="both".
 pllm.value(layer: 'int | Callable[[Any], int]') -> 'Any'
     Inside a @pllm.custom_residual method, the value rows [rows, kv_heads, head_dim] layer `layer` computed for the same token in this forward (after its own value rewrite).
-pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, runner: Literal['mrv1', 'mrv2'] = 'mrv2', execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
+pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
 pllm.ExecutionOptions(max_host_training_rows: int = 1, cuda_graph_pool_budget_bytes: int | None = None, state_page_budget_bytes: int = 0, execution_peak_budget_bytes: int | None = None, allow_numerical_transforms: bool = True, tuning: Literal['heuristic', 'measured'] = 'heuristic', publish_lag: int = 1, guidance_capacity: int | None = 4096)
     Framework execution policy; lag counts post-sampler steps hidden from readers.
 pllm.KVOffload(connector: Literal['OffloadingConnector', 'SimpleCPUOffloadConnector'] = 'OffloadingConnector', cpu_bytes: int = 536870912, prompt_only: bool = False)

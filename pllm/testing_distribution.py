@@ -13,8 +13,7 @@ from unittest.mock import patch
 
 import torch
 from vllm import SamplingParams
-from vllm.v1.sample.sampler import Sampler as Mrv1Sampler
-from vllm.v1.worker.gpu.sample.sampler import Sampler as Mrv2Sampler
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 import pllm
 from pllm.backends.vllm.runtime import VllmLlm
@@ -163,33 +162,12 @@ def _record_sample(
 
 
 @contextmanager
-def _observe_mrv2(sampler: Mrv2Sampler, observation: SamplerObservation) -> Generator[None]:
-    with patch.object(sampler, "sample", _record_sample(observation, sampler.sample)):
-        yield
-
-
-@contextmanager
-def _observe_mrv1(sampler: Mrv1Sampler, observation: SamplerObservation) -> Generator[None]:
-    with (
-        patch.object(sampler, "sample", _record_sample(observation, sampler.sample)),
-        patch.object(sampler, "logprobs_mode", "processed_logits"),
-        patch.object(sampler.topk_topp_sampler, "logprobs_mode", "processed_logits"),
-    ):
-        yield
-
-
-@contextmanager
-def _observe(llm: VllmLlm[_DataT, _ResultT], config: ModelConfig, observation: SamplerObservation) -> Generator[None]:
+def _observe(llm: VllmLlm[_DataT, _ResultT], observation: SamplerObservation) -> Generator[None]:
     runner = llm.require_llm().llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
     sampler = runner.sampler
-    if config.runner == "mrv2":
-        assert isinstance(sampler, Mrv2Sampler)
-        with _observe_mrv2(sampler, observation):
-            yield
-    else:
-        assert isinstance(sampler, Mrv1Sampler)
-        with _observe_mrv1(sampler, observation):
-            yield
+    assert isinstance(sampler, Sampler)
+    with patch.object(sampler, "sample", _record_sample(observation, sampler.sample)):
+        yield
 
 
 @dataclass(frozen=True)
@@ -221,7 +199,7 @@ def _plain_continuations(
             params = SamplingParams(temperature=temperature or 1, seed=17, max_tokens=tokens, ignore_eos=True)
             torch.cuda.synchronize()
             start = perf_counter()
-            with _observe(plain, config, observation):
+            with _observe(plain, observation):
                 output = plain.generate([prompt], params, use_tqdm=False)[0]
             torch.cuda.synchronize()
             seconds += perf_counter() - start
@@ -245,7 +223,7 @@ def _workload_distances(
             params = SamplingParams(temperature=1, seed=17, max_tokens=len(reference.continuation), ignore_eos=True)
             torch.cuda.synchronize()
             start = perf_counter()
-            with _observe(handle, config, observation):
+            with _observe(handle, observation):
                 output = handle.generate([reference.prompt], params, use_tqdm=False, prompt_indices=(index,))[0]
             torch.cuda.synchronize()
             seconds += perf_counter() - start

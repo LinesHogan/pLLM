@@ -224,7 +224,7 @@ True
   - 普通 RoPE 注意力：不支持带有 ALiBi、Logit Soft-capping 或硬件特定 Sink Token 的注意力模型。
   - 关闭前缀缓存：滑动窗口与跨层共享会改变每个请求实际留存的 KV 结构，破坏前缀缓存的全局哈希树假设。
   - 仅限全部分页模型：仅支持 KV 全部存放在 vLLM 分页块中的模型（Qwen2/2.5、Llama、Qwen3 等）；带有额外递归状态的模型（如 Qwen3.5 DeltaNet）不支持。
-  - 静态布局需要 `runner="mrv2"` 且不能与 `PositionState` 或 `@pllm.custom_forward` 组合：静态布局会将 vLLM 划分为多个独立的 KV 组，而自定义前向与跨步状态要求单一全局的 KV 组管理。
+  - 静态布局不能与 `PositionState` 或 `@pllm.custom_forward` 组合：静态布局会将 vLLM 划分为多个独立的 KV 组，而自定义前向与跨步状态要求单一全局的 KV 组管理。
 
 ---
 
@@ -331,7 +331,7 @@ True
   在 [12 自适应深度](../examples/12_adaptive_depth.ipynb) 的实测中（RTX 4090，Qwen2.5-7B，32 个并发请求，256 token，vLLM 0.32.0），一个无跳层、分段调用的 `custom_forward` 吞吐为原生 vLLM CUDA graph 的 **99%**。这个设置下原生 eager 也有 99%（7B 一步约 19 ms，发射开销藏得住）；步长只有几毫秒的小模型上，分段图和 eager 的差别才明显。
 - **显存与硬件限制**：
   - 分段图捕获需要自己的池空间，可能超过默认的 64 MiB 模型图预算（示例 12 的负载在 7B、32 个并发请求下要 143 MiB 左右），需要时在配置中调大捕获预算（例如 `ExecutionOptions(cuda_graph_pool_budget_bytes=128 << 20)`；这份预算会计入 `explain` 报的 pLLM 显存峰值，所以按报错给出的字节数留一点余量即可，不必给到几 GiB）；若预算不足，生成时会直接报错并指明所需的精确字节数。
-  - 多卡张量并行要求使用 vLLM 0.32.0 与 `runner="mrv2"`。
+  - 多卡张量并行要求使用 vLLM 0.32.0。
 - **与状态读取器（`pllm.hidden`）互斥**：
   在同一个负载中，挂了 `@pllm.custom_forward` 后**不能**再声明读取 `pllm.hidden(layer)` 或 `pllm.final_hidden()`。
   **原因**：在循环或跳层前向中，某一层可能被运行了多次，也可能一次都没运行，“第 $L$ 层的隐藏状态”不再具备唯一的物理定义。如需观测，请改用语义明确的 `pllm.residual(layer)` 或 `pllm.layer_logits((layer,))`，它们稳定读取该层**最后一次被访问时**输出的残差流。

@@ -271,19 +271,15 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
     assert results[0] == results[1]
 
 
-@pytest.mark.parametrize(
-    "runner,budget,seqs",
-    [(runner, 128, seqs) for runner in ("mrv1", "mrv2") for seqs in (2, 128)],
-)
-def test_chunked_runners_discard_partial_prompt_feedback(runner, budget, seqs):
+@pytest.mark.parametrize("seqs", (2, 128))
+def test_chunked_prefill_discards_partial_prompt_feedback(seqs):
     from pllm.workloads.esamp import ESampConfig, ESampWorkload
 
-    tokens = []
+    budget, tokens = 128, []
     prompts = ["word"] * (seqs + 2) if seqs == 128 else ["word " * (budget + 4), "word " * 74]
     for chunked in (False, True):
         with open_llm(
             ESampWorkload(ESampConfig(rank=2)),
-            runner=runner,
             seqs=seqs,
             chunked=chunked,
             tokens=budget if chunked else 2176,

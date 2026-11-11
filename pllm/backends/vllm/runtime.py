@@ -15,7 +15,7 @@ from enum import StrEnum
 from functools import partial
 from hashlib import sha256
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import torch
 from vllm import RequestOutput, SamplingParams
@@ -35,11 +35,15 @@ from pllm.backends.vllm.admission import admit_workload
 from pllm.backends.vllm.checkpoint import load_options
 from pllm.backends.vllm.compile_facts import compile_facts
 from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement
+from pllm.backends.vllm.kv_layout import LAYOUT_ENV
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.backends.vllm.overlay_graph import (
     GraphOptions,
     graph_options,
 )
+from pllm.backends.vllm.position_state import POSITION_ENV
+from pllm.backends.vllm.prefix_cache import CachePolicy
+from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.training import CausalTraining
 from pllm.config import ModelConfig, ModelDType
 from pllm.contracts.backend_attachment import (
@@ -61,6 +65,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorField
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.host_runtime import CompletionInput
+from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
 from pllm.execution.state_feed import Feed
@@ -72,21 +77,12 @@ from pllm.execution.torch_private import (
 )
 from pllm.execution.trace import TraceSelection, TraceSnapshot
 
-if TYPE_CHECKING:
-    from pllm.backends.vllm.mrv1 import Mrv1Runner
-
-
-from pllm.backends.vllm.kv_layout import LAYOUT_ENV
-from pllm.backends.vllm.position_state import POSITION_ENV
-from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
-from pllm.execution.position_state import PositionAnnouncement
-
 _logger = logging.getLogger(__name__)
 
 _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 
 
+# pLLM runs only on vLLM's MRv2 runner, which 0.27.1 selects only through this variable.
 _V2_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 
@@ -164,7 +160,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     """The engine handle returned by make_llm, with workload diagnostics, traces and feeds when installed."""
 
     llm: LLM | None
-    _runner: WorkloadModelRunner | Mrv1Runner | None = None
+    _runner: WorkloadModelRunner | None = None
     backend_attachment: BackendAttachment | None = None
     compile_facts: BackendCompileFacts | None = None
     cache_policy: CachePolicy | None = None
@@ -238,7 +234,7 @@ class VllmLlm(Generic[DataT, ResultT]):
         return replace(self.worker_state().diagnostics, eager_reason=self._eager_reason)
 
     @property
-    def runner(self) -> WorkloadModelRunner | Mrv1Runner:
+    def runner(self) -> WorkloadModelRunner:
         self.require_llm()
         if self._runner is None:
             raise RuntimeError("use tensor_parallel_size=1 and multiprocessing=False to access the runner")
@@ -657,18 +653,18 @@ def vllm_engine(
     """
     environment = {
         _MP_ENV: "1" if config.multiprocessing else "0",
-        _V2_RUNNER_ENV: "1" if config.runner == "mrv2" else "0",
+        _V2_RUNNER_ENV: "1",
         **environment,
     }
     if config.tensor_parallel_size > 1:
         if cuda_graphs:
             workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
-        environment.update(VLLM_USE_V2_MODEL_RUNNER="1", VLLM_WORKER_MULTIPROC_METHOD="spawn")
+        environment.update(VLLM_WORKER_MULTIPROC_METHOD="spawn")
     previous = {name: os.environ.get(name) for name in environment}
     conflicts = tuple(name for name, value in environment.items() if previous[name] not in (None, value))
     if conflicts:
         raise RuntimeError(
-            f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose matching runner/multiprocessing settings"
+            f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose a matching multiprocessing setting"
         )
     os.environ.update(environment)
     # vLLM's startup profile asserts that free memory does not grow while it measures, and it collects garbage
@@ -735,9 +731,8 @@ def create_vllm_llm(
             **load_options(requirements.checkpoint_names),
             "worker_cls": _WORKER_CLASS,
             # The supported uni-process, non-speculative decoder enables async by default.
-            "async_scheduling": config.runner == "mrv2",
-            "scheduler_cls": "pllm.backends.vllm.prefix_cache."
-            + ("WorkloadAsyncScheduler" if config.runner == "mrv2" else "WorkloadScheduler"),
+            "async_scheduling": True,
+            "scheduler_cls": "pllm.backends.vllm.prefix_cache.WorkloadScheduler",
         },
         environment,
         cuda_graphs=not eager_reason,
@@ -798,7 +793,7 @@ def create_vllm_llm(
         return handle
 
 
-def probe_backend(requirements: BackendRequirements, runner: WorkloadModelRunner | Mrv1Runner) -> BackendCompileFacts:
+def probe_backend(requirements: BackendRequirements, runner: WorkloadModelRunner) -> BackendCompileFacts:
     shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     dtypes: dict[torch.dtype, ModelDType] = {
@@ -814,7 +809,6 @@ def probe_backend(requirements: BackendRequirements, runner: WorkloadModelRunner
         max_num_seqs=runner.max_num_reqs,
         max_num_batched_tokens=runner.max_num_tokens,
         seed=runner.model_config.seed,
-        runner=runner.runner_kind,
         tensor_parallel_size=runner.parallel_config.tensor_parallel_size,
     )
     return compile_facts(

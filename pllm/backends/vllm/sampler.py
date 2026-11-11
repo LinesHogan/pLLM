@@ -6,10 +6,8 @@ reweights inside the seeded draw), and add_logits folds declared-order additions
 into MRv2's FP32 sampler-input copy when vLLM processes logits; steps without
 processing keep the LM-head dtype. Each addition rounds in the LM-head logit's
 dtype before the next stage, including row subsets. All upstream processors,
-filters, raw/processed logprobs and guidance see that same distribution. MRv1
-uses the same ordered-add copy before its upstream processors; it has no separate
-FP32 copy to remove when its LM head already returns FP32. No step reads device
-values on the host.
+filters, raw/processed logprobs and guidance see that same distribution. No step
+reads device values on the host.
 """
 
 from __future__ import annotations
@@ -18,11 +16,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
-from vllm.v1.outputs import SamplerOutput as Mrv1SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
-from vllm.v1.sample.sampler import Sampler as UpstreamMrv1Sampler
+from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
@@ -108,11 +103,23 @@ class _SampledGuidance:
     feedback: SamplerFeedback | None
 
 
-class SamplerGuidance:
-    """One intervention lifecycle and mathematical boundary shared by both runner ABIs."""
+class GuidedSampler(compat.Sampler):
+    """vLLM's MRv2 sampler with one explicit signed guidance lifecycle.
 
-    _active_guidance: SignedSamplerStages | _SampledGuidance | None = None
-    bounded_guidance: bool = False
+    Pre-filter addition draws from the guided logits with the stock sampler.
+    Post-filter guidance reweights the finite top-k/top-p survivors before the stock Gumbel draw.
+    Inactive steps delegate directly to the upstream sampler.
+    """
+
+    __slots__ = ("_active_guidance",)
+
+    def __init__(self, upstream: VllmSampler) -> None:
+        assert type(upstream) is VllmSampler
+        if upstream.num_speculative_tokens != 1:
+            raise ValueError("pLLM workloads need non-speculative decoding; disable speculative decoding")
+        # The loaded vLLM instance's whole state: the inherited apply, draw and logprob methods read it.
+        vars(self).update(vars(upstream))
+        self._active_guidance: SignedSamplerStages | _SampledGuidance | None = None
 
     def begin_guidance(self, guidance: SignedSamplerStages) -> None:
         assert self._active_guidance is None
@@ -157,26 +164,6 @@ class SamplerGuidance:
         output = processed_logits.clone()
         output.index_copy_(0, rows, reweighted)
         return output
-
-
-class GuidedSampler(compat.Sampler, SamplerGuidance):
-    """vLLM's MRv2 sampler with one explicit signed guidance lifecycle.
-
-    Pre-filter addition draws from the guided logits with the stock sampler, as the MRv1 sampler does.
-    Post-filter guidance reweights the finite top-k/top-p survivors before the stock Gumbel draw.
-    Inactive steps delegate directly to the upstream sampler.
-    """
-
-    __slots__ = ("_active_guidance",)
-    bounded_guidance = True
-
-    def __init__(self, upstream: VllmSampler) -> None:
-        assert type(upstream) is VllmSampler
-        if upstream.num_speculative_tokens != 1:
-            raise ValueError("pLLM workloads need non-speculative decoding; disable speculative decoding")
-        # The loaded vLLM instance's whole state: the inherited apply, draw and logprob methods read it.
-        vars(self).update(vars(upstream))
-        self._active_guidance: SignedSamplerStages | _SampledGuidance | None = None
 
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         match self._active_guidance:
@@ -258,78 +245,6 @@ class GuidedSampler(compat.Sampler, SamplerGuidance):
                 return super()._sample_random(
                     processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, use_fused_sampler
                 )
-
-
-class Mrv1Sampler(UpstreamMrv1Sampler, SamplerGuidance):
-    def __init__(self, upstream: UpstreamMrv1Sampler) -> None:
-        assert type(upstream) is UpstreamMrv1Sampler
-        torch.nn.Module.__init__(self)
-        self.topk_topp_sampler = upstream.topk_topp_sampler
-        self.logprobs_mode, self.use_fp64_gumbel = upstream.logprobs_mode, upstream.use_fp64_gumbel
-        self.pin_memory = upstream.pin_memory
-        self._active_guidance = None
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        predict_bonus_token: bool = False,
-        logprobs_mode_override: LogprobsMode | None = None,
-    ) -> Mrv1SamplerOutput:
-        match self._active_guidance:
-            case None:
-                return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
-            case SignedSamplerStages() as stages if not predict_bonus_token:
-                with torch.inference_mode(False):
-                    base = logits.detach().clone() if stages.capture_feedback else None
-                result = super().forward(stages.add_logits(logits), sampling_metadata, False, logprobs_mode_override)
-                with torch.inference_mode(False):
-                    feedback = (
-                        SamplerFeedback(
-                            stages.stages[0].guidance.sampler_rows,
-                            base,
-                            result.sampled_token_ids.detach().reshape(-1).clone(),
-                        )
-                        if base is not None
-                        else None
-                    )
-                self._active_guidance = _SampledGuidance(feedback)
-                return result
-            case _:
-                raise AssertionError("each sampler guidance admits one non-speculative draw")
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        logprobs_mode_override: LogprobsMode | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        match self._active_guidance:
-            case SignedSamplerStages(guide=SignedSamplerGuidance() as guidance):
-                pass
-            case _:
-                return super().sample(logits, sampling_metadata, logprobs_mode_override)
-        metadata = sampling_metadata
-        if not metadata.all_greedy:
-            assert metadata.temperature is not None
-            logits = self.apply_temperature(logits, metadata.temperature, metadata.all_random)
-            for processor in metadata.logitsprocs.argmax_invariant:
-                logits = processor.apply(logits)
-        logits = self.reweight_finite_survivors(apply_top_k_top_p(logits, metadata.top_k, metadata.top_p), guidance)
-        sampled = logits.argmax(dim=-1)
-        if not metadata.all_greedy:
-            assert metadata.temperature is not None
-            random = random_sample(logits.softmax(dim=-1), metadata.generators, self.use_fp64_gumbel)
-            sampled = random if metadata.all_random else torch.where(metadata.temperature < 1e-5, sampled, random)
-        mode = logprobs_mode_override or self.logprobs_mode
-        processed = (
-            logits
-            if mode == "processed_logits"
-            else logits.log_softmax(dim=-1)
-            if mode == "processed_logprobs"
-            else None
-        )
-        return sampled, processed
 
 
 __all__ = [

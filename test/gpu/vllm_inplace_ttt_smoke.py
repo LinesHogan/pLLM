@@ -113,7 +113,6 @@ def open_llm(
     *,
     cuda_graphs=False,
     chunked=False,
-    runner="mrv2",
     **execution,
 ) -> VllmLlm[object, object]:
     options = {"execution": pllm.ExecutionOptions(**execution)} if execution else {}
@@ -126,7 +125,6 @@ def open_llm(
         gpu_memory_utilization=0.25,
         cuda_graphs=cuda_graphs,
         enable_chunked_prefill=chunked,
-        runner=runner,
         seed=7,
         **options,
     )

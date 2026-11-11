@@ -312,17 +312,6 @@ observable_contract = "Plain inference then attached ESamp through the public fa
 replaces = "Legacy plain/canonical routing and ESamp public hidden/sampler/training smoke"
 
 [[evidence]]
-id = 31
-name = "mrv1_adapter_captures_exact_rows_and_sampler_links"
-group = "runtime"
-requires_gpu = true
-path = "test/gpu/vllm_mrv1_smoke.py"
-command = "/workspace/pllm/.venv/bin/python test/gpu/vllm_mrv1_smoke.py"
-environment = "Repository .venv; vLLM 0.27.1 MRv1, Qwen2.5-0.5B BF16, single GPU, eager synchronous persistent batch, n=1"
-observable_contract = "Actual MRv1 persistent-batch columns independently reproduce 21 packed rows across prefill/decode and widths 2/1, original request IDs and sampler links; six finite-support reweight comparisons, nine losses/updates, three owned completion rows and zero pending roots/fallback. Uses the shared invocation, not a converted MRv2 InputBatch; KV replay is not claimed"
-replaces = "Legacy MRv1 row/sampler adapter tests; no duplicate workload matrix"
-
-[[evidence]]
 id = 32
 name = "public_vllm_parameter_overlays_pin_produced_request_versions"
 group = "runtime"
@@ -373,8 +362,8 @@ group = "runtime"
 requires_gpu = true
 requires_mp = true
 path = "test/gpu/enginecore_smoke.py"
-command = "/workspace/pllm/.venv/bin/python test/gpu/enginecore_smoke.py; /workspace/pllm/.venv/bin/python test/gpu/enginecore_smoke.py --mrv1-captured"
-environment = "Repository .venv; vLLM 0.27.1, Qwen2.5-0.5B, MRv2/eager/FA2 plus MRv1 captured ESamp, TP1/PP1/DP1, actual EngineCore spawn child; final GPU IO slice intentionally initializes frontend CUDA"
+command = "/workspace/pllm/.venv/bin/python test/gpu/enginecore_smoke.py"
+environment = "Repository .venv; vLLM 0.27.1, Qwen2.5-0.5B, MRv2/eager/FA2, TP1/PP1/DP1, actual EngineCore spawn child; final GPU IO slice intentionally initializes frontend CUDA"
 observable_contract = "Frontend planning and default CPU feedback do not initialize CUDA; only the child owns the arena. Original identities and shared inputs are staged under scheduling pause. ESamp trains across slots and calls; CPU completion drives FTTT/TTRL, ReFT and TLM use original shared inputs with real updates. Opt-in CUDA IO preserves a strided offset input's original allocation alias, demonstrated by an ordered pre-launch mutation; ReFT publishes once and changes output. FINISH confirms destination writes; owned CPU/CUDA outputs survive worker shutdown. All fallback counts are zero. Built-in and user workloads reach the child through the same by-reference transport (module, qualname, module digest and frozen fields, never function bodies); the worker imports, rebuilds and re-binds the class, and installation requires its compilation signature to equal the driver's signed plan. A frozen-dataclass user workload from an ordinary example module trains in the child with real losses and zero fallback. State import and CPU IO still perform explicit device copies; cross-GPU transport and distributed consensus are not claimed"
 replaces = "In-process runner reach-through as the sole public routing option; no second MP scheduler/session or parent arena"
 

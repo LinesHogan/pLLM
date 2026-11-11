@@ -13,7 +13,7 @@ from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm.v1.request import Request
 
 import pllm
-from pllm.backends.vllm.prefix_cache import CachePolicy, RequestBlockHasher, WorkloadAsyncScheduler, WorkloadScheduler
+from pllm.backends.vllm.prefix_cache import CachePolicy, RequestBlockHasher, WorkloadScheduler
 from pllm.config import ExecutionOptions
 from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.step_loop import StepLoopWorkload
@@ -53,10 +53,9 @@ def test_reuse_and_stateless_routes(policy):
     assert donor.block_hashes == receiver.block_hashes
 
 
-@pytest.mark.parametrize("scheduler_type", (WorkloadScheduler, WorkloadAsyncScheduler))
 @pytest.mark.parametrize("enabled", (True, False))
-def test_admission_rehashes_before_connector(scheduler_type, enabled):
-    scheduler = object.__new__(scheduler_type)
+def test_admission_rehashes_before_connector(enabled):
+    scheduler = object.__new__(WorkloadScheduler)
     scheduler.hash_block_size, scheduler.cache_config = (
         4,
         SimpleNamespace(prefix_caching_hash_algo="sha256", enable_prefix_caching=enabled),

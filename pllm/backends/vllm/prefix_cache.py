@@ -11,7 +11,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import BlockHash, generate_block_hash_extra_keys, hash_block_tokens
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -89,8 +88,11 @@ class RequestBlockHasher:
         return hashes
 
 
-class WorkloadScheduler(Scheduler):
-    """Rehash before stock admission and connector callbacks, including EngineCore's initial hashes."""
+class WorkloadScheduler(AsyncScheduler):
+    """vLLM's async scheduler, rehashing before stock admission and connector callbacks.
+
+    The rehash also covers the initial hashes EngineCore computes before admission.
+    """
 
     def __init__(
         self,
@@ -103,7 +105,8 @@ class WorkloadScheduler(Scheduler):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
-        super().__init__(
+        # AsyncScheduler forwards Scheduler's arguments through untyped *args.
+        super().__init__(  # pyright: ignore[reportUnknownMemberType]
             vllm_config,
             kv_cache_config,
             structured_output_manager,
@@ -126,7 +129,3 @@ class WorkloadScheduler(Scheduler):
             request.block_hashes.clear()
             request.update_block_hashes()
         super().add_request(request)
-
-
-class WorkloadAsyncScheduler(WorkloadScheduler, AsyncScheduler):
-    """Keep upstream asynchronous scheduling with the same admission boundary."""

@@ -220,7 +220,7 @@ def _sampler_kernels(
     copies_logits: bool,
 ) -> int:
     from pllm.backends.vllm.guided_sampling import guided_sample
-    from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerGuidance, SignedSamplerStages
+    from pllm.backends.vllm.sampler import GuidedSampler, SignedSamplerGuidance, SignedSamplerStages
     from pllm.contracts.sampler import PackedSamplerGuidanceBatch
 
     task = binding.tensor_tasks.get(symbol)
@@ -265,7 +265,7 @@ def _sampler_kernels(
                 )
             else:
                 dense = torch.mm(prediction.to(dtype), weights.T)[:, : facts.vocab_size]
-                SamplerGuidance.reweight_finite_survivors(logits, SignedSamplerGuidance(guidance, dense))
+                GuidedSampler.reweight_finite_survivors(logits, SignedSamplerGuidance(guidance, dense))
         elif copies_logits:
             SignedSamplerStages((SignedSamplerGuidance(guidance, prediction),)).add_logits(logits)
     return counter.count

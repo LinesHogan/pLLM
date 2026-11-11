@@ -21,8 +21,6 @@ def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Ite
     """Every model-eager cause, keyed by setting or public effect name in engine priority order."""
     if config.cuda_graphs is False:
         yield "cuda_graphs", "ModelConfig(cuda_graphs=False)"
-    if config.runner == "mrv1":
-        yield "runner", 'runner="mrv1" runs workloads without CUDA graphs'
     if requirements.custom_forward:
         yield "custom_forward", "@pllm.custom_forward schedules model slices and owns their wave graphs"
     if requirements.instance_adapter:
@@ -31,8 +29,6 @@ def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Ite
 
 def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> str:
     """Reject unsupported engine settings and return the model forward eager reason."""
-    if requirements.input_token_history >= 0 and config.runner != "mrv2":
-        raise ValueError('pllm.input_tokens needs runner="mrv2"')
     compat.admit_parallel(config, requirements)
     if model_hooks(requirements) and config.enable_prefix_caching:
         raise ValueError(
@@ -40,15 +36,10 @@ def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> st
             "@pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: vLLM keys cached K/V by tokens, "
             "not by state, so a cached prefix would carry K/V computed under another request's state"
         )
-    if requirements.position_states and config.runner == "mrv1":
-        raise ValueError('PositionState and @pllm.custom_forward need runner="mrv2"')
-    if any(layout.keep != "all" for layout in requirements.kv_layouts):
-        if config.runner != "mrv2":
-            raise ValueError('static KV layouts need runner="mrv2"')
-        if requirements.custom_forward or requirements.position_states:
-            raise ValueError(
-                "static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)"
-            )
+    if any(layout.keep != "all" for layout in requirements.kv_layouts) and (
+        requirements.custom_forward or requirements.position_states
+    ):
+        raise ValueError("static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)")
     reason = next((reason for _, reason in eager_reasons(config, requirements)), "")
     if config.cuda_graphs is True and reason:
         raise ValueError(f'{reason}; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False')

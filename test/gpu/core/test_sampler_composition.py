@@ -1,4 +1,4 @@
-"""Qwen composition oracle: independent additions, stock filtering, then one ESamp guide on both runners."""
+"""Qwen composition oracle: independent additions, stock filtering, then one ESamp guide."""
 
 from dataclasses import dataclass
 
@@ -8,7 +8,7 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.backends.vllm import compat, sampler
-from pllm.backends.vllm.sampler import SamplerGuidance, SignedSamplerStages, reweight
+from pllm.backends.vllm.sampler import GuidedSampler, SignedSamplerStages, reweight
 from pllm.backends.vllm.sampler_epilogue import copy_additions
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload
 
@@ -30,19 +30,14 @@ class Stack(pllm.Workload):
     esamp: ESampWorkload = ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5))
 
 
-@pytest.mark.parametrize(
-    "runner,capacity,passthrough",
-    (("mrv1", 512, False), ("mrv2", None, False), ("mrv2", 512, False), ("mrv2", None, True)),
-)
-def test_additions_then_filtered_guidance(monkeypatch, runner, capacity, passthrough):
+@pytest.mark.parametrize("capacity,passthrough", ((None, False), (512, False), (None, True)))
+def test_additions_then_filtered_guidance(monkeypatch, capacity, passthrough):
     workload = Stack()
-    add, reweight = SignedSamplerStages.add_logits, SamplerGuidance.reweight_finite_survivors
+    add, reweight = SignedSamplerStages.add_logits, GuidedSampler.reweight_finite_survivors
     checks = {"add": 0, "guide": 0, "trained": 0}
     fused = sampler.guided_sample
     raw_logprobs = []
-    sampler_type = sampler.GuidedSampler if runner == "mrv2" else sampler.Mrv1Sampler
-    entry = "__call__" if runner == "mrv2" else "forward"
-    call = sampler.GuidedSampler.__call__ if runner == "mrv2" else sampler.Mrv1Sampler.forward
+    call = GuidedSampler.__call__
 
     def inspect_call(instance, logits, *args, **kwargs):
         output = call(instance, logits, *args, **kwargs)
@@ -121,13 +116,12 @@ def test_additions_then_filtered_guidance(monkeypatch, runner, capacity, passthr
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
-        runner=runner,
         execution=pllm.ExecutionOptions(guidance_capacity=capacity),
     )
     with pllm.make_llm(config, workload=workload) as handle:
-        monkeypatch.setattr(sampler_type, entry, inspect_call)
+        monkeypatch.setattr(GuidedSampler, "__call__", inspect_call)
         monkeypatch.setattr(SignedSamplerStages, "add_logits", inspect_add)
-        monkeypatch.setattr(SamplerGuidance, "reweight_finite_survivors", staticmethod(inspect_guide))
+        monkeypatch.setattr(GuidedSampler, "reweight_finite_survivors", staticmethod(inspect_guide))
         monkeypatch.setattr(sampler, "guided_sample", inspect_fused)
         outputs = handle.generate(
             ["The sky is", "Water freezes because"],

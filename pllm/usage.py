@@ -210,7 +210,6 @@ def input_tokens(*, history: int = 0) -> Any:
     """Int64 [rows, history + 1] token ids: current token first, then lookbacks; -1 before the request starts.
 
     Results consumed by custom_residual use every scheduled token; other methods use sampled rows.
-    Requires runner="mrv2".
     """
     if type(history) is not int or history < 0:
         raise ValueError("pllm.input_tokens(history=) needs a nonnegative integer")
@@ -392,7 +391,7 @@ class Adapter:
     receive no correction. Native QKV propagation for skipped layers still applies the Q/V deltas when it runs.
     This lets custom depth schedules use the same adapted model as the standard forward.
 
-    At TP>1 (vLLM 0.32 MRv2), dense and low_rank deltas follow each projection's shards.
+    At TP>1 (vLLM 0.32), dense and low_rank deltas follow each projection's shards.
     Declare fields with Field(lambda inputs, outputs: ...). Down deltas partition dense weights and A
     by input columns, with replicated B. Attention q/k/v and MLP gate/up deltas partition dense weights and B
     by output rows, with replicated A; KV head replicas follow vLLM's head placement. Small fields replicate.
@@ -599,7 +598,7 @@ def custom_attention(
     keep="none", source=k allocates no cache and reads the layer k below.
     Layouts restrict every read, including topk; window_start marks the retained tail.
     Requires TP=1, unquantized FA2 attention and prefix caching disabled.
-    Static layouts need MRv2 and cannot accompany PositionState or custom forwards.
+    Static layouts cannot accompany PositionState or custom forwards.
     The prompt-sink FA2 read uses a gathered FP32 softmax; storage and reclamation
     are owned by vLLM's RSWAManager. Score-based memory eviction is unsupported.
     """

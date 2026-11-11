@@ -38,11 +38,10 @@ print(pllm.explain(DummyWorkload(), config).eager_reason == "")
 | `generated_kv` | `"isolate"` | pLLM：打开前缀缓存时，生成 token 的 KV 能否被后来的请求当作 prompt 前缀复用。负载区分 prompt 与生成 token 时（例如激活补丁只改生成的 token），同样的 token 在两种身份下算出的 KV 不同，`"isolate"` 禁止这种复用 | `"reuse"` 只在你确认生成部分的 KV 与它是不是 prompt 无关时使用 |
 | `revision` | `None` | 模型仓库的版本 | 固定检查点版本 |
 | `multiprocessing` | `False` | pLLM：把负载送进 vLLM 的 EngineCore 子进程 | 上生产时打开，要求见 [上生产](../howto/production.md) |
-| `runner` | `"mrv2"` | vLLM 的 model runner：`"mrv2"` 或 `"mrv1"` | `pllm.input_tokens`、静态 KV 布局和张量并行需要 `"mrv2"` |
 | `execution` | `ExecutionOptions()` | pLLM 的执行策略，见下一节 | — |
 | `cuda_graphs` | `"auto"` | pLLM：`"auto"` 能进 CUDA graph 就进，否则 eager 并把原因写进 `eager_reason`；`True` 要求进图，不能进就报错；`False` 一律 eager | 测吞吐时设 `True`，防止悄悄退回 eager |
 | `kv_offload` | `None` | 把完整的 KV 页卸载到 CPU 内存，见 `KVOffload` | KV 显存不够、又要保留长上下文时 |
-| `tensor_parallel_size` | `1` | 张量并行的卡数 | 需要 vLLM 0.32.0 和 `runner="mrv2"`；哪些功能可以多卡见[支持矩阵](support-matrix.md) |
+| `tensor_parallel_size` | `1` | 张量并行的卡数 | 需要 vLLM 0.32.0；哪些功能可以多卡见[支持矩阵](support-matrix.md) |
 | `pipeline_parallel_size`、`data_parallel_size` | `1` | 流水线并行、数据并行 | 目前必须为 1，pLLM 只支持张量并行 |
 
 ## ExecutionOptions：pLLM 的执行策略
