@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 
 import pllm
 from examples.engram_lite import EngramLite
-from pllm.testing import check
+from pllm.testing import ContractError, check
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,8 @@ def test_explicit_placement_and_engram_contracts(tmp_path):
     assert {"mixed prefill/decode", "preempted", "neutral"} <= set(
         check(host, config, neutral=replace(host, gate=0)).passed
     )
+    with pytest.raises(ContractError, match=r"\[neutral\] custom residual `add`"):
+        check(host, config, neutral=replace(host, gate=1.0))
     rejected = pllm.explain(replace(host, placement="device"), config)
     assert rejected.budget_errors and 'placement="host"' in rejected.budget_errors[0]
     assert next(state for state in rejected.states if state.name == "memory").placement == "device"

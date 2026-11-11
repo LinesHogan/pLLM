@@ -110,6 +110,8 @@ Values = dict[tuple[str, int, str], torch.Tensor]
 @dataclass
 class _Run:
     device_equivalence: bool = False
+    # Whether residual methods must reproduce the base model's residual (testing.check(neutral=)).
+    neutral: bool = False
     timing: VersionChecks = field(default_factory=VersionChecks)
     preemption_skip: str | None = None
     values: Values = field(default_factory=lambda: {})
@@ -569,6 +571,7 @@ def _site_step(
         tokens * 0.5,
         seed=facts.initialization_seed,
         device_equivalence=run.device_equivalence,
+        neutral=run.neutral,
         results=context.results,
     )
     for name, output in outputs.items():
@@ -587,9 +590,11 @@ def _run(
     perturbed: int | None = None,
     preempted: Literal["none", "full", "chunked"] = "none",
     device_equivalence: bool = False,
+    neutral: bool = False,
 ) -> _Run:
     run = _Run(
         device_equivalence=device_equivalence,
+        neutral=neutral,
         shared_resources=_shared_resources(declaration),
         immutable_resources=frozenset(str(state.resource) for state in declaration.graph.states if state.immutable),
     )
@@ -888,19 +893,35 @@ def affects_model(workload: Workload, config: ModelConfig) -> bool:
     return workload.build(contract_facts(workload, config)[1]).affects_model
 
 
-def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
-    failures: list[str] = []
+def _check_neutral(neutral: Workload, config: ModelConfig, failures: list[str]) -> CheckSkip | None:
+    """Run the neutral workload on the CPU schedules and append how it differs from the base model.
+
+    Returns a skip when it declares a model effect the CPU harness does not execute; check_on_gpu compares those
+    with vanilla generation."""
     if not affects_model(neutral, config):
-        return failures
+        return None
     neutral_shape, neutral_facts = contract_facts(neutral, config)
     neutral_facts, neutral_declaration = neutral.specialize(neutral_facts, config.execution)
     sampler = neutral.plan_backend(neutral_facts, neutral_declaration).spec.sampler
     if any(stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in sampler):
         failures.append("[neutral] guide_sampling still declares a sampler stage; set its beta to zero.")
-    if neutral.backend_requirements().custom_forward or neutral.backend_requirements().custom_residual:
-        neutral.plan_backend(neutral_facts, neutral_declaration)
-        return failures
-    result = _run(neutral, neutral_facts, neutral_declaration, neutral_shape, (0, 1, 2))
+    requirements = neutral.backend_requirements()
+    unexecuted = {
+        "a custom forward": requirements.custom_forward,
+        "stateful or multi-stream residual methods": any(
+            rewrite.memory is not None or rewrite.streams > 1 for rewrite in neutral_declaration.sites.rewrites
+        ),
+        "adapters": bool(requirements.parameter_targets),
+        "activation patches": bool(requirements.activation_layers),
+    }
+    for effect, declared in unexecuted.items():
+        if declared:
+            return CheckSkip("neutral", f"the CPU harness does not execute {effect}; run check_on_gpu(neutral=)")
+    try:
+        result = _run(neutral, neutral_facts, neutral_declaration, neutral_shape, (0, 1, 2), neutral=True)
+    except AssertionError as error:
+        failures.append(str(error))
+        return None
     failures.extend(result.failures)
     additive_outputs = {
         f"sampler {stage.task}" for stage in sampler if stage.stage is SamplerStage.PACKED_PRE_FILTER_ADD
@@ -910,7 +931,7 @@ def _neutral_failures(neutral: Workload, config: ModelConfig) -> list[str]:
         for key, value in result.values.items()
         if key[2] in additive_outputs and torch.count_nonzero(value)
     )
-    return failures
+    return None
 
 
 def _initial_parameters(
@@ -1153,7 +1174,8 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
     Checks actual state versions against publish_lag; exact projection visibility uses chunk/replay equivalence.
     ContractError lists discrepancies and identifies workload row mixing or framework routing.
     Composites also compare each field component with its standalone outputs, bitwise.
-    Pass neutral= with disabled author settings to check zero additive logits or absent guidance.
+    Pass neutral= with disabled author settings to check zero additive logits, absent guidance and residual methods
+    that return the base residual; neutral model effects the CPU harness does not execute are reported as skips.
     Model execution, host inputs and shared training exceptions are reported as explicit skips.
     """
     failures: list[str] = []
@@ -1175,8 +1197,12 @@ def check(workload: Workload, config: ModelConfig, *, neutral: Workload | None =
         )
     else:
         try:
-            failures.extend(_neutral_failures(neutral, config))
-            result = replace(result, passed=(*result.passed, "neutral"))
+            skip = _check_neutral(neutral, config, failures)
+            result = (
+                replace(result, passed=(*result.passed, "neutral"))
+                if skip is None
+                else replace(result, skipped=(*result.skipped, skip))
+            )
         except (RuntimeError, ValueError, TypeError) as error:
             failures.append(f"[neutral compile/execution] {''.join(format_exception_only(error)).strip()}")
     if failures:

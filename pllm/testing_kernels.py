@@ -100,9 +100,14 @@ def check_sites(
     *,
     seed: int,
     device_equivalence: bool,
+    neutral: bool,
     results: Mapping[tuple[TaskSymbol, str], torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Run stateless residual math at each declared place on the check script's token rows."""
+    """Run stateless residual math at each declared place on the check script's token rows.
+
+    neutral=True requires every result to equal the base model's: the stream plus the branch output, or the stream
+    itself where there is no branch (read=, "value", "final").
+    """
     kwargs = seeded_site_arguments(binding, facts, seed, results)
     outputs: dict[str, torch.Tensor] = {}
     for rewrite in binding.sites.rewrites:
@@ -128,5 +133,10 @@ def check_sites(
                 result = function(*args, **arguments)
                 if device_equivalence:
                     compare_device(name, function, args, arguments, result)
+                if neutral and not torch.equal(result, args[0] if len(args) == 1 else args[0] + args[1]):
+                    raise AssertionError(
+                        f"[neutral] custom residual `{name}` at {place}: with the neutral settings it must return the "
+                        "base model's residual exactly (x + y, or x where there is no branch)"
+                    )
                 outputs[f"{name}:{place}"] = result
     return outputs
