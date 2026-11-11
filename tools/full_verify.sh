@@ -4,7 +4,7 @@ set -uo pipefail
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 cd "$ROOT" || exit 1
 export PY=${PY:-/workspace/pllm/.venv/bin/python}
-export PATH="$(dirname "$PY"):$PATH" PYTHONPATH=$ROOT HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 VLLM_USE_FLASHINFER_SAMPLER=1
+export PATH="$(dirname "$PY"):$PATH" PYTHONPATH=$ROOT HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 VLLM_USE_FLASHINFER_SAMPLER=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 options=(); requested=(); listing=''; explain=no
 while [ "$#" -gt 0 ]; do
@@ -22,6 +22,7 @@ Stages: ruff format pyright typing layers docs cpu gpu-core graph-replay enginec
 TP stages are selected only under vLLM 0.32; with fewer than two visible GPUs they record exit=NOT_RUN (a failure).
 CPU tests hide CUDA. Local GPU work holds /tmp/pllm-gpu.lock, affinity 0-15; Slurm owns remote affinity.
 Logs, exit codes and per-stage wall seconds go to LOGS (default docs/cleanup/verify). No test retries.
+A failing stage's log is also copied to <stage>.fail-<UTC time>.log, which reruns never overwrite.
 HELP
       exit 0 ;;
     --all) options+=(--all); shift ;;
@@ -77,7 +78,7 @@ if [ -f pyrightconfig.vllm032.json ] && [ "$vllm032" = yes ]; then PROJECT=(-p p
 CPU=(); GPU=()
 if [ -z "${SLURM_JOB_ID:-}" ]; then CPU=(taskset -c 0-15);  fi
 pytest_cpu() { env CUDA_VISIBLE_DEVICES='' "${CPU[@]}" "$PY" -m pytest -q -p no:cacheprovider --durations=0 "$@"; }
-pytest_gpu() { "${GPU[@]}" "${CPU[@]}" "$PY" -m pytest -q -p no:cacheprovider --durations=0 "$@"; }
+pytest_gpu() { "${GPU[@]}" "${CPU[@]}" "$PY" -m pytest -q -p no:cacheprovider --durations=0 --tb=long "$@"; }
 smoke() { "${GPU[@]}" "${CPU[@]}" "$PY" "test/gpu/$1.py" "${@:2}"; }
 run_stage() {
   local rc=0
@@ -160,7 +161,13 @@ for stage in "${stages[@]}"; do
   printf '%s exit=%s wall=%ss\n' "$stage" "$rc" "$(cat "$LOGS/$stage.seconds")"
   tail -1 "$LOGS/$stage.log"
   [ -z "$gpu_lock" ] || { flock -u "$gpu_lock"; exec {gpu_lock}>&-; }
-  [ "$rc" -eq 0 ] || failed=1
+  if [ "$rc" -ne 0 ]; then
+    # A rerun in the same snapshot rewrites $stage.log; an intermittent failure must outlive it.
+    kept=$LOGS/$stage.fail-$(date -u +%Y%m%dT%H%M%SZ).log
+    cp "$LOGS/$stage.log" "$kept"
+    echo "failure log kept: $kept"
+    failed=1
+  fi
 done
 if [ -n "${commit:-}" ] && [ "$dirty" = no ]; then
   [ "$(git rev-parse HEAD)" = "$commit" ] && [ -z "$(git status --porcelain)" ] || failed=1
