@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.sequence import IntermediateTensors
@@ -20,11 +20,6 @@ from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from pllm.authoring import (
-    BackendDeployment,
-    DataT,
-    ResultT,
-)
 from pllm.backends.vllm.checkpoint import CheckpointLoader as CheckpointLoader
 from pllm.backends.vllm.hidden_taps import (
     TAPS_ENV,
@@ -47,6 +42,9 @@ from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.ptts.slot_pools import SlotPools
 from pllm.execution.state_execution import StateDiagnostics
 
+if TYPE_CHECKING:
+    from pllm.workload import BackendDeployment
+
 
 class WorkloadModelRunner(OverlayGraphRunner):
     """vLLM's MRv2 runner with the workload attachment slot, hidden taps and the guided sampler."""
@@ -57,7 +55,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
     hidden_pools: dict[tuple[str, int], SlotPools]
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
-    workload_session: VllmSession[Any, Any] | None = None
+    workload_session: VllmSession | None = None
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
@@ -93,7 +91,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
 
     def attach_workload(
         self,
-        deployment: BackendDeployment[DataT, ResultT],
+        deployment: BackendDeployment,
         cache_policy: CachePolicy,
     ) -> None:
         spec = deployment.attachment.spec
@@ -124,7 +122,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
         session.close()
         self.workload_session = None
 
-    def require_session(self) -> VllmSession[Any, Any]:
+    def require_session(self) -> VllmSession:
         session = self.workload_session
         assert session is not None
         return session

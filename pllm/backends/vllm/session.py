@@ -7,12 +7,11 @@ publication) for one attached workload. Runners drive its hooks; the worker and 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 
-from pllm.authoring import BackendDeployment, DataT, HostBatch, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.architecture import Decoder
 from pllm.backends.vllm.custom_attention import CustomAttention
@@ -32,7 +31,7 @@ from pllm.backends.vllm.sampler import (
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.host_batch import StateImport
+from pllm.contracts.host_batch import HostBatch, StateImport
 from pllm.contracts.packed_rows import PackedSamplerRowBatch, RowLabeler
 from pllm.contracts.request_identity import RequestIdentity, prompt_rows
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
@@ -58,20 +57,23 @@ from pllm.execution.state_feed import (
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.step_input import StepInput, gather_input_tokens
 
+if TYPE_CHECKING:
+    from pllm.workload import BackendDeployment
+
 
 @dataclass(slots=True)
-class _PackedStep(Generic[DataT]):
+class _PackedStep:
     rows: PackedSamplerRowBatch
-    context: StateTaskContext[DataT] | None = None
+    context: StateTaskContext | None = None
     forward_done: bool = False
 
 
-class VllmSession(Generic[DataT, ResultT]):
+class VllmSession:
     """Model primitives over one original signed tensor-state invocation."""
 
     def __init__(
         self,
-        deployment: BackendDeployment[DataT, ResultT],
+        deployment: BackendDeployment,
         decoder: Decoder,
         sampler: GuidedSampler | None,
         max_sampler_rows: int,
@@ -185,7 +187,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self.state_feed: FeedReceiver | None = None
         self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
         self._input_failed = False
-        self.custom_forward: VllmCustomForward[DataT, ResultT] | None = None
+        self.custom_forward: VllmCustomForward | None = None
         if custom_forward_task is not None:
             self.custom_forward = VllmCustomForward(
                 decoder.kv_writable("a @pllm.custom_forward"),
@@ -204,7 +206,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self.keep_replayed_state = preemption_policy(self.attachment, deployment.execution.math.model_sites) == "keep"
         self._pending_identities: dict[str, RequestIdentity] = {}
         self._next_step_id = 0
-        self.step: _PackedStep[DataT] | None = None
+        self.step: _PackedStep | None = None
         self._host_batch: HostBatch[torch.Tensor] | None = None
         self._import_rows: dict[str, int] = {}
         self.completion_rows: CompletionRows | None = None
@@ -360,7 +362,7 @@ class VllmSession(Generic[DataT, ResultT]):
         self._require_input_live()
         self._next_step_id += 1
         execution = self.deployment.execution
-        step = _PackedStep[DataT](rows)
+        step = _PackedStep(rows)
         self.step = step
         if self.hidden_taps is not None:
             self.hidden_taps.prepare(rows.row_batch)
@@ -642,6 +644,6 @@ class VllmSession(Generic[DataT, ResultT]):
                     self.deployment.execution.discard_borrows()
                     self.state_feed.close()
 
-    def _context(self) -> StateTaskContext[DataT]:
+    def _context(self) -> StateTaskContext:
         assert self.step is not None and self.step.context is not None
         return self.step.context

@@ -22,7 +22,6 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.freeze import fingerprint
 from pllm.execution.task_memory import example, meta_site_arguments, producers_first, task_example
 from pllm.execution.tensor_declaration import TensorDeclaration
-from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import TensorBatch, TensorOperation
 from pllm.execution.token_program import Cell
 from pllm.execution.torch_private import (
@@ -196,7 +195,7 @@ def _traffic(binding: TensorDeclaration, facts: BackendCompileFacts, symbol: Tas
     return reads, writes
 
 
-def _copy_kernels(operation: TensorOperation[TensorFrame], batch: TensorBatch) -> int:
+def _copy_kernels(operation: TensorOperation, batch: TensorBatch) -> int:
     if operation.mode == "read" or operation.copy_fields == ():
         return 0
     batch = operation.scoped(batch)

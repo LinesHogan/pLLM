@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from examples.video_session import video_frames
-from pllm.authoring import BackendDeployment
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
@@ -47,6 +46,7 @@ from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import FunctionMath, TaskOutput
 from pllm.testing import RequestIdentity, backend_facts, step_input
+from pllm.workload import BackendDeployment
 from pllm.workloads.video import VideoWorkload, frame_features
 
 

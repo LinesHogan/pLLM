@@ -755,7 +755,7 @@ execution.retire(rows, wait=True)
 ### pllm
 
 ```text
-pllm.make_llm(config: 'ModelConfig', *, workload: 'BackendWorkload[D, R] | None' = None) -> 'VllmLlm[D, R] | VllmLlm[None, None]'
+pllm.make_llm(config: 'ModelConfig', *, workload: 'Workload | None' = None) -> 'VllmLlm'
     A context-managed vLLM engine; execution options apply when a workload is installed.
 pllm.explain(workload: 'Workload', config: 'ModelConfig') -> 'ExplainResult'
     Plan using model/quantization metadata and shape-only tracing; never load weights or allocate CUDA storage.
@@ -888,7 +888,7 @@ pllm.host.make_host(config: 'HostConfig', workload: 'Workload') -> 'HostTrainer'
     Compile `workload` without a model and admit its instance state; `train(batch)` steps it on one host batch.
 pllm.host.HostConfig(device: 'torch.device', hidden_size: 'int' = 0, target_shape: 'tuple[int, ...]' = (), seed: 'int' = 0, state_page_budget_bytes: 'int' = 67108864, max_input_rows: 'int | None' = None, execution_peak_budget_bytes: 'int | None' = None)
     What pllm.host.make_host compiles a workload against: the device, the width of hidden rows in host batches and the shape of each row's target (() for one value per row), the seed of initial state values, and the state and per-step memory limits (max_input_rows bounds a batch).
-pllm.host.HostTrainer(execution: 'StateExecution[StepInput, TensorFrame, TensorOutput]')
+pllm.host.HostTrainer(execution: 'StateExecution')
     A workload's instance state, trained on host batches without a model.
 pllm.host.TrainStep(loss: 'torch.Tensor | None', parameters: 'Mapping[str, torch.Tensor]')
     One host training step: its loss (None when the train method skipped the update) and the trained state's fields after the step, by name, as owned copies ready on the caller's current stream.
@@ -953,15 +953,15 @@ pllm.testing.RequestIdentity(request_id: 'str', prompt_index: 'int', sample_inde
 pllm.testing.SamplerFeedback(sampler_rows: 'PackedSamplerRowBatch', base_logits: 'torch.Tensor', sampled_tokens: 'torch.Tensor')
 pllm.testing.backend_facts(hidden_size: 'int', hidden: 'tuple[PackedHiddenResourceBinding, ...]' = (), *, device: 'str' = 'cpu', capabilities: 'tuple[str, ...]' = ..., pages: 'int' = 0, max_lineages: 'int' = 2, memory_bytes: 'int' = 10000, max_rows: 'int | None' = None, dtype: 'torch.dtype' = torch.float32, vocab_size: 'int' = 0, layer_count: 'int' = 0, targets: 'Mapping[Projection, tuple[int, int]]' = {}) -> 'BackendCompileFacts'
     Facts for an eager in-process model, in place of what the vLLM runner probes.
-pllm.testing.compile_execution(workload: 'BackendWorkload[DataT, ResultT]', facts: 'BackendCompileFacts', stream: 'torch.cuda.Stream | None' = None) -> 'StateExecution[StepInput, DataT, ResultT]'
+pllm.testing.compile_execution(workload: 'Workload', facts: 'BackendCompileFacts', stream: 'torch.cuda.Stream | None' = None) -> 'StateExecution'
     Compile `workload` against `facts` and admit its instance state, as the vLLM runner does on install.
 pllm.testing.final_hidden_binding(layer_count: 'int') -> 'PackedHiddenResourceBinding'
     The tap `pllm.final_hidden()` reads, named as the vLLM runner names it.
 pllm.testing.hidden_binding(layer: 'int', layer_count: 'int') -> 'PackedHiddenResourceBinding'
     The tap `pllm.hidden(layer)` reads, named as the vLLM runner names it.
-pllm.testing.run_guided_step(execution: 'StateExecution[StepInput, DataT, ResultT]', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'tuple[tuple[PackedSamplerGuidanceBatch, ...], ResultT]'
+pllm.testing.run_guided_step(execution: 'StateExecution', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'tuple[tuple[PackedSamplerGuidanceBatch, ...], TensorOutput]'
     Like `run_step`, also returning additions in declaration order, followed by any guidance stage.
-pllm.testing.run_step(execution: 'StateExecution[StepInput, DataT, ResultT]', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'ResultT'
+pllm.testing.run_step(execution: 'StateExecution', value: 'StepInput', *, feedback: 'SamplerFeedback | None' = None, stream: 'torch.cuda.Stream | None' = None) -> 'TensorOutput'
     Execute every anchor of one step, completing the sampler with `feedback` when the workload reads it.
 pllm.testing.step_input(identities: 'Sequence[RequestIdentity]', hidden: 'Mapping[PackedHiddenResourceBinding, torch.Tensor] | None' = None, *, step_id: 'int' = 0, token_offset: 'int' = 0, tokens: "Sequence[Literal['prefill', 'decode']] | None" = None, sampler_order: 'Sequence[int] | None' = None, batch: 'HostBatch[torch.Tensor] | None' = None, operands: 'tuple[ProjectionOperands, ...]' = (), stream: 'torch.cuda.Stream | None' = None) -> 'StepInput'
     One packed step: row i belongs to `identities[i]` and decodes unless `tokens` says otherwise.
@@ -975,9 +975,9 @@ pllm.testing.scheduled_step(identities: 'tuple[RequestIdentity, ...]', scheduled
 pllm.benchmark.BenchmarkOptions(model: 'str' = 'Qwen/Qwen2.5-0.5B-Instruct', batch: 'int' = 8, tokens: 'int' = 256, rounds: 'int' = 3, warmup: 'int' = 1, gpu_memory_utilization: 'float' = 0.25, profile: 'Path | None' = None, cuda_graph_pool_budget_bytes: 'int | None' = None, state_page_budget_bytes: 'int' = 0, execution_peak_budget_bytes: 'int | None' = None, sampling_n: 'int' = 16, cuda_graphs: 'bool' = True, guidance_capacity: 'int | None' = 4096)
     Aligned benchmark settings; capture and state pages size themselves unless explicitly capped.
 pllm.benchmark.BenchmarkResult(implementation: 'str', cold_seconds: 'float', round_seconds: 'tuple[float, ...]', output_tokens: 'int', loss_count: 'int', update_count: 'int', trained_rows: 'int', peak_allocated_bytes: 'int', baseline_allocated_bytes: 'int', plan_digest: 'str', task_implementations: 'tuple[tuple[str, str], ...]', planned_peak_memory_bytes: 'int', round_process_cpu_seconds: 'tuple[float, ...]', state_usage: 'PageBundleUsage', vanilla_tokens_per_second: 'float')
-pllm.benchmark.compare(workload: 'BackendWorkload[D, R]', options: 'BenchmarkOptions', *, prepare: 'Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None' = None, max_host_training_rows: 'int' = 1, require_training: 'bool' = False, prompt_indices: 'tuple[int, ...] | None' = None, alternatives: 'tuple[tuple[str, BackendWorkload[D, R]], ...]' = ()) -> 'tuple[BenchmarkResult, ...]'
+pllm.benchmark.compare(workload: 'Workload', options: 'BenchmarkOptions', *, prepare: 'Callable[[VllmLlm], HostBatch[torch.Tensor]] | None' = None, max_host_training_rows: 'int' = 1, require_training: 'bool' = False, prompt_indices: 'tuple[int, ...] | None' = None, alternatives: 'tuple[tuple[str, Workload], ...]' = ()) -> 'tuple[BenchmarkResult, ...]'
     Measure ordinary model workloads against plain vLLM; optimized arms and nonzero training are opt-in.
-pllm.benchmark.throughput(llm: 'VllmLlm[D, R]', prompts: 'list[str]', sampling: 'SamplingParams', *, warmup: 'int' = 1, rounds: 'int' = 3) -> 'float'
+pllm.benchmark.throughput(llm: 'VllmLlm', prompts: 'list[str]', sampling: 'SamplingParams', *, warmup: 'int' = 1, rounds: 'int' = 3) -> 'float'
     Median output tokens per second over `rounds` generate calls after `warmup` untimed ones.
 ```
 <!-- end of generated signatures -->

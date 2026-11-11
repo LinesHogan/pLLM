@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -39,12 +39,9 @@ from pllm.execution.tensor_program import PoolSGD, TaskOutput, TensorBatch, read
 from pllm.execution.torch_private import MemoryTrace
 from pllm.kernels.page_copy import chunk_capacity, prepend_rows
 
-DataT = TypeVar("DataT")
-ResultT = TypeVar("ResultT")
 if TYPE_CHECKING:
     from pllm.execution.overlay_batch import OverlayBatch
     from pllm.execution.state_execution import StateExecution, StateTaskContext
-    from pllm.execution.step_input import StepInput
 
 
 def join_tail(
@@ -314,13 +311,13 @@ class GradientUpdate:
         return UpdateOutput(output, updates > 0, updates, trained, {"tail_rows": length.clone()})
 
 
-class ProjectionTask(Generic[DataT, ResultT]):
+class ProjectionTask:
     """One invocation's projection segments; private writes remain owned by StateExecution."""
 
     def __init__(
         self,
-        execution: StateExecution[StepInput, DataT, ResultT],
-        context: StateTaskContext[DataT],
+        execution: StateExecution,
+        context: StateTaskContext,
         rows: PackedSamplerRowBatch,
         task: TaskId,
         targets: tuple[Projection, ...],

@@ -9,7 +9,6 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from pllm.authoring import CausalTrainBatch
 from pllm.config import ExecutionOptions
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
@@ -20,6 +19,8 @@ from pllm.execution.causal_batch import LMHead
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.step_input import StepInput
+from pllm.execution.workload_lowering import reserve_resources
+from pllm.host import CausalTrainBatch
 from pllm.kernels.adamw import AdamWConfig
 from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
@@ -161,7 +162,7 @@ def test_tlm_matches_objective_online_offline_graph_and_qv_publication() -> None
         config = TLMConfig(mode=mode, threshold=0.0)
         limits = (TaskResourceFact(TaskSymbol("update"), 4096, input_shapes=((1, 3),)),)
         workload, facts = TLMWorkload(config, 2, 2), causal_facts(model)
-        timeline = workload.resource_facts(workload.build(facts), facts, ExecutionOptions())
+        timeline = reserve_resources(workload.build(facts), facts, ExecutionOptions())
         assert min(timeline.reserved_bytes) == model.resident_bytes
         execution = workload.compile_backend(causal_facts(model, task_resources=limits), causal=model.bind).execution
         (initial,) = execution.admit(())

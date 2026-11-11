@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -24,10 +24,8 @@ from pllm.execution.token_program_executor import execute_segment, execute_token
 from pllm.execution.trace import TraceEventKind
 
 if TYPE_CHECKING:
-    from pllm.execution.execution import TaskGraphImplementation
-    from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
+    from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext, TaskGraphImplementation
 
-DataT = TypeVar("DataT")
 CUSTOM_FORWARD_IMPLEMENTATION = ImplementationId("custom_forward@1")
 
 
@@ -151,26 +149,24 @@ class SerialCustomForward(CustomForwardPrimitive):
 
 
 @dataclass(frozen=True, slots=True)
-class CustomForwardTask(Generic[DataT]):
+class CustomForwardTask:
     """Disjoint role programs and their publication-owned optional overlay transition."""
 
     task: SemanticTask
     program: dict[str, TokenProgram]
     domain: CausalModelDomain
     implementation_id: ImplementationId = CUSTOM_FORWARD_IMPLEMENTATION
-    operation: TensorOperation[DataT] | None = None
+    operation: TensorOperation | None = None
     overlay_math: OverlayTransition | None = None
     primitive: CustomForwardPrimitive | None = None
 
     @classmethod
-    def from_implementation(
-        cls, implementation: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
-    ) -> CustomForwardTask[DataT]:
+    def from_implementation(cls, implementation: TaskGraphImplementation) -> CustomForwardTask:
         if not isinstance(implementation, cls):
             raise ValueError("a custom forward needs its native task binding")
         return implementation
 
-    def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
+    def execute(self, context: StateTaskContext) -> ProjectionResiduals:
         if self.operation is not None:
             # The program overlay stages and restores whole roots, so every field takes a private page; sharing
             # unchanged chunk carries applies to ordinary forwards only.
@@ -178,7 +174,7 @@ class CustomForwardTask(Generic[DataT]):
         self.run(context)
         return {}
 
-    def _overlay_body(self, data: DataT, batch: TensorBatch, context: StateTaskContext[DataT]) -> TaskOutput:
+    def _overlay_body(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext) -> TaskOutput:
         assert isinstance(data, TensorFrame) and self.overlay_math is not None
         primitive, operation = self.primitive, self.operation
         assert primitive is not None and operation is not None
@@ -189,7 +185,7 @@ class CustomForwardTask(Generic[DataT]):
         finally:
             primitive.overlay = None
 
-    def run(self, context: StateTaskContext[DataT]) -> None:
+    def run(self, context: StateTaskContext) -> None:
         primitive, effect = self.primitive, self.task.custom_forward
         assert primitive is not None and effect is not None
         task_id = TaskId(context.arena.plan.semantic_graph.tasks.index(self.task))

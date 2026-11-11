@@ -49,7 +49,7 @@ from pllm.execution.preemption import preemption_policy
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_executor import reads_rows
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
@@ -411,7 +411,7 @@ def _field_name(declaration: TensorDeclaration, resource: str, index: int) -> st
 
 
 def _state_values(
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput], row: PackedPhaseRow, declaration: TensorDeclaration
+    execution: StateExecution, row: PackedPhaseRow, declaration: TensorDeclaration
 ) -> dict[str, torch.Tensor]:
     selection = execution.directory.select(PackedRows.from_rows((row,)))
     immutable = {state.resource for state in declaration.graph.states if state.immutable}
@@ -436,7 +436,7 @@ def _shared_resources(declaration: TensorDeclaration) -> frozenset[str]:
 
 
 def _check_idle_state(
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput],
+    execution: StateExecution,
     versions: tuple[tuple[StateResource, StateRef], ...],
     run: _Run,
     observed: int,
@@ -454,8 +454,8 @@ def _check_idle_state(
 
 
 def _projection_step(
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput],
-    context: StateTaskContext[TensorFrame],
+    execution: StateExecution,
+    context: StateTaskContext,
     value: StepInput,
     run: _Run,
 ) -> None:
@@ -476,11 +476,11 @@ def _projection_step(
 
 
 def _execute_step(
-    execution: StateExecution[StepInput, TensorFrame, TensorOutput],
+    execution: StateExecution,
     value: StepInput,
     feedback: SamplerFeedback,
     run: _Run,
-    before_forward: Callable[[StateTaskContext[TensorFrame]], None] | None = None,
+    before_forward: Callable[[StateTaskContext], None] | None = None,
 ) -> None:
     run.timing.begin(execution, value)
     overlap = execution.post_sample
@@ -560,7 +560,7 @@ def _site_step(
     value: StepInput,
     tokens: torch.Tensor,
     run: _Run,
-    context: StateTaskContext[TensorFrame],
+    context: StateTaskContext,
 ) -> None:
     if context.prefetch_stream is not None:
         torch.cuda.current_stream().wait_stream(context.prefetch_stream)

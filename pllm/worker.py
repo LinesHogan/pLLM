@@ -10,7 +10,6 @@ import torch
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
-from pllm.authoring import BackendWorkload, DataT, ResultT, map_host_batch
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
 from pllm.backends.vllm.runtime import (
@@ -21,9 +20,11 @@ from pllm.backends.vllm.runtime import (
 )
 from pllm.backends.vllm.training import CausalTraining
 from pllm.contracts.codec import decode_boundary, encode_boundary
+from pllm.contracts.host_batch import map_host_batch
 from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.trace import TraceSelection
+from pllm.workload import Workload
 from pllm.workload_transport import decode_workload
 
 
@@ -42,7 +43,7 @@ class GPUWorker(compat.Worker):
         assert isinstance(runner, WorkloadModelRunner)
         return runner
 
-    def install_workload(self, workload: BackendWorkload[DataT, ResultT], install: BackendInstall) -> None:
+    def install_workload(self, workload: Workload, install: BackendInstall) -> None:
         """Bind the driver's plan to the workload this process imported, refusing drifted sources."""
         runner = self.workload_runner
         plan = install.attachment.plan

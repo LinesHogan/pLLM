@@ -21,7 +21,7 @@ from pllm.execution.model_sites import ResidualRewrite
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan_execution import PreparedScan
-from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.torch_private import compile_math, compiling_method
 from pllm.kernels.page_copy import copy_pages
 
@@ -60,7 +60,7 @@ class SiteMemorySchedule:
         self._counts: tuple[int, ...] | None = None
         self._buckets: dict[tuple[int, int], Callable[..., tuple[dict[str, Tensor], Tensor]]] = {}
 
-    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
+    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext) -> None:
         """Upload host scheduling facts and the exact slots authorized by the pending PTTS write."""
         resource = self.memory.carry.resource
         write = context.pending_write(resource)

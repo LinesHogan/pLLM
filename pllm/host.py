@@ -43,8 +43,6 @@ from pllm.execution.tensor_declaration import StepResult
 
 if TYPE_CHECKING:
     from pllm.execution.state_execution import StateDiagnostics, StateExecution
-    from pllm.execution.tensor_declaration import TensorOutput
-    from pllm.execution.tensor_frame import TensorFrame
     from pllm.workload import Workload
 
 
@@ -64,7 +62,7 @@ class HostTrainer:
     `close()` (or leaving a `with` block) releases the state.
     """
 
-    def __init__(self, execution: StateExecution[StepInput, TensorFrame, TensorOutput]) -> None:
+    def __init__(self, execution: StateExecution) -> None:
         self._execution = execution
         execution.admit((), self._stream())
 

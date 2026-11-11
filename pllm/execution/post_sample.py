@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -22,8 +22,6 @@ from pllm.execution.tensor_frame import TensorFrame
 
 if TYPE_CHECKING:
     from pllm.execution.state_execution import StateTaskContext
-
-_DataT = TypeVar("_DataT")
 
 
 class PostSampleOverlap:
@@ -46,7 +44,7 @@ class PostSampleOverlap:
         """Writer inputs, oldest first, retained independently of GPU completion."""
         return tuple(pin.refs for pin in self._history)
 
-    def hand_off(self, context: StateTaskContext[_DataT]) -> None:
+    def hand_off(self, context: StateTaskContext) -> None:
         """Protect reusable inputs and move the step to the writer stream, once per step."""
         if context.handed_off:
             return
@@ -61,7 +59,7 @@ class PostSampleOverlap:
                         self.arena.release_pin(self._history.popleft())
         context.handed_off = True
 
-    def _resume_latest(self, context: StateTaskContext[_DataT]) -> None:
+    def _resume_latest(self, context: StateTaskContext) -> None:
         """Move the step's pin to the writer stream without losing exact read holds.
 
         Old reader pages stay pinned on the writer stream until the step commits, including aliases
@@ -81,7 +79,7 @@ class PostSampleOverlap:
                 context.move_owned_pin(reader, self.stream)
         context.move_slots()
 
-    def _copy_inputs(self, context: StateTaskContext[_DataT]) -> None:
+    def _copy_inputs(self, context: StateTaskContext) -> None:
         """Own token rows, sampler feedback and results before the writer consumes them.
 
         Hidden rows stay in held slots. Copies of reusable token, feedback and result

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import Generic
 
 import numpy as np
 import torch
@@ -13,7 +12,6 @@ from vllm.distributed.parallel_state import GraphCaptureContext, get_tp_group
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.sequence import IntermediateTensors
 
-from pllm.authoring import DataT, ResultT
 from pllm.backends.vllm.activation import VllmActivationPatch
 from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
 from pllm.backends.vllm.architecture import KvLM
@@ -35,7 +33,6 @@ from pllm.execution.model_sites import StateInput
 from pllm.execution.overlay_task import ProgramOperand, ProgramOverlay
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_capture import capture_graph
-from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_frame import OverlayTargetResult
 from pllm.execution.token_program import KV, Save, TokenProgram
 from pllm.execution.token_program_executor import Stream, add, execute_token_program, ordinary_pass
@@ -43,10 +40,10 @@ from pllm.execution.token_program_executor import Stream, add, execute_token_pro
 Signature = tuple[bool, tuple[bool, ...], bool]
 
 
-class ProgramWave(Generic[DataT, ResultT]):
+class ProgramWave:
     """Stable inputs, page indices and captured outputs for an exact active width."""
 
-    def __init__(self, owner: VllmCustomForward[DataT, ResultT], width: int, signature: Signature) -> None:
+    def __init__(self, owner: VllmCustomForward, width: int, signature: Signature) -> None:
         self.custom_forward, self.signature = owner, signature
         tensor = owner.model.norm.weight
         self.seed = tensor.new_empty((width, tensor.numel()))
@@ -175,14 +172,14 @@ class ProgramWave(Generic[DataT, ResultT]):
             restore()
 
 
-class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
+class VllmCustomForward(CustomForwardPrimitive):
     """Run ordinary spans natively and dependent program positions in cross-request waves."""
 
     def __init__(
         self,
         model: KvLM,
         task: SemanticTask,
-        execution: StateExecution[StepInput, DataT, ResultT],
+        execution: StateExecution,
         anchor: AnchorId,
         *,
         activation: VllmActivationPatch | None = None,
@@ -196,9 +193,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, projections
         self.sites = sites
         implementation = execution.arena.plan.scheduled(task.symbol)
-        binding = CustomForwardTask[DataT].from_implementation(
-            execution.implementation(implementation.implementation_id)
-        )
+        binding = CustomForwardTask.from_implementation(execution.implementation(implementation.implementation_id))
         self.program, self.domain = binding.program, binding.domain
         self.resident_bytes = next(
             fact.resident_bytes for fact in execution.arena.plan.timeline.task_resources if fact.task == task.symbol
@@ -208,12 +203,12 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
         validate_attention_resources(self.attentions, hidden_size=model.config.hidden_size)
         self.original = self.model.forward
         self._rows: Sequence[PackedPhaseRow] = ()
-        self.context: StateTaskContext[DataT] | None = None
+        self.context: StateTaskContext | None = None
         self.hidden: torch.Tensor | None = None
         self.positions: torch.Tensor | None = None
         self.output: torch.Tensor | None = None
         self.observations: torch.Tensor | None = None
-        self.captures: dict[tuple[int, Signature], ProgramWave[DataT, ResultT]] = {}
+        self.captures: dict[tuple[int, Signature], ProgramWave] = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.parameters: dict[StateInput, torch.Tensor] = {}
         self.identity: tuple[int, ...] = ()
@@ -262,7 +257,7 @@ class VllmCustomForward(CustomForwardPrimitive, Generic[DataT, ResultT]):
             for tap in taps:
                 tap.rows, tap.active = previous
 
-    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT]) -> None:
+    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext) -> None:
         self.clear()
         self._rows, self.context = rows.rows, context
 

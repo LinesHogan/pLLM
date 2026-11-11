@@ -8,12 +8,12 @@ from dataclasses import replace
 import pytest
 import torch
 
-from pllm.authoring import CausalTrainBatch, StateImport
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.shared_tensor import SharedTensor
-from pllm.host import Completion, CompletionBatch, FinishReason
+from pllm.host import CausalTrainBatch, Completion, CompletionBatch, FinishReason
+from pllm.io import StateImport
 
 IDENTITIES = (RequestIdentity("a", 9, 0), RequestIdentity("b", 7, 0), RequestIdentity("c", 11, 0))
 BATCH = CompletionBatch(

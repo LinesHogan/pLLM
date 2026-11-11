@@ -7,7 +7,6 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import StateImport
 from pllm.backends.vllm.activation import activation_delta
 from pllm.contracts.backend_attachment import (
     DecodeRefresh,
@@ -18,6 +17,7 @@ from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch, Pack
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.step_input import StepInput
+from pllm.io import StateImport
 from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.reft import ReFTConfig, ReFTWorkload, load_loreft_interventions
 

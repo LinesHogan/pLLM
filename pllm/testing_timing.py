@@ -14,7 +14,6 @@ from pllm.contracts.semantic_graph import (
 from pllm.contracts.state_ref import LineageId, StateRef
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_declaration import TensorOutput
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
 
@@ -29,7 +28,7 @@ class VersionChecks:
     failures: list[str] = field(default_factory=lambda: [])
     values: dict[tuple[str, int, str], frozenset[tuple[str, int]]] = field(default_factory=lambda: {})
 
-    def begin(self, execution: StateExecution[StepInput, TensorFrame, TensorOutput], value: StepInput) -> None:
+    def begin(self, execution: StateExecution, value: StepInput) -> None:
         """Derive the permitted version before the executor selects its retained reader pages."""
         selection = execution.directory.select(value.rows.request_rows)
         entry = {ref.lineage_id: ref for ref in selection.refs}

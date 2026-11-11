@@ -15,22 +15,20 @@ from importlib.metadata import version
 from pathlib import Path
 from statistics import median
 from time import perf_counter, process_time
-from typing import TYPE_CHECKING, Generic, TypedDict, TypeVar
+from typing import TYPE_CHECKING, TypedDict
 
 import torch
 from vllm import SamplingParams
 
 from pllm import make_llm
-from pllm.authoring import BackendWorkload, HostBatch
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.codec import boundary_digest
+from pllm.contracts.host_batch import HostBatch
 from pllm.execution.ptts.page_bundle import PageBundleUsage
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.runtime import VllmLlm
-
-D = TypeVar("D")
-R = TypeVar("R")
+    from pllm.workload import Workload
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,25 +182,25 @@ class _Requests:
 
 
 @dataclass(frozen=True, slots=True)
-class _Arm(Generic[D, R]):
+class _Arm:
     name: str
-    workload: BackendWorkload[D, R]
+    workload: Workload
 
 
 @dataclass(frozen=True, slots=True)
-class _Setup(Generic[D, R]):
+class _Setup:
     """What every workload arm of one comparison shares."""
 
     options: BenchmarkOptions
     requests: _Requests
-    prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None
+    prepare: Callable[[VllmLlm], HostBatch[torch.Tensor]] | None
     max_host_training_rows: int
     require_training: bool
     vanilla_tokens_per_second: float
 
 
 def throughput(
-    llm: VllmLlm[D, R], prompts: list[str], sampling: SamplingParams, *, warmup: int = 1, rounds: int = 3
+    llm: VllmLlm, prompts: list[str], sampling: SamplingParams, *, warmup: int = 1, rounds: int = 3
 ) -> float:
     """Median output tokens per second over `rounds` generate calls after `warmup` untimed ones.
 
@@ -226,7 +224,7 @@ def _vanilla(options: BenchmarkOptions, requests: _Requests) -> float:
 
 
 def _generate_rounds(
-    handle: VllmLlm[D, R], requests: _Requests, host_batch: HostBatch[torch.Tensor] | None, rounds: int
+    handle: VllmLlm, requests: _Requests, host_batch: HostBatch[torch.Tensor] | None, rounds: int
 ) -> tuple[tuple[float, ...], tuple[float, ...], tuple[int, ...]]:
     """Wall and process CPU seconds, and generated tokens, of each round."""
     elapsed: list[float] = []
@@ -245,9 +243,7 @@ def _generate_rounds(
     return tuple(elapsed), tuple(cpu_elapsed), tuple(tokens)
 
 
-def _measure_arm(
-    setup: _Setup[D, R], arm: _Arm[D, R], directory: Path | None
-) -> tuple[BenchmarkResult, _ProfileFootprint]:
+def _measure_arm(setup: _Setup, arm: _Arm, directory: Path | None) -> tuple[BenchmarkResult, _ProfileFootprint]:
     """Run one arm end to end and check the effective-work and cleanup contract."""
     options, requests = setup.options, setup.requests
     config = replace(
@@ -465,14 +461,14 @@ def _print_profile(
 
 
 def compare(
-    workload: BackendWorkload[D, R],
+    workload: Workload,
     options: BenchmarkOptions,
     *,
-    prepare: Callable[[VllmLlm[D, R]], HostBatch[torch.Tensor]] | None = None,
+    prepare: Callable[[VllmLlm], HostBatch[torch.Tensor]] | None = None,
     max_host_training_rows: int = 1,
     require_training: bool = False,
     prompt_indices: tuple[int, ...] | None = None,
-    alternatives: tuple[tuple[str, BackendWorkload[D, R]], ...] = (),
+    alternatives: tuple[tuple[str, Workload], ...] = (),
 ) -> tuple[BenchmarkResult, ...]:
     """Measure ordinary model workloads against plain vLLM; optimized arms and nonzero training are opt-in.
 

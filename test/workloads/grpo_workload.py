@@ -4,7 +4,6 @@ import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from vllm import RequestOutput, SamplingParams
@@ -107,7 +106,7 @@ class TTRL(pllm.Workload):
 
     def run(
         self,
-        handle: VllmLlm[Any, Any],
+        handle: VllmLlm,
         prompts: list[str],
         sampling: SamplingParams,
         *,

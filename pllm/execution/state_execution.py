@@ -11,13 +11,12 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import TYPE_CHECKING, ClassVar, Generic, Literal, NoReturn, Protocol, Self, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Literal, NoReturn, Protocol, Self
 
 import numpy as np
 import torch
 
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
@@ -37,7 +36,6 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
-from pllm.execution.execution import TaskGraphExecution, TaskGraphImplementation
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import (
     FieldNumericHealth,
@@ -48,24 +46,19 @@ from pllm.execution.ptts.page_bundle import (
     PageRelease,
     PageWrite,
 )
-from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection, StateAddress
+from pllm.execution.ptts.request_state import RequestStateDirectory, RequestStateSelection
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.torch_private import MemoryUsage
 from pllm.execution.trace import ExecutionTrace, TraceEvent, TraceEventKind
 
 if TYPE_CHECKING:
-    from pllm.execution.attention_methods import AttentionProgram
-    from pllm.execution.model_sites import ResidualRewrite
-    from pllm.execution.overlay_task import OverlayTransition
     from pllm.execution.post_sample import PostSampleOverlap
-    from pllm.execution.tensor_program import TensorBatch
+    from pllm.execution.step_input import StepInput
+    from pllm.execution.tensor_declaration import TensorOutput
+    from pllm.execution.tensor_frame import TensorFrame
+    from pllm.execution.tensor_program import FunctionMath, TensorBatch
 
-InputT = TypeVar("InputT", contravariant=True)
-InputContra = TypeVar("InputContra", contravariant=True)
-DataT = TypeVar("DataT")
-ResultT = TypeVar("ResultT")
-ResultCo = TypeVar("ResultCo", covariant=True)
 ProjectionResiduals = Mapping[tuple[RequestIdentity, Projection], torch.Tensor]
 _PagePhase = Literal["abort", "release"]
 
@@ -114,7 +107,7 @@ class HeldInput:
 
 
 @dataclass(slots=True)
-class StateTaskContext(Generic[DataT]):
+class StateTaskContext:
     """Per-step cursor, pages and sampler handoff driven by StateExecution."""
 
     selection: RequestStateSelection
@@ -127,7 +120,7 @@ class StateTaskContext(Generic[DataT]):
     finished: bool = False
     handed_off: bool = False
     prefetch_stream: torch.cuda.Stream | None = None
-    value: DataT | None = None
+    value: TensorFrame | None = None
     results: dict[tuple[TaskSymbol, str], torch.Tensor] = field(
         default_factory=lambda: dict[tuple[TaskSymbol, str], torch.Tensor]()
     )
@@ -154,7 +147,7 @@ class StateTaskContext(Generic[DataT]):
     input_step_id: int = -1
     retain_gradients: bool = True
 
-    def data(self) -> DataT:
+    def data(self) -> TensorFrame:
         assert self.value is not None
         return self.value
 
@@ -338,46 +331,21 @@ class StateTaskContext(Generic[DataT]):
         return pin
 
 
-class StateMath(Protocol[InputContra, DataT, ResultCo]):
-    """Input validation and tensor mathematics, never invocation ownership."""
+class TaskGraphImplementation(Protocol):
+    """One planned task's body, run by StateExecution in Rust's task order."""
 
     @property
-    def parameter_overlay(self) -> OverlayTransition | None:
-        """Declared chunk mathematics available to model graph ports."""
-        ...
+    def implementation_id(self) -> ImplementationId: ...
 
-    @property
-    def parameter_phases(self) -> tuple[HiddenPhase, ...]:
-        """Authored training phases used to select pinned projection captures."""
-        ...
-
-    @property
-    def model_sites(self) -> tuple[ResidualRewrite, ...]:
-        """The @pllm.custom_residual methods a model backend installs."""
-        ...
-
-    @property
-    def attention(self) -> AttentionProgram | None:
-        """Dense attention reads and their fact snapshot scratch."""
-        ...
-
-    def initialize(
-        self, roots: tuple[tuple[torch.Tensor, ...], ...], addresses: tuple[StateAddress, ...], /
-    ) -> None: ...
-
-    def rows(self, value: InputContra, /) -> PackedRows: ...
-
-    def prepare(self, value: InputContra, context: StateTaskContext[DataT]) -> DataT: ...
-
-    def output(self, context: StateTaskContext[DataT]) -> ResultCo: ...
+    def execute(self, context: StateTaskContext) -> ProjectionResiduals: ...
 
 
 @dataclass(frozen=True, slots=True)
-class MathBinding(Generic[InputT, DataT, ResultT]):
+class MathBinding:
     """Local native implementations, separate from the closed data contracts."""
 
-    math: StateMath[InputT, DataT, ResultT]
-    tasks: tuple[TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals], ...]
+    math: FunctionMath
+    tasks: tuple[TaskGraphImplementation, ...]
     feeds: tuple[FeedBinding, ...] = ()
     on_export: Callable[[TraceEvent], None] | None = None
 
@@ -386,7 +354,7 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
         borrowed = {feed.resource for feed in self.feeds}
         return tuple(str(state.resource) for state in plan.semantic_graph.states if state.resource not in borrowed)
 
-    def bind(self, arena: PageBundleArena, sampler_anchor_id: AnchorId) -> StateExecution[InputT, DataT, ResultT]:
+    def bind(self, arena: PageBundleArena, sampler_anchor_id: AnchorId) -> StateExecution:
         states = arena.plan.semantic_graph.states
         # A borrowed binding owns only its local directory; test_video verifies no remote lineage.
         if self.feeds:
@@ -404,14 +372,14 @@ class MathBinding(Generic[InputT, DataT, ResultT]):
 
 
 @dataclass(frozen=True, slots=True)
-class ConditionalProducerTask(Generic[DataT]):
-    original: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
+class ConditionalProducerTask:
+    original: TaskGraphImplementation
 
     @property
     def implementation_id(self) -> ImplementationId:
         return self.original.implementation_id
 
-    def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
+    def execute(self, context: StateTaskContext) -> ProjectionResiduals:
         context.check_page_execution()
         if context.held_input is None:
             return self.original.execute(context)
@@ -420,11 +388,11 @@ class ConditionalProducerTask(Generic[DataT]):
 
 
 @dataclass(frozen=True, slots=True)
-class PublishStateTask(Generic[DataT]):
+class PublishStateTask:
     implementation_id: ImplementationId
     resource: StateResource
 
-    def memory(self, data: DataT, batch: TensorBatch) -> MemoryUsage:
+    def memory(self, data: TensorFrame, batch: TensorBatch) -> MemoryUsage:
         """Publication changes ownership metadata; PTTS already funds its tensor pages."""
         return MemoryUsage(0, 0)
 
@@ -436,7 +404,7 @@ class PublishStateTask(Generic[DataT]):
     def resident(self, capture_bytes: int) -> int:
         return 0
 
-    def execute(self, context: StateTaskContext[DataT]) -> ProjectionResiduals:
+    def execute(self, context: StateTaskContext) -> ProjectionResiduals:
         write = context.pending_write(self.resource)
         if write is not None:
             context.publish_owned_write(write)
@@ -475,8 +443,8 @@ class StateDiagnostics:
         )
 
 
-class PartialCommitError(RuntimeError, Generic[DataT]):
-    def __init__(self, context: StateTaskContext[DataT], receipt: PagePublication) -> None:
+class PartialCommitError(RuntimeError):
+    def __init__(self, context: StateTaskContext, receipt: PagePublication) -> None:
         super().__init__(
             "the state update is published but finishing the step failed; finish it again (finish_step) without rerunning the step"
         )
@@ -484,13 +452,13 @@ class PartialCommitError(RuntimeError, Generic[DataT]):
         self.receipt = receipt
 
 
-class StateExecution(Generic[InputT, DataT, ResultT]):
+class StateExecution:
     def __init__(
         self,
         arena: PageBundleArena,
         directory: RequestStateDirectory,
-        math: StateMath[InputT, DataT, ResultT],
-        implementations: tuple[TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals], ...],
+        math: FunctionMath,
+        implementations: tuple[TaskGraphImplementation, ...],
         sampler_anchor_id: AnchorId,
         *,
         feeds: tuple[FeedBinding, ...] = (),
@@ -503,8 +471,14 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._values = tuple(
             (task.symbol, output.name) for task in arena.plan.semantic_graph.tasks for output in task.outputs
         )
-        self._runner = TaskGraphExecution(arena.plan.schedule, implementations, self.trace, self._release_values)
-        self._active: dict[int, StateTaskContext[DataT]] = {}
+        bindings = {implementation.implementation_id: implementation for implementation in implementations}
+        assert len(bindings) == len(implementations)
+        assert set(bindings) == {task.implementation_id for task in self.plan.tasks}
+        # Rust numbers tasks densely, so position i holds the implementation of task i.
+        self._implementations = tuple(
+            bindings[task.implementation_id] for task in sorted(self.plan.tasks, key=lambda task: task.task_id)
+        )
+        self._active: dict[int, StateTaskContext] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
         self._training_counters = DeviceCounters(self.device)
@@ -617,23 +591,17 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
     def plan(self) -> ScheduleDecision:
         return self.arena.plan.schedule
 
-    def _release_values(self, context: StateTaskContext[DataT], values: tuple[int, ...]) -> None:
+    def _release_values(self, context: StateTaskContext, values: tuple[int, ...]) -> None:
         for value in values:
             context.results.pop(self._values[value], None)
 
-    def implementation(
-        self, identity: ImplementationId
-    ) -> TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]:
-        return next(item for item in self._runner.implementations if item.implementation_id == identity)
+    def implementation(self, identity: ImplementationId) -> TaskGraphImplementation:
+        return next(item for item in self._implementations if item.implementation_id == identity)
 
-    def rebind_implementation(
-        self, implementation: TaskGraphImplementation[StateTaskContext[DataT], ProjectionResiduals]
-    ) -> None:
+    def rebind_implementation(self, implementation: TaskGraphImplementation) -> None:
         """Install a locally verified lowering while no original invocation is active."""
         original = self.implementation(implementation.implementation_id)
-        self._runner.implementations = tuple(
-            implementation if item is original else item for item in self._runner.implementations
-        )
+        self._implementations = tuple(implementation if item is original else item for item in self._implementations)
 
     @property
     def device(self) -> torch.device:
@@ -673,13 +641,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
         retain_gradients: bool = True,
-    ) -> StateTaskContext[DataT]:
+    ) -> StateTaskContext:
         """Open a state invocation; token-only consumers can omit returned gradient snapshots."""
         self._require_borrow_live()
         self.arena.collect_completed()
         selection = self.directory.select(rows, history)
         pin = self.arena.pin_exact(selection.refs, stream)
-        context = StateTaskContext[DataT](selection, self.arena, pin, self.trace, self._next_invocation)
+        context = StateTaskContext(selection, self.arena, pin, self.trace, self._next_invocation)
         context.held_input = held_input
         context.retain_gradients = retain_gradients
         self._next_invocation += 1
@@ -704,13 +672,13 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def start_step(
         self,
-        value: InputT,
+        value: StepInput,
         stream: torch.cuda.Stream | None = None,
         *,
         history: tuple[StateRefs, ...] = (),
         held_input: HeldInput | None = None,
         retain_gradients: bool = True,
-    ) -> StateTaskContext[DataT]:
+    ) -> StateTaskContext:
         """Prepare one invocation, retaining gradients for direct step results unless the consumer opts out."""
         context = self.begin(
             self.math.rows(value), stream, history=history, held_input=held_input, retain_gradients=retain_gradients
@@ -718,7 +686,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self.submit_input(context, value)
         return context
 
-    def advance_to(self, context: StateTaskContext[DataT], symbol: str) -> None:
+    def advance_to(self, context: StateTaskContext, symbol: str) -> None:
         """Run every anchor up to `symbol`, handing the step to the post-sample overlap before its first latest read."""
         target = self._anchors[symbol]
         for ordinal in range(context.last_anchor_id + 1, target + 1):
@@ -727,8 +695,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self.execute_anchor(context, AnchorId(ordinal))
 
     def step(
-        self, value: InputT, stream: torch.cuda.Stream | None = None, *, feedback: SamplerFeedback | None = None
-    ) -> ResultT:
+        self, value: StepInput, stream: torch.cuda.Stream | None = None, *, feedback: SamplerFeedback | None = None
+    ) -> TensorOutput:
         """Run without an external sampler borrower using the same staged lifecycle."""
         if stream is None and self.side_stream is not None:
             stream = torch.cuda.current_stream(self.device)
@@ -746,8 +714,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def submit_input(
         self,
-        context: StateTaskContext[DataT],
-        value: InputT,
+        context: StateTaskContext,
+        value: StepInput,
         readiness: CudaStreamReadiness | None = None,
     ) -> None:
         """Consume original inputs, ordering an external CUDA producer when supplied."""
@@ -765,7 +733,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             self.cancel_step(context)
             raise
 
-    def execute_anchor(self, context: StateTaskContext[DataT], anchor_id: AnchorId) -> None:
+    def execute_anchor(self, context: StateTaskContext, anchor_id: AnchorId) -> None:
         """Advance the step through every task at this anchor, retaining its cursor on backpressure."""
         self._require_borrow_live()
         try:
@@ -785,7 +753,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         except Exception as exc:
             self._failed(context, exc)
 
-    def execute_task(self, context: StateTaskContext[DataT], task: PhysicalTask) -> None:
+    def execute_task(self, context: StateTaskContext, task: PhysicalTask) -> None:
         """Borrow the same exact versions on the chosen lane until its kernels finish."""
         prefetch = task.lane == "side" and task.read_origin != "latest"
         stream = self.side_stream if prefetch else context.pin.stream
@@ -801,7 +769,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
                 context.pin = self.arena.pin_exact(pin.refs, stream)
             try:
                 with self.trace.task(context.invocation_id, task.task_id, stream):
-                    self._runner.implementations[int(task.task_id)].execute(context)
+                    self._implementations[int(task.task_id)].execute(context)
             finally:
                 if prefetch:
                     self.arena.release_pin(context.pin)
@@ -811,8 +779,8 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def execute_part(
         self,
-        context: StateTaskContext[DataT],
-        value: InputT,
+        context: StateTaskContext,
+        value: StepInput,
         task_id: TaskId,
         *,
         complete: bool,
@@ -827,7 +795,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             task = plan.tasks[context.next_task]
             assert task.task_id == task_id and task.anchor_id >= context.last_anchor_id
             with self.trace.task(context.invocation_id, task_id, context.pin.stream):
-                result = self._runner.implementations[int(task_id)].execute(context)
+                result = self._implementations[int(task_id)].execute(context)
             context.last_anchor_id = int(task.anchor_id)
             if complete:
                 if task.release_values:
@@ -839,7 +807,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def sampler_guidance(
         self,
-        context: StateTaskContext[DataT],
+        context: StateTaskContext,
         stream: torch.cuda.Stream | None = None,
     ) -> tuple[PackedSamplerGuidanceBatch, ...]:
         self._require_borrow_live()
@@ -852,7 +820,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def complete_sampler(
         self,
-        context: StateTaskContext[DataT],
+        context: StateTaskContext,
         stream: torch.cuda.Stream | None = None,
         *,
         feedback: SamplerFeedback | None = None,
@@ -863,7 +831,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self._sampler_count += 1
         self.trace.record(TraceEventKind.SAMPLER_COMPLETE, context.invocation_id, pin_id=context.pin.pin_id)
 
-    def finish_step(self, context: StateTaskContext[DataT], stream: torch.cuda.Stream | None = None) -> ResultT:
+    def finish_step(self, context: StateTaskContext, stream: torch.cuda.Stream | None = None) -> TensorOutput:
         """Complete the step; pass the stream that will read the result so it is ordered after the writer lane.
 
         The vLLM session passes none: it discards results, and waiting would serialize the overlap.
@@ -884,7 +852,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
             CudaStreamReadiness(self.post_sample.stream).order_on(stream)
         return result
 
-    def cancel_step(self, context: StateTaskContext[DataT]) -> None:
+    def cancel_step(self, context: StateTaskContext) -> None:
         context.cancel_requested = True
         self._require_borrow_live()
         # Cancellation cannot prove that remote aliases were discarded; test_video checks no ACK.
@@ -905,7 +873,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         if self.post_sample is not None:
             self.post_sample.release_history()
 
-    def _failed(self, context: StateTaskContext[DataT], exc: Exception) -> NoReturn:
+    def _failed(self, context: StateTaskContext, exc: Exception) -> NoReturn:
         context.cancel_requested = True
         self.trace.record(
             TraceEventKind.FAILED,
@@ -926,7 +894,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
         self.cancel_step(context)
         raise exc
 
-    def _release(self, context: StateTaskContext[DataT]) -> None:
+    def _release(self, context: StateTaskContext) -> None:
         # Discard aliases before borrowed ACKs and the commit; test_video checks ACK/failure ordering.
         context.value = None
         context.results.clear()
@@ -961,7 +929,7 @@ class StateExecution(Generic[InputT, DataT, ResultT]):
 
     def _order_sampler(
         self,
-        context: StateTaskContext[DataT],
+        context: StateTaskContext,
         stream: torch.cuda.Stream | None,
     ) -> None:
         consumer = context.pin.stream

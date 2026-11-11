@@ -411,7 +411,7 @@ class TensorExecutor:
             last = last[: self.state_count]
         return trained, updates, last
 
-    def __call__(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> TaskOutput:
+    def __call__(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext) -> TaskOutput:
         """Prepare operands, run the shared body or graph, then write invocation outputs."""
         scoped = self._scope(data, batch)
         if scoped is None:
@@ -477,7 +477,7 @@ class TensorExecutor:
         self.results = tuple(batch.results[self.task.symbol, name] for name in self.task.outputs)
         return self.write_outputs(data, batch, source_rows)
 
-    def _stage(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> tuple[int, ...]:
+    def _stage(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext) -> tuple[int, ...]:
         """Stage the row table, with the private pages a training body writes; returns the hidden taps' capture key."""
         capture_key = self._inputs(data, batch)
         plan = row_plan(data, batch)
@@ -650,7 +650,7 @@ class FieldWriteExecutor:
         for value, target, destinations in zip(self.buffers, self.targets, self.table, strict=True):
             copy_pages(value, target, self.rows, destinations)
 
-    def __call__(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> TaskOutput:
+    def __call__(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext) -> TaskOutput:
         """Stage the selected states' values and destinations, then store them in one body or graph replay."""
         writer = self.writer
         selected = writer.select(data, batch.selection)

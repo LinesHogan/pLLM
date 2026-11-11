@@ -9,9 +9,9 @@ from torch.nn import functional as F
 
 import pllm
 from pllm import testing
-from pllm.authoring import WeightedCEBatch
 from pllm.config import ExecutionOptions
 from pllm.execution.ptts.state_refs import StateRefs
+from pllm.host import WeightedCEBatch
 from pllm.testing import RequestIdentity, backend_facts
 from pllm.workloads.lora import OutputLoRAConfig, OutputLoRAWorkload
 

@@ -9,17 +9,18 @@ crossing pLLM's boundary outside generate's arguments) and pllm.testing (checkin
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypeVar, overload
+from typing import TYPE_CHECKING
 
 from pllm import host as host, io as io, model as model  # noqa: E402
-from pllm.authoring import AdamW as AdamW, Dimensions as Dimensions
 from pllm.config import (
     ExecutionOptions as ExecutionOptions,
     KVOffload as KVOffload,
     ModelConfig as ModelConfig,
 )
+from pllm.execution.declaration import Dimensions as Dimensions
 from pllm.execution.scan import scan as scan
 from pllm.explanation import explain as explain
+from pllm.kernels.adamw import AdamWConfig as AdamW
 from pllm.usage import (
     SGD as SGD,
     Computed as Computed,
@@ -70,24 +71,10 @@ from pllm.usage import (
 from pllm.workload import Workload as Workload
 
 if TYPE_CHECKING:
-    from pllm.authoring import BackendWorkload
     from pllm.backends.vllm.runtime import VllmLlm
 
-D = TypeVar("D")
-R = TypeVar("R")
 
-
-@overload
-def make_llm(config: ModelConfig, *, workload: BackendWorkload[D, R]) -> VllmLlm[D, R]: ...
-
-
-@overload
-def make_llm(config: ModelConfig, *, workload: None = None) -> VllmLlm[None, None]: ...
-
-
-def make_llm(
-    config: ModelConfig, *, workload: BackendWorkload[D, R] | None = None
-) -> VllmLlm[D, R] | VllmLlm[None, None]:
+def make_llm(config: ModelConfig, *, workload: Workload | None = None) -> VllmLlm:
     """A context-managed vLLM engine; execution options apply when a workload is installed."""
     if workload is None:
         from pllm.backends.vllm.compat import admit_parallel
@@ -95,7 +82,7 @@ def make_llm(
 
         admit_parallel(config)
         llm, hooks = vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
-        return VllmLlm[None, None](llm, compile_hooks=hooks)
+        return VllmLlm(llm, compile_hooks=hooks)
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None

@@ -26,12 +26,10 @@ AUTHORITY_FILES = (
     Path("rust/pllm_core/src/planning/state_representation.rs"),
     Path("rust/pllm_core/src/planning/scheduler.rs"),
     Path("pllm/execution/custom_forward.py"),
-    Path("pllm/execution/execution.py"),
     Path("pllm/execution/module_graph.py"),
     Path("pllm/execution/paged_access.py"),
     Path("pllm/execution/tensor_borrow.py"),
     Path("pllm/execution/state_execution.py"),
-    Path("pllm/authoring.py"),
     Path("pllm/backends/vllm/runtime.py"),
     Path("pllm/backends/vllm/session.py"),
     Path("pllm/backends/vllm/runner.py"),
@@ -52,7 +50,6 @@ NATIVE_BINDING_FILES = (
 
 PHYSICAL_FILES = frozenset(
     {
-        Path("pllm/execution/execution.py"),
         Path("pllm/execution/state_execution.py"),
     }
 )

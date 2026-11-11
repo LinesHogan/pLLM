@@ -8,10 +8,10 @@ itself in the worker. The worker compares its declaration with the driver's plan
 import pickle
 from base64 import b64decode, b64encode
 
-from pllm.authoring import BackendWorkload, DataT, ResultT
+from pllm.workload import Workload
 
 
-def encode_workload(workload: BackendWorkload[DataT, ResultT]) -> str:
+def encode_workload(workload: Workload) -> str:
     """Pickle the workload for the worker; everything it holds must be importable there."""
     if type(workload).__module__ == "__main__":
         raise ValueError(
@@ -27,6 +27,6 @@ def encode_workload(workload: BackendWorkload[DataT, ResultT]) -> str:
         ) from exc
 
 
-def decode_workload(payload: str) -> BackendWorkload[object, object]:
+def decode_workload(payload: str) -> Workload:
     """Rebuild the driver's workload inside the worker."""
     return pickle.loads(b64decode(payload))

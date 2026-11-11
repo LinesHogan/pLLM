@@ -360,7 +360,7 @@ def derive_resources(
     tasks: list[TaskResourceFact] = []
     values: list[ValueResourceFact] = []
     required_capture = 0
-    operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
+    operations: dict[TaskSymbol, MemoryOperation] = {
         **binding.executables(facts, resources),
         **binding.publications,
     }
@@ -478,7 +478,7 @@ def derive_host_resources(binding: TensorDeclaration, config: HostConfig) -> Sch
         field_slots=lambda field: (pools[field], (0,)),
     )
     data = TensorFrame(StepInput.of_batch(host_batch), PackedPhaseRowBatch.from_rows(0, 0, ()).rows)
-    operations: dict[TaskSymbol, MemoryOperation[TensorFrame]] = {
+    operations: dict[TaskSymbol, MemoryOperation] = {
         **binding.executables(None, ()),
         **binding.publications,
     }

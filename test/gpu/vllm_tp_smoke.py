@@ -161,7 +161,7 @@ def test_j1_admission():
 
 
 def test_j1_reward_head(monkeypatch):
-    from pllm.authoring import WeightedRowBatch
+    from pllm.host import WeightedRowBatch
 
     # Only the test digest callback crosses EngineCore via pickle; production commands remain JSON.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")

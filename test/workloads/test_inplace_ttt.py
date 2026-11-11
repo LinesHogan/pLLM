@@ -12,7 +12,6 @@ import torch
 
 import pllm
 from pllm import UpdateOutput, testing
-from pllm.authoring import StateImport
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.parameter_overlay import (
     Projection,
@@ -20,6 +19,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.step_input import StepInput
+from pllm.io import StateImport
 from pllm.testing import RequestIdentity, backend_facts
 from test.backend_facts import assert_finite_resources
 from test.dense_update import DenseUpdate, DenseUpdateConfig

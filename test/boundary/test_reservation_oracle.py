@@ -98,7 +98,7 @@ class PeakArena(PageBundleArena):
 
 
 class StubMath:
-    """StateMath without tensors: a step's data is its StepInput."""
+    """FunctionMath without tensors: a step's data is its StepInput."""
 
     parameter_overlay = None
     parameter_phases = ()
@@ -126,7 +126,7 @@ class StubTask:
     effects: tuple[tuple[str, StateEffectKind], ...]
     host_batch: bool
 
-    def execute(self, context: StateTaskContext[TensorFrame]) -> dict:
+    def execute(self, context: StateTaskContext) -> dict:
         if self.host_batch and context.data().step.batch is None:
             return {}
         for resource, kind in self.effects:

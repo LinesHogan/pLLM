@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import ceil, isfinite
 from time import perf_counter
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec
 from unittest.mock import patch
 
 import torch
@@ -22,8 +22,6 @@ from pllm.testing_gpu import CHECK_PROMPTS, plain_model
 from pllm.workload import Workload
 
 _Sample = ParamSpec("_Sample")
-_DataT = TypeVar("_DataT")
-_ResultT = TypeVar("_ResultT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +160,7 @@ def _record_sample(
 
 
 @contextmanager
-def _observe(llm: VllmLlm[_DataT, _ResultT], observation: SamplerObservation) -> Generator[None]:
+def _observe(llm: VllmLlm, observation: SamplerObservation) -> Generator[None]:
     runner = llm.require_llm().llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
     sampler = runner.sampler
     assert isinstance(sampler, Sampler)

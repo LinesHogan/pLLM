@@ -23,7 +23,7 @@ from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.ptts.page_bundle import PageBundleArena, PagePin
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.state_execution import StateTaskContext
 
 
 def activation_delta(hidden: torch.Tensor, fields: tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -76,9 +76,7 @@ class VllmActivationPatch:
         """Stable read ports of the captured residual hook."""
         return [buffer for patch in self.patches.values() for buffer in (patch.table, *patch.pools)]
 
-    def prepare(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
-    ) -> None:
+    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory) -> None:
         """Upload row masks and the slots of the exact versions the invocation holds."""
         held = context.held_input
         assert held is None or (
@@ -136,7 +134,7 @@ class VllmActivationPatch:
         resource: StateResource,
         identity: RequestIdentity,
         refresh: bool,
-        context: StateTaskContext[DataT],
+        context: StateTaskContext,
         directory: RequestStateDirectory,
         versions: dict[tuple[StateResource, RequestIdentity, bool], tuple[PagePin, StateRef]],
     ) -> tuple[PagePin, StateRef]:

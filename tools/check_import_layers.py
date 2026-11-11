@@ -21,8 +21,8 @@ RULES: dict[str, frozenset[str]] = {
     "execution": frozenset({"config", "contracts", "kernels"}),
     "kernels": frozenset({"contracts"}),
     # Workloads may also use the public grouped API modules (pllm.host, pllm.model, pllm.io).
-    "workloads": frozenset({"authoring", "config", "contracts", "execution", "kernels", "host", "model", "io"}),
-    "backends": frozenset({"authoring", "config", "contracts", "execution"}),
+    "workloads": frozenset({"config", "contracts", "execution", "kernels", "host", "model", "io"}),
+    "backends": frozenset({"config", "contracts", "execution"}),
 }
 
 

@@ -114,7 +114,7 @@ def open_llm(
     cuda_graphs=False,
     chunked=False,
     **execution,
-) -> VllmLlm[object, object]:
+) -> VllmLlm:
     options = {"execution": pllm.ExecutionOptions(**execution)} if execution else {}
     config = ModelConfig(
         model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -142,7 +142,7 @@ def texts(outputs) -> tuple[str, ...]:
     return tuple(output.outputs[0].text for output in outputs)
 
 
-def _check(handle: VllmLlm[object, object], label: str) -> tuple[str, ...]:
+def _check(handle: VllmLlm, label: str) -> tuple[str, ...]:
     prompts = (
         ["The sky is blue. " * 5, "Water freezes when it is cold. " * 4]
         if label.startswith(("dense", "gated"))
@@ -282,7 +282,7 @@ def _check_hybrid(handle):
     return first
 
 
-def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
+def _check_imported(handle: VllmLlm) -> tuple[str, ...]:
     (layout,) = handle.attachment.plan.tensor_layout_request.layouts
     down_shape, up_shape = (tuple(field.shape) for field in layout.layout.fields[:2])
     device = handle.device
@@ -312,7 +312,7 @@ def _check_imported(handle: VllmLlm[object, object]) -> tuple[str, ...]:
     return mixed
 
 
-def _check_routed(handle: VllmLlm[object, object]) -> tuple[str, ...]:
+def _check_routed(handle: VllmLlm) -> tuple[str, ...]:
     prompts = ["2 plus 2 is", "The sum of 1 and 1 is", "def main():"]
     try:
         handle.generate(prompts, SAMPLING)

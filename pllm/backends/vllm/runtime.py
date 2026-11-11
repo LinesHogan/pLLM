@@ -15,22 +15,13 @@ from enum import StrEnum
 from functools import partial
 from hashlib import sha256
 from types import TracebackType
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 from vllm import RequestOutput, SamplingParams
 from vllm.entrypoints.llm import LLM
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
-from pllm.authoring import (
-    BackendRequirements,
-    BackendWorkload,
-    DataT,
-    HostBatch,
-    ResultT,
-    StateImport,
-    map_host_batch,
-)
 from pllm.backends.vllm.admission import admit_workload
 from pllm.backends.vllm.checkpoint import load_options
 from pllm.backends.vllm.compile_facts import compile_facts
@@ -58,12 +49,12 @@ from pllm.contracts.feedback import (
     FinishReason,
     RetryAction,
 )
-from pllm.contracts.host_batch import validate_host_batch
+from pllm.contracts.host_batch import HostBatch, StateImport, map_host_batch, validate_host_batch
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import TaskId
 from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorFieldSpec
 from pllm.execution.checkpoint import checkpoint_directory
-from pllm.execution.compile_facts import BackendCompileFacts
+from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.shared_tensor import SharedTensor
@@ -76,6 +67,9 @@ from pllm.execution.torch_private import (
     remove_bytecode_hooks,
 )
 from pllm.execution.trace import TraceSelection, TraceSnapshot
+
+if TYPE_CHECKING:
+    from pllm.workload import Workload
 
 _logger = logging.getLogger(__name__)
 
@@ -156,7 +150,7 @@ class _Generation:
 
 
 @dataclass(slots=True)
-class VllmLlm(Generic[DataT, ResultT]):
+class VllmLlm:
     """The engine handle returned by make_llm, with workload diagnostics, traces and feeds when installed."""
 
     llm: LLM | None
@@ -205,7 +199,7 @@ class VllmLlm(Generic[DataT, ResultT]):
     def device(self) -> torch.device:
         return self._runner.device if self._runner is not None else torch.device("cuda", 0)
 
-    def __enter__(self) -> VllmLlm[DataT, ResultT]:
+    def __enter__(self) -> VllmLlm:
         self.require_llm()
         return self
 
@@ -702,11 +696,11 @@ def vllm_engine(
 
 
 def create_vllm_llm(
-    workload: BackendWorkload[DataT, ResultT],
+    workload: Workload,
     config: ModelConfig,
     *,
     definition: str | None = None,
-) -> VllmLlm[DataT, ResultT]:
+) -> VllmLlm:
     requirements = workload.backend_requirements()
     eager_reason = admit_workload(config, requirements)
     if config.cuda_graphs == "auto" and eager_reason:
@@ -740,7 +734,7 @@ def create_vllm_llm(
 
     with ExitStack() as construction:
         # Until the workload handle exists, a plain handle owns the engine and releases it on failure.
-        construction.callback(VllmLlm[None, None](llm, compile_hooks=hooks).close)
+        construction.callback(VllmLlm(llm, compile_hooks=hooks).close)
         if config.multiprocessing or config.tensor_parallel_size > 1:
             replies = llm.collective_rpc(
                 "workload_command",
@@ -759,7 +753,7 @@ def create_vllm_llm(
             facts, declaration = workload.specialize(facts, config.execution)
             attachment = workload.plan_backend(facts, declaration)
             policy = CachePolicy.for_attachment(attachment, config.generated_kv)
-            handle = VllmLlm[DataT, ResultT](
+            handle = VllmLlm(
                 llm, None, attachment, facts, policy, requirements.sample_limit, eager_reason, compile_hooks=hooks
             )
             install = encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
@@ -779,7 +773,7 @@ def create_vllm_llm(
             )
             policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
             runner.attach_workload(deployment, policy)
-            handle = VllmLlm[DataT, ResultT](
+            handle = VllmLlm(
                 llm,
                 runner,
                 deployment.attachment,

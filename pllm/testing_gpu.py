@@ -35,8 +35,6 @@ from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_declaration import TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_program import read_batch
 from pllm.explanation import explain, explain_facts
 from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, affects_model, check_contracts
@@ -48,7 +46,7 @@ _Allocation = ParamSpec("_Allocation")
 CHECK_PROMPTS = ["Continue the sequence: 1, 2, 3,", "Continue the alphabet: A, B, C,"]
 
 
-def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
+def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm) -> None:
     """Compare config-only and loaded-model reports through the same pure computation."""
     expected = explain(workload, config)
     runner = handle.runner
@@ -94,7 +92,7 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm[TensorF
 class SynchronizationCheck:
     """Check pLLM anchors and model-site staging after two decode warmup steps at each packed width."""
 
-    def __init__(self, handle: VllmLlm[TensorFrame, TensorOutput]) -> None:
+    def __init__(self, handle: VllmLlm) -> None:
         session = handle.runner.require_session()
         execution = session.deployment.execution
         self.prepare_tokens = session.prepare_tokens
@@ -110,7 +108,7 @@ class SynchronizationCheck:
         self.input_checked: set[int] = set()
 
     @contextmanager
-    def scope(self, context: StateTaskContext[TensorFrame]) -> Generator[None]:
+    def scope(self, context: StateTaskContext) -> Generator[None]:
         rows = context.selection.rows
         if not rows and context.value is not None:
             rows = context.value.step.rows.rows
@@ -145,9 +143,7 @@ class SynchronizationCheck:
         finally:
             torch.cuda.set_sync_debug_mode(mode)
 
-    def prepare(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[TensorFrame], directory: RequestStateDirectory
-    ) -> None:
+    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory) -> None:
         """Include uploads and state staging between anchors in the model-site sync check."""
         assert self.prepare_sites is not None
         with self.scope(context):
@@ -171,27 +167,25 @@ class SynchronizationCheck:
     def overlay(
         self,
         rows: PackedPhaseRowBatch,
-        context: StateTaskContext[TensorFrame],
+        context: StateTaskContext,
         directory: RequestStateDirectory,
-        task: ProjectionTask[TensorFrame, TensorOutput] | None = None,
+        task: ProjectionTask | None = None,
     ) -> None:
         """Include graph port and private-page staging in steady decode sync checks."""
         assert self.prepare_overlay is not None
         with self.scope(context):
             self.prepare_overlay(rows, context, directory, task)
 
-    def anchor(self, context: StateTaskContext[TensorFrame], anchor: AnchorId) -> None:
+    def anchor(self, context: StateTaskContext, anchor: AnchorId) -> None:
         with self.scope(context):
             self.execute(context, anchor)
 
-    def part(
-        self, context: StateTaskContext[TensorFrame], value: StepInput, task: TaskId, *, complete: bool
-    ) -> ProjectionResiduals:
+    def part(self, context: StateTaskContext, value: StepInput, task: TaskId, *, complete: bool) -> ProjectionResiduals:
         with self.scope(context):
             return self.execute_part(context, value, task, complete=complete)
 
 
-def _tokens(handle: VllmLlm[TensorFrame, TensorOutput], temperature: float = 0) -> tuple[tuple[int, ...], ...]:
+def _tokens(handle: VllmLlm, temperature: float = 0) -> tuple[tuple[int, ...], ...]:
     params = SamplingParams(temperature=temperature, seed=17, max_tokens=16, ignore_eos=True)
     return tuple(tuple(output.outputs[0].token_ids) for output in handle.generate(CHECK_PROMPTS, params))
 
@@ -274,7 +268,7 @@ class _Generation:
                     ) from error
 
 
-def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generation | None = None) -> _Generation:
+def _state_tokens(handle: VllmLlm, reference: _Generation | None = None) -> _Generation:
     session = handle.runner.require_session()
     execution = session.deployment.execution
     retire = execution.retire
@@ -290,9 +284,7 @@ def _state_tokens(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Genera
             )
         return retire(identities, wait=wait)
 
-    def part(
-        context: StateTaskContext[TensorFrame], value: StepInput, task: TaskId, *, complete: bool
-    ) -> ProjectionResiduals:
+    def part(context: StateTaskContext, value: StepInput, task: TaskId, *, complete: bool) -> ProjectionResiduals:
         if value.overlay_updates and reference is not None:
             # Captured math has already run. Replay the fixed diagnostic operands from the
             # input pages, just as eager projection interception does before the authored step.
@@ -346,7 +338,7 @@ class _Eviction:
         return allocation
 
 
-def _preemption(handle: VllmLlm[TensorFrame, TensorOutput], reference: _Generation) -> _Generation:
+def _preemption(handle: VllmLlm, reference: _Generation) -> _Generation:
     manager = handle.require_llm().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
     eviction = _Eviction()
     with patch.object(manager, "allocate_slots", new=eviction.wrap(manager.allocate_slots)):
@@ -362,7 +354,7 @@ def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tupl
 
 
 @contextmanager
-def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[None, None]]:
+def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm]:
     """Load vanilla vLLM with the workload's checkpoint and graph/compile options."""
     report = explain(workload, config)
     requirements = workload.backend_requirements()
@@ -373,7 +365,7 @@ def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm[No
         {},
         cuda_graphs=not bool(report.eager_reason),
     )
-    with VllmLlm[None, None](llm, compile_hooks=hooks) as vanilla:
+    with VllmLlm(llm, compile_hooks=hooks) as vanilla:
         yield vanilla
 
 
@@ -439,9 +431,7 @@ def _neutral(workload: Workload, config: ModelConfig) -> str:
     return "neutral: greedy and seeded sampling bitwise vs vanilla with the same kernels"
 
 
-def _sequence_update(
-    handle: VllmLlm[TensorFrame, TensorOutput], batch: CausalTrainBatch[torch.Tensor]
-) -> tuple[torch.Tensor, ...]:
+def _sequence_update(handle: VllmLlm, batch: CausalTrainBatch[torch.Tensor]) -> tuple[torch.Tensor, ...]:
     """Exercise the host-to-worker path and read the complete published optimizer state."""
     handle.generate(CHECK_PROMPTS, SamplingParams(temperature=0, max_tokens=1, ignore_eos=True), batch=batch)
     execution = handle.runner.require_session().deployment.execution

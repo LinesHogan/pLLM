@@ -16,7 +16,6 @@ from pllm.execution.token_program import KV, Segment
 from pllm.execution.token_program_executor import execute_segment
 
 if TYPE_CHECKING:
-    from pllm.authoring import DataT, ResultT
     from pllm.backends.vllm.custom_forward import ProgramWave
 
 
@@ -37,7 +36,7 @@ def _omit_projection(hidden: torch.Tensor) -> tuple[torch.Tensor, None]:
 class AdaptiveSlice:
     """Stable bucket metadata and device predicates; no active counts ever cross to the host."""
 
-    def __init__(self, wave: ProgramWave[DataT, ResultT]) -> None:
+    def __init__(self, wave: ProgramWave) -> None:
         self.wave = wave
         width = len(wave.seed)
         widths = tuple(sorted({width, *(2**power for power in range(width.bit_length()) if 2**power < width)}))

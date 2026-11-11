@@ -54,7 +54,7 @@ from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.state_init import Computed, Fed, Imported, Pretrained, Zeros
 from pllm.execution.step_input import StepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources, shape_site_results
-from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_frame import TensorFrame, TensorPort, UpdateOutput, result_port
 from pllm.execution.tensor_program import TaskOutput, TensorBatch
 from pllm.execution.tensor_task import TensorExport
@@ -812,7 +812,7 @@ def host_declaration(name: str, config: HostConfig) -> TensorDeclaration:
 
 def bind_host_declaration(
     b: TensorDeclaration, config: HostConfig, on_export: Callable[[TraceEvent], None] | None
-) -> StateExecution[StepInput, TensorFrame, TensorOutput]:
+) -> StateExecution:
     """Plan and bind a lowered host declaration; each step checks its host batch before reading it."""
     timeline = config.timeline()
     if config.execution_peak_budget_bytes is not None and b.graph.states:

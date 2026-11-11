@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
 
 import numpy as np
 import torch
@@ -43,7 +42,7 @@ from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.ptts.state_refs import StateRefs
-from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.tensor_frame import UpdateOutput
 from pllm.execution.torch_private import blas_workspace_bytes
 
@@ -254,7 +253,7 @@ class ProjectionReader:
         self.apply_count = self.updated_apply_count = 0
         # This invocation's exact segments and their consumer: the step's task, or a custom forward's lanes.
         self.segments: tuple[_Segment, ...] = ()
-        self.task: ProjectionTask[Any, Any] | None = None
+        self.task: ProjectionTask | None = None
         self.row_overlays: tuple[ProgramOverlay, ...] = ()
         self.call_rows: torch.Tensor | None = None
         self.decode: DecodeOverlay | None = None
@@ -555,7 +554,7 @@ class ParameterOverlay:
             self.install_decode(arena, self.math, requests)
         self.requests, self.device = requests, arena.device
         self.operand_staging = PinnedStaging()
-        self.task: ProjectionTask[Any, Any] | None = None
+        self.task: ProjectionTask | None = None
         self.sources: Sequence[PackedPhaseRow] = ()
         self.starts: Slots = np.empty(0, dtype=np.int64)
         self.total_rows = 0
@@ -596,9 +595,9 @@ class ParameterOverlay:
     def prepare(
         self,
         rows: PackedPhaseRowBatch,
-        context: StateTaskContext[DataT],
+        context: StateTaskContext,
         directory: RequestStateDirectory,
-        task: ProjectionTask[Any, Any] | None = None,
+        task: ProjectionTask | None = None,
     ) -> None:
         """Select exact segments or pinned reads from the labelled row facts, as vLLM's graph dispatch does."""
         if self.exact and not (
@@ -616,9 +615,9 @@ class ParameterOverlay:
     def prepare_pinned(
         self,
         rows: PackedPhaseRowBatch,
-        context: StateTaskContext[DataT],
+        context: StateTaskContext,
         directory: RequestStateDirectory,
-        task: ProjectionTask[Any, Any] | None,
+        task: ProjectionTask | None,
     ) -> None:
         """Stage the pinned ports, or the in-graph decode transition, after the previous invocation's reads."""
         self.stream = context.pin.stream
@@ -631,9 +630,7 @@ class ParameterOverlay:
             assert task is not None
             self.prepare_decode(rows, task)
 
-    def prepare_segments(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], task: ProjectionTask[Any, Any]
-    ) -> None:
+    def prepare_segments(self, rows: PackedPhaseRowBatch, context: StateTaskContext, task: ProjectionTask) -> None:
         """Upload each request's packed rows per phase and its prompt-end flag for the eager forward."""
         grouped: dict[tuple[RequestIdentity, HiddenPhase], list[PackedPhaseRow]] = {}
         for row in rows.rows:
@@ -680,7 +677,7 @@ class ParameterOverlay:
                 for row, row_overlay, index in zip(rows, row_overlays, indices, strict=True)
             )
 
-    def prepare_decode(self, rows: PackedPhaseRowBatch, task: ProjectionTask[Any, Any]) -> None:
+    def prepare_decode(self, rows: PackedPhaseRowBatch, task: ProjectionTask) -> None:
         """Open private pages and stage every decode target before replay starts."""
         assert self.math is not None
         self.task = task
@@ -695,7 +692,7 @@ class ParameterOverlay:
             reader.decode.prepare(batch, identities)
 
     def prepare_reads(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
+        self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory
     ) -> None:
         """Pin each request's readable version and upload the readers' block tables."""
         assert self.stream is not None
@@ -750,7 +747,7 @@ class ParameterOverlay:
                 )
         return tuple(results)
 
-    def complete_decode(self, task: ProjectionTask[Any, Any]) -> None:
+    def complete_decode(self, task: ProjectionTask) -> None:
         """Settle replay's stable results through the ordinary projection task."""
         operands: list[ProjectionOperands] = []
         updates: dict[tuple[RequestIdentity, Projection], UpdateOutput] = {}

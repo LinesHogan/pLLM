@@ -88,7 +88,6 @@ from pllm.execution.declaration import (
     operation_mode,
     planned_implementation,
 )
-from pllm.execution.execution import TaskGraphImplementation
 from pllm.execution.model_sites import SiteOwners
 from pllm.execution.module_state import copy_initial
 from pllm.execution.overlay_batch import OverlayBatch
@@ -98,9 +97,8 @@ from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.scan import ScanContext
 from pllm.execution.state_execution import (
     ConditionalProducerTask,
-    ProjectionResiduals,
     PublishStateTask,
-    StateTaskContext,
+    TaskGraphImplementation,
 )
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.task_memory import example, producers_first, task_example
@@ -240,9 +238,9 @@ class TensorDeclaration:
         self.graph = SemanticGraph(WorkloadId(name), (), digest)
         self.layouts = TensorLayoutRequest(())
         self.effects = BackendAttachmentSpec()
-        self.operations: dict[TaskSymbol, TensorOperation[TensorFrame]] = {}
+        self.operations: dict[TaskSymbol, TensorOperation] = {}
         self.field_shards: dict[str, dict[int, FieldShard]] = {}
-        self.publications: dict[TaskSymbol, PublishStateTask[TensorFrame]] = {}
+        self.publications: dict[TaskSymbol, PublishStateTask] = {}
         # Fields that start at zero in a fresh page pool, so admission need not write them (AdamW state other than
         # the parameters). Request-scoped pages are recycled and dirty, so only instance states qualify.
         self.zero_start_fields: dict[str, frozenset[int]] = {}
@@ -365,9 +363,7 @@ class TensorDeclaration:
             ),
         )
 
-    def require_resident_side_tasks(
-        self, plan: PlanBundle, operations: Mapping[TaskSymbol, TensorOperation[TensorFrame]]
-    ) -> None:
+    def require_resident_side_tasks(self, plan: PlanBundle, operations: Mapping[TaskSymbol, TensorOperation]) -> None:
         """Side-lane tensor tasks run concurrently with the model, so their inputs must be fixed-size."""
         if not plan.timeline.task_resources:
             return
@@ -393,7 +389,7 @@ class TensorDeclaration:
         read = self.row_reader()
         return lambda value: read(value.rows)
 
-    def function_math(self, device: torch.device, seed: int) -> FunctionMath[StepInput, TensorFrame, TensorOutput]:
+    def function_math(self, device: torch.device, seed: int) -> FunctionMath:
         """Bind state initialization, step rows and frame preparation for execution."""
         for weights in self.pretrained.values():
             weights.verify()
@@ -438,7 +434,7 @@ class TensorDeclaration:
         *,
         warmup: bool = False,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
-    ) -> dict[TaskSymbol, TensorOperation[TensorFrame]]:
+    ) -> dict[TaskSymbol, TensorOperation]:
         """Build each tensor operation once, with the same scan scope for eager and captured math."""
         capture = facts is not None and "compute/cuda_graph@1" in facts.timeline.capabilities
         limits = {fact.task: fact for fact in resources}
@@ -496,7 +492,7 @@ class TensorDeclaration:
 
     def _operation(
         self, symbol: TaskSymbol, capture: bool, limits: Mapping[TaskSymbol, TaskResourceFact]
-    ) -> TensorOperation[TensorFrame]:
+    ) -> TensorOperation:
         """A declared operation; a chunked overlay transition runs through its OverlayBatch."""
         operation, math = self.operations[symbol], self.overlay_math
         if math is None or math.chunk is None or symbol != math.task:
@@ -516,7 +512,7 @@ class TensorDeclaration:
         compiled: TensorMath | None,
         sample: tuple[TensorFrame, TensorBatch] | None = None,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
-    ) -> TensorOperation[TensorFrame]:
+    ) -> TensorOperation:
         """A tensor task's executor: a field writer or a body over masked tables, captured when `limits` funds it."""
         declaration = next(item for item in self.graph.tasks if item.symbol == task.symbol)
         state = task.training
@@ -788,7 +784,7 @@ class TensorDeclaration:
         custom_forward: TokenProgramEffect | None = None,
         math: MathContract | None = None,
         function: Callable[[TensorFrame, TensorBatch], TaskOutput] | None = None,
-        operation_type: type[TensorOperation[TensorFrame]] = TensorOperation,
+        operation_type: type[TensorOperation] = TensorOperation,
         select: Callable[[TensorFrame, RequestStateSelection], tuple[int, ...]] | None = None,
     ) -> Call:
         """Declare a semantic task and its optional tensor operation."""
@@ -844,10 +840,10 @@ class TensorDeclaration:
         )
 
     def bind(
-        self, plan: PlanBundle | None = None, *, operations: Mapping[TaskSymbol, TensorOperation[TensorFrame]]
-    ) -> tuple[TensorOperation[TensorFrame], ...]:
+        self, plan: PlanBundle | None = None, *, operations: Mapping[TaskSymbol, TensorOperation]
+    ) -> tuple[TensorOperation, ...]:
         """Bind declared tensor operations to the implementations selected by the plan."""
-        functions: list[TensorOperation[TensorFrame]] = []
+        functions: list[TensorOperation] = []
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
             if task.symbol not in operations:
@@ -875,12 +871,10 @@ class TensorDeclaration:
         plan: PlanBundle | None = None,
         *,
         model_probe: ModelProbe | None = None,
-        operations: Mapping[TaskSymbol, TensorOperation[TensorFrame]],
-    ) -> tuple[TaskGraphImplementation[StateTaskContext[TensorFrame], ProjectionResiduals], ...]:
+        operations: Mapping[TaskSymbol, TensorOperation],
+    ) -> tuple[TaskGraphImplementation, ...]:
         """Bind tensor operations, custom forwards and publications with conditional input guards."""
-        functions: list[TaskGraphImplementation[StateTaskContext[TensorFrame], ProjectionResiduals]] = list(
-            self.bind(plan, operations=operations)
-        )
+        functions: list[TaskGraphImplementation] = list(self.bind(plan, operations=operations))
         graph = self.graph if plan is None else plan.semantic_graph
         for task in graph.tasks:
             if task.symbol in operations and task.custom_forward is None:
@@ -890,7 +884,7 @@ class TensorDeclaration:
                 assert model_probe is not None and model_probe.causal_domain is not None
                 assert self.custom_forward_programs is not None
                 functions.append(
-                    CustomForwardTask[TensorFrame](
+                    CustomForwardTask(
                         task,
                         self.custom_forward_programs,
                         model_probe.causal_domain,

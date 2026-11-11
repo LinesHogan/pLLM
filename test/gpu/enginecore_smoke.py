@@ -23,10 +23,10 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 import pllm
-from pllm.authoring import CausalTrainBatch, StateImport, WeightedCEBatch
 from pllm.config import ExecutionOptions, ModelConfig
 from pllm.execution.trace import TraceEventKind, TraceSelection
-from pllm.host import HostConfig, make_host
+from pllm.host import CausalTrainBatch, HostConfig, WeightedCEBatch, make_host
+from pllm.io import StateImport
 from pllm.workloads.dummy import DummyConfig, DummyWorkload
 from pllm.workloads.esamp import ESampConfig, ESampWorkload
 from pllm.workloads.fttt import (

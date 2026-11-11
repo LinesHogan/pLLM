@@ -18,9 +18,9 @@ from torch.nn import functional as F
 from vllm import SamplingParams
 
 import pllm
-from pllm.authoring import CausalTrainBatch
 from pllm.config import ModelConfig
 from pllm.contracts.packed_rows import PackedRows
+from pllm.host import CausalTrainBatch
 from pllm.workloads.tlm import TLMConfig, TLMMode, TLMWorkload
 
 

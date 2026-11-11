@@ -7,8 +7,8 @@ import pytest
 import torch
 
 import pllm
-from pllm.authoring import StepInput, WeightedRowBatch
-from pllm.host import HostConfig
+from pllm.execution.step_input import StepInput
+from pllm.host import HostConfig, WeightedRowBatch
 
 
 @dataclass(frozen=True)

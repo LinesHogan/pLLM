@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Generic, Literal, Never, Protocol, TypeVar
+from typing import TYPE_CHECKING, Literal, Never, Protocol
 
 import numpy as np
 import torch
@@ -45,10 +45,9 @@ if TYPE_CHECKING:
     from pllm.execution.attention_methods import AttentionProgram
     from pllm.execution.model_sites import ResidualRewrite
     from pllm.execution.overlay_task import OverlayTransition
+    from pllm.execution.tensor_declaration import TensorOutput
+    from pllm.execution.tensor_frame import TensorFrame
 
-I = TypeVar("I", bound=StepInput)
-D = TypeVar("D")
-R = TypeVar("R")
 Roots = tuple[tuple[torch.Tensor, ...], ...]
 ProducedVersions = tuple[tuple[StateResource, Literal["private", "published"]], ...]
 # An AdamW state's leading fields, in layout order: one flat parameter field and its optimizer fields.
@@ -139,16 +138,16 @@ class TaskOutput:
 
 
 def autograd_loss(
-    function: Callable[[D, Mapping[str, torch.Tensor]], torch.Tensor | None],
+    function: Callable[[TensorFrame, Mapping[str, torch.Tensor]], torch.Tensor | None],
     names: tuple[str, ...],
-    summary: Callable[[D], TaskOutput],
-) -> Callable[[D, TensorBatch], TaskOutput]:
+    summary: Callable[[TensorFrame], TaskOutput],
+) -> Callable[[TensorFrame, TensorBatch], TaskOutput]:
     """Compile tensor forward/loss and AOT backward; report and update outside the graph."""
     compiled = torch.compile(  # pyright: ignore[reportUnknownMemberType]
         function, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
     )
 
-    def execute(data: D, batch: TensorBatch) -> TaskOutput:
+    def execute(data: TensorFrame, batch: TensorBatch) -> TaskOutput:
         (root,) = batch.roots
         with torch.enable_grad():
             (name,) = names
@@ -183,7 +182,7 @@ class InvocationOutput:
 
 
 def _batch_access(
-    context: StateTaskContext[D],
+    context: StateTaskContext,
     reads: tuple[tuple[StateResource, Literal["input", "private", "published"]], ...],
 ) -> tuple[StateRefs, tuple[PagePin | PageWrite, ...], Slots]:
     refs = context.pin.refs
@@ -210,7 +209,7 @@ def _batch_access(
 
 
 def read_batch(
-    context: StateTaskContext[D],
+    context: StateTaskContext,
     version: Literal["input", "private", "published"] = "input",
     resource: StateResource = StateResource(""),
     produced: ProducedVersions = (),
@@ -254,12 +253,12 @@ def read_batch(
 
 
 @dataclass(frozen=True, slots=True)
-class FunctionMath(Generic[I, D, R]):
+class FunctionMath:
     initializers: Mapping[str, Callable[[Roots, tuple[RequestStateKey | None, ...]], None]]
-    rows: Callable[[I], PackedRows]
-    prepare_data: Callable[[I, TensorBatch], D]
-    output_data: Callable[[D, InvocationOutput], R]
-    resume_data: Callable[[D, D], D] | None = None
+    rows: Callable[[StepInput], PackedRows]
+    prepare_data: Callable[[StepInput, TensorBatch], TensorFrame]
+    output_data: Callable[[TensorFrame, InvocationOutput], TensorOutput]
+    resume_data: Callable[[TensorFrame, TensorFrame], TensorFrame] | None = None
     # The @pllm.custom_residual methods the backend installs on the model.
     model_sites: tuple[ResidualRewrite, ...] = ()
     parameter_overlay: OverlayTransition | None = None
@@ -281,7 +280,7 @@ class FunctionMath(Generic[I, D, R]):
             )
             self.initializers[resource](tuple(root for root, _ in selected), tuple(key for _, key in selected))
 
-    def prepare(self, value: I, context: StateTaskContext[D]) -> D:
+    def prepare(self, value: StepInput, context: StateTaskContext) -> TensorFrame:
         with (
             nullcontext() if context.pin.stream is None else torch.cuda.stream(context.pin.stream),
             torch.inference_mode(False),
@@ -289,7 +288,7 @@ class FunctionMath(Generic[I, D, R]):
             data = self.prepare_data(value, read_batch(context))
             return data if context.value is None or self.resume_data is None else self.resume_data(context.value, data)
 
-    def output(self, context: StateTaskContext[D]) -> R:
+    def output(self, context: StateTaskContext) -> TensorOutput:
         graph = context.arena.plan.semantic_graph
         value = next(
             (
@@ -451,13 +450,10 @@ class PageUpdate:
             )
 
 
-MemoryDataT = TypeVar("MemoryDataT", contravariant=True)
-
-
-class MemoryOperation(Protocol[MemoryDataT]):
+class MemoryOperation(Protocol):
     """Resource projection of a bound executable operation."""
 
-    def memory(self, data: MemoryDataT, batch: TensorBatch) -> MemoryUsage: ...
+    def memory(self, data: TensorFrame, batch: TensorBatch) -> MemoryUsage: ...
     def input_shapes(
         self, rows: int, hidden: int, training_shapes: tuple[tuple[int, ...], ...]
     ) -> tuple[tuple[int, ...], ...]: ...
@@ -465,7 +461,10 @@ class MemoryOperation(Protocol[MemoryDataT]):
 
 
 def native_body(
-    function: Callable[[D, TensorBatch], TaskOutput], data: D, batch: TensorBatch, context: StateTaskContext[D]
+    function: Callable[[TensorFrame, TensorBatch], TaskOutput],
+    data: TensorFrame,
+    batch: TensorBatch,
+    context: StateTaskContext,
 ) -> TaskOutput:
     """Adapt native mathematical functions to the operation's single body interface."""
     return function(data, batch)
@@ -476,22 +475,22 @@ def _no_resident(capture_bytes: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class TensorOperation(Generic[D]):
+class TensorOperation:
     """Run one mathematical body and write its declared effects."""
 
     implementation_id: ImplementationId
-    body: Callable[[D, TensorBatch, StateTaskContext[D]], TaskOutput]
+    body: Callable[[TensorFrame, TensorBatch, StateTaskContext], TaskOutput]
     # The same body for planning: run on meta or example inputs without page writes, so memory is traceable.
-    trace_body: Callable[[D, TensorBatch], TaskOutput]
+    trace_body: Callable[[TensorFrame, TensorBatch], TaskOutput]
     mode: Literal["read", "transition", "update", "gradient"] = "read"
-    select: Callable[[D, RequestStateSelection], tuple[int, ...]] | None = None
+    select: Callable[[TensorFrame, RequestStateSelection], tuple[int, ...]] | None = None
     optimizer: PageUpdate | None = None
     publish: bool = False
     version: Literal["input", "private", "published"] = "input"
     produced: ProducedVersions = ()
     copy_fields: tuple[LayoutFieldId, ...] | None = None
     select_fields: (
-        Callable[[D, RequestStateSelection, tuple[int, ...]], tuple[tuple[LayoutFieldId, ...], ...]] | None
+        Callable[[TensorFrame, RequestStateSelection, tuple[int, ...]], tuple[tuple[LayoutFieldId, ...], ...]] | None
     ) = None
     capture_resident: Callable[[int], int] = _no_resident
     # The state the operation changes; its body sees that state's selection and roots. Empty for a reader.
@@ -505,7 +504,7 @@ class TensorOperation(Generic[D]):
     def resident(self, capture_bytes: int) -> int:
         return self.capture_resident(capture_bytes)
 
-    def memory(self, data: D, batch: TensorBatch) -> MemoryUsage:
+    def memory(self, data: TensorFrame, batch: TensorBatch) -> MemoryUsage:
         """Execute this operation's tensor path, excluding the already-funded pages."""
 
         batch = self.scoped(batch)
@@ -537,10 +536,10 @@ class TensorOperation(Generic[D]):
         """The roots the body writes, or every readable state for a read-only operation."""
         return batch.for_resource(self.resource) if self.resource else batch
 
-    def batch(self, context: StateTaskContext[D], version: Literal["input", "private", "published"]) -> TensorBatch:
+    def batch(self, context: StateTaskContext, version: Literal["input", "private", "published"]) -> TensorBatch:
         return self.scoped(read_batch(context, version, self.resource, self.produced))
 
-    def execute(self, context: StateTaskContext[D]) -> ProjectionResiduals:
+    def execute(self, context: StateTaskContext) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
         with nullcontext() if stream is None else torch.cuda.stream(stream), torch.inference_mode(False):
             batch = self.batch(context, self.version)
@@ -631,7 +630,7 @@ class TensorOperation(Generic[D]):
             return output.residuals
 
 
-class BatchOperation(TensorOperation[D]):
+class BatchOperation(TensorOperation):
     """A tensor operation whose admitted rows come from the external training batch."""
 
     def input_shapes(
@@ -640,7 +639,7 @@ class BatchOperation(TensorOperation[D]):
         return (training_shapes[0],)
 
 
-class BatchPreparation(BatchOperation[D]):
+class BatchPreparation(BatchOperation):
     """Validate both hidden and logit input capacities before training."""
 
     def input_shapes(

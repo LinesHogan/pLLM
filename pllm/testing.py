@@ -19,7 +19,7 @@ when the workload reads it. `hidden_binding` and `final_hidden_binding` name the
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, TypeVar
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
@@ -73,10 +73,8 @@ from pllm.testing_distribution import (
 from pllm.testing_gpu import check_on_gpu as check_on_gpu
 
 if TYPE_CHECKING:
-    from pllm.authoring import BackendWorkload
-
-DataT = TypeVar("DataT")
-ResultT = TypeVar("ResultT")
+    from pllm.execution.tensor_declaration import TensorOutput
+    from pllm.workload import Workload
 
 
 def backend_facts(
@@ -141,8 +139,8 @@ def final_hidden_binding(layer_count: int) -> PackedHiddenResourceBinding:
 
 
 def compile_execution(
-    workload: BackendWorkload[DataT, ResultT], facts: BackendCompileFacts, stream: torch.cuda.Stream | None = None
-) -> StateExecution[StepInput, DataT, ResultT]:
+    workload: Workload, facts: BackendCompileFacts, stream: torch.cuda.Stream | None = None
+) -> StateExecution:
     """Compile `workload` against `facts` and admit its instance state, as the vLLM runner does on install.
 
     Request state is admitted per request with `execution.admit(identities)`.
@@ -197,23 +195,23 @@ def step_input(
 
 
 def run_step(
-    execution: StateExecution[StepInput, DataT, ResultT],
+    execution: StateExecution,
     value: StepInput,
     *,
     feedback: SamplerFeedback | None = None,
     stream: torch.cuda.Stream | None = None,
-) -> ResultT:
+) -> TensorOutput:
     """Execute every anchor of one step, completing the sampler with `feedback` when the workload reads it."""
     return execution.step(value, stream, feedback=feedback)
 
 
 def run_guided_step(
-    execution: StateExecution[StepInput, DataT, ResultT],
+    execution: StateExecution,
     value: StepInput,
     *,
     feedback: SamplerFeedback | None = None,
     stream: torch.cuda.Stream | None = None,
-) -> tuple[tuple[PackedSamplerGuidanceBatch, ...], ResultT]:
+) -> tuple[tuple[PackedSamplerGuidanceBatch, ...], TensorOutput]:
     """Like `run_step`, also returning additions in declaration order, followed by any guidance stage."""
     context = execution.start_step(value, stream)
     guidance: tuple[PackedSamplerGuidanceBatch, ...] = ()

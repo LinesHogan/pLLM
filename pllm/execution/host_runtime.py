@@ -7,7 +7,6 @@ pllm.host.make_host compiles a pllm.Workload with this config; the vLLM session 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TypeVar
 
 import torch
 
@@ -31,18 +30,14 @@ from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts, co
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.torch_private import MemoryUsage
 
-ResultT = TypeVar("ResultT")
-InputT = TypeVar("InputT")
-DataT = TypeVar("DataT")
-
 
 def bind_host(
     graph: SemanticGraph,
     layouts: TensorLayoutRequest,
-    math: MathBinding[InputT, DataT, ResultT],
+    math: MathBinding,
     config: HostConfig,
     timeline: SchedulerTimeline,
-) -> StateExecution[InputT, DataT, ResultT]:
+) -> StateExecution:
     """Plan a host graph against `timeline` and bind its math to a page arena on `config.device`."""
     providers = (
         (PageBundleProviderFacts(f"page_bundle_{config.device.type}@1", StateDeviceKind(config.device.type)),)

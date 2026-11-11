@@ -40,7 +40,7 @@ from pllm.execution.model_sites import (
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.site_memory import SiteMemorySchedule
-from pllm.execution.state_execution import DataT, StateTaskContext
+from pllm.execution.state_execution import StateTaskContext
 
 Forward = Callable[..., Tensor | tuple[Tensor, ...]] | Callable[[Tensor], LinearOutput]
 
@@ -298,9 +298,7 @@ class ModelSites:
         self._installed.append((module, module.forward))
         module.forward = hook
 
-    def prepare(
-        self, rows: PackedPhaseRowBatch, context: StateTaskContext[DataT], directory: RequestStateDirectory
-    ) -> None:
+    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory) -> None:
         """Copy the step's version of every state input, and each packed row's request, into the stable buffers.
 
         Request state is read at each request's version; instance state at the step's newest version, the one value

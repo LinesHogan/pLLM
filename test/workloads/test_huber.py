@@ -4,11 +4,11 @@ import torch
 
 from examples.huber import HuberWorkload
 from pllm import testing
-from pllm.authoring import StepResult
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.semantic_graph import AnchorId
 from pllm.execution.ptts.state_refs import StateRefs
+from pllm.execution.tensor_declaration import StepResult
 from pllm.testing import RequestIdentity, backend_facts
 from test import reference_huber as oracle
 

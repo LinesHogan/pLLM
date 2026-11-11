@@ -20,21 +20,17 @@ from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.custom_forward import CustomForwardTask, SerialCustomForward
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_declaration import TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.token_program import KV
 
 
 class CheckForward(SerialCustomForward):
     """Run authored token math against a small deterministic stack, with production state reads."""
 
-    def __init__(self, execution: StateExecution[StepInput, TensorFrame, TensorOutput]) -> None:
+    def __init__(self, execution: StateExecution) -> None:
         task = execution.arena.plan.semantic_graph.custom_forward_task
         assert task is not None
         scheduled = execution.arena.plan.scheduled(task.symbol)
-        binding = CustomForwardTask[TensorFrame].from_implementation(
-            execution.implementation(scheduled.implementation_id)
-        )
+        binding = CustomForwardTask.from_implementation(execution.implementation(scheduled.implementation_id))
         execution.rebind_implementation(replace(binding, primitive=self))
         self.attention: CheckAttention | None = None
         self._rows: Sequence[PackedPhaseRow] = ()

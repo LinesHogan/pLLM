@@ -1,11 +1,13 @@
 """pllm.Workload, the base class every workload subclasses, and reflection: reading a workload's declared states,
 decorated methods and input markers once into a WorkloadContext, which pllm.execution.workload_lowering lowers into
-a TensorDeclaration. Used by pllm (make_llm, explain), pllm.host and pllm.testing."""
+a TensorDeclaration. Workload also compiles itself against a model backend (specialize, plan_backend,
+bind_backend) into a BackendDeployment. Used by pllm (make_llm, explain), the vLLM backend and worker, pllm.host
+and pllm.testing."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import partial
 from graphlib import CycleError, TopologicalSorter
 from inspect import Parameter as SignatureParameter, signature
@@ -15,10 +17,17 @@ from typing import Any, ClassVar, TypeVar
 
 import torch
 
-from pllm.authoring import BackendWorkload
 from pllm.config import ExecutionOptions
+from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.semantic_graph import SchedulerTimeline, SemanticGraph, StateScope, TaskId
+from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline, SemanticGraph, StateScope, TaskId
+from pllm.contracts.tensor_policy import TensorPolicy
+from pllm.contracts.visibility import VisibilitySource
+from pllm.execution.backend_attachment import (
+    attachment_buffer_bytes,
+    bind_backend_attachment,
+    derive_attachment_resources,
+)
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.declaration import When
@@ -44,11 +53,12 @@ from pllm.execution.method_inputs import (
     Result,
 )
 from pllm.execution.position_state import PositionState
+from pllm.execution.ptts.page_bundle import PageBundleArena
+from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.state_init import Computed
-from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
-from pllm.execution.tensor_frame import TensorFrame
+from pllm.execution.task_memory import custom_forward_capture_bytes
+from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.trace import TraceEvent
 from pllm.execution.workload_lowering import (
     Operation,
@@ -65,7 +75,18 @@ from pllm.usage import ActivationPatch, Adapter, InstanceState, Phase, RequestSt
 C = TypeVar("C")
 
 
-class Workload(BackendWorkload[TensorFrame, TensorOutput]):
+@dataclass(frozen=True, slots=True)
+class BackendDeployment:
+    """A compiled workload: its bound execution and the backend attachment it was planned with."""
+
+    execution: StateExecution
+    attachment: BackendAttachment
+
+    def __post_init__(self) -> None:
+        assert self.attachment.plan is self.execution.arena.plan
+
+
+class Workload:
     """Python methods and effects compiled once, with independent sub-workloads in dataclass fields.
 
     Sampler additions follow member declaration order (parent methods, then fields recursively), before
@@ -79,7 +100,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         """Reject members that would silently replace pLLM's own Workload methods; on_export and
         required_publish_lag are the ones an author overrides."""
         super().__init_subclass__(**kwargs)
-        framework = {name for base in (Workload, BackendWorkload) for name in vars(base) if not name.startswith("_")}
+        framework = {name for name in vars(Workload) if not name.startswith("_")}
         reserved = framework - {"on_export", "required_publish_lag"}
         for name in (*vars(cls), *vars(cls).get("__annotations__", {})):
             if name in reserved:
@@ -91,14 +112,30 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
     def specialize(
         self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
     ) -> tuple[BackendCompileFacts, TensorDeclaration]:
-        """Check component timing requirements against the single engine setting."""
+        """Measure and fund the declaration on this backend, then declare against the funded facts as workers do;
+        planning and binding reuse both."""
         for path, component in component_workloads(self):
             required = component.required_publish_lag
             if required is not None and required != options.publish_lag:
                 raise ValueError(
                     f"{path or type(component).__name__} requires publish_lag={required}; the engine uses publish_lag={options.publish_lag}; all components must use the engine-wide lag"
                 )
-        return super().specialize(facts, options, causal=causal)
+        facts = _apply_options(facts, options)
+        measured = self.build(facts, causal=causal)
+        timeline = _fund_attachment(measured, facts.probe, reserve_resources(measured, facts, options), options)
+        facts = replace(facts, timeline=timeline)
+        declaration = self.funded_declaration(facts, causal=causal)
+        declaration.gather_bytes = measured.gather_bytes
+        return facts, declaration
+
+    def funded_declaration(
+        self, facts: BackendCompileFacts, *, causal: CausalBinder | None = None
+    ) -> TensorDeclaration:
+        """The declaration on funded facts: tensor tasks funded resident memory run as captured CUDA graphs. The
+        driver and every worker process declare here, so their graphs agree."""
+        declaration = self.build(facts, causal=causal)
+        declaration.select_capture(facts.timeline.task_resources)
+        return declaration
 
     def _export_handler(
         self, declaration: TensorDeclaration, graph: SemanticGraph
@@ -167,12 +204,6 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             )
         )
 
-    def resource_facts(
-        self, declaration: TensorDeclaration, facts: BackendCompileFacts, options: ExecutionOptions
-    ) -> SchedulerTimeline:
-        """Reserve ordinary tensor scratch and each requested graph's private pool."""
-        return reserve_resources(declaration, facts, options)
-
     def bind_math(
         self,
         facts: BackendCompileFacts,
@@ -180,7 +211,7 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
         declaration: TensorDeclaration,
         *,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
-    ) -> MathBinding[StepInput, TensorFrame, TensorOutput]:
+    ) -> MathBinding:
         """Bind the planned declaration's tensor tasks to the implementations the plan selected."""
         declaration.attention.bind(facts.device)
         operations = declaration.executables(facts, plan.timeline.task_resources, warmup=True, map_host=map_host)
@@ -192,11 +223,108 @@ class Workload(BackendWorkload[TensorFrame, TensorOutput]):
             on_export=self._export_handler(declaration, plan.semantic_graph),
         )
 
-    def compile_host(self, config: HostConfig) -> StateExecution[StepInput, TensorFrame, TensorOutput]:
+    def plan_backend(self, facts: BackendCompileFacts, declaration: TensorDeclaration) -> BackendAttachment:
+        """Plan the specialized declaration; binding reuses the same declaration."""
+        graph, layouts, attachment = declaration.finish()
+        plan = compile_page_bundle_plan(
+            (graph, layouts),
+            facts.timeline,
+            facts.providers,
+            facts.max_admitted_lineages,
+            facts.state_page_budget_bytes,
+        )
+        return bind_backend_attachment(
+            plan, facts.probe, replace(attachment, guidance_capacity=facts.guidance_capacity)
+        )
+
+    def bind_backend(
+        self,
+        facts: BackendCompileFacts,
+        attachment: BackendAttachment,
+        declaration: TensorDeclaration,
+        *,
+        is_output_rank: bool = True,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> BackendDeployment:
+        plan = attachment.plan
+        math = self.bind_math(facts, plan, declaration, map_host=map_host)
+        if not is_output_rank:
+            math = replace(math, on_export=None)
+        arena = PageBundleArena(
+            plan, device=facts.device, owned_resources=math.local_resources(plan), map_host=map_host
+        )
+        (sampler,) = (
+            AnchorId(anchor.ordinal) for anchor in plan.timeline.anchors if anchor.symbol == "sampler.pre_draw"
+        )
+        return BackendDeployment(math.bind(arena, sampler), attachment)
+
+    def compile_backend(
+        self,
+        facts: BackendCompileFacts,
+        options: ExecutionOptions = ExecutionOptions(),
+        *,
+        causal: CausalBinder | None = None,
+        map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> BackendDeployment:
+        """Specialize, plan and bind: the whole compile on probed backend facts."""
+        facts, declaration = self.specialize(facts, options, causal=causal)
+        return self.bind_backend(facts, self.plan_backend(facts, declaration), declaration, map_host=map_host)
+
+    def compile_host(self, config: HostConfig) -> StateExecution:
         """Build, plan and bind the graph without a model (see pllm.host.make_host); training reads host batches."""
         declaration = host_declaration(type(self).__qualname__, config)
         lower_workload(read_workload(self), declaration)
         return bind_host_declaration(declaration, config, self._export_handler(declaration, declaration.graph))
+
+
+def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:
+    """The execution options the declaration and plan depend on: capabilities, budgets, tensor policy, visibility."""
+    if options.state_page_budget_bytes > facts.state_page_budget_bytes:
+        raise ValueError(
+            f"ExecutionOptions.state_page_budget_bytes={options.state_page_budget_bytes} exceeds the "
+            f"{facts.state_page_budget_bytes} bytes free on the device; lower it, or lower gpu_memory_utilization "
+            "so vLLM leaves more memory free"
+        )
+    capabilities = set(facts.timeline.capabilities)
+    if "compute/cuda@1" in capabilities:
+        capabilities.add("compute/cuda_graph@1")
+    timeline = replace(
+        facts.timeline,
+        capabilities=tuple(sorted(capabilities)),
+        execution_peak_budget_bytes=min(
+            (
+                n
+                for n in (facts.timeline.execution_peak_budget_bytes, options.execution_peak_budget_bytes)
+                if n is not None
+            ),
+            default=None,
+        ),
+        tensor_policy=TensorPolicy(options.allow_numerical_transforms, options.tuning),
+        visibility=VisibilitySource.post_sampler(options.publish_lag),
+    )
+    return replace(
+        facts,
+        timeline=timeline,
+        state_page_budget_bytes=options.state_page_budget_bytes or facts.state_page_budget_bytes,
+        guidance_capacity=options.guidance_capacity if facts.guidance_rejection is None else None,
+    )
+
+
+def _fund_attachment(
+    declaration: TensorDeclaration, probe: ModelProbe, timeline: SchedulerTimeline, options: ExecutionOptions
+) -> SchedulerTimeline:
+    """Reserve the attachment's effect buffers and fund the custom-forward task."""
+    graph, layouts, attachment = declaration.finish()
+    buffers = attachment_buffer_bytes(probe, graph, layouts, attachment)
+    if buffers:
+        timeline = replace(
+            timeline,
+            reserved_bytes=tuple(
+                value + buffers for value in (timeline.reserved_bytes or (0,) * len(timeline.anchors))
+            ),
+        )
+    capture = options.cuda_graph_pool_budget_bytes or custom_forward_capture_bytes(declaration, probe)
+    return derive_attachment_resources(probe, graph, timeline, cuda_graph_pool_budget_bytes=capture)
 
 
 def component_workloads(workload: Workload) -> tuple[tuple[str, Workload], ...]:
@@ -522,7 +650,7 @@ def _check_base_collisions(owner: Workload) -> None:
     """Reject unrelated declaration owners whose common name Python would silently discard."""
     declarations: dict[str, list[type]] = {}
     for base in type(owner).__mro__:
-        if base in (Workload, BackendWorkload, object):
+        if base in (Workload, object):
             continue
         own_fields = _own_fields(base)
         for name in dict.fromkeys((*vars(base), *sorted(own_fields))):
