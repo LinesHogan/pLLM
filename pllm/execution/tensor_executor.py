@@ -157,8 +157,9 @@ class TensorExecutor:
     input_gradients: dict[tuple[str, str], torch.Tensor] = dataclass_field(
         default_factory=lambda: dict[tuple[str, str], torch.Tensor]()
     )
-    addresses: tuple[int, ...] = ()
-    hidden_inputs: Mapping[tuple[str, str, str], torch.Tensor] | None = None
+    hidden_inputs: Mapping[tuple[str, str, str], torch.Tensor] = dataclass_field(
+        default_factory=lambda: dict[tuple[str, str, str], torch.Tensor]()
+    )
     active_rows: int = 0
     active_states: int = 0
     updated: tuple[int, ...] = ()
@@ -215,7 +216,7 @@ class TensorExecutor:
     @property
     def table_size(self) -> int:
         """Resource tables followed by one hidden slot column per bound locator."""
-        return sum(layout.size for layout in self.layouts.values()) + len(self.hidden_inputs or {}) * self.rows
+        return sum(layout.size for layout in self.layouts.values()) + len(self.hidden_inputs) * self.rows
 
     def _fill(self, host: npt.NDArray[np.int64], plan: RowPlan, layout: TableLayout) -> None:
         """Stage a RowPlan and row-input addresses into the zeroed fixed table."""
@@ -306,7 +307,7 @@ class TensorExecutor:
             columns[5] > 0,
             {
                 key: (pool, slots)
-                for (key, pool), slots in zip((self.hidden_inputs or {}).items(), self.hidden_slots, strict=True)
+                for (key, pool), slots in zip(self.hidden_inputs.items(), self.hidden_slots, strict=True)
             },
             self._row_inputs(columns),
             leaf=fields[0].detach().to(torch.promote_types(fields[0].dtype, torch.float32)).requires_grad_(True)
@@ -477,7 +478,7 @@ class TensorExecutor:
         return self.write_outputs(data, batch, source_rows)
 
     def _stage(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> tuple[int, ...]:
-        """Stage the row table, with the private pages a training body writes; returns the hidden tap addresses."""
+        """Stage the row table, with the private pages a training body writes; returns the hidden taps' capture key."""
         addresses = self._inputs(data, batch)
         plan = row_plan(data, batch)
         self.updated = () if self.optimizer is None else tuple(plan.updated.tolist())
@@ -540,15 +541,13 @@ class TensorExecutor:
                 )
             self.pools = self.resource_pools[self.task.resource]
         taps = () if data.step.hidden is None else data.step.hidden_batch(batch.stream).taps
-        addresses = tuple(item.storage.data_ptr() for item in taps)
-        if self.hidden_inputs is None or self.addresses != addresses:
-            self.hidden_inputs = {item.resource.locator_key: item.storage for item in taps}
-        self.addresses = addresses
+        self.hidden_inputs = {item.resource.locator_key: item.storage for item in taps}
         self.row_input_values = tuple(self._row_input(name, data, batch) for name in self.row_input_names)
         if batch.stream is not None:
             for value in self.row_input_values:
                 value.record_stream(batch.stream)
-        return addresses
+        # A captured body bakes in each tap's address and shape; slices of one buffer share an address.
+        return tuple(value for item in taps for value in (item.storage.data_ptr(), *item.storage.shape))
 
     @staticmethod
     def _row_input(name: str, data: TensorFrame, batch: TensorBatch) -> torch.Tensor:

@@ -205,10 +205,12 @@ def test_requests_admitted_between_writes_keep_their_instance_versions():
     execution = deployment(InstanceDecodeFactors()).execution
     execution.admit_instances()
     a, b = RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0)
+    # Steps read growing slices of one buffer, which share its address.
+    buffers = {testing.hidden_binding(layer, layer_count=10): torch.randn(2, 4) for layer in (0, 9)}
     for step, rows in enumerate(((a,), (a, b), (a, b), (a, b))):
         if step < 2:
             execution.admit(rows[-1:])
-        hidden = {testing.hidden_binding(layer, layer_count=10): torch.randn(len(rows), 4) for layer in (0, 9)}
+        hidden = {binding: buffer[: len(rows)] for binding, buffer in buffers.items()}
         testing.run_step(execution, testing.step_input(rows, hidden, step_id=step, token_offset=step))
     assert [ref.version_id for r in (a, b) for ref in execution.directory.inference_pin(r).refs] == [0, 1]
     execution.retire((a, b), wait=True)
