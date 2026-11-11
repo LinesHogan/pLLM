@@ -71,7 +71,7 @@ class StepCapture:
     budget: TaskResourceFact
     states: int
     graph: torch.cuda.CUDAGraph | None = None
-    addresses: tuple[int, ...] = ()
+    key: tuple[int, ...] = ()
     resident_bytes: int = 0
     stream: torch.cuda.Stream | None = None
 
@@ -80,16 +80,16 @@ class StepCapture:
         body: Callable[[], None],
         table: torch.Tensor,
         destinations: torch.Tensor,
-        addresses: tuple[int, ...],
+        key: tuple[int, ...],
         refill: Callable[[], None],
         buffers: tuple[torch.Tensor, ...] = (),
     ) -> None:
-        """Capture when addresses change; warmup never writes live destinations. The caller has called `order`
-        before refilling the table and buffers."""
-        if self.graph is None or self.addresses != addresses:
+        """Capture when `key`, the input addresses and shapes the graph bakes in, changes; warmup never writes live
+        destinations. The caller has called `order` before refilling the table and buffers."""
+        if self.graph is None or self.key != key:
             self._capture(body, table, destinations, buffers)
             refill()
-        self.addresses = addresses
+        self.key = key
         assert self.graph is not None
         self.graph.replay()
 

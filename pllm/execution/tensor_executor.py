@@ -421,11 +421,11 @@ class TensorExecutor:
             return self._reuse(rows, selected, source_rows)
         if self.capture is not None:
             self.capture.order(selected.stream)
-        addresses = self._stage(rows, selected, context) if self.rowwise else ()
+        capture_key = self._stage(rows, selected, context) if self.rowwise else ()
         if self.capture is None:
             self.execute_body(rows, selected)
         else:
-            self._replay(rows, selected, addresses)
+            self._replay(rows, selected, capture_key)
         return self._output(data, batch, rows, selected, source_rows)
 
     def trace(self, data: TensorFrame, batch: TensorBatch) -> TaskOutput:
@@ -479,23 +479,23 @@ class TensorExecutor:
 
     def _stage(self, data: TensorFrame, batch: TensorBatch, context: StateTaskContext[TensorFrame]) -> tuple[int, ...]:
         """Stage the row table, with the private pages a training body writes; returns the hidden taps' capture key."""
-        addresses = self._inputs(data, batch)
+        capture_key = self._inputs(data, batch)
         plan = row_plan(data, batch)
         self.updated = () if self.optimizer is None else tuple(plan.updated.tolist())
         if self.optimizer is not None:
             slots = context.owned_write_slots(batch.selection.refs.take(self.updated), copy_fields=())
             plan = replace(plan, writes=(self.updated, slots))
         self._prepare(plan, data, batch)
-        return addresses
+        return capture_key
 
-    def _replay(self, data: TensorFrame, batch: TensorBatch, addresses: tuple[int, ...]) -> None:
+    def _replay(self, data: TensorFrame, batch: TensorBatch, capture_key: tuple[int, ...]) -> None:
         assert self.capture is not None and self.table is not None
         table = self.table
         self.capture.run(
             lambda: self.execute_body(data, batch),
             table,
             self.views[self.task.resource][2],
-            addresses,
+            capture_key,
             lambda: self.staging.copy_to(table),
         )
 
