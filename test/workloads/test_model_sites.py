@@ -165,3 +165,27 @@ def test_stateful_custom_residual_matches_serial_chunk_oracle(chunk: int) -> Non
         torch.testing.assert_close(torch.stack(outputs[request]), expected, rtol=1e-12, atol=1e-12)
         latest = execution.arena.latest(refs[request].lineage_id)
         torch.testing.assert_close(execution.snapshot(latest)[0], memory, rtol=1e-12, atol=1e-12)
+
+
+@dataclass(frozen=True)
+class ObservedMemory(pllm.Workload):
+    """An export declared before the stateful residual reads the carry the residual allocates."""
+
+    init: pllm.Zeros | pllm.Imported = pllm.Zeros()
+
+    @property
+    def memory(self) -> pllm.RequestState:
+        return pllm.RequestState({"M": (WIDTH, WIDTH)}, init=self.init)
+
+    @pllm.export()
+    def observe(self, h=pllm.hidden(0), M=pllm.parameter("memory", "M")):
+        return h @ M
+
+    @pllm.custom_residual(site="mlp", layers=(1,), state="memory", chunk=2)
+    def remember(self, x, y, M=pllm.parameter("memory", "M")):
+        return x + y, M
+
+
+def test_stateful_residual_declares_independently_of_method_order() -> None:
+    facts = testing.backend_facts(WIDTH, (testing.hidden_binding(0, LAYERS),), layer_count=LAYERS)
+    ObservedMemory().build(facts)

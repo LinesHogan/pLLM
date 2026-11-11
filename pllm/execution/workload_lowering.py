@@ -43,7 +43,7 @@ from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, State, When
 from pllm.execution.freeze import fingerprint, freeze
 from pllm.execution.host_runtime import HostConfig, bind_host
-from pllm.execution.method_effects import TRAINING_INPUTS, CustomAttention, Effect, Gradient, Sampler
+from pllm.execution.method_effects import TRAINING_INPUTS, Effect, Gradient, Sampler
 from pllm.execution.method_inputs import Carried, Carry, InputMarker, Parameter, Result, method_inputs
 from pllm.execution.model_effect_binding import declare_activation_patch, declare_custom_forward
 from pllm.execution.model_sites import StateInput
@@ -702,7 +702,7 @@ def lower_workload(context: WorkloadContext, b: TensorDeclaration, capabilities:
         component.binding = b
         component.adapters = adapters
     context.declare_values()
-    ordered = sorted(context.operations, key=lambda operation: not isinstance(operation.effect, CustomAttention))
+    ordered = sorted(context.operations, key=lambda operation: not operation.effect.declared_first)
     for operation in ordered:
         description = operation.effect.description()
         if operation.phase_override:

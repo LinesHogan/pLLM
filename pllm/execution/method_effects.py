@@ -115,6 +115,11 @@ class Effect:
         """Whether the backend taps the rows the method's inputs read."""
         return True
 
+    @property
+    def declared_first(self) -> bool:
+        """Whether other methods' declarations read what this one declares, so it is declared before them."""
+        return False
+
     def accumulates(self, operation: Operation, field: str) -> bool:
         """Whether this effect carries the field's previous value into its next version."""
         return False
@@ -747,6 +752,11 @@ class CustomAttention(Effect):
         """It reads state and earlier attention facts inside the forward."""
         return False
 
+    @property
+    def declared_first(self) -> bool:
+        """Methods reading pllm.attention(...) facts read the attention method this registers."""
+        return True
+
     def layouts(self) -> tuple[KVLayout, ...]:
         """Validate storage declarations at the authoring boundary."""
         layers, window, source, sink = (
@@ -833,6 +843,11 @@ class CustomResidual(Effect):
 
     def requirements(self) -> BackendRequirements:
         return BackendRequirements(custom_residual=True, stateful_residual=bool(self.state))
+
+    @property
+    def declared_first(self) -> bool:
+        """A stateful method allocates the carry state that other methods may read."""
+        return bool(self.state)
 
     @property
     def reads_taps(self) -> bool:
