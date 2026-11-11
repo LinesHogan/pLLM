@@ -293,7 +293,11 @@ class InstanceState:
         ):
             raise ValueError("layers needs sorted unique nonnegative indices on an InstanceState")
         if self.shape is not None:
+            if self.fields:
+                raise ValueError("give a state fields or shape=, not both; shape= declares one field named 'value'")
+            # shape= is shorthand; keeping only `fields` lets dataclasses.replace() rebuild the state.
             object.__setattr__(self, "fields", {"value": self.shape})
+            object.__setattr__(self, "shape", None)
         # A pllm.Field without its own dtype is stored in the state's dtype, like a plain shape.
         fields = {
             key: replace(value, dtype=self.dtype) if isinstance(value, Field) and value.dtype == "auto" else value
