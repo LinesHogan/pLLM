@@ -71,7 +71,7 @@ pLLM 的文档按用途分成五类，每一页只做一件事：**教程**带�
 - [核心概念](explain/core-concepts.md)：为什么不是 hook、行、一步的时间线、状态版本与 `publish_lag`、为什么有边界
 - [设计取舍](explain/design-tradeoffs.md)：为什么有些算法今天写不了，以及替代做法
 - [性能与显存](explain/performance.md)：decode 的瓶颈、pLLM 替你省了什么、各写法的实测代价
-- [技术杂谈](explain/highlights/00-overview.md)：十二篇长文，讲 pLLM 的每项技术是被什么真实约束逼出来的、和别的做法比如何、代价在哪里
+- [技术杂谈](explain/highlights/00-guide.md)：一篇导读加十篇独立长文，每篇讲一个在 vLLM 里跑推理期算法时会撞上的系统问题、pLLM 怎么解、代价在哪里
 
 ## 示例库
 
