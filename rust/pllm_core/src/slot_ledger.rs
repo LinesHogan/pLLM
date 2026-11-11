@@ -9,28 +9,45 @@ pyo3::create_exception!(_core, PageCapacity, pyo3::exceptions::PyRuntimeError);
 
 pub(crate) type Array<'py> = Bound<'py, PyArray1<i64>>;
 
+/// Each field has its own page count: older versions keep only the fields their readers pin.
 #[derive(Default)]
 pub(crate) struct Pool {
     pub width: usize,
-    pub capacity: usize,
+    pub capacities: Vec<usize>,
+    offsets: Vec<usize>,
     holders: Vec<i64>,
     generations: Vec<i64>,
     fences: Vec<(i64, Vec<bool>)>,
 }
 
 impl Pool {
-    fn new(width: usize, capacity: usize) -> Self {
+    fn new(capacities: Vec<usize>) -> Self {
+        let offsets: Vec<usize> = capacities
+            .iter()
+            .scan(0, |start, &capacity| {
+                let offset = *start;
+                *start += capacity;
+                Some(offset)
+            })
+            .collect();
+        let pages = capacities.iter().sum();
         Self {
-            width,
-            capacity,
-            holders: vec![0; width * capacity],
-            generations: vec![0; width * capacity],
+            width: capacities.len(),
+            capacities,
+            offsets,
+            holders: vec![0; pages],
+            generations: vec![0; pages],
             fences: Vec::new(),
         }
     }
 
+    fn index(&self, field: usize, slot: usize) -> usize {
+        assert!(slot < self.capacities[field]);
+        self.offsets[field] + slot
+    }
+
     pub fn free_count(&self, field: usize) -> usize {
-        self.holders[field * self.capacity..(field + 1) * self.capacity]
+        self.holders[self.offsets[field]..self.offsets[field] + self.capacities[field]]
             .iter()
             .filter(|&&count| count == 0)
             .count()
@@ -49,10 +66,10 @@ impl Pool {
         field: usize,
         count: usize,
     ) -> PyResult<(Vec<i64>, Vec<i64>, Vec<i64>)> {
-        let offset = field * self.capacity;
+        let offset = self.offsets[field];
         let mut ready = Vec::with_capacity(count);
         let mut reuse = Vec::new();
-        for slot in 0..self.capacity {
+        for slot in 0..self.capacities[field] {
             if ready.len() == count {
                 break;
             }
@@ -102,21 +119,29 @@ impl Pool {
 
     pub fn share(&mut self, field: usize, slots: &[i64]) {
         for &slot in slots {
-            self.holders[field * self.capacity + slot as usize] += 1;
+            let index = self.index(field, slot as usize);
+            self.holders[index] += 1;
         }
     }
 
-    pub fn hold(&mut self, slots: &[i64]) {
-        for (index, &slot) in slots.iter().enumerate() {
-            self.holders[(index % self.width) * self.capacity + slot as usize] += 1;
+    /// Hold the `held` fields of a [rows, fields] slot matrix.
+    pub fn hold(&mut self, slots: &[i64], held: &[bool]) {
+        for (position, &slot) in slots.iter().enumerate() {
+            if held[position % self.width] {
+                let index = self.index(position % self.width, slot as usize);
+                self.holders[index] += 1;
+            }
         }
     }
 
-    pub fn release(&mut self, slots: &[i64], completion: i64) {
+    pub fn release(&mut self, slots: &[i64], held: &[bool], completion: i64) {
         let mut counts = vec![0; self.holders.len()];
         let mut touched = Vec::new();
         for (position, &slot) in slots.iter().enumerate() {
-            let index = (position % self.width) * self.capacity + slot as usize;
+            if !held[position % self.width] {
+                continue;
+            }
+            let index = self.index(position % self.width, slot as usize);
             if counts[index] == 0 {
                 touched.push(index);
             }
@@ -145,17 +170,14 @@ impl Pool {
         }
     }
 
-    pub fn check(&self, slots: &[i64], generations: &[i64]) {
-        assert_eq!(slots.len(), generations.len());
-        assert_eq!(slots.len(), self.width);
-        for (field, (&slot, &generation)) in slots.iter().zip(generations).enumerate() {
-            self.check_page(field, slot as usize, generation);
-        }
+    fn check_page(&self, field: usize, slot: usize, generation: i64) {
+        assert!(self.live_page(field, slot, generation));
     }
 
-    fn check_page(&self, field: usize, slot: usize, generation: i64) {
-        let index = field * self.capacity + slot;
-        assert!(self.holders[index] >= 1 && self.generations[index] == generation);
+    /// Whether a page still holds the allocation `generation` names: held, and not reclaimed since.
+    fn live_page(&self, field: usize, slot: usize, generation: i64) -> bool {
+        let index = self.index(field, slot);
+        self.holders[index] >= 1 && self.generations[index] == generation
     }
 }
 
@@ -170,9 +192,9 @@ type Allocation<'py> = (Array<'py>, Array<'py>, Array<'py>, Array<'py>);
 #[pymethods]
 impl SlotLedger {
     #[new]
-    fn new(width: usize, capacity: usize) -> Self {
+    fn new(capacities: Vec<usize>) -> Self {
         Self {
-            pool: Pool::new(width, capacity),
+            pool: Pool::new(capacities),
         }
     }
 
@@ -204,7 +226,8 @@ impl SlotLedger {
     fn hold(&mut self, slots: PyReadonlyArray2<'_, i64>) -> PyResult<()> {
         let slots = column(&slots)?;
         let pool = &mut self.pool;
-        pool.hold(slots);
+        let held = vec![true; pool.width];
+        pool.hold(slots, &held);
         Ok(())
     }
 
@@ -218,21 +241,26 @@ impl SlotLedger {
         let (slots, completed) = (column(&slots)?, column(&completed)?);
         let pool = &mut self.pool;
         pool.collect(completed);
-        pool.release(slots, completion);
+        let held = vec![true; pool.width];
+        pool.release(slots, &held, completion);
         Ok(pool.events().into_pyarray(py))
-    }
-
-    fn check(
-        &self,
-        slots: PyReadonlyArray1<'_, i64>,
-        generations: PyReadonlyArray1<'_, i64>,
-    ) -> PyResult<()> {
-        self.pool.check(column(&slots)?, column(&generations)?);
-        Ok(())
     }
 
     fn check_page(&self, field: usize, slot: usize, generation: i64) {
         self.pool.check_page(field, slot, generation);
+    }
+
+    /// Per field of one version, whether its page is still live.
+    fn live(
+        &self,
+        slots: PyReadonlyArray1<'_, i64>,
+        generations: PyReadonlyArray1<'_, i64>,
+    ) -> PyResult<Vec<bool>> {
+        let (slots, generations) = (column(&slots)?, column(&generations)?);
+        assert_eq!(slots.len(), self.pool.width);
+        Ok((0..self.pool.width)
+            .map(|field| self.pool.live_page(field, slots[field] as usize, generations[field]))
+            .collect())
     }
 }
 

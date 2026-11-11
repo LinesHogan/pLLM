@@ -729,7 +729,10 @@ class TensorDeclaration:
         self.field_shards[name] = {i: field.shard for i, field in enumerate(fields) if field.shard is not None}
         if len({field.name for field in fields}) != len(fields):
             raise ValueError(f"{name}: duplicate field name")
-        declaration = SemanticState(StateResource(name), scope, keys)
+        # Ports read parameters and carries; the optimizer reads its own fields from the version it updates.
+        declaration = SemanticState(
+            StateResource(name), scope, keys, writer_fields=() if optimizer is None else tuple(range(1, ADAM))
+        )
         self.graph = replace(
             self.graph, states=tuple(sorted((*self.graph.states, declaration), key=lambda state: state.resource))
         )

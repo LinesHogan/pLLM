@@ -89,7 +89,8 @@ class StateCost:
 
     name: str
     scope: str
-    roots: int
+    # Pages per field; older versions keep only the fields their readers pin, so optimizer fields need fewer.
+    pages: tuple[int, ...]
     bytes_per_root: int
     reserved_bytes: int
     max_admitted_lineages: int
@@ -229,10 +230,13 @@ class ExplainResult:
             f"{tap.resident_bytes} bytes shared by {', '.join(tap.members)}"
             for tap in self.taps
         )
-        lines.append("state  scope  roots  bytes/root  reserved bytes [exact; state_page_budget_bytes]")
+        lines.append("state  scope  bytes/root  reserved bytes [exact; state_page_budget_bytes]")
         lines.extend(
-            f"{state.name}  {state.scope}  {state.roots}  {state.bytes_per_root}  {state.reserved_bytes}  "
-            + ", ".join(f"field {field.field_id}: {field.dtype}" for field in state.fields)
+            f"{state.name}  {state.scope}  {state.bytes_per_root}  {state.reserved_bytes}  "
+            + ", ".join(
+                f"field {field.field_id}: {field.dtype} x {pages} pages"
+                for field, pages in zip(state.fields, state.pages, strict=True)
+            )
             + f"; source: {state.source}; placement: {state.placement}; host bytes: {state.host_bytes}; "
             + f"logical transfer bytes/row: {state.transfer_bytes_per_row}; decode bytes/step: {state.transfer_bytes_per_step}"
             for state in self.states
@@ -449,7 +453,7 @@ def _states(plan: PlanBundle, binding: TensorDeclaration, rows: int) -> tuple[St
             StateCost(
                 storage.resource,
                 state.scope.value,
-                storage.page_capacity,
+                storage.page_capacities,
                 sum(page_stride_bytes(field) for field in layout.fields),
                 storage.reserved_bytes,
                 storage.max_admitted_lineages,

@@ -22,8 +22,7 @@ pub(crate) struct StateProviderPlan {
     pub(crate) device_kind: StateDeviceKind,
     layout_id: u64,
     max_admitted_lineages: u64,
-    page_capacity: u64,
-    root_page_count: u64,
+    page_capacities: Vec<u64>,
     pub(crate) reserved_bytes: u64,
     #[serde(default)]
     host_bytes: u64,
@@ -170,8 +169,8 @@ mod tests {
             json!({
                 "resource": resource, "provider_id": provider,
                 "device_kind": "cpu", "layout_id": 0,
-                "max_admitted_lineages": 1, "page_capacity": 3,
-                "root_page_count": 1, "reserved_bytes": bytes, "capture_stable": false,
+                "max_admitted_lineages": 1, "page_capacities": [3],
+                "reserved_bytes": bytes, "capture_stable": false,
                 "capabilities": if retained {vec!["state/exact_versions@1"]} else {vec![]}
             })
         };

@@ -138,7 +138,8 @@ def _reweight_oracle():
         (latest,) = result.publication.after_refs
         torch.testing.assert_close(result.loss[0], loss.detach())
         assert_roots(execution.snapshot(latest), adam_roots(optimizer, down, up))
-    assert_roots(execution.arena.snapshot(held, initial), original, exact=True)
+    # An older version keeps the parameters its readers pin; the optimizer fields belong to the latest only.
+    assert_roots(execution.arena.snapshot(held, initial)[:1], original[:1], exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
     execution.retire(())
     assert (execution.diagnostics().loss_count, execution.diagnostics().update_count) == (3, 2)
@@ -440,7 +441,9 @@ def _domains_oracle(device, request, identities) -> None:
                 execution.snapshot(ref, stream), (*adam_roots(optimizers[index], parameters[index]), carries[index])
             )
     for ref, root in zip(initial, original, strict=True):
-        assert_roots(execution.arena.snapshot(held, ref), root, exact=True)
+        # The held version keeps its parameters and carry; its optimizer fields belonged to the latest version only.
+        snapshot = execution.arena.snapshot(held, ref)
+        assert_roots((snapshot[0], snapshot[-1]), (root[0], root[-1]), exact=True)
     execution.arena.wait_release(execution.arena.release_pin(held))
     execution.retire(identities if request else (), wait=True)
     assert execution.diagnostics().active_states == execution.diagnostics().pending_state_releases == 0

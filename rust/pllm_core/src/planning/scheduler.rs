@@ -944,7 +944,7 @@ mod tests {
             "reserved_bytes": 32,
             "plans": [{"resource": "state", "provider_id": "pages",
                 "device_kind": "cpu", "layout_id": 0,
-                "max_admitted_lineages": 1, "page_capacity": 3, "root_page_count": 1,
+                "max_admitted_lineages": 1, "page_capacities": [3],
                 "reserved_bytes": 32, "capture_stable": false, "capabilities": ["state/exact_versions@1"]}]
         }).to_string()).unwrap();
         let permutations = [

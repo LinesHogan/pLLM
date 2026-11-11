@@ -22,8 +22,8 @@ class StateProviderPlan:
     device_kind: StateDeviceKind
     layout_id: LayoutId
     max_admitted_lineages: int
-    page_capacity: int
-    root_page_count: int
+    # Pages per field, in layout order: older versions keep only the fields their readers pin.
+    page_capacities: tuple[int, ...]
     reserved_bytes: int
     capture_stable: bool
     capabilities: tuple[str, ...] = ()

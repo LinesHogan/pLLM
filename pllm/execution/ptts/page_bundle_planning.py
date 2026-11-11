@@ -150,9 +150,14 @@ class PageBundleProviderFacts:
         graph: SemanticGraph,
         history: int,
     ) -> StateProviderPlan:
-        """Reserve every version one state can hold at once, so a transition never waits for a page."""
+        """Reserve every version one state can hold at once, so a transition never waits for a page.
+
+        Older versions are held only by pins, which keep the fields readers read; fields only the state's writer
+        reads (AdamW's step and moments) need the latest version and the private one per lineage.
+        """
         state = next(state for state in graph.states if state.resource == resource)
         instance = state.scope is StateScope.INSTANCE
+        lineages = 1 if instance else max_admitted_lineages
         if any(state.resource in group.borrowed_resources for group in graph.input_groups):
             capacity = FEED_SLOTS
         elif instance and state.immutable:
@@ -165,23 +170,25 @@ class PageBundleProviderFacts:
             # call: its requests pin the version before or after that write, both within the lineage's own.
             pinned = state.resource in graph.admission_reads and written_while_requests_run(graph, state.resource)
             pins = max_admitted_lineages if pinned else 0
-            capacity = max(self.minimum_pages, version_capacity(1, history, written=True) + pins)
+            capacity = version_capacity(1, history, written=True) + pins
         else:
-            capacity = max(
-                self.minimum_pages, version_capacity(max_admitted_lineages, history, written=not state.immutable)
-            )
+            capacity = version_capacity(max_admitted_lineages, history, written=not state.immutable)
+        writer_capacity = version_capacity(lineages, 0, written=True)
+        capacities = tuple(
+            max(self.minimum_pages, writer_capacity if field in state.writer_fields else capacity)
+            for field in range(len(layout.fields))
+        )
         reserved_bytes = sum(
-            capacity * page_stride_bytes(field) + max(field.alignment_bytes - field.dtype.itemsize, 0)
-            for field in layout.fields
+            pages * page_stride_bytes(field) + max(field.alignment_bytes - field.dtype.itemsize, 0)
+            for pages, field in zip(capacities, layout.fields, strict=True)
         )
         return StateProviderPlan(
             resource=resource,
             provider_id=self.provider_id,
             device_kind=self.device_kind,
             layout_id=binding.layout_id,
-            max_admitted_lineages=1 if instance else max_admitted_lineages,
-            page_capacity=capacity,
-            root_page_count=len(layout.fields),
+            max_admitted_lineages=lineages,
+            page_capacities=capacities,
             reserved_bytes=0 if state.placement == "host" else reserved_bytes,
             host_bytes=reserved_bytes if state.placement == "host" else 0,
             capture_stable=self.device_kind is StateDeviceKind.CUDA,

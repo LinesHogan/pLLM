@@ -139,7 +139,7 @@ def test_reward_head_matches_reward_update_retry_and_control_quorum(
                 # The snapshot must be ready for comparison on the caller's default stream.
                 with torch.cuda.stream(stream):
                     torch.cuda._sleep(100_000_000)
-            for value, reference in zip(execution.arena.snapshot(old_pin, initial), original, strict=True):
+            for value, reference in zip(execution.arena.snapshot(old_pin, initial)[:1], original[:1], strict=True):
                 torch.testing.assert_close(value, reference, rtol=0, atol=0)
             execution.arena.wait_release(execution.arena.release_pin(old_pin))
     pending = execution.start_step(step, stream)

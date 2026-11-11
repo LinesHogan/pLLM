@@ -73,6 +73,8 @@ struct Table {
     layout: i64,
     max_lineages: usize,
     mutable: bool,
+    // The fields a pin holds: older versions keep only what their readers read.
+    pinned: Vec<bool>,
     rows: Vec<Row>,
     row_of: HashMap<i64, usize>,
 }
@@ -107,18 +109,20 @@ struct Pages {
     generations: Vec<i64>,
     readiness: Vec<i64>,
     written: Option<Vec<bool>>,
+    // The fields these pages hold; a pin holds only its table's pinned fields.
+    held: Vec<bool>,
 }
 
 impl Pages {
     fn hold(&self, table: &mut Table, pool: &mut Pool) {
-        pool.hold(&self.slots);
+        pool.hold(&self.slots, &self.held);
         for &row in &self.rows {
             table.rows[row].owners += 1;
         }
     }
 
     fn release(&self, table: &mut Table, pool: &mut Pool, completion: i64) {
-        pool.release(&self.slots, completion);
+        pool.release(&self.slots, &self.held, completion);
         for &row in &self.rows {
             table.rows[row].owners -= 1;
         }
@@ -208,6 +212,7 @@ impl Arena {
                     generations: Vec::new(),
                     readiness: Vec::new(),
                     written: None,
+                    held: vec![true; table.pinned.len()],
                 };
                 for index in indices {
                     self.select_ref(&mut group, table, refs, index, latest);
@@ -521,7 +526,10 @@ impl Arena {
     }
 
     fn pin(&mut self, pools: &mut [&mut Pool], refs: &Refs<'_>, stream: i64) -> (i64, Vec<i64>) {
-        let groups = self.select(refs, false);
+        let mut groups = self.select(refs, false);
+        for group in &mut groups {
+            group.held.clone_from(&self.tables[group.resource].pinned);
+        }
         let events = unique_events(groups.iter().flat_map(|p| p.readiness.iter().copied()));
         for group in &groups {
             group.hold(&mut self.tables[group.resource], pools[group.resource]);
@@ -669,6 +677,7 @@ fn admit_pages(
         slots: vec![0; refs.len() * pool.width],
         generations: vec![0; refs.len() * pool.width],
         written: Some(vec![true; refs.len() * pool.width]),
+        held: vec![true; pool.width],
         refs,
         rows,
         readiness: Vec::new(),
@@ -859,20 +868,29 @@ impl PageLedger {
         py: Python<'_>,
         pools: Vec<Py<SlotLedger>>,
         specs: PyReadonlyArray2<'_, i64>,
+        pinned: Vec<Vec<bool>>,
     ) -> PyResult<Self> {
         let specs = column(&specs)?;
         assert_eq!(specs.len(), pools.len() * 3);
+        assert_eq!(pinned.len(), pools.len());
         let tables = pools
             .iter()
+            .zip(pinned)
             .enumerate()
-            .map(|(i, p)| Table {
-                layout: specs[i * 3],
-                max_lineages: specs[i * 3 + 1] as usize,
-                mutable: specs[i * 3 + 2] != 0,
-                rows: (0..p.borrow(py).pool.capacity)
-                    .map(|_| Row::default())
-                    .collect(),
-                row_of: HashMap::new(),
+            .map(|(i, (p, pinned))| {
+                let pool = &p.borrow(py).pool;
+                assert_eq!(pinned.len(), pool.width);
+                Table {
+                    layout: specs[i * 3],
+                    max_lineages: specs[i * 3 + 1] as usize,
+                    mutable: specs[i * 3 + 2] != 0,
+                    pinned,
+                    // Retired lineages keep their row while a pin holds them; the largest field bounds both.
+                    rows: (0..pool.capacities.iter().copied().max().unwrap_or(0))
+                        .map(|_| Row::default())
+                        .collect(),
+                    row_of: HashMap::new(),
+                }
             })
             .collect();
         Ok(Self {
@@ -1172,6 +1190,7 @@ impl PageLedger {
                         readiness: rows.iter().map(|&r| t.rows[r].readiness).collect(),
                         rows,
                         written: None,
+                        held: vec![true; t.pinned.len()],
                     })
                 })
                 .collect(),

@@ -120,7 +120,12 @@ def scalar_plan(plan: PlanBundle, capacity: Callable[[str], int]) -> PlanBundle:
         )
     )
     plans = tuple(
-        replace(p, device_kind=StateDeviceKind.CPU, page_capacity=capacity(p.resource), host_bytes=0)
+        replace(
+            p,
+            device_kind=StateDeviceKind.CPU,
+            page_capacities=(capacity(p.resource),) * len(p.page_capacities),
+            host_bytes=0,
+        )
         for p in plan.states.plans
     )
     return replace(plan, tensor_layout_request=layouts, states=replace(plan.states, plans=plans))
@@ -248,8 +253,7 @@ class PeakArena(PageBundleArena):
 
     def _sample(self) -> None:
         for resource, pools in self.pools.items():
-            capacity = self._plans[resource].page_capacity
-            for f in range(len(pools.tensors)):
+            for f, capacity in enumerate(self._plans[resource].page_capacities):
                 self.peak[resource][f] = max(self.peak[resource][f], capacity - pools.free_count(f))
         current: dict[str, list[set[int]]] = {r: [set() for _ in p.tensors] for r, p in self.pools.items()}
         latest = set()
@@ -558,7 +562,7 @@ def main() -> None:
         strides = {
             e.resource: [page_stride_bytes(f) for f in e.layout.fields] for e in plan.tensor_layout_request.layouts
         }
-        today = {p.resource: p.page_capacity for p in plan.states.plans}
+        today = {p.resource: max(p.page_capacities) for p in plan.states.plans}
         started = time.perf_counter()
         native = drive(plan, fields, structured(n), roomy, field_aware=False)
         aware = drive(plan, fields, structured(n), roomy, field_aware=True)

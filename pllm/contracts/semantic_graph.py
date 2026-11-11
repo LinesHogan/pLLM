@@ -130,6 +130,8 @@ class SemanticState:
     key_fields: tuple[RequestKeyField, ...]
     immutable: bool = False
     placement: Literal["device", "host"] = "device"
+    # Fields only the state's own writer reads (AdamW's step and moments): older versions keep no pages for them.
+    writer_fields: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

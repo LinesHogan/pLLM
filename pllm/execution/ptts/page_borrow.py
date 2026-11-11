@@ -87,7 +87,7 @@ def receive_field(
     storage = descriptor.cuda_storage
     tensor = (
         storage.map(
-            (provider.page_capacity * stride + alignment - 1) * size,
+            (provider.page_capacities[descriptor.field_id] * stride + alignment - 1) * size,
             spec.dtype.torch,
             descriptor.storage_offset,
             spec.shape,

@@ -69,7 +69,7 @@ class HiddenTapLayout:
     def create_pool(self, device: torch.device) -> SlotPools:
         """Allocate stable storage before capture; steps lease free rows from field zero."""
         field = TensorFieldSpec(LayoutFieldId(0), self.shape, self.dtype, self.dtype.itemsize)
-        return SlotPools(TensorLayoutSpec("pllm.hidden@1", (field,)), self.retained_rows, device)
+        return SlotPools(TensorLayoutSpec("pllm.hidden@1", (field,)), (self.retained_rows,), device)
 
 
 @dataclass(frozen=True, slots=True)

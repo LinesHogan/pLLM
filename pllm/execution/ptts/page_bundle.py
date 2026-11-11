@@ -239,13 +239,15 @@ class PageBundleArena:
         self._plans = {
             selected.resource: selected for selected in plan.states.plans if selected.resource in self._owned_resources
         }
+        states = {str(state.resource): state for state in plan.semantic_graph.states}
         for resource, selected in self._plans.items():
             self.pools[resource] = SlotPools(
                 layouts[resource],
-                selected.page_capacity,
+                selected.page_capacities,
                 self.device,
                 host=bool(selected.host_bytes),
                 map_host=map_host,
+                writer_fields=states[resource].writer_fields,
             )
         self.resource_names = tuple(self._plans)
         self._resource_ids = {resource: index for index, resource in enumerate(self.resource_names)}
@@ -262,7 +264,10 @@ class PageBundleArena:
             ],
             dtype=np.int64,
         ).reshape(-1, 3)
-        self._ledger = _core.PageLedger([pool.ledger for pool in self.pools.values()], specs)
+        pinned = [
+            [field not in pools.writer_fields for field in range(len(pools.tensors))] for pools in self.pools.values()
+        ]
+        self._ledger = _core.PageLedger([pool.ledger for pool in self.pools.values()], specs, pinned)
         self._events = PageEvents()
         self._remote_reads: dict[int, list[RemoteCompletion]] = {}
         # Remote readers retain their native pin until every ACK arrives.
@@ -342,7 +347,7 @@ class PageBundleArena:
             sum(sizes[resource, field] for resource, field, _ in live_pages | private_pages | retiring_pages),
             reserved
             - sum(
-                selected.page_capacity * sizes[resource, field.field_id]
+                selected.page_capacities[field.field_id] * sizes[resource, field.field_id]
                 for resource, selected in self._plans.items()
                 for field in self.pools[resource].layout.fields
             ),

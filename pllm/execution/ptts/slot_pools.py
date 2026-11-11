@@ -80,16 +80,18 @@ class SlotPools:
     def __init__(
         self,
         layout: TensorLayoutSpec,
-        capacity: int,
+        capacities: tuple[int, ...],
         device: torch.device,
         *,
         host: bool = False,
         map_host: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        writer_fields: tuple[int, ...] = (),
     ) -> None:
         self.layout = layout
+        self.writer_fields = writer_fields
         self.host_tensors: list[torch.Tensor] = []
         tensors: list[torch.Tensor] = []
-        for field in layout.fields:
+        for field, capacity in zip(layout.fields, capacities, strict=True):
             size = field.dtype.itemsize
             stride = page_stride_bytes(field) // size
             alignment = max(field.alignment_bytes // size, 1)
@@ -118,7 +120,7 @@ class SlotPools:
                 ) from error
             tensors.append(pool)
         self.tensors = tuple(tensors)
-        self.ledger = _core.SlotLedger(len(layout.fields), capacity)
+        self.ledger = _core.SlotLedger(list(capacities))
         self._events = PageEvents()
 
     def free_count(self, field: int) -> int:
@@ -145,10 +147,18 @@ class SlotPools:
         copy_pages(source, self.tensors[field], rows, slots)
 
     def views(self, slots: Slots, generations: Slots, *, host: bool = False) -> tuple[torch.Tensor, ...]:
-        """One tensor view per field of a version, after checking none of its pages was reclaimed."""
-        self.ledger.check(slots, generations)
+        """One tensor view per field of a version, after checking none of its pages was reclaimed.
+
+        An older version keeps no pages for its writer fields (AdamW's step and moments); their views are meta
+        placeholders with the field's shape, which fail on any read.
+        """
+        live = self.ledger.live(slots, generations)
+        assert all(alive or field in self.writer_fields for field, alive in enumerate(live))
         tensors = self.host_tensors if host and self.host_tensors else self.tensors
-        return tuple(tensor[slot] for tensor, slot in zip(tensors, slots.tolist()))
+        return tuple(
+            tensor[slot] if alive else torch.empty(tensor.shape[1:], dtype=tensor.dtype, device="meta")
+            for tensor, slot, alive in zip(tensors, slots.tolist(), live, strict=True)
+        )
 
     def hold(self, slots: Slots) -> None:
         """Add a batch of holders, including repeated shared pages."""
