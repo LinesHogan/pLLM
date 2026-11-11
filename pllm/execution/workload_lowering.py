@@ -51,7 +51,7 @@ from pllm.execution.position_state import PositionState
 from pllm.execution.row_task_binding import declare_logits, declare_parameters, declare_tensor, validate_gradients
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.state_init import Computed, Fed, Imported, Zeros
+from pllm.execution.state_init import Computed, Fed, Imported, Pretrained, Zeros
 from pllm.execution.step_input import StepInput
 from pllm.execution.task_memory import derive_host_resources, derive_resources, shape_site_results
 from pllm.execution.tensor_declaration import TensorDeclaration, TensorOutput
@@ -601,7 +601,16 @@ def declare_state(context: WorkloadContext, name: str, definition: InstanceState
     """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
     digest = definition.init.register(context.binding, name, definition.scope)
     context.signature.append((name, boundary_digest(fingerprint(definition), tuple(definition.fields), digest)))
-    if name in context.in_forward_states or name in context.states:
+    if name in context.in_forward_states:
+        # The in-forward transition allocates the state and runs only the source's initializer.
+        if not isinstance(definition.init, (Zeros, Computed, Pretrained)):
+            raise ValueError(
+                f"{name} is written inside the forward (@pllm.train_in_forward or @pllm.custom_residual(state=)), "
+                f"which cannot apply pllm.{type(definition.init).__name__}; start it from pllm.Zeros(), "
+                "pllm.Computed(...) or pllm.Pretrained(...)"
+            )
+        return
+    if name in context.states:
         return
     fields = _layout_fields(context, name, definition)
     if context.binding.dimensions.tensor_parallel_size > 1 and any(field.shard is not None for field in fields):

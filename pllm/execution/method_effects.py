@@ -65,7 +65,7 @@ from pllm.execution.model_sites import (
 from pllm.execution.overlay_parallel import admit_update
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, overlay_gradient
 from pllm.execution.row_task_binding import declare_parameters, declare_weighted_train
-from pllm.execution.state_init import Fed, FromModule
+from pllm.execution.state_init import Fed
 from pllm.execution.tensor_frame import Tensors, UpdateOutput
 from pllm.execution.tensor_program import PoolSGD
 from pllm.execution.tensor_task import TensorExport
@@ -928,7 +928,6 @@ class CustomResidual(Effect):
         if (
             definition.scope is not StateScope.REQUEST
             or definition.optimizer is not None
-            or isinstance(definition.init, FromModule)
             or len(definition.fields) != 1
             or self.chunk is None
             or len(places) != 1

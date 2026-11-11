@@ -186,6 +186,8 @@ class ObservedMemory(pllm.Workload):
         return x + y, M
 
 
-def test_stateful_residual_declares_independently_of_method_order() -> None:
+def test_stateful_residual_declares_independently_of_method_order_and_rejects_imports() -> None:
     facts = testing.backend_facts(WIDTH, (testing.hidden_binding(0, LAYERS),), layer_count=LAYERS)
     ObservedMemory().build(facts)
+    with pytest.raises(ValueError, match="written inside the forward.*cannot apply pllm.Imported"):
+        ObservedMemory(pllm.Imported()).build(facts)
