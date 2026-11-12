@@ -4,9 +4,9 @@
 
 pLLM 提供了三种声明式的改模型机制，在不改动共享底座权重的前提下，让每个请求或全局实例按需定制计算：
 
-1. [`pllm.model.ActivationPatch`](../agent/reference.md#all-signatures)：在指定层之后的残差流上叠加激活修正（例如激活引导 Steering、LoReFT），完全运行在模型的 CUDA graph 内。
-2. [`pllm.model.Adapter`](../agent/reference.md#all-signatures)：在指定的投影矩阵（如注意力 Q/K/V 或 MLP 投影）上叠加权重增量 $\Delta W$（例如每请求 LoRA、稠密增量、多头增量），自动按请求隔离并在 CUDA graph 内寻址。
-3. [`@pllm.train_in_forward`](../agent/reference.md#all-signatures)：在前向传播运行的过程中，直接利用投影层的输入与目标更新私有状态（例如 In-Place TTT 快权重），实现边前向边训练的闭环。
+1. [`pllm.model.ActivationPatch`](../reference/api.md#pllmmodelactivationpatch)：在指定层之后的残差流上叠加激活修正（例如激活引导 Steering、LoReFT），完全运行在模型的 CUDA graph 内。
+2. [`pllm.model.Adapter`](../reference/api.md#pllmmodeladapter)：在指定的投影矩阵（如注意力 Q/K/V 或 MLP 投影）上叠加权重增量 $\Delta W$（例如每请求 LoRA、稠密增量、多头增量），自动按请求隔离并在 CUDA graph 内寻址。
+3. [`@pllm.train_in_forward`](../reference/api.md#pllmtrain_in_forward)：在前向传播运行的过程中，直接利用投影层的输入与目标更新私有状态（例如 In-Place TTT 快权重），实现边前向边训练的闭环。
 
 ---
 

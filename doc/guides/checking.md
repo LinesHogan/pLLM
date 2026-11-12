@@ -284,4 +284,4 @@ vLLM 底座引擎在初始化时会分配独占的 GPU 显存池并进行 CUDA g
 - [负载的组成](workload-anatomy.md)：深入理解三类声明、方法体编写规则与版本可见性。
 - [自写算子](custom-ops.md)：如何为负载引入 Triton 算子并注册 CPU 参考实现以支持契约检查。
 - [排查报错](../howto/troubleshooting.md)：完整的报错信息目录与排错指引。
-- [API 签名汇总](../agent/reference.md#all-signatures)：查阅 `pllm.testing` 与全套公开接口的最新参数签名。
+- [API 参考](../reference/api.md#检查正确性)：`pllm.testing` 与全部公开接口的签名和说明。

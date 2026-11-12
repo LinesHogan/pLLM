@@ -64,6 +64,12 @@
 
 ## 执行与检查
 
+- **规划器**：pLLM 构建引擎时读负载声明、决定每个方法在一步的什么位置、哪条 stream 上运行、预留多少显存的那一部分；
+  `pllm.explain` 打印的就是它的计划。见[看成本：pllm.explain](../guides/explain.md)。
+- **准入（admission）**：pLLM 接纳一样东西的时刻。请求准入是请求进入引擎、分到状态副本并绑定它读的状态版本的那一刻；
+  模型或写法的准入是构建引擎时检查它是否受支持，不受支持就报错。
+- **Inductor**：PyTorch `torch.compile` 的代码生成器，把相邻的小算子融合成一个 kernel；vLLM 用它编译模型的 CUDA graph，
+  pLLM 用它融合只读查表。
 - **阶段（`pllm.Phase`）**：一步里的时间窗口：`BEFORE_FORWARD`、`IN_FORWARD`、`AFTER_FORWARD`、`BEFORE_SAMPLE`、
   `AFTER_SAMPLE`，以及由 pLLM 决定的 `AUTOMATIC`。每个效果有默认阶段，`@pllm.on(phase)` 可以改。
 - **锚点**：`pllm.explain` 打印的、一步里的位置名：`request.prepare`、`model.execute`、`state.publish`、

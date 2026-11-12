@@ -47,10 +47,8 @@ class ExecutionOptions:
     Post-filter guidance defaults to capacity K=4096. Choose capacities so the common
     case never takes the overflow path; smaller K is slower because overflow rows need
     top-K selection. In the measured ESamp beta=.5 corpus, the largest real nucleus was
-    2,785 tokens: K=4096 kept those rows on the simple path, reaching 34,742 tok/s versus
-    33,737 at K=256, 34,069 at K=1024 and 32,624 with dense guidance. Policy p99.9 TV
-    was about 6e-14 with 100% shared-Gumbel draw agreement on those measured corpora.
-    These measurements do not guarantee that other workloads fit the capacity.
+    2,785 tokens, so K=4096 kept those rows on the simple path; throughput per capacity is
+    recorded in doc/reference/measurements.toml. Other workloads may not fit the capacity.
 
     Capture pools are automatic unless cuda_graph_pool_budget_bytes sets a cap.
     Tensor tasks reserve their traced requirements; vLLM owns its model-graph pool,

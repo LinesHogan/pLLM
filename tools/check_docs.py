@@ -12,10 +12,12 @@ Checks over README.md, doc/ and examples/:
    right after an executed block shows its output and must match what it prints, where a line `...` stands for
    any number of lines, `...` within a line for any text, and memory addresses and times in s or ms always match;
    a text block that is not that output is fenced ```text not-output;
-5. doc/agent/reference.md names every public pllm name in its task sections, and every generated block equals
-   what this tool renders from its source (`--write-generated` rewrites them): the signature list of reference.md
-   from the code, and the error tables of doc/reference/errors.md (Chinese) and doc/agent/pitfalls.md (English)
-   from doc/reference/errors.toml;
+5. doc/agent/reference.md names every public pllm name in its task sections, API_GROUPS files every public name
+   under one task, and every generated block equals what this tool renders from its source (`--write-generated`
+   rewrites them): from the code, the signature list of reference.md, the API page doc/reference/api.md (each
+   name's full docstring) and the field and default columns of doc/reference/config.md; from
+   doc/reference/errors.toml, the error tables of doc/reference/errors.md (Chinese) and doc/agent/pitfalls.md
+   (English);
 6. error messages quoted in backticks in the first table column of a section about rejections or errors still
    exist in pllm's Python or Rust sources: every piece between `...` markers (which stand for text that
    depends on the user's code) must appear in one string literal;
@@ -24,8 +26,9 @@ Checks over README.md, doc/ and examples/:
    measured number has one source; a line whose numbers are not measurements ends with
    `<!-- check-docs: not measured -->`.
 
-Warnings, which do not fail the run: README.md and doc/ outside doc/dev/ are written for users, so contributor
-vocabulary (PTTS, receipts, evidence numbers, milestones, local paths, commit hashes) found there is listed per file.
+8. README.md and doc/ outside doc/dev/ are written for users: a word from JARGON appears there only if the
+   glossary (doc/reference/glossary.md) explains it in a bold term. Contributor vocabulary (PTTS, receipts,
+   evidence numbers, milestones, local paths, commit hashes) has no glossary entry, so it always fails.
 
 The essays in doc/explain/highlights/ are dated articles: each names the commit and setup it was written against
 and is not kept current, so their code does not run and their vocabulary and numbers are not checked.
@@ -38,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import dataclasses
 import importlib
 import inspect
 import json
@@ -49,10 +53,10 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 from types import ModuleType
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 from urllib.parse import unquote, urlsplit
 
 from github_slugger import GithubSlugger
@@ -70,12 +74,160 @@ EXECUTED_DOCS = (
 REFERENCE = AGENT_DOCS / "reference.md"
 PUBLIC_NAMESPACES = ("pllm", "pllm.model", "pllm.host", "pllm.io", "pllm.testing", "pllm.benchmark")
 ERRORS = ROOT / "doc" / "reference" / "errors.toml"
+API = ROOT / "doc" / "reference" / "api.md"
+CONFIG = ROOT / "doc" / "reference" / "config.md"
+CONFIG_CLASSES = (
+    "pllm.ModelConfig",
+    "pllm.ExecutionOptions",
+    "pllm.KVOffload",
+    "pllm.host.HostConfig",
+    "pllm.benchmark.BenchmarkOptions",
+)
+# The API page's sections, by what a user wants to do; every public name is filed under exactly one.
+API_GROUPS = (
+    ("引擎与负载", ("make_llm", "explain", "Workload", "ModelConfig", "ExecutionOptions", "KVOffload")),
+    (
+        "读什么：输入标记",
+        (
+            "hidden",
+            "residual",
+            "final_hidden",
+            "layer_logits",
+            "attention",
+            "input_tokens",
+            "sample_index",
+            "base_logits",
+            "sampled_tokens",
+            "result",
+            "parameter",
+            "module",
+            "version",
+            "index",
+            "carry",
+            "depth",
+            "value",
+            "operand",
+            "batch",
+            "causal_model",
+        ),
+    ),
+    (
+        "存什么：状态、初值与优化器",
+        (
+            "RequestState",
+            "InstanceState",
+            "PositionState",
+            "Field",
+            "Dimensions",
+            "Zeros",
+            "Computed",
+            "Pretrained",
+            "ModelCheckpoint",
+            "FromModule",
+            "Fed",
+            "Imported",
+            "AdamW",
+            "SGD",
+        ),
+    ),
+    (
+        "结果去哪：效果与时机",
+        ("export", "add_logits", "guide_sampling", "write", "train", "differentiate", "UpdateOutput", "on", "Phase"),
+    ),
+    (
+        "改模型与 forward",
+        (
+            "model.ActivationPatch",
+            "model.Adapter",
+            "model.Projection",
+            "train_in_forward",
+            "custom_residual",
+            "custom_attention",
+            "model.PagedKV",
+            "custom_forward",
+            "model.Layers",
+            "model.LayerOutputs",
+            "scan",
+        ),
+    ),
+    (
+        "宿主与负载之间的数据：导出、导入与投喂",
+        (
+            "io.TraceEvent",
+            "io.TraceSelection",
+            "io.TraceSnapshot",
+            "io.StateImport",
+            "io.Feed",
+            "io.checkpoint_directory",
+            "io.checkpoint_tensors",
+            "io.load_tensor_fields",
+        ),
+    ),
+    (
+        "宿主循环与批训练",
+        (
+            "host.make_host",
+            "host.HostConfig",
+            "host.HostTrainer",
+            "host.TrainStep",
+            "host.WeightedRowBatch",
+            "host.CausalTrainBatch",
+            "host.WeightedCEBatch",
+            "model.CausalModel",
+            "host.CompletionInput",
+            "host.Completion",
+            "host.CompletionBatch",
+            "host.RewardOutcome",
+            "host.RetryControl",
+            "host.RetryAction",
+            "host.UpdateBarrier",
+            "host.BarrierState",
+            "host.ControlReason",
+            "host.FinishReason",
+        ),
+    ),
+    (
+        "检查正确性",
+        (
+            "testing.check",
+            "testing.check_on_gpu",
+            "testing.check_distribution",
+            "testing.CheckResult",
+            "testing.ContractError",
+            "testing.DistributionResult",
+            "testing.DistanceSummary",
+            "testing.TokenDistance",
+        ),
+    ),
+    (
+        "在测试里手动单步",
+        (
+            "testing.compile_execution",
+            "testing.backend_facts",
+            "testing.scheduled_step",
+            "testing.step_input",
+            "testing.run_step",
+            "testing.run_guided_step",
+            "testing.hidden_binding",
+            "testing.final_hidden_binding",
+            "testing.RequestIdentity",
+            "testing.SamplerFeedback",
+        ),
+    ),
+    (
+        "测吞吐",
+        ("benchmark.throughput", "benchmark.compare", "benchmark.BenchmarkOptions", "benchmark.BenchmarkResult"),
+    ),
+)
 ERROR_SECTION = re.compile(r"rejection|error|pitfall|报错|错误", re.I)
-# Contributor vocabulary that user documents should not need; doc/dev/ is where it belongs.
-CONTRIBUTOR_WORDS = re.compile(
-    r"PTTS|receipt|签署|证据 \d+|(?<![A-Za-z0-9_])E\d(?![A-Za-z0-9_])|已移除|/home/"
+# Words a reader of the user documents may not know: each needs a glossary entry. The contributor vocabulary
+# after them (PTTS, receipts, evidence numbers, milestones, local paths, commit hashes) belongs in doc/dev/.
+JARGON = re.compile(
+    r"准入|规划器|旁路|锚点|Inductor|StepCapture"
+    r"|PTTS|receipt|签署|证据 \d+|(?<![A-Za-z0-9_])E\d(?![A-Za-z0-9_])|已移除|/home/"
     r"|(?<![A-Za-z0-9_])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,12}(?![A-Za-z0-9_])"
 )
+GLOSSARY = ROOT / "doc" / "reference" / "glossary.md"
 DEV_DOCS = ROOT / "doc" / "dev"
 ESSAYS = ROOT / "doc" / "explain" / "highlights"
 MEASUREMENTS = ROOT / "doc" / "reference" / "measurements.toml"
@@ -415,15 +567,26 @@ def user_document(path: Path) -> bool:
     return path.suffix != ".py" and not path.is_relative_to(DEV_DOCS) and not path.is_relative_to(ESSAYS)
 
 
-def contributor_words(path: Path) -> str:
-    """A one-line summary of the contributor vocabulary in a user document, or an empty string."""
+@cache
+def glossary_terms() -> tuple[str, ...]:
+    """The bold terms the glossary explains."""
+    return tuple(re.findall(r"\*\*([^*]+)\*\*", GLOSSARY.read_text()))
+
+
+def unexplained_words(path: Path) -> list[str]:
+    """JARGON words in a user document that no glossary term contains."""
     hits: dict[str, list[str]] = {}
     for index, text in enumerate(document_markdown(path)):
-        where = f"cell {index} line " if path.suffix == ".ipynb" else ""
+        where = f"cell {index} line " if path.suffix == ".ipynb" else "line "
         for number, line in enumerate(text.splitlines(), start=1):
-            for match in CONTRIBUTOR_WORDS.finditer(line):
-                hits.setdefault(match.group(), []).append(f"{where}{number}")
-    return "; ".join(f"{word} ({', '.join(places)})" for word, places in sorted(hits.items()))
+            for match in JARGON.finditer(line):
+                if not any(match.group() in term for term in glossary_terms()):
+                    hits.setdefault(match.group(), []).append(f"{where}{number}")
+    return [
+        f"{', '.join(places)}: {word} is not explained in doc/reference/glossary.md; add an entry there, or say it in "
+        "plain words (contributor vocabulary belongs in doc/dev/)"
+        for word, places in sorted(hits.items())
+    ]
 
 
 # Runs each cell in one shared namespace under its own file name, so a traceback names the failing cell, and
@@ -540,30 +703,39 @@ def public_names() -> list[tuple[str, Callable[..., object]]]:
     return names
 
 
-def signature_line(name: str, value: Callable[..., object]) -> str:
-    """`name(parameters)` for callables, `name: A | B` for enums, with the docstring's first line beneath."""
+def signature(name: str, value: Callable[..., object]) -> str:
+    """`name(parameters)` for callables, `name: A | B` for enums."""
     is_class = inspect.isclass(value)
     if is_class and issubclass(value, Enum):
-        head = f"{name}: {' | '.join(member.name for member in value)}"
-    else:
-        signature = inspect.signature(value)
-        parameters = [
-            parameter.replace(default=_Default(parameter.default))
-            if parameter.default is not inspect.Parameter.empty
-            else parameter
-            for parameter in signature.parameters.values()
-        ]
-        if is_class:
-            signature = signature.replace(return_annotation=inspect.Signature.empty)
-        head = f"{name}{signature.replace(parameters=parameters)}"
-    # A class's own docstring only: inherited ones and dataclass-generated `Name(fields)` say nothing new.
-    own = vars(value).get("__doc__") if is_class else value.__doc__
-    summary = inspect.cleandoc(own or "").split("\n\n")[0].replace("\n", " ")
-    generated = is_class and summary.startswith(f"{value.__name__}(")
-    return head if generated or not summary else f"{head}\n    {summary}"
+        return f"{name}: {' | '.join(member.name for member in value)}"
+    head = inspect.signature(value)
+    parameters = [
+        parameter.replace(default=_Default(parameter.default))
+        if parameter.default is not inspect.Parameter.empty
+        else parameter
+        for parameter in head.parameters.values()
+    ]
+    head = head.replace(parameters=parameters)
+    if is_class:
+        head = head.replace(return_annotation=inspect.Signature.empty)
+    return f"{name}{head}"
 
 
-def render_signatures() -> str:
+def docstring(value: Callable[..., object]) -> str:
+    """The value's own docstring: for a class, not an inherited one nor the dataclass-generated `Name(fields)`."""
+    if not inspect.isclass(value):
+        return inspect.cleandoc(value.__doc__ or "")
+    text = inspect.cleandoc(vars(value).get("__doc__") or "")
+    return "" if text.startswith(f"{value.__name__}(") else text
+
+
+def signature_line(name: str, value: Callable[..., object]) -> str:
+    """The signature with the docstring's first paragraph beneath, as the agent reference lists it."""
+    summary = docstring(value).split("\n\n")[0].replace("\n", " ")
+    return f"{signature(name, value)}\n    {summary}" if summary else signature(name, value)
+
+
+def render_signatures(_: str) -> str:
     """The generated block of reference.md: one text list of signatures per namespace."""
     parts: list[str] = []
     for namespace in PUBLIC_NAMESPACES:
@@ -594,13 +766,75 @@ def render_errors(chinese: bool) -> str:
     return "\n".join(parts)
 
 
+def render_api(_: str) -> str:
+    """The API page: each public name's signature and full docstring, in the sections of API_GROUPS."""
+    values = dict(public_names())
+    parts: list[str] = []
+    for title, names in API_GROUPS:
+        parts.append(f"## {title}\n")
+        for name in (f"pllm.{short}" for short in names if f"pllm.{short}" in values):
+            text = docstring(values[name])
+            parts.append(
+                f"### `{name}`\n\n```text\n{signature(name, values[name])}\n```\n" + (f"\n{text}\n" if text else "")
+            )
+    return "\n".join(parts)
+
+
+def ungrouped_names() -> list[str]:
+    """Public names API_GROUPS does not file exactly once, and names it files that are not public."""
+    filed = [f"pllm.{short}" for _, names in API_GROUPS for short in names]
+    public = [name for name, _ in public_names()]
+    return [
+        f"public name {name} is filed {filed.count(name)} times in API_GROUPS; file it under one section"
+        for name in public
+        if filed.count(name) != 1
+    ] + [f"API_GROUPS files {name}, which is not a public name" for name in filed if name not in public]
+
+
+def cells(line: str) -> list[str]:
+    """The cells of one markdown table row."""
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line)[1:-1]]
+
+
+def default_text(field: dataclasses.Field[Any]) -> str:
+    """A field's default as config.md shows it: 必填 when there is none, `Name()` for a default dataclass value,
+    byte counts also in MiB."""
+    assert field.default_factory is dataclasses.MISSING, field.name  # no config field uses a factory
+    value = field.default
+    if value is dataclasses.MISSING:
+        return "必填"
+    if dataclasses.is_dataclass(value) and value == type(value)():
+        return f"`{type(value).__name__}()`"
+    text = f'`"{value}"`' if isinstance(value, str) else f"`{value!r}`"
+    if field.name.endswith("_bytes") and isinstance(value, int) and value and value % (1 << 20) == 0:
+        return f"{text}（{value >> 20} MiB）"
+    return text
+
+
+def render_config(dotted: str, current: str) -> str:
+    """A config dataclass's table: the field and default columns from the code, the other columns kept from the
+    current table by field name (empty for a new field)."""
+    module, name = dotted.rsplit(".", 1)
+    fields = dataclasses.fields(getattr(importlib.import_module(module), name))
+    header, separator, *rows = current.strip("\n").splitlines()
+    written = {cells(row)[0].strip("`"): cells(row)[2:] for row in rows}
+    blank = [""] * (len(cells(header)) - 2)
+    lines = [header, separator]
+    for field in fields:
+        lines.append(
+            "| " + " | ".join([f"`{field.name}`", default_text(field), *written.get(field.name, blank)]) + " |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 @dataclass(frozen=True)
 class Generated:
-    """A block of a document that this tool writes from code or data, between two comment markers."""
+    """A block of a document that this tool writes from code or data, between two comment markers. `render`
+    receives the block's current text, so a generated table can keep the columns people write by hand."""
 
     path: Path
     name: str
-    render: Callable[[], str]
+    render: Callable[[str], str]
 
     @property
     def begin(self) -> str:
@@ -621,8 +855,13 @@ class Generated:
 SIGNATURES = Generated(REFERENCE, "signatures", render_signatures)
 GENERATED = (
     SIGNATURES,
-    Generated(ROOT / "doc" / "reference" / "errors.md", "errors", lambda: render_errors(chinese=True)),
-    Generated(AGENT_DOCS / "pitfalls.md", "errors", lambda: render_errors(chinese=False)),
+    Generated(ROOT / "doc" / "reference" / "errors.md", "errors", lambda _: render_errors(chinese=True)),
+    Generated(AGENT_DOCS / "pitfalls.md", "errors", lambda _: render_errors(chinese=False)),
+    Generated(API, "api", render_api),
+    *(
+        Generated(CONFIG, f"{dotted.rsplit('.', 1)[1]} fields", partial(render_config, dotted))
+        for dotted in CONFIG_CLASSES
+    ),
 )
 
 
@@ -635,7 +874,7 @@ def stale_blocks(path: Path, text: str) -> list[str]:
         parts = block.split(text)
         if parts is None:
             failures.append(f"the generated {block.name} block is missing; add its markers {block.begin.strip()}")
-        elif parts[1] != block.render():
+        elif parts[1] != block.render(parts[1]):
             failures.append(f"the generated {block.name} block is stale; run tools/check_docs.py --write-generated")
     return failures
 
@@ -645,7 +884,7 @@ def write_generated() -> None:
     for block in GENERATED:
         parts = block.split(block.path.read_text())
         assert parts is not None, f"{block.path} has no {block.name} markers"
-        block.path.write_text(parts[0] + block.render() + parts[2])
+        block.path.write_text(parts[0] + block.render(parts[1]) + parts[2])
 
 
 def reference_failures(text: str) -> list[str]:
@@ -675,7 +914,7 @@ def check_file(
         blocks = markdown_blocks(text)
         failures = missing_symbols(blocks) + broken_links(path, [text], anchors) + stale_messages(text)
         if user_document(path):
-            failures += unmeasured_figures(text)
+            failures += unmeasured_figures(text) + unexplained_words(path)
         if runs_code(path):
             use_gpu = gpu and path.parent == AGENT_DOCS
             executed = [block for block in blocks if not block.skip_reason and (use_gpu or not block.gpu)]
@@ -690,9 +929,11 @@ def check_file(
         failures += stale_blocks(path, text)
         if path == REFERENCE:
             failures += reference_failures(text)
+        if path == API:
+            failures += ungrouped_names()
         return failures, True
     notebook = read_notebook(path)
-    failures = broken_links(path, notebook.markdown, anchors)
+    failures = broken_links(path, notebook.markdown, anchors) + unexplained_words(path)
     failures += [
         f"markdown cell {index} {failure}"
         for index, text in enumerate(notebook.markdown)
@@ -733,7 +974,6 @@ def main() -> int:
     skipped: list[str] = []
     opt_outs: list[str] = []
     unexecuted: dict[str, Notebook] = {}
-    warnings: list[str] = []
     anchors: dict[Path, set[str]] = {}
     paths = documents()
     for path in paths:
@@ -751,8 +991,6 @@ def main() -> int:
             unexecuted[name] = notebook
         if not checked:
             skipped.append(name)
-        if user_document(path) and (words := contributor_words(path)):
-            warnings.append(f"  {name}: {words}")
         for failure in failures:
             print(f"{name}: {failure}")
         failed += bool(failures)
@@ -766,9 +1004,6 @@ def main() -> int:
     print(f"execution opt-outs: {len(opt_outs)}")
     for opt_out in opt_outs:
         print(f"  {opt_out}")
-    if warnings:
-        print(f"warning: contributor vocabulary in {len(warnings)} user documents (move it to doc/dev/):")
-        print("\n".join(warnings))
     print(f"check_docs: {len(paths) - len(skipped)} documents checked, {failed} with failures")
     return 1 if failed else 0
 

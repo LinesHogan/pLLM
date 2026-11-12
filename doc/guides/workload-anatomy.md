@@ -85,7 +85,7 @@ class Distill(pllm.Workload):
 | **存什么**（跨步或跨请求持有的张量） | 类属性，或标注了返回类型的 `@property` | 状态作用域：`pllm.RequestState`（每个请求一份独立副本）、`pllm.InstanceState`（全引擎共享一份副本）、`pllm.PositionState`<br>字段描述：`pllm.Field`、`pllm.Dimensions`<br>初值 `init=`：`pllm.Zeros`（默认）、`pllm.Computed`、`pllm.Pretrained`、`pllm.ModelCheckpoint`、`pllm.FromModule`、`pllm.Fed`、`pllm.Imported`<br>优化器 `optimizer=`：`pllm.AdamW`、`pllm.SGD` | [状态](state.md)<br>[在线训练](training.md) |
 | **结果去哪**（返回值或状态如何生效） | 方法装饰器，或模型改动类属性 | 观测与采样：`@pllm.export`、`@pllm.add_logits`、`@pllm.guide_sampling`<br>状态更新与训练：`@pllm.write`、`@pllm.train`、`@pllm.differentiate`<br>模型层内改动：`pllm.model.ActivationPatch`、`pllm.model.Adapter`、`@pllm.train_in_forward`<br>前向结构改写：`@pllm.custom_residual`、`@pllm.custom_attention`、`@pllm.custom_forward` | [结果去哪](results.md)<br>[改模型](model-edits.md)<br>[改 forward 结构](forward-structure.md)<br>[宿主循环与批训练](host-loops.md) |
 
-全部公开接口的参数签名可查 [API 签名汇总](../agent/reference.md#all-signatures)。写这三类声明时有三条基本规则：
+全部公开接口的签名与说明见 [API 参考](../reference/api.md)。写这三类声明时有三条基本规则：
 
 1. **除 `self` 外的每个输入参数都必须写标记默认值。** Python 参数名（如 `shallow`、`deep`）只是方法体内部使用的局部变量名，pLLM 不会根据参数名猜测你想读哪一层；默认值（如 `= pllm.hidden(0)`）才是给规划器看的声明，类型注解（`: torch.Tensor`）则告诉 IDE 和类型检查器方法体拿到的值是什么类型。（唯一的例外是 `@pllm.custom_residual` 的流张量 `x, y`、`@pllm.custom_attention` 的 `q, kv` 以及 `@pllm.custom_forward` 的 `layers`，它们作为打头的位置参数传入，后面的参数依然使用标记默认值。）
 2. **产出结果的方法必须挂效果装饰器。** 一个普通方法只返回张量、不挂 `@pllm.export` / `@pllm.train` 等装饰器时，pLLM 不知道返回值该送往采样器、导出队列还是优化器，因此不会单独调度它（除非它被另一个方法通过 `pllm.result("方法名")`、`rows="方法名"` 引用，或显式挂了 `@pllm.on`）。若整个负载没有任何效果声明，构建时会直接报错提醒。
