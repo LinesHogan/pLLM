@@ -31,6 +31,7 @@ print(pllm.explain(DummyWorkload(), config).eager_reason == "")
 | `max_num_seqs` | `8` | 同时运行的请求数上限 | 吞吐测量常用 128；pLLM 为请求状态预留的份数随它增长 |
 | `max_num_batched_tokens` | `512` | 一步最多计算的 token 数（含 prompt 分块） | 长 prompt 多时调大；`tokens="all"` 导出的行数上限也是它 |
 | `gpu_memory_utilization` | `0.5` | vLLM 可用的显存比例（权重、KV、pLLM 预留都在其中） | 显存不够或要和别的引擎共享 GPU 时调整 |
+| `kv_cache_memory_bytes` | `None` | KV 缓存的字节数；`None` 让 vLLM 按启动时测到的空闲显存自己定 | 同一张卡上还有别的进程在申请或释放显存时（启动测量会因此失败），或要固定 KV 大小时 |
 | `seed` | `0` | vLLM 的全局随机种子，也是 pLLM 状态初值（`pllm.Computed`、模块初始化）的种子；单个请求的采样种子写在 `SamplingParams(seed=...)` | 复现实验时固定 |
 | `trust_remote_code` | `False` | 允许加载模型仓库里的代码 | 只有需要远程 tokenizer 代码的模型（如 Kimi 切片） |
 | `enable_prefix_caching` | `False` | vLLM 的前缀缓存 | 只读、不改 forward 的负载可以打开；改模型或 forward 的负载（overlay、激活补丁、`custom_residual`、`custom_attention`）要求关闭，因为缓存里的 KV 是在别的状态下算出来的 |

@@ -29,6 +29,7 @@ class LLM:
         max_num_seqs: int,
         max_num_batched_tokens: int,
         gpu_memory_utilization: float,
+        kv_cache_memory_bytes: int | None = None,
         seed: int,
         trust_remote_code: bool,
         enable_prefix_caching: bool,

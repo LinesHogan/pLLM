@@ -43,7 +43,7 @@ value; every component must agree with the engine's ExecutionOptions.publish_lag
 ### `pllm.ModelConfig`
 
 ```text
-pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
+pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, kv_cache_memory_bytes: int | None = None, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
 ```
 
 ### `pllm.ExecutionOptions`
@@ -919,7 +919,8 @@ mean/P99 TV <= .01/.05. Successful checks report the comparison and measured dis
 Causal batches also check that permuting sequences and weights preserves an AdamW update.
 Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
 with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
-Needs a CUDA device; multiprocessing and parallel workers are unsupported.
+Needs a CUDA device; multiprocessing and parallel workers are unsupported. The child starts like a
+multiprocessing "spawn" process, so a script that calls this at module level needs `if __name__ == "__main__":`.
 
 ### `pllm.testing.check_distribution`
 

@@ -14,7 +14,6 @@ from vllm import SamplingParams
 
 import pllm
 from pllm.testing import check_on_gpu
-from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROMPTS = ("The capital of France is", "Water boils at a temperature of", "def fibonacci(n):")
@@ -25,6 +24,7 @@ CONFIG = pllm.ModelConfig(
     max_num_batched_tokens=128,
     # These tiny schedules need little KV; leave room for the resident FP32 oracle on a 24 GiB GPU.
     gpu_memory_utilization=0.2,
+    kv_cache_memory_bytes=32 << 20,
     cuda_graphs=False,
 )
 # The largest per-token logprob gap of bf16 vLLM to an FP32 oracle over these prompts: one near-tie dominates it, so it

@@ -1,25 +1,17 @@
 """Public GPU contract checks over sampling, adapters, activation steering and exact training."""
 
 from dataclasses import dataclass, replace
-from functools import partial
 
 import pytest
 import torch
 
 import pllm
-from pllm.backends.vllm import runtime
 from pllm.testing import check_on_gpu
 from pllm.workloads import DoLaWorkload, ESampConfig, ESampWorkload, OutputLoRAWorkload, PromptFactorsWorkload
 from pllm.workloads.state_producers import FactorAdapterWorkload
 from test.gpu.vllm_adaptive_depth_smoke import Exit
 
 pytestmark = pytest.mark.gpu
-
-
-@pytest.fixture(autouse=True)
-def fixed_kv_cache(monkeypatch):
-    """Keep small contract models independent of free-memory profiling."""
-    monkeypatch.setattr(runtime, "LLM", partial(runtime.LLM, kv_cache_memory_bytes=32 << 20))
 
 
 @dataclass(frozen=True)
@@ -58,6 +50,7 @@ def test_gpu_contracts(workload, neutral, capacity):
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
+        kv_cache_memory_bytes=32 << 20,
         execution=pllm.ExecutionOptions(cuda_graph_pool_budget_bytes=256 << 20, guidance_capacity=capacity),
     )
     result = check_on_gpu(workload, config, neutral=neutral)
@@ -94,7 +87,12 @@ def test_inplace_neutral_contract(tmp_path):
     )
     save_file(weights, path)
     config = pllm.ModelConfig(
-        str(tmp_path), max_model_len=64, max_num_seqs=2, max_num_batched_tokens=64, gpu_memory_utilization=0.25
+        str(tmp_path),
+        max_model_len=64,
+        max_num_seqs=2,
+        max_num_batched_tokens=64,
+        gpu_memory_utilization=0.25,
+        kv_cache_memory_bytes=32 << 20,
     )
     options = InPlaceTTTConfig((pllm.model.Projection("down_proj", 0),), 4, 0.01)
     result = check_on_gpu(
@@ -126,6 +124,7 @@ def test_distribution_contract(monkeypatch):
         max_num_seqs=2,
         max_num_batched_tokens=64,
         gpu_memory_utilization=0.25,
+        kv_cache_memory_bytes=32 << 20,
     )
     near = check_distribution(
         ESampWorkload(ESampConfig(rank=2, intervention_beta=1e-4)),

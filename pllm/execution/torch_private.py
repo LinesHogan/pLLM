@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import linecache
+import sys
 import weakref
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager
@@ -14,6 +16,7 @@ from typing import ParamSpec, TypedDict, TypeVar
 from uuid import UUID
 
 import torch
+import triton
 from torch import _decomp
 from torch._dynamo.convert_frame import _bytecode_hooks  # pyright: ignore[reportPrivateUsage]
 from torch._dynamo.utils import CleanupManager
@@ -118,7 +121,7 @@ class CustomOp:
 
     name: str
     schema: str
-    functions: tuple[tuple[str, object], ...]
+    functions: tuple[tuple[str, Callable[..., object]], ...]
     cpu: bool
     autograd: bool
     vmap: bool
@@ -136,7 +139,7 @@ def custom_op(value: object) -> CustomOp | None:
             f"{name} mutates {', '.join(mutated)}; kernels called from workload math must return new tensors "
             "(mutates_args=()); change state only through pLLM effects"
         )
-    attributes: dict[str, object] = vars(value)
+    attributes: dict[str, Callable[..., object] | None] = vars(value)
     if attributes["_abstract_fn"] is None:
         raise ValueError(f"{name} has no fake implementation; add @{name.split('::')[-1]}.register_fake")
     kernels: dict[str | None, Callable[..., object]] = value.__dict__["_backend_fns"]
@@ -147,7 +150,9 @@ def custom_op(value: object) -> CustomOp | None:
         ("setup_context", attributes["_setup_context_fn"]),
         ("vmap", attributes["_vmap_fn"]),
     )
-    functions = [(key, function) for key, function in registrations if function is not None]
+    functions: list[tuple[str, Callable[..., object]]] = [
+        (key, function) for key, function in registrations if function is not None
+    ]
     for device, wrapper in kernels.items():
         function = unwrap(wrapper)
         assert isinstance(function, FunctionType)
@@ -160,6 +165,105 @@ def custom_op(value: object) -> CustomOp | None:
         any(key == "backward" for key, _ in functions),
         any(key == "vmap" for key, _ in functions),
     )
+
+
+def define_custom_op(op: CustomOp) -> CustomOpDef:
+    """Register `op` again in this process through torch.library's public calls (another process sent it by value).
+
+    An operator this process already defines, because it imported the defining module, is reused.
+    """
+    existing = _maybe_get_opdef(op.name)
+    if existing is not None:
+        return existing
+    functions = dict(op.functions)
+    implementation = functions.pop("implementation")
+    kernels = {
+        key.removeprefix("kernel:"): function for key, function in functions.items() if key.startswith("kernel:")
+    }
+    devices = (
+        None if "None" in kernels else tuple(device for device, kernel in kernels.items() if kernel is implementation)
+    )
+    defined = torch.library.custom_op(  # pyright: ignore[reportUnknownMemberType]
+        op.name, implementation, mutates_args=(), device_types=devices, schema=op.schema[len(op.name) :]
+    )
+    assert isinstance(defined, CustomOpDef)
+    for device, kernel in kernels.items():
+        if kernel is not implementation:
+            defined.register_kernel(device, kernel)  # pyright: ignore[reportUnknownMemberType]
+    defined.register_fake(functions["fake"])  # pyright: ignore[reportUnknownMemberType]
+    if "backward" in functions:
+        defined.register_autograd(functions["backward"], setup_context=functions.get("setup_context"))  # pyright: ignore[reportUnknownMemberType,reportArgumentType]
+    if "vmap" in functions:
+        defined.register_vmap(functions["vmap"])  # pyright: ignore[reportUnknownMemberType,reportArgumentType]
+    _publish(implementation, defined)
+    return defined
+
+
+def _publish(function: Callable[..., object], value: object) -> None:
+    """Dynamo guards a global it calls through the defining module (G['__import___main__'].name); in the receiving
+    process __main__ is another script, so the rebuilt object is placed there under its name too."""
+    module = sys.modules[function.__module__]
+    if not hasattr(module, function.__name__):
+        setattr(module, function.__name__, value)
+
+
+@dataclass(frozen=True)
+class TritonKernel:
+    """A @triton.jit function as triton.jit needs it in another process: the Python function, the source lines it
+    was compiled from (a notebook cell has no file to read them from) and its public jit options."""
+
+    function: FunctionType
+    source: tuple[str, ...]
+    first_line: int
+    version: int | None
+    repr: Callable[..., str] | None
+    launch_metadata: Callable[..., object] | None
+    do_not_specialize: tuple[int | str, ...]
+    do_not_specialize_on_alignment: tuple[int | str, ...]
+    debug: bool | None
+    noinline: bool | None
+
+
+def triton_kernel(kernel: triton.JITFunction[..., object]) -> TritonKernel:
+    """Read a jit function's source and options (attributes of this Triton release)."""
+    try:
+        return TritonKernel(
+            kernel.fn,
+            tuple(kernel.raw_src),
+            kernel.starting_line_number,
+            kernel.version,
+            kernel._repr,  # pyright: ignore[reportPrivateUsage]
+            kernel.launch_metadata,
+            tuple(kernel.do_not_specialize),
+            tuple(kernel.do_not_specialize_on_alignment),
+            kernel.debug,
+            kernel.noinline,
+        )
+    except AttributeError as error:
+        raise ValueError(
+            f"this Triton release does not expose what sending @triton.jit {kernel.__name__} to another process "
+            "needs; move it into an importable .py module"
+        ) from error
+
+
+def define_triton_kernel(kernel: TritonKernel) -> triton.JITFunction[..., object]:
+    """Compile-ready triton.jit of a function another process sent by value; its source lines are made readable."""
+    filename = kernel.function.__code__.co_filename
+    if not linecache.getlines(filename):
+        lines = ["\n"] * (kernel.first_line - 1) + list(kernel.source)
+        linecache.cache[filename] = (sum(map(len, lines)), None, lines, filename)
+    defined = triton.jit(
+        kernel.function,
+        version=kernel.version,
+        repr=kernel.repr,
+        launch_metadata=kernel.launch_metadata,
+        do_not_specialize=kernel.do_not_specialize,
+        do_not_specialize_on_alignment=kernel.do_not_specialize_on_alignment,
+        debug=kernel.debug,
+        noinline=kernel.noinline,
+    )
+    _publish(kernel.function, defined)
+    return defined
 
 
 def custom_op_definition(target: object) -> CustomOpDef | None:

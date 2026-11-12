@@ -679,6 +679,7 @@ def vllm_engine(
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
             gpu_memory_utilization=config.gpu_memory_utilization,
+            kv_cache_memory_bytes=config.kv_cache_memory_bytes,
             seed=config.seed,
             trust_remote_code=config.trust_remote_code,
             enable_prefix_caching=config.enable_prefix_caching,

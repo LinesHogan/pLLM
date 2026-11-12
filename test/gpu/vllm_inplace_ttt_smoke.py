@@ -131,8 +131,7 @@ def open_llm(
     # Separate engine starts profile different CUDA/library warmup overhead.
     # A common public vLLM byte budget makes the strict/batched comparison
     # about overlay execution rather than that profiling variation.
-    with patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=4 << 30)):
-        handle = pllm.make_llm(workload=workload, config=config)
+    handle = pllm.make_llm(workload=workload, config=replace(config, kv_cache_memory_bytes=4 << 30))
     if not isinstance(handle, VllmLlm):
         raise RuntimeError("public make_llm did not route the parameter overlay to vLLM")
     return handle
@@ -392,10 +391,7 @@ def checkpoint_ttt() -> None:
                     allow_numerical_transforms=False, cuda_graph_pool_budget_bytes=512 << 20
                 ),
             )
-            with (
-                patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=32 << 20)),
-                pllm.make_llm(model_config, workload=workload) as handle,
-            ):
+            with pllm.make_llm(replace(model_config, kv_cache_memory_bytes=32 << 20), workload=workload) as handle:
                 check_probe(workload, model_config, handle)
                 prompts = [{"prompt_token_ids": [100, 101, 102]}, {"prompt_token_ids": [103] * 8}]
                 sampling = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
@@ -450,8 +446,7 @@ def community_t2(checkpoint: str) -> None:
         execution=pllm.ExecutionOptions(allow_numerical_transforms=False, execution_peak_budget_bytes=5 << 30),
     )
     with (
-        patch("pllm.backends.vllm.runtime.LLM", partial(LLM, kv_cache_memory_bytes=512 << 20)),
-        pllm.make_llm(config, workload=InPlaceTTTWorkload(options)) as handle,
+        pllm.make_llm(replace(config, kv_cache_memory_bytes=512 << 20), workload=InPlaceTTTWorkload(options)) as handle,
         patch.object(ChunkUpdate, "contiguous", record),
     ):
         started = perf_counter()

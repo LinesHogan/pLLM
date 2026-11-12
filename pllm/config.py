@@ -104,6 +104,8 @@ class ModelConfig:
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 512
     gpu_memory_utilization: float = 0.5
+    # KV cache size in bytes; None lets vLLM size it from the free GPU memory it measures at startup.
+    kv_cache_memory_bytes: int | None = None
     seed: int = 0
     trust_remote_code: bool = False
     enable_prefix_caching: bool = False
@@ -125,5 +127,7 @@ class ModelConfig:
             raise ValueError("tensor_parallel_size must be an integer >= 1")
         if self.dtype not in get_args(ModelDType):
             raise ValueError(f'dtype must be "bfloat16", "float16" or "float32"; got {self.dtype!r}')
+        if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 1:
+            raise ValueError("kv_cache_memory_bytes must be positive, or None to let vLLM size the KV cache")
         if self.generated_kv not in ("reuse", "isolate"):
             raise ValueError('generated_kv must be "reuse" or "isolate"')

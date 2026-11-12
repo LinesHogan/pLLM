@@ -30,6 +30,7 @@ from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch
 from pllm.contracts.semantic_graph import StateEffectKind, StateScope
+from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.step_input import StepInput
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.explanation import explain, explain_facts
@@ -408,7 +409,8 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     Causal batches also check that permuting sequences and weights preserves an AdamW update.
     Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
     with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
-    Needs a CUDA device; multiprocessing and parallel workers are unsupported.
+    Needs a CUDA device; multiprocessing and parallel workers are unsupported. The child starts like a
+    multiprocessing "spawn" process, so a script that calls this at module level needs `if __name__ == "__main__":`.
     """
     if (
         config.multiprocessing
@@ -417,6 +419,12 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
     if config.max_num_seqs < 2 or config.max_model_len < 32:
         raise ValueError("check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script")
+    if config.kv_cache_memory_bytes is None:
+        # The check's engines are small and fixed: size their KV cache instead of letting vLLM measure free memory,
+        # which fails when an engine closed just before is still releasing it.
+        shape = ModelShape.of_config(config)
+        token = 2 * shape.layer_count * shape.kv_heads * shape.head_dim * TensorDType(config.dtype).torch.itemsize
+        config = replace(config, kv_cache_memory_bytes=config.max_num_seqs * config.max_model_len * token)
     context = get_context("spawn")
     received, sent = context.Pipe(duplex=False)
     payload = encode_workload(workload), None if neutral is None else encode_workload(neutral), config

@@ -18,7 +18,6 @@ from pllm.execution.step_capture import capture_graph
 from pllm.execution.torch_private import HostGather
 from pllm.testing import check_on_gpu
 from test.gpu.features.test_custom_residual import CONFIG, Observe, generate_tokens, logprob_deviation, oracle_logprobs
-from test.workloads.test_gpu_contracts import fixed_kv_cache as fixed_kv_cache
 from test.workloads.test_pretrained import LogitLookup
 
 
