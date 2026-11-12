@@ -4,11 +4,15 @@ The worker, runner, graph and sampler modules subclass the four classes below an
 0.32.0 the runner names are vLLM's own classes; on 0.27.1 thin subclasses accept 0.32.0's arguments and
 provide its seams. The sampler also exposes the FP32 copy seam on both releases. Dropping 0.27.1 deletes the `if VLLM_027` branch. Pyright checks each branch against its own
 release: pyrightconfig.json defines VLLM_027 true for .venv, pyrightconfig.vllm032.json false for .venv-vllm032.
+`release_offload_pins` works around a vLLM bug that both releases share.
 """
 
 import numpy as np
 import torch
 from vllm import __version__
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import SimpleCPUOffloadConnector
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
@@ -298,3 +302,31 @@ def enable_batch_invariance() -> torch.library.Library:
     for operator in (torch.ops.aten.matmul.default, torch.ops.aten.linear.default):
         autograd.impl(operator, operator.decompose, "AutogradCUDA")  # pyright: ignore[reportUnknownMemberType]
     return autograd
+
+
+def release_offload_pins(config: VllmConfig) -> None:
+    """Stop SimpleCPUOffloadConnector's copies and unpin its CPU KV cache before the worker is dropped.
+
+    vLLM bug (0.27.1 and 0.32.0): the connector pins its CPU KV cache tensors with cudaHostRegister but never
+    unregisters them, and its shutdown leaves the copy thread running. When the tensors are freed, CUDA still treats
+    those host addresses as pinned. A later ordinary tensor allocated there makes `pin_memory()` skip its copy, so a
+    non-blocking upload reads memory the host has already reused and the GPU receives garbage (seen as index asserts
+    in the next engine of the same process). Delete this once vLLM's connector shuts down properly.
+    """
+    transfer = config.kv_transfer_config
+    if transfer is None or transfer.kv_connector != "SimpleCPUOffloadConnector" or not has_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    assert isinstance(connector, SimpleCPUOffloadConnector)
+    worker = connector.worker_handler
+    # The CPU cache exists once vLLM registered its GPU KV caches; an engine that failed earlier pinned nothing.
+    if worker is None or worker.cpu_kv_caches is None:
+        return
+    assert worker._backend is not None and worker.load_stream is not None and worker.store_stream is not None  # pyright: ignore[reportPrivateUsage]
+    worker._backend.shutdown()  # pyright: ignore[reportPrivateUsage]
+    worker.load_stream.synchronize()
+    worker.store_stream.synchronize()
+    for tensor in worker.cpu_kv_caches.values():
+        # vLLM pins through torch's untyped cudart module; unpin the same way.
+        torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())  # pyright: ignore[reportOptionalMemberAccess, reportUnknownMemberType]
+    worker.cpu_kv_caches.clear()

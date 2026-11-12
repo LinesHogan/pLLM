@@ -29,6 +29,10 @@ from pllm.workload_transport import decode_workload
 
 
 class GPUWorker(compat.Worker):
+    def shutdown(self) -> None:
+        compat.release_offload_pins(self.vllm_config)
+        super().shutdown()
+
     def _make_model_runner(self) -> WorkloadModelRunner:
         if self.parallel_config.tensor_parallel_size > 1:
             # Prioritize TP collectives over the replicated training lane, whose stream has priority 0.

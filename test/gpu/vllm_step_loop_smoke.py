@@ -17,6 +17,7 @@ from vllm import RequestOutput, SamplingParams
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.simple_kv_offload import worker as simple_offload
 
 import pllm
 from pllm.backends.vllm import runtime
@@ -168,17 +169,19 @@ def generate_ids(handle, prompts, params=None):
 
 def offload_roundtrips():
     """Restore generated-prefix KV/carry from both stock CPU connectors after GPU eviction."""
-    stage, lookup = PositionCacheProvider.stage, KVCacheManager.get_computed_blocks
+    stage, lookup, register = PositionCacheProvider.stage, KVCacheManager.get_computed_blocks, simple_offload.pin_tensor
+    pinned = []
     for connector in ("OffloadingConnector", "SimpleCPUOffloadConnector"):
         local, boundaries = {}, []
-        handle = replay_handle(
-            StepLoopWorkload(),
-            length=64,
-            prefix=True,
-            generated_kv="reuse",
-            blocks=6,
-            offload=KVOffload(connector, 8 * 1024**2),
-        )
+        with patch.object(simple_offload, "pin_tensor", lambda tensor: (pinned.append(tensor), register(tensor))):
+            handle = replay_handle(
+                StepLoopWorkload(),
+                length=64,
+                prefix=True,
+                generated_kv="reuse",
+                blocks=6,
+                offload=KVOffload(connector, 8 * 1024**2),
+            )
 
         def locate(manager, request):
             result = lookup(manager, request)
@@ -218,6 +221,10 @@ def offload_roundtrips():
             print(f"{connector} full-page asynchronous restore PASS allocation={first[1]}->{last[1]}", flush=True)
         finally:
             handle.close()
+    # vLLM leaves SimpleCPUOffloadConnector's cache host-registered after close; a later tensor reusing that memory
+    # would make pin_memory() skip its copy and race a non-blocking upload. Closing must unpin it.
+    assert pinned and not any(tensor.is_pinned() for tensor in pinned)
+    print("Closed SimpleCPUOffloadConnector leaves no host-registered cache PASS", flush=True)
 
 
 def donor_loss():
