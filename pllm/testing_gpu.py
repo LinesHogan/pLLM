@@ -108,7 +108,8 @@ class _Run:
         return _Run(self.tokens | other.tokens, self.values | other.values)
 
     def differences(self, other: _Run, contract: str, cause: str) -> list[str]:
-        """Token IDs bitwise; float values within dtype tolerance, since chunking reorders a request's own sums."""
+        """Token IDs bitwise; float values within dtype tolerance, since chunking reorders a request's own sums. An
+        export row present in one run only is not compared: max_rows drops rows of crowded steps."""
         failures = [
             f"[{contract}] prompt {prompt} sample {sample}: token IDs differ from token "
             f"{next(index for index, (a, b) in enumerate(zip(tokens, theirs)) if a != b)}; {cause}"
@@ -117,6 +118,8 @@ class _Run:
         ]
         for key in self.values.keys() | other.values.keys():
             prompt, sample, name = key
+            if name.startswith("export ") and not (key in self.values and key in other.values):
+                continue
             try:
                 assert key in self.values and key in other.values, "missing in one run"
                 torch.testing.assert_close(other.values[key], self.values[key])
