@@ -221,6 +221,7 @@ class Operation:
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
                         for key, source in sources[self.context.selector_name(self.name, method)].items()
                     },
+                    gated=inputs,
                 )
             key = f"__{domain}"
             inputs[key] = result_port(TaskResultInputSource(selectors[method].symbol, "value"))

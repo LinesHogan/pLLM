@@ -303,12 +303,7 @@ class PromptMask(pllm.Workload):
     ],
     ids=lambda value: type(value).__name__ if isinstance(value, pllm.Workload) else "",
 )
-def test_schedule_contracts(workload, neutral, error, model_config, request):
-    if isinstance(workload, OverRIDEWorkload):
-        # Expected: a method reading sampler feedback sees the prompt's last row whether or not decode rows share
-        # the step. Today the engine skips a step of prompt endings only, so [mixed] differs.
-        reason = "sampler feedback reaches a prompt's last row only when decode rows share its step"
-        request.applymarker(pytest.mark.xfail(strict=True, reason=reason))
+def test_schedule_contracts(workload, neutral, error, model_config):
     cuda_initialized = torch.cuda.is_initialized()
     if error:
         with pytest.raises(testing.ContractError, match=error) as caught:

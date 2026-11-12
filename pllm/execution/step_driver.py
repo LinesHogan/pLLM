@@ -46,8 +46,11 @@ if TYPE_CHECKING:
 class StepOpen(Enum):
     """When a step's state invocation opens, decided once from what the model forward reads."""
 
-    # Nothing in the forward reads the step's state: open once the forward produced the step's inputs.
+    # Nothing in the forward reads the step's state: open once the forward produced the step's inputs, on steps
+    # with rows a hidden tap keeps.
     AFTER_FORWARD = "after_forward"
+    # As AFTER_FORWARD, on every step: a sampler method without hidden inputs reads rows no hidden tap keeps.
+    AFTER_EVERY_FORWARD = "after_every_forward"
     # Model effects, token history, a custom forward or host-batch training read the step before the forward.
     BEFORE_FORWARD = "before_forward"
     # An exact overlay trains inside the forward: open before it, with inputs arriving in projection parts.
@@ -71,7 +74,13 @@ class StepOpen(Enum):
             or state_inputs(rewrites, attention)
             or any(rewrite.results or rewrite.memory is not None for rewrite in rewrites)
         )
-        return StepOpen.BEFORE_FORWARD if reads else StepOpen.AFTER_FORWARD
+        if reads:
+            return StepOpen.BEFORE_FORWARD
+        tasks = {task.symbol: task for task in graph.tasks}
+        untapped = any(
+            not any(graph.hidden_phases(port.source) for port in tasks[sampler.task].inputs) for sampler in spec.sampler
+        )
+        return StepOpen.AFTER_EVERY_FORWARD if untapped else StepOpen.AFTER_FORWARD
 
 
 @dataclass(slots=True)
@@ -233,7 +242,7 @@ class StepDriver:
         rows = value.sampler_rows
         step = self.step = ActiveStep(rows)
         execution = self.execution
-        if self.open is StepOpen.AFTER_FORWARD:
+        if self.open in (StepOpen.AFTER_FORWARD, StepOpen.AFTER_EVERY_FORWARD):
             return None
         if self.open is StepOpen.IN_FORWARD:
             step.context = execution.begin(rows.row_batch.request_rows, stream, retain_gradients=False)
@@ -297,7 +306,7 @@ class StepDriver:
         value = self._staged(value)
         with self._checked():
             if step.context is None:
-                if not self._tapped(step.rows.row_batch):
+                if self.open is StepOpen.AFTER_FORWARD and not self._tapped(step.rows.row_batch):
                     self.step = None
                     return
                 overlap = execution.post_sample

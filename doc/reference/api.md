@@ -459,7 +459,8 @@ training, where each surviving token should contribute without division by the g
 
 Host-batch methods return one scalar and own their reduction; a non-default reduction= is rejected.
 `rows=` names a selector whose mask picks the rows that count; zero-weight losses still count toward the
-mean, and the method still runs on every row. For request training, rows= and update_rows= require a model
+mean, and the method still runs on every row. The selector runs on the method's rows, at its tokens= phase,
+whatever the selector itself reads. For request training, rows= and update_rows= require a model
 effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update
 every selected state.
 

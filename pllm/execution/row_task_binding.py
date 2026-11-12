@@ -20,7 +20,6 @@ from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
-    HiddenInputSource,
     MathContract,
     PackedSamplerRowsInputSource,
     SamplerFeedbackInputSource,
@@ -434,9 +433,11 @@ def declare_tensor(
     export: TensorExport | None = None,
     sampler_stage: SamplerStage | None = None,
     sampler_beta: float = 0.0,
+    gated: Mapping[str, TensorPort] = {},
 ) -> Call:
-    """Declare a tensor task with its final inputs, effects and output adapter."""
-    phase = _input_phase(b, name, inputs, when, export)
+    """Declare a tensor task with its final inputs, effects and output adapter. A rows= selector passes the inputs
+    of the method it gates as `gated`, so it runs on that method's rows."""
+    phase = _input_phase(b, name, (*inputs.values(), *gated.values()), when, export)
     sources = _task_sources(inputs, phase, update, carries)
     policy = MathContract() if math is None else math
     if policy.parameter_gradient_rows and any(
@@ -491,31 +492,16 @@ def declare_tensor(
     )
 
 
-def _phases(b: TensorDeclaration, source: SemanticInputSource) -> set[HiddenPhase]:
-    """The hidden phases an input reads, directly or through the methods whose results it reads."""
-    if isinstance(source, HiddenInputSource):
-        # Layer logits cover every row the sampler draws, of either phase.
-        return set() if source.phase is HiddenPhase.NONE else {source.phase}
-    return set[HiddenPhase]().union(
-        *(
-            _phases(b, port.source)
-            for task in b.graph.tasks
-            if isinstance(source, TaskResultInputSource) and task.symbol == source.task
-            for port in task.inputs
-        )
-    )
-
-
 def _input_phase(
-    b: TensorDeclaration, name: str, inputs: Mapping[str, TensorPort], when: When, export: TensorExport | None
+    b: TensorDeclaration, name: str, inputs: tuple[TensorPort, ...], when: When, export: TensorExport | None
 ) -> HiddenPhase | None:
     """The one row phase a method's inputs read, None for a method without hidden inputs."""
-    domains = set[HiddenPhase]().union(*(_phases(b, port.source) for port in inputs.values()))
+    domains = set[HiddenPhase]().union(*(b.graph.hidden_phases(port.source) for port in inputs))
     if len(domains) > 1 or domains and when is When.BEFORE_FORWARD:
         raise ValueError("tensor inputs need one phase; hidden inputs become available after model forward")
     phase = next(iter(domains), None)
     if phase is HiddenPhase.ALL and (
-        export is None or any(isinstance(port.source, TaskResultInputSource) for port in inputs.values())
+        export is None or any(isinstance(port.source, TaskResultInputSource) for port in inputs)
     ):
         # Other methods run on one row per request and are funded and captured for that many rows.
         raise ValueError(

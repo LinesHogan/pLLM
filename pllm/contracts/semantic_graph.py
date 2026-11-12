@@ -268,6 +268,20 @@ class SemanticGraph:
         }
         return next((state for state in self.states if state.resource in resources), None)
 
+    def hidden_phases(self, source: SemanticInputSource) -> set[HiddenPhase]:
+        """The hidden phases an input reads, directly or through the methods whose results it reads."""
+        if isinstance(source, HiddenInputSource):
+            # Layer logits cover every row the sampler draws, of either phase.
+            return set() if source.phase is HiddenPhase.NONE else {source.phase}
+        return set[HiddenPhase]().union(
+            *(
+                self.hidden_phases(port.source)
+                for task in self.tasks
+                if isinstance(source, TaskResultInputSource) and task.symbol == source.task
+                for port in task.inputs
+            )
+        )
+
     @property
     def trains_on_batch(self) -> bool:
         """Whether the workload trains on a host CausalTrainBatch or WeightedRowBatch (declare_batch_train)."""
