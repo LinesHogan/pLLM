@@ -34,7 +34,7 @@ from pllm.execution.binding_base import SGD, Field, TargetRows
 from pllm.execution.causal_batch import declare_batch_train
 from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.declaration import Dimensions, LayoutField, Shape, When
-from pllm.execution.freeze import fingerprint, freeze
+from pllm.execution.freeze import fingerprint
 from pllm.execution.method_inputs import (
     Attention,
     Batch,
@@ -277,7 +277,7 @@ class Train(Effect):
                 operation.name,
                 context.states[self.state],
                 ports={key: source.training_port(context, schema) for key, source in arguments.items()},
-                function=freeze(operation.function),
+                function=operation.function,
                 identity=operation.identity,
                 when=operation.transition_window,
             ),
@@ -354,8 +354,8 @@ class Train(Effect):
                 identity=f"{operation.identity}:{identity}",
                 optimizer=optimizer,
                 steps=self.steps,
-                reset=freeze(reset),
-                function=freeze(operation.function),
+                reset=reset,
+                function=operation.function,
                 arguments=sources,
             ),
             self.state,
@@ -642,7 +642,7 @@ class TrainInForward(Effect):
                 "rename the state fields that repeat an operand name (input, target, embedding, weight, prompt_end)"
             )
         admit_update(
-            freeze(operation.function),
+            operation.function,
             fields,
             effect,
             context.binding.dimensions,
@@ -655,7 +655,7 @@ class TrainInForward(Effect):
             chunked=self.chunk is not None,
         )
         identity = fingerprint(operation.function)
-        function: Callable[..., UpdateOutput] = freeze(operation.function)
+        function: Callable[..., UpdateOutput] = operation.function
         initialize = definition.init.initializer(context.binding, self.state, tuple(definition.fields))
         if self.chunk is not None:
             function, initialize = _chunked_in_forward(
@@ -818,7 +818,7 @@ class CustomAttention(Effect):
                         "inside the math"
                     )
             inputs.append((name, value))
-        binding.attention.add(AttentionMethod(operation.name, layers, freeze(operation.function), tuple(inputs)))
+        binding.attention.add(AttentionMethod(operation.name, layers, operation.function, tuple(inputs)))
         binding.attention.layouts += expand_layouts(self.layouts(), count)
         binding.model_reads(tuple(source.resource for _, source in inputs if isinstance(source, StateInput)))
         context.signature.append((operation.name, boundary_digest(fingerprint(operation.function), self)))
@@ -887,9 +887,9 @@ class CustomResidual(Effect):
             operation.name,
             self.site,
             places,
-            freeze(operation.function),
+            operation.function,
             _site_inputs(operation.function, SITE_TENSORS[self.site], context, operation.name),
-            None if reader is None else freeze(reader),
+            reader,
             () if reader is None else _site_inputs(reader, 1, context, self.read),
             self.streams,
             memory,

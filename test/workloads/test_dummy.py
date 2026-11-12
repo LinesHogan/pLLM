@@ -2,7 +2,7 @@
 
 Also covers the execution trace it reports through (bounded, selectable snapshots
 that survive the process boundary) and authoring rules shared by every workload:
-signed declarations, chained results, values frozen at compile time and frozen state.
+signed declarations, chained results, closure transforms and frozen state.
 """
 
 from dataclasses import replace
@@ -105,12 +105,9 @@ def test_dummy_runs_graph_sign_plan_execute(device_name) -> None:
     ):
         torch.testing.assert_close(exported(execution, value(2)), (expected + 1) * 2)
 
-    # A transform's closure values are frozen when the workload compiles.
-    scale = [2.0]
-    custom = replace(workload, transform=lambda rows: rows * scale[0])
-    frozen = custom.compile_host(CPU)
-    scale[0] = 3.0
-    torch.testing.assert_close(exported(frozen, value(2)), expected * 2)
+    # A transform may be a closure over plain values.
+    scale = 3.0
+    custom = replace(workload, transform=lambda rows: rows * scale)
     torch.testing.assert_close(exported(custom.compile_host(CPU), value(2)), expected * 3)
 
     class Unsourced(DummyWorkload):

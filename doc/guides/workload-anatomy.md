@@ -75,7 +75,7 @@ class Distill(pllm.Workload):
 
 一个负载是 `pllm.Workload` 的子类。当负载带有超参数或开关（如上面的 `beta: float = 0.5`）时，把它写成 `@dataclass(frozen=True)`。
 
-为什么要冻结（`frozen=True`）？因为 pLLM 在构建引擎时一次性读取负载实例上的配置并生成执行计划；引擎启动后再去修改 Python 实例的属性，不会改变已经在 GPU 上编译好的执行图。使用冻结的 dataclass 既能防止运行期误改属性，又能随时用 `Distill(beta=0.0)` 或 `dataclasses.replace(workload, beta=0.0)` 构造一个零强度的对照实例，交给 `pllm.testing.check` 检查“关闭算法时是否严格等价于原模型”。
+为什么要冻结（`frozen=True`）？因为 pLLM 在构建引擎时一次性读取负载实例上的配置并生成执行计划；引擎启动后再去修改 Python 实例的属性，不会改变已经在 GPU 上编译好的执行图。`make_llm` 会深拷贝负载；之后再修改模块全局变量或方法捕获的对象，结果未定义（在 `torch.compile` 下本来就是如此）。使用冻结的 dataclass 既能防止运行期误改属性，又能随时用 `Distill(beta=0.0)` 或 `dataclasses.replace(workload, beta=0.0)` 构造一个零强度的对照实例，交给 `pllm.testing.check` 检查“关闭算法时是否严格等价于原模型”。
 
 负载里的所有声明都归为三类：
 

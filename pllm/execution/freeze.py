@@ -10,7 +10,6 @@ change already-signed behavior.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from copy import deepcopy
 from dataclasses import fields, is_dataclass
 from dis import Instruction, get_instructions, hasjabs, hasjrel, stack_effect
 from enum import Enum
@@ -22,7 +21,7 @@ from itertools import pairwise
 from marshal import dumps
 from pathlib import Path
 from sys import modules, version_info
-from types import CellType, CodeType, FunctionType, MethodType, ModuleType
+from types import CodeType, FunctionType, MethodType, ModuleType
 from typing import TypeGuard, TypeVar, cast
 
 import torch
@@ -30,7 +29,7 @@ from triton.runtime import JITFunction
 
 from pllm.contracts.codec import boundary_digest
 from pllm.execution.method_dependencies import OP_ACCESS, check_op_access, global_names
-from pllm.execution.torch_private import CustomOpDef, custom_op, dispatcher_namespace
+from pllm.execution.torch_private import custom_op, dispatcher_namespace
 
 G = TypeVar("G", bound=Callable[..., object])
 C = TypeVar("C")
@@ -297,46 +296,6 @@ def reachable_functions(candidates: Mapping[str, FunctionType], seeds: tuple[Fun
     return frozenset(reachable)
 
 
-def _borrowed(value: object) -> bool:
-    """Dispatcher and JIT objects are process-owned code handles, like imported modules."""
-    return isinstance(value, (ModuleType, type, CustomOpDef, JITFunction)) or dispatcher_namespace(value) is not None
-
-
-def freeze(function: G) -> G:
-    if isinstance(function, MethodType):
-        return cast(G, MethodType(freeze(function.__func__), function.__self__))
-    if not isinstance(function, FunctionType):
-        raise TypeError(f"{function!r}: workload operations must be Python functions")
-    globals_used = global_names(function.__code__)
-    global_values = dict(function.__globals__)
-    for key in globals_used & global_values.keys():
-        value = global_values[key]
-        global_values[key] = (
-            freeze(value) if isinstance(value, FunctionType) else (value if _borrowed(value) else deepcopy(value))
-        )
-    copied = FunctionType(
-        function.__code__,
-        global_values,
-        function.__name__,
-        deepcopy(function.__defaults__),
-        None
-        if function.__closure__ is None
-        else tuple(
-            CellType(
-                freeze(cell.cell_contents)
-                if isinstance(cell.cell_contents, FunctionType)
-                else cell.cell_contents
-                if _borrowed(cell.cell_contents)
-                else deepcopy(cell.cell_contents)
-            )
-            for cell in function.__closure__
-        ),
-    )
-    copied.__annotations__ = dict(function.__annotations__)
-    copied.__kwdefaults__ = deepcopy(function.__kwdefaults__)
-    return cast(G, copied)
-
-
 def members(owner: object) -> dict[str, object]:
     """Every class attribute of the owner's MRO, base classes first and subclasses overriding."""
     return {name: item for cls in reversed(type(owner).__mro__) for name, item in vars(cls).items()}
@@ -353,12 +312,3 @@ def owner_values(owner: object, marker_types: tuple[type, ...]) -> dict[str, obj
     if is_dataclass(owner) and not isinstance(owner, type):
         result.update((item.name, getattr(owner, item.name)) for item in fields(owner))
     return result
-
-
-def owner_snapshot(owner: C, marker_types: tuple[type, ...], borrowed: tuple[object, ...] = ()) -> C:
-    """Deep-copy the owner, freezing its function values so signed math cannot drift."""
-    memo = {id(value): value for value in borrowed}
-    copied = deepcopy(owner, memo)
-    for key, value in owner_values(copied, marker_types).items():
-        object.__setattr__(copied, key, freeze(value) if isinstance(value, FunctionType) else deepcopy(value, memo))
-    return copied

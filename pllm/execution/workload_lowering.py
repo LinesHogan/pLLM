@@ -41,7 +41,7 @@ from pllm.execution.binding_base import Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, State, When
-from pllm.execution.freeze import fingerprint, freeze
+from pllm.execution.freeze import fingerprint
 from pllm.execution.host_runtime import HostConfig, bind_host
 from pllm.execution.method_effects import TRAINING_INPUTS, Effect, Gradient, Sampler
 from pllm.execution.method_inputs import Carried, Carry, InputMarker, Parameter, Result, method_inputs
@@ -157,7 +157,7 @@ class Operation:
         return declare_tensor(
             context.binding,
             self.name,
-            freeze(self.function),
+            self.function,
             inputs=inputs,
             when=self.phase if when is None else when,
             identity=self.identity,
@@ -214,7 +214,7 @@ class Operation:
                 selectors[method] = declare_tensor(
                     self.context.binding,
                     self.context.selector_name(self.name, method),
-                    freeze(selector),
+                    selector,
                     when=self.phase,
                     identity=f"python:{identity}:{self.name}:{method}",
                     inputs={

@@ -7,6 +7,7 @@ and pllm.testing."""
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import partial
 from graphlib import CycleError, TopologicalSorter
@@ -33,9 +34,7 @@ from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirement
 from pllm.execution.declaration import When
 from pllm.execution.freeze import (
     fingerprint,
-    freeze,
     members as _members,
-    owner_snapshot,
     owner_values,
     reachable_functions,
 )
@@ -391,7 +390,7 @@ def read_workload(workload: Workload) -> WorkloadContext:
 
 def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
     """Snapshot and sign reachable mathematics before evaluating state properties."""
-    owner = _snapshot(workload)
+    owner = deepcopy(workload)
     values, members = _values(owner), _members(owner)
     _check_base_collisions(owner)
     context, candidates = WorkloadContext(owner, prefix=prefix), _candidates(owner, values, members)
@@ -410,7 +409,7 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
                 seeds.append(function)
     _declare_result_helpers(context, candidates, seeds)
     _reject_result_cycles(context)
-    _freeze_helpers(context, candidates, seeds)
+    _check_helpers(context, candidates, seeds)
     configuration = {key: value for key, value in sorted(values.items()) if not isinstance(value, Workload)}
     check_dependencies(configuration)
     context.bindings = tuple((key, fingerprint(value)) for key, value in configuration.items())
@@ -536,8 +535,8 @@ def _reject_result_cycles(context: WorkloadContext) -> None:
         raise ValueError(f"{chain}; results can only flow one way within a step, remove one of the reads") from None
 
 
-def _freeze_helpers(context: WorkloadContext, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:
-    """Freeze only helpers reachable from operations, state properties or markers."""
+def _check_helpers(context: WorkloadContext, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:
+    """Check and sign the helpers reachable from operations, state properties or markers."""
     reachable = reachable_functions(candidates, tuple(seeds)) | {
         name for name, member in candidates.items() if any(member is seed for seed in seeds)
     }
@@ -547,7 +546,6 @@ def _freeze_helpers(context: WorkloadContext, candidates: dict[str, FunctionType
             with context.declaring(name):
                 check_dependencies(function)
                 context.signature.append((name, fingerprint(function)))
-            object.__setattr__(context.owner, name, freeze(function))
 
 
 def _namespace(context: WorkloadContext) -> None:
@@ -587,10 +585,6 @@ def _namespace(context: WorkloadContext) -> None:
 
 def _values(owner: object) -> dict[str, object]:
     return owner_values(owner, (InstanceState, ActivationPatch, Adapter, PositionState, Workload))
-
-
-def _snapshot(owner: C, borrowed: tuple[object, ...] = ()) -> C:
-    return owner_snapshot(owner, (InstanceState, ActivationPatch, Adapter, PositionState, Workload), borrowed)
 
 
 def _of_type(values: dict[str, object], expected: type[C]) -> dict[str, C]:

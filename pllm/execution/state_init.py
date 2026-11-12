@@ -18,7 +18,6 @@ from pllm.execution.binding_base import Field
 from pllm.execution.checkpoint import PretrainedFile, initialize_checkpoint
 from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.declaration import Shape, When
-from pllm.execution.freeze import freeze
 from pllm.execution.model_effect_binding import import_update
 from pllm.execution.module_state import ModuleFactory, initial_values, parameter_count
 from pllm.execution.tensor_declaration import TensorDeclaration
@@ -84,7 +83,7 @@ class Computed(StateInit):
         return "computed"
 
     def initializer(self, binding: TensorDeclaration, name: str, fields: tuple[str, ...]) -> Initializer | None:
-        return freeze(self.function)
+        return self.function
 
 
 @dataclass(frozen=True)
