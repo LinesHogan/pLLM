@@ -4,9 +4,8 @@ from __future__ import annotations
 
 # Diagnostics deliberately inspect the installed session and in-process engine.
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from traceback import extract_tb
 from typing import Concatenate, ParamSpec
 from unittest.mock import patch
 
@@ -25,11 +24,7 @@ from pllm.config import ExecutionOptions, ModelConfig
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch
-from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, StateScope, TaskId
-from pllm.execution.overlay_task import ProjectionTask
-from pllm.execution.ptts.request_state import RequestStateDirectory
-from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
+from pllm.contracts.semantic_graph import StateEffectKind, StateScope
 from pllm.execution.step_input import StepInput
 from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.explanation import explain, explain_facts
@@ -83,102 +78,6 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm) -> Non
             failures.append("[explain/reservations] installed plan differs from the probe; report a pLLM planning bug")
     if failures:
         raise ContractError(tuple(failures))
-
-
-class SynchronizationCheck:
-    """Check pLLM anchors and model-site staging after two decode warmup steps at each packed width."""
-
-    def __init__(self, handle: VllmLlm) -> None:
-        session = handle.runner.require_session()
-        execution = session.deployment.execution
-        self.prepare_tokens = session.prepare_tokens
-        self.prepare_input = session.prepare_input
-        self.token_checked = 0
-        self.prepare_sites = None if session.model_sites is None else session.model_sites.prepare
-        self.prepare_overlay = None if session.forward_overlay is None else session.forward_overlay.prepare
-        self.execute = execution.execute_anchor
-        self.execute_part = execution.execute_part
-        self.steps: dict[int, set[int]] = {}
-        self.checked: set[int] = set()
-        self.input_steps: dict[int, set[int]] = {}
-        self.input_checked: set[int] = set()
-
-    @contextmanager
-    def scope(self, context: StateTaskContext) -> Generator[None]:
-        rows = context.selection.rows
-        if not rows and context.value is not None:
-            rows = context.value.step.rows.rows
-        steps = self.steps.setdefault(len(rows), set())
-        if rows and all(row.role is HiddenPhase.DECODE for row in rows):
-            steps.add(context.invocation_id)
-        enabled = len(steps) > 2 and context.invocation_id in steps
-        mode = torch.cuda.get_sync_debug_mode()
-        try:
-            if enabled:
-                torch.cuda.set_sync_debug_mode("error")
-                self.checked.add(context.invocation_id)
-            yield
-        except RuntimeError as error:
-            locations = "; ".join(
-                f"{frame.filename}:{frame.lineno} ({frame.name})" for frame in extract_tb(error.__traceback__)[-5:]
-            )
-            raise RuntimeError(f"{error}; {locations}") from error
-        finally:
-            torch.cuda.set_sync_debug_mode(mode)
-
-    def tokens(
-        self, history: torch.Tensor, indices: tuple[int, ...], starts: torch.Tensor, positions: torch.Tensor, rows: int
-    ) -> None:
-        """Include the native history gather in the existing steady-decode sync check."""
-        mode = torch.cuda.get_sync_debug_mode()
-        try:
-            if rows == len(indices) and len(self.steps.get(rows, set())) > 2:
-                torch.cuda.set_sync_debug_mode("error")
-                self.token_checked += 1
-            self.prepare_tokens(history, indices, starts, positions, rows)
-        finally:
-            torch.cuda.set_sync_debug_mode(mode)
-
-    def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory) -> None:
-        """Include uploads and state staging between anchors in the model-site sync check."""
-        assert self.prepare_sites is not None
-        with self.scope(context):
-            self.prepare_sites(rows, context, directory)
-
-    def input(self, sampler: PackedSamplerRowBatch) -> None:
-        """Check native step staging even when a stateless hook needs no task context."""
-        rows = sampler.row_batch
-        mode = torch.cuda.get_sync_debug_mode()
-        try:
-            steps = self.input_steps.setdefault(len(rows.rows), set())
-            if rows.rows and all(row.role is HiddenPhase.DECODE for row in rows.rows):
-                steps.add(rows.step_id)
-            if len(steps) > 2 and rows.step_id in steps:
-                torch.cuda.set_sync_debug_mode("error")
-                self.input_checked.add(rows.step_id)
-            self.prepare_input(sampler)
-        finally:
-            torch.cuda.set_sync_debug_mode(mode)
-
-    def overlay(
-        self,
-        rows: PackedPhaseRowBatch,
-        context: StateTaskContext,
-        directory: RequestStateDirectory,
-        task: ProjectionTask | None = None,
-    ) -> None:
-        """Include graph port and private-page staging in steady decode sync checks."""
-        assert self.prepare_overlay is not None
-        with self.scope(context):
-            self.prepare_overlay(rows, context, directory, task)
-
-    def anchor(self, context: StateTaskContext, anchor: AnchorId) -> None:
-        with self.scope(context):
-            self.execute(context, anchor)
-
-    def part(self, context: StateTaskContext, value: StepInput, task: TaskId, *, complete: bool) -> ProjectionResiduals:
-        with self.scope(context):
-            return self.execute_part(context, value, task, complete=complete)
 
 
 def _tokens(handle: VllmLlm, temperature: float = 0) -> tuple[tuple[int, ...], ...]:
@@ -444,26 +343,12 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             reason = "a fed state's values follow another process's timing; its protocol tests cover it"
             return CheckResult(tuple(passed), (CheckSkip("GPU schedules", reason),))
         handle.select_trace(_TRACE)
-        sync = SynchronizationCheck(handle)
-        sites = handle.runner.require_session().model_sites
-        overlay = handle.runner.require_session().forward_overlay
-        execution = handle.runner.require_session().deployment.execution
+        driver = handle.runner.require_session().driver
+        driver.check_host_syncs()
         try:
-            with (
-                patch.object(execution, "execute_anchor", sync.anchor),
-                patch.object(execution, "execute_part", sync.part),
-                patch.object(handle.runner.require_session(), "prepare_tokens", sync.tokens),
-                patch.object(sites, "prepare", sync.prepare) if sites is not None else nullcontext(),
-                patch.object(overlay, "prepare", sync.overlay) if overlay is not None else nullcontext(),
-                patch.object(handle.runner.require_session(), "prepare_input", sync.input),
-            ):
-                solo = _run(handle, (0,), params).merged(_run(handle, (1,), params)).merged(_run(handle, (2,), params))
-                batched = _run(handle, _REVERSED, params)
-            if (
-                max(len(sync.checked), len(sync.input_checked)) < 8
-                or requirements.input_token_history >= 0
-                and sync.token_checked < 8
-            ):
+            solo = _run(handle, (0,), params).merged(_run(handle, (1,), params)).merged(_run(handle, (2,), params))
+            batched = _run(handle, _REVERSED, params)
+            if driver.steady_steps < 8:
                 raise ContractError(("[host syncs] fewer than eight steady decode steps; report a pLLM checker bug",))
             passed.append("host syncs: eight steady decode steps")
         except (RuntimeError, ContractError) as error:
@@ -486,11 +371,7 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             skipped.append(CheckSkip("preempted", "instance training needs a caller-provided host batch"))
         elif batched is not None:
             try:
-                with (
-                    patch.object(execution, "execute_anchor", sync.anchor),
-                    patch.object(execution, "execute_part", sync.part),
-                ):
-                    evicted = _preemption(handle, params)
+                evicted = _preemption(handle, params)
                 differences = batched.differences(evicted, "preempted", "report a pLLM recompute bug")
                 failures.extend(differences)
                 if not differences:

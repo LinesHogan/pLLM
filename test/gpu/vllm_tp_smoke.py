@@ -426,25 +426,16 @@ def test_j5_routes(route, graphs):
 
 
 _M4_FIELDS = []
-_M4_SYNC = None
 _M4_RETIRE = None
 
 
 def _m4_instrument(worker):
-    from types import SimpleNamespace
-
-    from pllm.testing_gpu import SynchronizationCheck
     from test.gpu import vllm_tp_smoke as test
 
     runner = worker.workload_runner
     session = runner.require_session()
     execution = session.deployment.execution
-    sync = SynchronizationCheck(SimpleNamespace(runner=runner))
-    test._M4_SYNC = sync
-    execution.execute_anchor = sync.anchor
-    execution.execute_part = sync.part
-    session.prepare_input = sync.input
-    session.forward_overlay.prepare = sync.overlay
+    session.driver.check_host_syncs()
     test._M4_FIELDS.clear()
     retire = execution.arena.retire
     test._M4_RETIRE = retire
@@ -469,16 +460,11 @@ def _m4_instrument(worker):
 
 
 def _m4_fields(worker):
-    from test.gpu.vllm_tp_smoke import _M4_FIELDS, _M4_RETIRE, _M4_SYNC
+    from test.gpu.vllm_tp_smoke import _M4_FIELDS, _M4_RETIRE
 
-    assert len(_M4_SYNC.input_checked) >= 8
     session = worker.workload_runner.require_session()
-    execution = session.deployment.execution
-    execution.arena.retire = _M4_RETIRE
-    execution.execute_anchor = _M4_SYNC.execute
-    execution.execute_part = _M4_SYNC.execute_part
-    session.prepare_input = _M4_SYNC.prepare_input
-    session.forward_overlay.prepare = _M4_SYNC.prepare_overlay
+    assert session.driver.steady_steps >= 8
+    session.deployment.execution.arena.retire = _M4_RETIRE
     return _M4_FIELDS
 
 
