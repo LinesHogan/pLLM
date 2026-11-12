@@ -86,7 +86,7 @@ class PerCallReference:
 
     def stage(self):
         context = self.owner.context
-        execution = self.owner.execution
+        execution = self.owner.driver.execution
         self.fields = {}
         for row in self.owner.rows:
             ((pin, ref),) = context.read_versions((row.identity,), StateResource("lora"), execution.directory)

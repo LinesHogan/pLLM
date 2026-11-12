@@ -1,12 +1,13 @@
-"""One vLLM session: a signed tensor-state invocation driven step by step inside the model runner.
+"""One vLLM session: the model-side effects of an attached workload and the translation of vLLM's runner callbacks
+into StepDriver calls.
 
-VllmSession owns the per-step lifecycle (row preparation, model effects, sampler guidance, completion and
-publication) for one attached workload. Runners drive its hooks; the worker and driver stage and retire requests.
+VllmSession builds the hooks a workload installs on the model (overlays, activation patches, residual sites, custom
+attention and forward, hidden taps) and the sampler guidance, and prepares them for each step; the step's order of
+state calls is the StepDriver's. Runners call its hooks; the worker and driver stage and retire requests.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,41 +32,23 @@ from pllm.backends.vllm.sampler import (
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.host_batch import HostBatch, StateImport
-from pllm.contracts.packed_rows import PackedSamplerRowBatch, RowLabeler
-from pllm.contracts.request_identity import RequestIdentity, prompt_rows
+from pllm.contracts.host_batch import HostBatch
+from pllm.contracts.packed_rows import PackedSamplerRowBatch
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerStage
-from pllm.contracts.semantic_graph import (
-    SamplerFeedbackInputSource,
-    StateScope,
-    TaskResourceFact,
-    TaskSymbol,
-)
+from pllm.contracts.semantic_graph import SamplerFeedbackInputSource, TaskResourceFact, TaskSymbol
 from pllm.execution.backend_attachment import attachment_buffer_bytes
-from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
+from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
-from pllm.execution.preemption import preemption_policy
-from pllm.execution.state_execution import HeldInput, StateDiagnostics, StateTaskContext
-from pllm.execution.state_feed import (
-    Feed,
-    FeedReceiver,
-    ReadonlyStepAbsent,
-    ReadonlyStepEnd,
-    ReadonlyStepInput,
-)
+from pllm.execution.state_execution import StateDiagnostics
+from pllm.execution.state_feed import Feed
 from pllm.execution.step_capture import StepCapture
+from pllm.execution.step_driver import StepDriver
 from pllm.execution.step_input import StepInput, gather_input_tokens
 
 if TYPE_CHECKING:
     from pllm.workload import BackendDeployment
-
-
-@dataclass(slots=True)
-class _PackedStep:
-    rows: PackedSamplerRowBatch
-    context: StateTaskContext | None = None
-    forward_done: bool = False
 
 
 class VllmSession:
@@ -184,15 +167,13 @@ class VllmSession:
             if attention is not None and attention.methods and self.model_sites is not None
             else None
         )
-        self.state_feed: FeedReceiver | None = None
-        self._received_readonly: ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd | None = None
-        self._input_failed = False
+        self.driver = StepDriver(deployment.execution, attachment)
         self.custom_forward: VllmCustomForward | None = None
         if custom_forward_task is not None:
             self.custom_forward = VllmCustomForward(
                 decoder.kv_writable("a @pllm.custom_forward"),
                 custom_forward_task,
-                deployment.execution,
+                self.driver,
                 plan.scheduled(custom_forward_task.symbol).anchor_id,
                 activation=self.activation_patch,
                 sites=self.model_sites,
@@ -201,20 +182,9 @@ class VllmSession:
                 projections=self.parameter_overlay,
             )
         self._sampler = sampler
-        self.request_identities: dict[str, RequestIdentity] = {}
-        self.row_labeler = RowLabeler()
-        self.keep_replayed_state = preemption_policy(self.attachment, deployment.execution.math.model_sites) == "keep"
-        self._pending_identities: dict[str, RequestIdentity] = {}
-        self._next_step_id = 0
-        self.step: _PackedStep | None = None
-        self._host_batch: HostBatch[torch.Tensor] | None = None
-        self._import_rows: dict[str, int] = {}
         self.completion_rows: CompletionRows | None = None
         execution = deployment.execution
         execution.admit_instances(torch.cuda.current_stream(execution.device))
-        if execution.feeds:
-            (binding,) = execution.feeds
-            self.state_feed = FeedReceiver(execution.arena, binding)
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:
@@ -230,48 +200,15 @@ class VllmSession:
         samples_per_prompt: int = 1,
     ) -> None:
         """Stage request inputs, already validated by generate, and their optional completion destination."""
-        self._require_input_live()
-        # Planning reserves no admission pins for states written only from host batches: no request may hold one.
-        assert not self.request_identities, "generate stages a call's inputs after the previous call retired"
+        self.driver.stage(identities, batch, samples_per_prompt)
         self.completion_rows = None if completion is None else CompletionRows(identities, completion)
-        self._host_batch = batch
-        self._import_rows = prompt_rows(identities, samples_per_prompt)
-        self._pending_identities = {identity.request_id: identity for identity in identities}
 
     def feed(self, name: str) -> Feed:
         """Obtain the declared writer while the consumer is idle."""
-        if self.state_feed is None or self._next_step_id or self.step is not None:
-            raise RuntimeError("declare a fed state and obtain its writer before generate")
-        return self.state_feed.take(name)
-
-    def _require_input_live(self) -> None:
-        if self._input_failed:
-            raise RuntimeError("this engine stopped after an earlier error; create a new one with pllm.make_llm")
-
-    def _receive_readonly(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream) -> HeldInput | None:
-        if self.state_feed is None:
-            return None
-        try:
-            self._received_readonly = self.state_feed(rows, stream)
-            received = self._received_readonly
-            assert received.step_id == rows.step_id
-            held_input = None
-            if isinstance(received, (ReadonlyStepAbsent, ReadonlyStepEnd)):
-                held_input = self.deployment.execution.stage_hold(
-                    tuple(rows.identities),
-                    "end" if isinstance(received, ReadonlyStepEnd) else "absent",
-                    step_id=rows.step_id,
-                )
-            else:
-                self.deployment.execution.stage_readonly(received.roots)
-            self._received_readonly = None  # Ownership is now the original execution's pending/active borrow.
-            return held_input
-        except BaseException:
-            self._input_failed = True
-            raise
+        return self.driver.feed(name)
 
     def identity(self, request_id: str) -> RequestIdentity:
-        return self.request_identities[request_id]
+        return self.driver.admitted[request_id]
 
     @property
     def attachment(self) -> BackendAttachment:
@@ -290,53 +227,15 @@ class VllmSession:
 
     @torch.inference_mode(False)
     def before_execute(self, scheduler_output: SchedulerOutput) -> None:
-        self._require_input_live()
-        execution = self.deployment.execution
-        execution.arena.collect_completed()
-        finished = tuple(
-            self.request_identities[request_id]
-            for request_id in sorted(self.request_identities.keys() & scheduler_output.finished_req_ids)
-        )
-        self._retire(finished)
-        if preemption_policy(self.attachment, execution.math.model_sites) == "reset":
-            for request_id in scheduler_output.finished_req_ids:
-                self._pending_identities.pop(request_id, None)
-            self.preempt_requests(scheduler_output.preempted_req_ids or set())
-        pending: list[RequestIdentity] = []
+        new: list[str] = []
         for request in scheduler_output.scheduled_new_reqs:
-            if request.req_id in self.request_identities:
+            if request.req_id in self.driver.admitted:
                 continue
             params = request.sampling_params
             if params is None or (params.extra_args or {}).get(POLICY_KEY) != self.cache_envelope:
                 raise ValueError("request cache policy differs from installed workload; submit through its handle")
-            pending.append(self._pending_identities[request.req_id])
-        if pending:
-            if bool(execution.directory.request_states):
-                execution.admit(tuple(pending), torch.cuda.current_stream(execution.device))
-            for identity in pending:
-                self.row_labeler.admit(identity)
-                self.request_identities[identity.request_id] = identity
-                self._pending_identities.pop(identity.request_id)
-
-    def preempt_requests(self, request_ids: set[str]) -> None:
-        """Apply workload state policy to the requests preempted by vLLM."""
-        identities = tuple(self.request_identities[key] for key in sorted(self.request_identities.keys() & request_ids))
-        if not identities:
-            return
-        rejection = self.attachment.plan.schedule.recompute_rejection
-        if rejection is not None:
-            self._input_failed = True
-            raise RuntimeError(
-                "vLLM preempted a request and would recompute its history; "
-                f"{rejection}. To avoid preemption, give vLLM more KV cache "
-                "(gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)"
-            )
-        self._retire(identities)
-        self._pending_identities.update((identity.request_id, identity) for identity in identities)
-
-    @property
-    def next_step_id(self) -> int:
-        return self._next_step_id
+            new.append(request.req_id)
+        self.driver.schedule(scheduler_output.finished_req_ids, scheduler_output.preempted_req_ids or set(), new)
 
     def prepare_tokens(
         self, history: torch.Tensor, indices: tuple[int, ...], starts: torch.Tensor, positions: torch.Tensor, rows: int
@@ -359,81 +258,25 @@ class VllmSession:
     @torch.inference_mode(False)
     @torch.enable_grad()
     def prepare_input(self, rows: PackedSamplerRowBatch) -> None:
-        self._require_input_live()
-        self._next_step_id += 1
-        execution = self.deployment.execution
-        step = _PackedStep(rows)
-        self.step = step
+        """Prepare the model's hooks for the step's rows, after the driver opened the step's state invocation."""
         if self.hidden_taps is not None:
             self.hidden_taps.prepare(rows.row_batch)
         if self._attention is not None:
             self._attention.prepare(rows.row_batch, rows)
         adapter = self.forward_overlay
-        # Token-only helpers need their side lane started before the model forward.
-        if (
-            adapter is None
-            and self.activation_patch is None
-            and (self.model_sites is None or not self.model_sites.needs_step)
-            and (self._attention is None or not self._attention.program.facts)
-            and self.custom_forward is None
-            and not self._trains_on_batch
-            and self.input_tokens is None
-        ):
-            return
         if adapter is not None:
             adapter.reserve()
         execution = self.deployment.execution
-        identities = tuple(
-            sorted(
-                rows.identities,
-                key=lambda identity: (identity.request_id, identity.prompt_index, identity.sample_index),
-            )
-        )
         stream = torch.cuda.current_stream(execution.device)
-        if not self._in_forward_overlay:
-            held_input = self._receive_readonly(rows, stream)
-            value = StepInput(
-                rows.row_batch,
-                rows,
-                batch=self._host_batch,
-                import_rows=self._import_rows,
-                input_tokens=self.input_tokens,
-            )
-            context = execution.start_step(value, stream, held_input=held_input, retain_gradients=False)
-            instance_states = bool(execution.directory.instance_states)
-            imported_state = self.attachment.plan.semantic_graph.host_state(StateImport.schema)
-            request_import = (
-                isinstance(self._host_batch, StateImport)
-                and imported_state is not None
-                and imported_state.scope is StateScope.REQUEST
-            )
-            if not self._pending_identities or instance_states and not request_import:
-                self._host_batch = None
-            step.context = context
-            execution.advance_to(context, "request.prepare")
-            # Offline publication precedes admission; existing request pins remain unchanged.
-            pending = tuple(
-                identity
-                for identity in identities
-                if execution.directory.pinned_states and not execution.directory.has_inference_pin(identity)
-            )
-            if pending:
-                execution.admit(pending, stream)
-        else:
-            context = execution.begin(rows.row_batch.request_rows, stream, retain_gradients=False)
-            step.context = context
+        context = self.driver.begin(StepInput(rows.row_batch, rows, input_tokens=self.input_tokens), stream)
+        if context is None:
+            return
         if adapter is not None:
             projection = None
             if self._in_forward_overlay:
                 assert self._transition_task is not None
-                execution.advance_to(context, "request.prepare")
-                projection = ProjectionTask(
-                    execution,
-                    context,
-                    rows,
-                    self._transition_task,
-                    tuple(item.target for item in self.attachment.spec.overlay_bindings),
-                )
+                targets = tuple(item.target for item in self.attachment.spec.overlay_bindings)
+                projection = ProjectionTask(self.driver, context, rows, self._transition_task, targets)
             adapter.prepare(rows.row_batch, context, execution.directory, projection)
         if self.activation_patch is not None:
             self.activation_patch.prepare(rows.row_batch, context, execution.directory)
@@ -445,48 +288,16 @@ class VllmSession:
     @torch.inference_mode(False)
     @torch.enable_grad()
     def complete_forward(self) -> None:
-        step = self.step
+        step = self.driver.step
         if step is None or step.forward_done:
             return
-        step.forward_done = True
-        execution = self.deployment.execution
-        stream = torch.cuda.current_stream(execution.device)
         operands = () if self.parameter_overlay is None else self.parameter_overlay.take_operands()
-        value = StepInput(
-            step.rows.row_batch,
-            step.rows,
-            operands=operands,
-            batch=self._host_batch,
-            import_rows=self._import_rows,
-            input_tokens=self.input_tokens,
-        )
+        value = StepInput(step.rows.row_batch, step.rows, operands=operands, input_tokens=self.input_tokens)
+        holds = ()
         if self.hidden_taps is not None and self._hidden_resources:
             value = self.hidden_taps.publish(value, self._hidden_resources)
-        if (
-            step.context is None
-            and not operands
-            and self.input_tokens is None
-            and HiddenPhase.ALL not in self._hidden_phases
-            and not any(
-                (step.rows.row_batch.phases == int(phase is HiddenPhase.PREFILL)).any() for phase in self._hidden_phases
-            )
-        ):
-            self._finish_effects()
-            self.step = None
-            return
-        if step.context is None:
-            overlap = execution.post_sample
-            if overlap is not None and not overlap.lag:
-                stream = overlap.stream
-            step.context = execution.start_step(
-                value, stream, history=() if overlap is None else overlap.history, retain_gradients=False
-            )
-            self._host_batch = None
-        elif step.context.value is None or self._hidden_resources or operands:
-            execution.submit_input(step.context, value, CudaStreamReadiness(stream))
-        if self.hidden_taps is not None and self._hidden_resources:
-            self.hidden_taps.hold(step.context)
-        execution.advance_to(step.context, "sampler.pre_draw")
+            holds = self.hidden_taps.holds()
+        self.driver.after_forward(value, torch.cuda.current_stream(self.deployment.execution.device), holds)
         self._finish_effects()
 
     def _finish_effects(self) -> None:
@@ -514,7 +325,7 @@ class VllmSession:
         means the transformer forward is over.
         """
         lm_head = self._compute_logits
-        step = self.step
+        step = self.driver.step
         # Prompt logprobs call the LM head again; capture and guidance run only for the sampling rows.
         if step is None or step.forward_done:
             return lm_head(hidden)
@@ -527,7 +338,7 @@ class VllmSession:
             assert logits is not None
             self._layer_logits.compute(step.rows, logits)
         self.complete_forward()
-        if self.step is None or self._sampler is None or not self._context().guidance:
+        if self.driver.step is None or self._sampler is None or not self.driver.context().guidance:
             return lm_head(hidden) if logits is None else logits
         stages: list[SignedSamplerGuidance | BoundedSamplerGuidance] = []
         for guidance in self._sampler_guidance():
@@ -552,65 +363,33 @@ class VllmSession:
 
     def _sampler_guidance(self) -> tuple[PackedSamplerGuidanceBatch, ...]:
         execution = self.deployment.execution
-        return execution.sampler_guidance(self._context(), torch.cuda.current_stream(execution.device))
+        return execution.sampler_guidance(self.driver.context(), torch.cuda.current_stream(execution.device))
 
     @torch.inference_mode(False)
     @torch.enable_grad()
     def complete_sampler(self) -> None:
-        if self.step is None:
+        if self.driver.step is None:
             return
-        feedback = None
-        if self._sampler is not None:
-            feedback = self._sampler.finish_guidance()
-        execution = self.deployment.execution
-        context = self._context()
-        execution.execute_anchor(context, execution.sampler_anchor_id)
-        execution.complete_sampler(context, torch.cuda.current_stream(execution.device), feedback=feedback)
+        feedback = None if self._sampler is None else self._sampler.finish_guidance()
+        self.driver.sample(feedback, torch.cuda.current_stream(self.deployment.execution.device))
 
     @torch.inference_mode(False)
     @torch.enable_grad()
     def commit_token(self) -> None:
-        if self.step is None:
-            return
-        execution = self.deployment.execution
-        context = self._context()
-        execution.advance_to(context, "next.prepare")
-        execution.finish_step(context)
-        self.step = None
-        execution.arena.collect_completed()
+        self.driver.commit()
 
     @torch.inference_mode(False)
     def abort_active(self) -> None:
         if self._sampler is not None:
             self._sampler.abort_guidance()
         self._finish_effects()
-        self.deployment.execution.cancel_active()
-        self._host_batch = None
-        self.step = None
-
-    def _retire(self, identities: tuple[RequestIdentity, ...]) -> None:
-        execution = self.deployment.execution
-        held = (
-            tuple(identity for identity in identities if execution.directory.has_inference_pin(identity))
-            if not execution.directory.request_states
-            else identities
-        )
-        if held:
-            # Released pages remain fenced in the arena. Finishing a subset of the
-            # requests must not make the host wait for unrelated side-stream work.
-            execution.retire(held)
-        for identity in identities:
-            self.request_identities.pop(identity.request_id)
-            self.row_labeler.retire(identity)
+        self.driver.abort()
 
     @torch.inference_mode(False)
     def retire_all(self, *, wait: bool = False) -> None:
         if self.completion_rows is not None:
             self.completion_rows.synchronize()
-        self.deployment.execution.release_history()
-        self._retire(tuple(self.request_identities[request_id] for request_id in sorted(self.request_identities)))
-        self._pending_identities.clear()
-        self.deployment.execution.arena.collect_completed(wait=wait)
+        self.driver.finish_call(wait=wait)
         self.completion_rows = None
 
     def finish_requests(self) -> None:
@@ -619,31 +398,12 @@ class VllmSession:
             self.completion_rows.require_complete()
         self.retire_all()
 
-    def require_idle(self) -> None:
-        """Workload replacement cannot discard admitted or staged requests."""
-        if self.step is not None or self.request_identities or self._pending_identities:
-            raise RuntimeError("finish or abort active requests before replacing the workload")
-
     @torch.inference_mode(False)
     def close(self) -> None:
         try:
             self.abort_active()
             self.retire_all(wait=True)
-            execution = self.deployment.execution
-            if bool(execution.directory.instance_states):
-                execution.retire((), wait=True)
-            if execution.directory.request_states:
-                execution.retire_dormant(wait=True)
+            self.driver.release()
             self._close_effects()
         finally:
-            try:
-                self.deployment.execution.close()
-            finally:
-                if self.state_feed is not None:
-                    self._input_failed = True
-                    self.deployment.execution.discard_borrows()
-                    self.state_feed.close()
-
-    def _context(self) -> StateTaskContext:
-        assert self.step is not None and self.step.context is not None
-        return self.step.context
+            self.driver.close()

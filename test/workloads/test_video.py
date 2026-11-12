@@ -246,7 +246,7 @@ def _decode_steps_keep_exact_publications_and_ack_order():
             received.append(rows.step_id)
             return ReadonlyStepInput(rows.step_id, ((first, second)[rows.step_id],))
 
-        session.state_feed = Mock(spec=FeedReceiver, side_effect=receive)
+        session.driver.receiver = Mock(spec=FeedReceiver, side_effect=receive)
         session.stage_input(None, identities)
         for step, (root, peers) in enumerate(((first, first_peers), (second, second_peers))):
             session.before_execute(_scheduler(session, *(identities if step == 0 else ())))
@@ -296,7 +296,7 @@ def _hold_steps_reuse_the_settled_injection():
             ReadonlyStepInput(2, (second,)),
             ReadonlyStepEnd(3),
         )
-        session.state_feed = Mock(spec=FeedReceiver, side_effect=lambda batch, stream: outcomes[batch.step_id])
+        session.driver.receiver = Mock(spec=FeedReceiver, side_effect=lambda batch, stream: outcomes[batch.step_id])
         session.stage_input(None, (identity,))
         refs = []
         for step in range(4):

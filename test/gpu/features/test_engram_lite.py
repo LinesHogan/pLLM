@@ -116,7 +116,7 @@ def test_engram_placements_and_capture(tmp_path, logits):
 
     def complete_forward(session):
         # A late request.prepare would serialize host reads after the transformer.
-        assert session.step is not None and session.step.context is not None
+        assert session.driver.step is not None and session.driver.step.context is not None
         complete(session)
 
     def delayed(execution, context, task):

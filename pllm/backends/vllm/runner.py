@@ -118,7 +118,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
 
     def detach_workload(self) -> None:
         session = self.require_session()
-        session.require_idle()
+        session.driver.require_idle()
         session.close()
         self.workload_session = None
 
@@ -172,7 +172,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
         session = self.workload_session
         if session is not None:
             for request in scheduler_output.scheduled_new_reqs:
-                session.row_labeler.bind(
+                session.driver.labeler.bind(
                     request.req_id, self.req_states.req_id_to_index[request.req_id], self.req_states.max_num_reqs
                 )
 
@@ -184,23 +184,24 @@ class WorkloadModelRunner(OverlayGraphRunner):
         """
         session = self.workload_session
         if session is not None:
-            if session.input_tokens is not None:
-                session.prepare_tokens(
-                    self.req_states.all_token_ids.gpu,
-                    tuple(int(index) for index in input_batch.idx_mapping_np),
-                    input_batch.query_start_loc,
-                    input_batch.positions,
-                    input_batch.num_tokens,
-                )
-            session.prepare_input(
-                encode_mrv2_rows(
-                    input_batch,
-                    self.req_states.prompt_len.np[input_batch.idx_mapping_np],
-                    session.row_labeler,
-                    step_id=session.next_step_id,
-                    keep=session.keep_replayed_state,
-                )
+            driver = session.driver
+            rows = encode_mrv2_rows(
+                input_batch,
+                self.req_states.prompt_len.np[input_batch.idx_mapping_np],
+                driver.labeler,
+                step_id=driver.next_step_id,
+                keep=driver.preemption == "keep",
             )
+            with driver.step_scope(rows.row_batch):
+                if session.input_tokens is not None:
+                    session.prepare_tokens(
+                        self.req_states.all_token_ids.gpu,
+                        tuple(int(index) for index in input_batch.idx_mapping_np),
+                        input_batch.query_start_loc,
+                        input_batch.positions,
+                        input_batch.num_tokens,
+                    )
+                session.prepare_input(rows)
         return super().prepare_attn(input_batch)
 
     def execute_model(

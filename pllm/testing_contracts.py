@@ -26,22 +26,24 @@ from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedRows, RowLabeler, label_rows
 from pllm.contracts.parameter_overlay import ProjectionOperands
-from pllm.contracts.request_identity import RequestIdentity, prompt_rows
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import SamplerFeedback, SamplerStage
 from pllm.contracts.semantic_graph import (
+    AnchorId,
     StateResource,
     StateScope,
     StateSelectionInputSource,
     TaskResultInputSource,
+    TaskSymbol,
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.execution.checkpoint import checkpoint_directory
 from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.model_sites import StateInput
-from pllm.execution.preemption import preemption_policy
 from pllm.execution.runtime_facts import model_timeline
 from pllm.execution.state_execution import StateExecution, StateTaskContext
+from pllm.execution.step_driver import StepDriver
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_executor import reads_rows
@@ -447,20 +449,13 @@ def _check_idle_state(
     )
 
 
-def _projection_step(
-    execution: StateExecution,
-    context: StateTaskContext,
-    value: StepInput,
-    run: _Run,
-) -> None:
+def _projection_step(driver: StepDriver, context: StateTaskContext, value: StepInput, run: _Run) -> None:
     """Exercise the model driver's prompt-before-decode projection segments without a loaded model."""
-    task = execution.plan.tasks[context.next_task]
+    task = driver.execution.plan.tasks[context.next_task]
     phases = tuple(phase for phase in HiddenPhase if any(o.phase is phase for o in value.operands))
     for phase in phases:
         operands = tuple(o for o in value.operands if o.phase is phase)
-        outputs = execution.execute_part(
-            context, replace(value, operands=operands), task.task_id, complete=phase is phases[-1]
-        )
+        outputs = driver.part(context, replace(value, operands=operands), task.task_id, complete=phase is phases[-1])
         for operand in operands:
             rows = tuple(row for row in value.rows.rows if row.identity == operand.identity and row.phase is phase)
             for row, tensor in zip(rows, outputs[operand.identity, operand.target], strict=True):
@@ -469,36 +464,40 @@ def _projection_step(
                 )
 
 
-def _execute_step(
-    execution: StateExecution,
-    value: StepInput,
-    feedback: SamplerFeedback,
-    run: _Run,
-    before_forward: Callable[[StateTaskContext], None] | None = None,
-) -> None:
+@dataclass(frozen=True)
+class _CheckModel:
+    """The CPU stand-ins for what the model forward runs: a custom forward's anchor and residual methods."""
+
+    forward_anchor: AnchorId | None = None
+    sites: Callable[[Mapping[tuple[TaskSymbol, str], torch.Tensor]], None] | None = None
+
+
+def _drive_step(driver: StepDriver, value: StepInput, feedback: SamplerFeedback, run: _Run, model: _CheckModel) -> bool:
+    """One step in VllmSession's order: begin, the CPU model's forward, after_forward, sample, commit. False when the
+    driver skipped it because the workload reads none of its rows."""
+    execution = driver.execution
     run.timing.begin(execution, value)
-    overlap = execution.post_sample
-    context = execution.start_step(value, history=() if overlap is None else overlap.history)
-    versions = tuple(
-        (group.resource, ref) for group in context.selection.groups if group.keys != (None,) for ref in group.refs
-    )
     observed = len(run.operations)
-    for anchor in execution.arena.plan.timeline.anchors:
-        if anchor.symbol == "model.execute" and execution.arena.plan.semantic_graph.updates_in_forward:
-            _projection_step(execution, context, value, run)
-        execution.advance_to(context, anchor.symbol)
-        if anchor.symbol == "request.prepare" and before_forward is not None:
-            before_forward(context)
-        if anchor.ordinal == execution.sampler_anchor_id:
-            guidance = context.guidance
-            for stage in guidance:
-                for index, sampler_index in enumerate(stage.affected_row_ids):
-                    row = value.rows.inspect_row(int(value.sampler_rows.packed_indices[sampler_index]))
-                    point = row.identity.request_id, row.token_offset
-                    run.values[*point, f"sampler {stage.member}"] = stage.values[index].detach().clone()
-                    if stage.row_weights is not None:
-                        run.values[*point, f"sampler weight {stage.member}"] = stage.row_weights[index].detach().clone()
-            execution.complete_sampler(context, feedback=feedback)
+    context = driver.begin(replace(value, hidden=None, hidden_readiness=None, operands=()), None)
+    if context is not None and execution.arena.plan.semantic_graph.updates_in_forward:
+        _projection_step(driver, context, value, run)
+    if context is not None and model.forward_anchor is not None:
+        driver.anchor(context, model.forward_anchor)
+    if model.sites is not None:
+        model.sites({} if context is None else context.results)
+    driver.after_forward(value, None)
+    if driver.step is None:
+        run.timing.skip()
+        return False
+    context = driver.context()
+    for stage in context.guidance:
+        for index, sampler_index in enumerate(stage.affected_row_ids):
+            row = value.rows.inspect_row(int(value.sampler_rows.packed_indices[sampler_index]))
+            point = row.identity.request_id, row.token_offset
+            run.values[*point, f"sampler {stage.member}"] = stage.values[index].detach().clone()
+            if stage.row_weights is not None:
+                run.values[*point, f"sampler weight {stage.member}"] = stage.row_weights[index].detach().clone()
+    driver.sample(feedback, None)
     for entry in () if execution.arena.plan.semantic_graph.updates_in_forward else context.data().entries:
         rows = tuple(row for row in value.rows.rows if row.identity == entry.identity)
         for target in entry.targets:
@@ -506,12 +505,16 @@ def _execute_step(
                 run.values[entry.identity.request_id, row.token_offset, f"projection {target.target}"] = (
                     tensor.detach().clone()
                 )
-    execution.finish_step(context)
+    versions = tuple(
+        (group.resource, ref) for group in context.selection.groups if group.keys != (None,) for ref in group.refs
+    )
+    driver.commit()
     _check_idle_state(execution, versions, run, observed, value)
     for event in execution.trace.snapshot().events:
         if event.kind is TraceEventKind.TENSOR and event.step_id == value.rows.step_id:
             for identity, position, tensor in zip(event.identities, event.positions, event.tensor(), strict=True):
                 run.values[identity.request_id, position, f"export {event.tensor_name}"] = tensor
+    return True
 
 
 def _imported_batch(
@@ -554,10 +557,8 @@ def _site_step(
     value: StepInput,
     tokens: torch.Tensor,
     run: _Run,
-    context: StateTaskContext,
+    results: Mapping[tuple[TaskSymbol, str], torch.Tensor],
 ) -> None:
-    if context.prefetch_stream is not None:
-        torch.cuda.current_stream().wait_stream(context.prefetch_stream)
     outputs = check_sites(
         binding,
         replace(facts, max_admitted_lineages=len(tokens)),
@@ -566,7 +567,7 @@ def _site_step(
         seed=facts.initialization_seed,
         device_equivalence=run.device_equivalence,
         neutral=run.neutral,
-        results=context.results,
+        results=results,
     )
     for name, output in outputs.items():
         for row, tensor in zip(value.rows.rows, output, strict=True):
@@ -612,41 +613,31 @@ def _run(
     )
     if forward is not None:
         forward.attention = attention
-    policy = preemption_policy(deployment.attachment, execution.math.model_sites)
-    if (
-        preempted != "none"
-        and policy == "reset"
-        and deployment.attachment.plan.schedule.recompute_rejection is not None
-    ):
+    driver = StepDriver(execution, deployment.attachment)
+    if preempted != "none" and driver.preemption == "reset" and deployment.attachment.plan.schedule.recompute_rejection:
         run.preemption_skip = deployment.attachment.plan.schedule.recompute_rejection
         execution.close()
         return run
+    forward_task = deployment.attachment.plan.semantic_graph.custom_forward_task
+    forward_anchor = (
+        None if forward_task is None else deployment.attachment.plan.scheduled(forward_task.symbol).anchor_id
+    )
     execution.admit_instances()
     limit = workload.backend_requirements().sample_limit or 3
     script = tuple(replace(identity, sample_index=identity.sample_index % limit) for identity in _IDS)
     identities = tuple(script[i] for i in order)
-    execution.admit(identities)
-    imports = _imported_batch(declaration, identities, perturbed)
-    import_rows = prompt_rows(identities)
-    labeler = RowLabeler()
-    for identity in script:
-        labeler.admit(identity)
+    driver.stage(identities, _imported_batch(declaration, identities, perturbed))
     try:
         stride = lcm(*(task.export.every for task in tasks.values() if task.export is not None))
         for step, counts in enumerate(_schedule(order, mixed, preempted)):
-            if preempted != "none" and step == 3 and policy == "reset":
-                execution.retire((script[1],), wait=True)
-                execution.admit((script[1],))
-            value = replace(
-                contract_step_input(
-                    shape, facts, counts, step * stride, perturbed, script, declaration.graph.input_token_history
-                ),
-                batch=imports,
-                import_rows=import_rows,
+            preempt = (script[1].request_id,) if preempted != "none" and step == 3 else ()
+            driver.schedule((), preempt, [script[i].request_id for i, _, _ in counts])
+            value = contract_step_input(
+                shape, facts, counts, step * stride, perturbed, script, declaration.graph.input_token_history
             )
-            if policy == "keep":
-                value = retained_rows(labeler, value, counts, script)
-            site_step = None
+            if driver.preemption == "keep":
+                value = retained_rows(driver.labeler, value, counts, script)
+            sites = None
             if forward is not None or declaration.sites.rewrites or attention is not None:
                 tokens = _embeddings(value, shape.hidden_size, facts.probe.tensor_dtype.torch, perturbed)
                 if attention is not None:
@@ -657,8 +648,11 @@ def _run(
                 if forward is not None:
                     forward.prepare(value, tokens)
                 if declaration.sites.rewrites:
-                    site_step = partial(_site_step, declaration, facts, value, tokens, run)
-            _execute_step(execution, value, _feedback(value, shape, perturbed), run, site_step)
+                    sites = partial(_site_step, declaration, facts, value, tokens, run)
+            if not _drive_step(
+                driver, value, _feedback(value, shape, perturbed), run, _CheckModel(forward_anchor, sites)
+            ):
+                continue
             if forward is not None:
                 run.values.update(
                     ((row.identity.request_id, row.token_offset, "custom_forward"), output.detach().clone())
@@ -679,10 +673,9 @@ def _run(
                     for name, tensor in _state_values(execution, selected, declaration).items()
                 )
     finally:
-        execution.release_history()
-        execution.retire(identities, wait=True)
-        execution.retire((), wait=True)
-        execution.close()
+        driver.finish_call(wait=True)
+        driver.release()
+        driver.close()
     run.failures.extend(run.timing.failures)
     return run
 

@@ -41,7 +41,8 @@ from pllm.kernels.page_copy import chunk_capacity, prepend_rows
 
 if TYPE_CHECKING:
     from pllm.execution.overlay_batch import OverlayBatch
-    from pllm.execution.state_execution import StateExecution, StateTaskContext
+    from pllm.execution.state_execution import StateTaskContext
+    from pllm.execution.step_driver import StepDriver
 
 
 def join_tail(
@@ -316,13 +317,13 @@ class ProjectionTask:
 
     def __init__(
         self,
-        execution: StateExecution,
+        driver: StepDriver,
         context: StateTaskContext,
         rows: PackedSamplerRowBatch,
         task: TaskId,
         targets: tuple[Projection, ...],
     ) -> None:
-        self.execution, self.context, self.rows, self.task = execution, context, rows, task
+        self.driver, self.context, self.rows, self.task = driver, context, rows, task
         self.pending = set(targets)
 
     def prepare(self, math: OverlayTransition) -> TensorBatch:
@@ -341,7 +342,7 @@ class ProjectionTask:
         from pllm.execution.step_input import StepInput
 
         self.pending.clear()
-        self.execution.execute_part(
+        self.driver.part(
             self.context,
             StepInput(self.rows.row_batch, self.rows, operands=operands, overlay_updates=updates),
             self.task,
@@ -358,7 +359,7 @@ class ProjectionTask:
         assert targets and targets <= self.pending
         if complete:
             self.pending.difference_update(targets)
-        return self.execution.execute_part(
+        return self.driver.part(
             self.context,
             StepInput(self.rows.row_batch, self.rows, operands=operands),
             self.task,

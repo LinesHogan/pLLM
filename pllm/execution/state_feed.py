@@ -346,7 +346,7 @@ class FeedReceiver:
         if any(record.kind is FeedEvent.CANCEL for record in self.records):
             raise RuntimeError("feed producer cancelled or sent an invalid record")
 
-    def _receive(self, record: FeedRecord, stream: torch.cuda.Stream) -> BorrowedStateRoot:
+    def _receive(self, record: FeedRecord, stream: torch.cuda.Stream | None) -> BorrowedStateRoot:
         assert record.ref is not None and 0 <= record.slot < len(self.channels) and not self.partial
         for channel in self.channels[record.slot]:
             self.partial.append(receive_field(self.arena.plan, self.arena.plan_digest, channel, stream=stream))
@@ -356,7 +356,7 @@ class FeedReceiver:
         return root
 
     def __call__(
-        self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream
+        self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream | None
     ) -> ReadonlyStepInput | ReadonlyStepAbsent | ReadonlyStepEnd:
         if self.failed or self.closed or self.writer is not None:
             raise RuntimeError("obtain the feed writer before generate; a failed feed cannot resume")

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import torch
 
@@ -17,6 +17,9 @@ from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.semantic_graph import StateResource, TaskSymbol
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.overlay_task import ChunkUpdate
+
+if TYPE_CHECKING:
+    from pllm.execution.attention_methods import AttentionProgram
 
 # Where a method applies: one sublayer's residual add (attention or MLP), both of a layer's adds, the value rows
 # attention reads and caches, or the stream entering the model's final norm.
@@ -311,3 +314,24 @@ class SiteOwners:
                 f"streams={count} keeps several residual streams; pllm.residual, pllm.layer_logits and "
                 "@pllm.custom_forward read one stream, so read pllm.residual inside a custom residual method instead"
             )
+
+
+def state_inputs(
+    rewrites: tuple[ResidualRewrite, ...], attention_program: AttentionProgram | None
+) -> tuple[StateInput, ...]:
+    """The states residual methods and attention methods read, excluding request memories' own carries."""
+    carries = {rewrite.memory.carry for rewrite in rewrites if rewrite.memory is not None}
+    sources = [
+        source
+        for rewrite in rewrites
+        for _, source in (*rewrite.inputs, *rewrite.read_inputs)
+        if isinstance(source, StateInput) and source not in carries
+    ]
+    if attention_program is not None:
+        sources.extend(
+            source
+            for method in attention_program.methods.values()
+            for _, source in method.inputs
+            if isinstance(source, StateInput)
+        )
+    return tuple(dict.fromkeys(sources))

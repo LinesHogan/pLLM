@@ -18,6 +18,7 @@ from pllm.contracts.parameter_overlay import (
     ProjectionOperands,
 )
 from pllm.execution.overlay_task import ChunkUpdate
+from pllm.execution.step_driver import StepDriver
 from pllm.execution.step_input import StepInput
 from pllm.io import StateImport
 from pllm.testing import RequestIdentity, backend_facts
@@ -354,7 +355,9 @@ def _check_exact_projection_lifecycle():
         value = projection_input(operands)
         invocation = execution.begin(value.rows.request_rows)
         execution.execute_anchor(invocation, AnchorId(0))
-        task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
+        task = ProjectionTask(
+            StepDriver(execution, deployment.attachment), invocation, value.sampler_rows, binding.task_id, targets
+        )
         _check_projection_reads(task, operands, states, refs, count)
         _publish_projection(execution, invocation)
         result = execution.finish_step(invocation)
@@ -365,7 +368,7 @@ def _check_exact_projection_lifecycle():
                 state, tail = states[identity, target]
                 torch.testing.assert_close(fields[index * 3], torch.tensor([[[state]]]))
                 assert fields[index * 3 + 2].item() == len(tail)
-    _check_projection_abort(execution, value, targets, binding, refs, operands, requests)
+    _check_projection_abort(deployment, value, targets, binding, refs, operands, requests)
     _check_causality_witness(workload, facts, requests, targets)
 
 
@@ -401,16 +404,20 @@ def _publish_projection(execution, invocation):
             execution.complete_sampler(invocation)
 
 
-def _check_projection_abort(execution, value, targets, binding, refs, operands, requests):
+def _check_projection_abort(deployment, value, targets, binding, refs, operands, requests):
     """Discard a partial forward without publishing either target's private state."""
     from pllm.contracts.semantic_graph import AnchorId
     from pllm.execution.overlay_task import ProjectionTask
+
+    execution = deployment.execution
 
     # A completed projection is still private until the forward's publish anchor.
     before = tuple(execution.snapshot(ref) for ref in refs)
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
-    task = ProjectionTask(execution, invocation, value.sampler_rows, binding.task_id, targets)
+    task = ProjectionTask(
+        StepDriver(execution, deployment.attachment), invocation, value.sampler_rows, binding.task_id, targets
+    )
     task.run(tuple(operand for operand in operands if operand.target == targets[0]))
     assert invocation.writing
     execution.cancel_step(invocation)
@@ -446,7 +453,7 @@ def _check_causality_witness(workload, facts, requests, targets):
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(
-        execution,
+        StepDriver(execution, deployment.attachment),
         invocation,
         value.sampler_rows,
         deployment.attachment.plan.scheduled(deployment.attachment.spec.in_forward).task_id,
@@ -494,7 +501,7 @@ def _check_exact_additive_projection():
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(
-        execution,
+        StepDriver(execution, deployment.attachment),
         invocation,
         value.sampler_rows,
         deployment.attachment.plan.scheduled(deployment.attachment.spec.in_forward).task_id,
@@ -526,7 +533,7 @@ def _check_exact_additive_projection():
     invocation = execution.begin(value.rows.request_rows)
     execution.execute_anchor(invocation, AnchorId(0))
     task = ProjectionTask(
-        execution,
+        StepDriver(execution, deployment.attachment),
         invocation,
         value.sampler_rows,
         deployment.attachment.plan.scheduled(deployment.attachment.spec.in_forward).task_id,
@@ -600,7 +607,7 @@ def test_prefill_adapters_keep_prompt_chunks_across_scheduler_spans(span):
         invocation = execution.begin(value.rows.request_rows)
         execution.execute_anchor(invocation, AnchorId(0))
         task = ProjectionTask(
-            execution,
+            StepDriver(execution, deployed.attachment),
             invocation,
             value.sampler_rows,
             deployed.attachment.plan.scheduled(deployed.attachment.spec.in_forward).task_id,
@@ -759,7 +766,7 @@ def run_paper_schedule(deployed, body, overlay, ids, prompts, expected, track):
         value = scheduled_step(ids, list(counts), [3, 5], done, {})
         context = execution.start_step(value)
         execution.advance_to(context, "request.prepare")
-        task = ProjectionTask(execution, context, value.sampler_rows, task_id, targets)
+        task = ProjectionTask(StepDriver(execution, deployed.attachment), context, value.sampler_rows, task_id, targets)
         overlay.prepare(value.rows, context, execution.directory, task)
         result = body(torch.cat(tuple(x[start : start + n] for x, start, n in zip(prompts, done, counts, strict=True))))
         overlay.take_operands()

@@ -73,7 +73,7 @@ def observe_model(workload):
         complete = session.complete_forward
 
         def completed():
-            step = session.step
+            step = session.driver.step
             rows = step.rows.row_batch.rows
             branch, stream, actual, prior_kv, after_kv, access = recordings[
                 min(n for n in recordings if n >= len(rows))
@@ -200,7 +200,7 @@ def observe_replay(*, versions):
         torch.testing.assert_close(wave.output, observed["normal"], rtol=0, atol=0)
         if not any(wave.signature[1]):
             return
-        step = holder["session"].step
+        step = holder["session"].driver.step
         context = step.context
         if context.held_input is None:
             (ref,) = context.publication.after_refs
@@ -229,7 +229,7 @@ def observe_replay(*, versions):
                     block, offset = map(int, access.cell(layer.self_attn.attn.layer_name, row))
                     view = layer.self_attn.attn.kv_cache[block, :, offset, :]
                     history[ordinal, row.token_offset] = view, view.clone()
-            step = holder["session"].step
+            step = holder["session"].driver.step
             seen = {ref for step_id, ref in calls if step_id == step.rows.step_id}
             assert seen == {versions[step.rows.step_id]}
             completed.append(tuple(row.identity for row in self.rows))
@@ -343,9 +343,9 @@ def test_video_session_failure_retains_owner_without_fallback():
     before_execute = VllmSession.before_execute
 
     def preempt(session, scheduler_output):
-        if session.next_step_id == 1:
+        if session.driver.next_step_id == 1:
             assert session.diagnostics().update_count == 1
-            scheduler_output.preempted_req_ids = set(session.request_identities)
+            scheduler_output.preempted_req_ids = set(session.driver.admitted)
         return before_execute(session, scheduler_output)
 
     with patch.object(VllmSession, "before_execute", preempt), pytest.raises(RuntimeError, match="preempt"):

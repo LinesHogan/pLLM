@@ -30,7 +30,6 @@ from pllm.contracts.tensor_layout import LayoutFieldId, TensorDType, TensorField
 from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging, upload
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
-from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_input import StepInput
 
 TAPS_ENV = "PLLM_HIDDEN_TAPS"
@@ -272,9 +271,9 @@ class HiddenTaps:
             hidden_readiness=CudaStreamReadiness(stream),
         )
 
-    def hold(self, context: StateTaskContext) -> None:
-        """Acquire the reader's holds before the runner releases the producer."""
-        context.hold_slots(tuple((self.pools[tap], slots) for tap, slots in self._slots.items()))
+    def holds(self) -> tuple[tuple[SlotPools, Slots], ...]:
+        """This step's producer slots, which the step's readers hold before the runner releases them."""
+        return tuple((self.pools[tap], slots) for tap, slots in self._slots.items())
 
 
 __all__ = ["TAPS_ENV", "HiddenTapAnnouncement", "HiddenTapLayout", "HiddenTaps"]

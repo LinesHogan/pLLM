@@ -36,6 +36,7 @@ from pllm.execution.model_sites import (
     ResultInput,
     StateInput,
     position,
+    state_inputs,
 )
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.request_state import RequestStateDirectory
@@ -70,27 +71,6 @@ def _model_site_meta(
 
 
 model_site.register_fake(_model_site_meta)  # pyright: ignore[reportUnknownMemberType]
-
-
-def _state_inputs(
-    rewrites: tuple[ResidualRewrite, ...], attention_program: AttentionProgram | None
-) -> tuple[StateInput, ...]:
-    """The states the hooks and attention methods read, excluding request memories' own carries."""
-    carries = {rewrite.memory.carry for rewrite in rewrites if rewrite.memory is not None}
-    sources = [
-        source
-        for rewrite in rewrites
-        for _, source in (*rewrite.inputs, *rewrite.read_inputs)
-        if isinstance(source, StateInput) and source not in carries
-    ]
-    if attention_program is not None:
-        sources.extend(
-            source
-            for method in attention_program.methods.values()
-            for _, source in method.inputs
-            if isinstance(source, StateInput)
-        )
-    return tuple(dict.fromkeys(sources))
 
 
 def _prefetch_events(sources: tuple[ResultInput, ...], arena: PageBundleArena) -> dict[ResultInput, torch.cuda.Event]:
@@ -140,7 +120,7 @@ class ModelSites:
         self._activation = activation
         self.count = 0  # rows of the current hook call (vLLM may pad the step's rows)
         self._requests_of = torch.zeros(rows, dtype=torch.long, device=weight.device)
-        self.state_inputs = _state_inputs(rewrites, attention_program)
+        self.state_inputs = state_inputs(rewrites, attention_program)
         self._memories = {
             rewrite.name: SiteMemorySchedule(rewrite, arena, requests, rows)
             for rewrite in rewrites

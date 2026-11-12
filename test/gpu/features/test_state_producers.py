@@ -21,7 +21,7 @@ def _assert_imported_factor_rows(handle, fields, indices):
     """Read the graph's actual page indices, independently of admission and publication order."""
     session = handle.runner.require_session()
     (reader,) = session.parameter_overlay.readers
-    rows = session.step.rows.row_batch
+    rows = session.driver.step.rows.row_batch
     count = next(size for size in reader.programs if size >= rows.total_rows)
     slots, positions, owners = reader.ports(reader.table, count)
     for row in rows.request_rows:
@@ -137,8 +137,8 @@ def test_internal_projection_consumes_pinned_request_factors(workload, monkeypat
             def compare(hidden, desired, pools, table, output, captured, desired_capture):
                 base = output.clone()
                 emit(hidden, desired, pools, table, output, captured, desired_capture)
-                context = session.step.context
-                rows = session.step.rows.row_batch.rows
+                context = session.driver.step.context
+                rows = session.driver.step.rows.row_batch.rows
                 phases.add(frozenset(row.phase for row in rows))
                 for row in rows:
                     ref = context.current_owned_ref(context.selection.ref_for(row.identity, StateResource("factors")))
@@ -261,7 +261,7 @@ def test_composed_readers_replay_model_graphs(workload, monkeypatch):
                 before_execute = session.before_execute
 
                 def preempt(scheduler_output):
-                    scheduler_output.preempted_req_ids = set(session.request_identities)
+                    scheduler_output.preempted_req_ids = set(session.driver.admitted)
                     return before_execute(scheduler_output)
 
                 with monkeypatch.context() as replay:

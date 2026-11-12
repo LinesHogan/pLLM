@@ -31,8 +31,9 @@ from pllm.execution.cuda_stream import PinnedStaging, upload
 from pllm.execution.custom_forward import CustomForwardPrimitive, CustomForwardTask
 from pllm.execution.model_sites import StateInput
 from pllm.execution.overlay_task import ProgramOperand, ProgramOverlay
-from pllm.execution.state_execution import StateExecution, StateTaskContext
+from pllm.execution.state_execution import StateTaskContext
 from pllm.execution.step_capture import capture_graph
+from pllm.execution.step_driver import StepDriver
 from pllm.execution.tensor_frame import OverlayTargetResult
 from pllm.execution.token_program import KV, Save, TokenProgram
 from pllm.execution.token_program_executor import Stream, add, execute_token_program, ordinary_pass
@@ -179,7 +180,7 @@ class VllmCustomForward(CustomForwardPrimitive):
         self,
         model: KvLM,
         task: SemanticTask,
-        execution: StateExecution,
+        driver: StepDriver,
         anchor: AnchorId,
         *,
         activation: VllmActivationPatch | None = None,
@@ -190,8 +191,9 @@ class VllmCustomForward(CustomForwardPrimitive):
     ) -> None:
         assert task.custom_forward is not None
         self.model, self.effect = model.model, task.custom_forward
-        self.execution, self.anchor, self.activation, self.projections = execution, anchor, activation, projections
+        self.driver, self.anchor, self.activation, self.projections = driver, anchor, activation, projections
         self.sites = sites
+        execution = driver.execution
         implementation = execution.arena.plan.scheduled(task.symbol)
         binding = CustomForwardTask.from_implementation(execution.implementation(implementation.implementation_id))
         self.program, self.domain = binding.program, binding.domain
@@ -277,7 +279,7 @@ class VllmCustomForward(CustomForwardPrimitive):
             inputs_embeds = self.model.embed_input_ids(input_ids)
         self.hidden, self.positions = inputs_embeds, positions
         attention_paged_access(get_forward_context(), self.attentions, self.rows)
-        self.execution.execute_anchor(self.context, self.anchor)
+        self.driver.anchor(self.context, self.anchor)
         assert self.output is not None
         return self.output
 

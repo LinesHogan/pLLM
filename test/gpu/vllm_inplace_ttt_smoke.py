@@ -722,11 +722,11 @@ def preemption_replays():
         ) as handle,
     ):
         session = handle.runner.require_session()
-        with patch.object(session, "preempt_requests", wraps=session.preempt_requests) as preempt:
+        with patch.object(session.driver, "schedule", wraps=session.driver.schedule) as schedule:
             outputs = handle.generate(
                 ["The number is"] * 8, SamplingParams(max_tokens=80, temperature=0, ignore_eos=True)
             )
-        assert any(call.args[0] for call in preempt.call_args_list)
+        assert any(call.args[1] for call in schedule.call_args_list)
         assert all(len(output.outputs[0].token_ids) == 80 for output in outputs)
         assert handle.diagnostics().active_states == 0
 

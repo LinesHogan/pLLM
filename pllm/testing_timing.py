@@ -68,6 +68,11 @@ class VersionChecks:
                     self.expected[symbol, str(group.resource), row.identity.request_id] = ref.version_id + int(imported)
         self.history.append(entry)
 
+    def skip(self) -> None:
+        """Forget the step just begun: the engine skips a step whose rows the workload does not read (prompt chunks,
+        recomputed history), and publish_lag counts only the steps it runs."""
+        self.history.pop()
+
     def record(self, task: TensorTask, data: TensorFrame, rows: Sequence[PackedPhaseRow]) -> None:
         """Inspect the version column used by the method, rather than trusting the planned distance."""
         if data.fixed is None:

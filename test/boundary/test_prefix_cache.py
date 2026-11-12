@@ -130,16 +130,11 @@ def test_signed_sensitivity(workload, sensitive):
     assert CachePolicy.for_attachment(changed, "isolate").namespace != policy.namespace
 
 
-@pytest.mark.parametrize("active", ("step", "request_identities", "_pending_identities"))
+@pytest.mark.parametrize("active", ("step", "admitted", "_pending"))
 def test_active_replacement_rejected(active):
-    from pllm.backends.vllm.session import VllmSession
+    from pllm.execution.step_driver import StepDriver
 
     with pytest.raises(RuntimeError, match="finish or abort"):
-        VllmSession.require_idle(
-            SimpleNamespace(
-                **{
-                    name: (True if name == active else None)
-                    for name in ("step", "request_identities", "_pending_identities")
-                }
-            )
+        StepDriver.require_idle(
+            SimpleNamespace(**{name: (True if name == active else None) for name in ("step", "admitted", "_pending")})
         )
