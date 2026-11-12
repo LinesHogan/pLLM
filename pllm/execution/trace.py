@@ -158,6 +158,7 @@ class TraceSelection:
     """Explicit observations only; empty filters match all, disabled flags retain nothing.
 
     Tensor payloads keep at most max_tensor_bytes (a flat prefix if truncated).
+    `states` records each retiring request's newest state fields as RETIRE events (testing.check_on_gpu compares them).
     Kernel profiling uses Kineto for a finite number of task calls, synchronizes,
     and measures real device events, not host operators or CUDA stream spans.
     """
@@ -168,6 +169,7 @@ class TraceSelection:
     names: tuple[str, ...] = ()
     tensors: bool = False
     gradients: bool = False
+    states: bool = False
     max_events: int = 0  # Zero keeps the recorder's current bounded capacity.
     max_tensor_bytes: int = MAX_SNAPSHOT_BYTES
     kernel_calls: int = 0
@@ -325,10 +327,6 @@ class ExecutionTrace:
         ):
             return
         assert not (tensor.is_cuda and torch.cuda.is_current_stream_capturing())
-        shape = tuple(tensor.shape)
-        if tensor.numel() * tensor.element_size() > selection.max_tensor_bytes:
-            count = selection.max_tensor_bytes // tensor.element_size()
-            tensor = torch.take(tensor.detach(), torch.arange(count, device=tensor.device))
         self.record(
             TraceEventKind.GRADIENT if gradient else TraceEventKind.TENSOR,
             invocation_id,
@@ -338,10 +336,32 @@ class ExecutionTrace:
             row=row,
             iteration=iteration,
             tensor_name=name,
-            tensor=tensor,
+            tensor=self._bounded(tensor),
             step_id=step_id,
-            source_shape=shape,
+            source_shape=tuple(tensor.shape),
         )
+
+    @property
+    def records_states(self) -> bool:
+        return self._selection.states
+
+    def retired_state(self, identity: RequestIdentity, name: str, tensor: torch.Tensor) -> None:
+        """Record one field of a retiring request's newest state version."""
+        self.record(
+            TraceEventKind.RETIRE,
+            0,
+            identities=(identity,),
+            tensor_name=name,
+            tensor=self._bounded(tensor),
+            source_shape=tuple(tensor.shape),
+        )
+
+    def _bounded(self, tensor: torch.Tensor) -> torch.Tensor:
+        """The selection's flat prefix of a value larger than max_tensor_bytes."""
+        limit = self._selection.max_tensor_bytes
+        if tensor.numel() * tensor.element_size() <= limit:
+            return tensor
+        return torch.take(tensor.detach(), torch.arange(limit // tensor.element_size(), device=tensor.device))
 
     def profile_tasks(self, tasks: tuple[TaskId, ...]) -> None:
         """Opt-in CUDA event instrumentation; an empty selection disables future timing.

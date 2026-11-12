@@ -919,7 +919,7 @@ pllm.io.Feed(plan: 'PlanBundle', binding: 'FeedBinding', control: 'Connection', 
 pllm.io.StateImport(values: tuple[~T, ...])
     External tensors in field order, visible from the importing call's first step.
 pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), positions: 'tuple[int, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
-pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
+pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, states: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
     Explicit observations only; empty filters match all, disabled flags retain nothing.
 pllm.io.TraceSnapshot(execution_id: 'str', process_id: 'int', events: 'tuple[TraceEvent, ...]', dropped: 'int', capacity: 'int', pending_device_timings: 'int' = 0, export_dropped: 'int' = 0, schema_version: 'int' = 10)
 pllm.io.checkpoint_directory(model: str, revision: str | None = None) -> str
@@ -948,7 +948,7 @@ pllm.testing.ContractError(failures: 'tuple[str, ...]')
 pllm.testing.check(workload: 'Workload', config: 'ModelConfig', *, neutral: 'Workload | None' = None) -> 'CheckResult'
     Check fixed request schedules on CPU using config shapes and the real planner/executor.
 pllm.testing.check_on_gpu(workload: 'Workload', config: 'ModelConfig', *, neutral: 'Workload | None' = None) -> 'CheckResult'
-    Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
+    Load real engines to check planning, eight steady decode anchors, schedule independence and neutral sampling.
 pllm.testing.RequestIdentity(request_id: 'str', prompt_index: 'int', sample_index: 'int', route: 'str' = '')
 pllm.testing.SamplerFeedback(sampler_rows: 'PackedSamplerRowBatch', base_logits: 'torch.Tensor', sampled_tokens: 'torch.Tensor')
 pllm.testing.backend_facts(hidden_size: 'int', hidden: 'tuple[PackedHiddenResourceBinding, ...]' = (), *, device: 'str' = 'cpu', capabilities: 'tuple[str, ...]' = ..., pages: 'int' = 0, max_lineages: 'int' = 2, memory_bytes: 'int' = 10000, max_rows: 'int | None' = None, dtype: 'torch.dtype' = torch.float32, vocab_size: 'int' = 0, layer_count: 'int' = 0, targets: 'Mapping[Projection, tuple[int, int]]' = {}) -> 'BackendCompileFacts'

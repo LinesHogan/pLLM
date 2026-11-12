@@ -6,9 +6,14 @@ provide its seams. The sampler also exposes the FP32 copy seam on both releases.
 release: pyrightconfig.json defines VLLM_027 true for .venv, pyrightconfig.vllm032.json false for .venv-vllm032.
 """
 
+import os
+from collections.abc import Generator
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 from vllm import __version__
+from vllm.envs import disable_envs_cache
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler as VllmSampler
@@ -54,6 +59,7 @@ if VLLM_027:
     from typing import Any
 
     from vllm.config.model import PROCESSED_LOGPROBS_MODES
+    from vllm.model_executor.layers import batch_invariant
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -116,6 +122,7 @@ if VLLM_027:
             return super().dispatch(num_reqs, num_tokens, uniform_token_count, num_active_loras)
 
 else:
+    from vllm.model_executor.determinism import batch_invariant
     from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 
     Worker = VllmWorker
@@ -278,3 +285,46 @@ class Sampler(VllmSampler):
             self.thinking_budget_state.apply(logits, ctx)
 
             return self._apply_sampling_filters(logits, expanded_idx_mapping, idx_mapping_np, skip_top_k_top_p)
+
+
+@contextmanager
+def batch_invariance() -> Generator[None]:
+    """vLLM's batch-invariant kernels (VLLM_BATCH_INVARIANT=1) for the engines started inside, removed on exit.
+
+    vLLM installs them process-wide when an engine starts and never removes them, so this installs them first and
+    afterwards restores the environment, torch's matmul flags and the aten kernels (unless they were installed
+    before). Inside, matmul and linear stay differentiable: on SM80/SM89 vLLM registers CUDA kernels for them, which
+    hides their autograd decomposition ("matmul_backward" fails), so autograd gets stock torch's decomposition into
+    mm/addmm back. 0.27.1 also rebinds torch.bmm, which bypasses dispatch modes (pLLM's memory tracing would launch
+    it on fake tensors); its aten::bmm kernel already covers bmm, so torch's binding stays. vLLM caches its
+    environment once an engine starts, so that cache is dropped on both sides.
+    """
+    installed = batch_invariant._batch_invariant_MODE  # pyright: ignore[reportPrivateUsage]
+    environment = dict(os.environ)
+    matmul, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    precision = matmul.fp32_precision, cudnn.conv.fp32_precision, cudnn.rnn.fp32_precision
+    reduction = matmul.allow_fp16_reduced_precision_reduction, matmul.allow_bf16_reduced_precision_reduction
+    blas, bmm = torch.backends.cuda.preferred_blas_library(), torch.bmm
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    disable_envs_cache()
+    batch_invariant.init_batch_invariance()
+    torch.bmm = bmm
+    autograd = torch.library.Library("aten", "IMPL")
+    for operator in (torch.ops.aten.matmul.default, torch.ops.aten.linear.default):
+        autograd.impl(operator, operator.decompose, "AutogradCUDA")  # pyright: ignore[reportUnknownMemberType]
+    try:
+        yield
+    finally:
+        autograd._destroy()  # pyright: ignore[reportPrivateUsage]
+        if not installed:
+            library = batch_invariant._batch_invariant_LIB  # pyright: ignore[reportPrivateUsage]
+            assert library is not None
+            library._destroy()  # pyright: ignore[reportPrivateUsage]
+            batch_invariant._batch_invariant_LIB = None  # pyright: ignore[reportPrivateUsage]
+            batch_invariant._batch_invariant_MODE = False  # pyright: ignore[reportPrivateUsage]
+            os.environ.clear()
+            os.environ.update(environment)
+            disable_envs_cache()
+            matmul.fp32_precision, cudnn.conv.fp32_precision, cudnn.rnn.fp32_precision = precision
+            matmul.allow_fp16_reduced_precision_reduction, matmul.allow_bf16_reduced_precision_reduction = reduction
+            torch.backends.cuda.preferred_blas_library(blas)

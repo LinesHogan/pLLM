@@ -5,7 +5,7 @@ from __future__ import annotations
 # Diagnostics deliberately inspect the installed session and in-process engine.
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from traceback import extract_tb
 from typing import Concatenate, ParamSpec
 from unittest.mock import patch
@@ -17,25 +17,21 @@ from vllm.v1.request import Request
 
 import pllm
 from pllm.backends.vllm.checkpoint import load_options
-from pllm.backends.vllm.hidden_taps import HiddenTaps
+from pllm.backends.vllm.compat import batch_invariance
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.backends.vllm.overlay_graph import GraphOptions, graph_options
 from pllm.backends.vllm.runtime import VllmLlm, probe_backend, vllm_engine
 from pllm.config import ExecutionOptions, ModelConfig
+from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import CausalTrainBatch, map_host_batch
-from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch
-from pllm.contracts.parameter_overlay import Projection, ProjectionOperands
-from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import AnchorId, TaskId
-from pllm.contracts.state_ref import StateRef
-from pllm.execution.cuda_stream import CudaStreamReadiness
+from pllm.contracts.semantic_graph import AnchorId, StateEffectKind, StateScope, TaskId
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import ProjectionResiduals, StateTaskContext
 from pllm.execution.step_input import StepInput
-from pllm.execution.tensor_program import read_batch
+from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.explanation import explain, explain_facts
 from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, affects_model, check_contracts
 from pllm.workload import Workload
@@ -190,132 +186,84 @@ def _tokens(handle: VllmLlm, temperature: float = 0) -> tuple[tuple[int, ...], .
     return tuple(tuple(output.outputs[0].token_ids) for output in handle.generate(CHECK_PROMPTS, params))
 
 
-@dataclass
-class _Generation:
-    """Token IDs and terminal request states, synchronized only by explicit diagnostics."""
+# Three key groups of different lengths; batched together they are chunked and mix prefill with decode rows.
+_KEY_GROUPS = (*CHECK_PROMPTS, "Continue the even numbers: 2, 4, 6,")
+_REVERSED = (2, 1, 0)
+_TRACE = TraceSelection(states=True, max_events=65536)
 
-    tokens: tuple[tuple[int, ...], ...] = ()
-    states: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=lambda: dict[int, tuple[torch.Tensor, ...]]())
-    taps: dict[tuple[PackedHiddenResourceBinding, int, int], torch.Tensor] = field(
-        default_factory=lambda: dict[tuple[PackedHiddenResourceBinding, int, int], torch.Tensor]()
-    )
 
-    projections: dict[tuple[Projection, int, int], tuple[torch.Tensor, torch.Tensor]] = field(
-        default_factory=lambda: dict[tuple[Projection, int, int], tuple[torch.Tensor, torch.Tensor]]()
-    )
+@dataclass(frozen=True)
+class _Run:
+    """What one generate call let each (prompt, sample) observe: token IDs, exports and terminal request state."""
 
-    def operands(self, value: StepInput, reference: _Generation | None) -> StepInput:
-        """Hold projection inputs fixed per token when the scheduler rebuilds a model-state history."""
-        operands: list[ProjectionOperands] = []
-        for operand in value.operands:
-            rows = tuple(
-                row for row in value.rows.rows if row.identity == operand.identity and row.phase is operand.phase
-            )
-            assert len(rows) == len(operand.hidden)
-            inputs: list[torch.Tensor] = []
-            targets: list[torch.Tensor] = []
-            for index, row in enumerate(rows):
-                key = operand.target, row.identity.prompt_index % len(CHECK_PROMPTS), row.token_offset
-                pair = operand.hidden[index], operand.desired[index]
-                if reference is not None:
-                    pair = reference.projections.get(key, pair)
-                self.projections[key] = pair[0].clone(), pair[1].clone()
-                inputs.append(pair[0])
-                targets.append(pair[1])
-            operands.append(replace(operand, hidden=torch.stack(inputs), desired=torch.stack(targets)))
-        return replace(value, operands=tuple(operands))
+    tokens: dict[tuple[int, int], tuple[int, ...]]
+    values: dict[tuple[int, int, str], torch.Tensor]
 
-    def hidden(self, value: StepInput, reference: _Generation | None, taps: HiddenTaps) -> StepInput:
-        """Keep per-token tap inputs fixed, as in the CPU schedule script, despite base-model rounding."""
-        hidden = value.hidden
-        assert hidden is not None
-        for tap in hidden.taps:
-            # Preserve the producer pool addresses that the workload CUDA graphs captured.
-            storage = tap.storage
-            for row in value.rows.inspect(taps.selected(tap.resource.tap)):
-                key = tap.resource, row.identity.prompt_index % len(CHECK_PROMPTS), row.token_offset
-                slot = int(tap.slots[row.packed_row_index])
-                if reference is not None and key in reference.taps:
-                    storage[slot].copy_(reference.taps[key])
-                self.taps[key] = storage[slot].clone()
-        return replace(
-            value,
-            hidden_readiness=CudaStreamReadiness(torch.cuda.current_stream()),
-        )
+    def merged(self, other: _Run) -> _Run:
+        return _Run(self.tokens | other.tokens, self.values | other.values)
 
-    def compare(self, replayed: _Generation, contract: str = "preempted") -> None:
-        if self.tokens != replayed.tokens:
-            raise ContractError(
-                (
-                    f"[{contract}] greedy tokens changed: {self.tokens} -> {replayed.tokens}; "
-                    "rerun with VLLM_BATCH_INVARIANT=1 to exclude batch-width rounding, "
-                    "then report a pLLM recompute bug if they still differ",
+    def differences(self, other: _Run, contract: str, cause: str) -> list[str]:
+        """Token IDs bitwise; float values within dtype tolerance, since chunking reorders a request's own sums."""
+        failures = [
+            f"[{contract}] prompt {prompt} sample {sample}: token IDs differ from token "
+            f"{next(index for index, (a, b) in enumerate(zip(tokens, theirs)) if a != b)}; {cause}"
+            for (prompt, sample), tokens in self.tokens.items()
+            if tokens != (theirs := other.tokens[prompt, sample])
+        ]
+        for key in self.values.keys() | other.values.keys():
+            prompt, sample, name = key
+            try:
+                assert key in self.values and key in other.values, "missing in one run"
+                torch.testing.assert_close(other.values[key], self.values[key])
+            except AssertionError as error:
+                failures.append(
+                    f"[{contract}] prompt {prompt} sample {sample}, {name}: {str(error).splitlines()[0]}; {cause}"
                 )
-            )
-        self.compare_states(replayed, contract)
-
-    def compare_states(self, replayed: _Generation, contract: str) -> None:
-        """Compare fixed-input state with dtype tolerances; floating transforms may change greedy tokens."""
-        if self.states.keys() != replayed.states.keys():
-            raise ContractError((f"[{contract}] request states disappeared; report a pLLM retirement bug",))
-        for request, fields in self.states.items():
-            for index, (expected, actual) in enumerate(zip(fields, replayed.states[request], strict=True)):
-                try:
-                    torch.testing.assert_close(actual, expected)
-                except AssertionError as error:
-                    raise ContractError(
-                        (f"[{contract}] request {request}, field {index}: {error}; report a pLLM recompute bug",)
-                    ) from error
+        return failures
 
 
-def _state_tokens(handle: VllmLlm, reference: _Generation | None = None) -> _Generation:
-    session = handle.runner.require_session()
-    execution = session.deployment.execution
-    retire = execution.retire
-    execute_part = execution.execute_part
-    result = _Generation()
-
-    def snapshot(identities: tuple[RequestIdentity, ...], *, wait: bool = False) -> tuple[StateRef, ...]:
-        for identity in identities:
-            result.states[identity.prompt_index % len(CHECK_PROMPTS)] = tuple(
-                tensor.detach().cpu()
-                for ref in execution.latest((identity,))
-                for tensor in execution.snapshot(ref, torch.cuda.current_stream(execution.device))
-            )
-        return retire(identities, wait=wait)
-
-    def part(context: StateTaskContext, value: StepInput, task: TaskId, *, complete: bool) -> ProjectionResiduals:
-        if value.overlay_updates and reference is not None:
-            # Captured math has already run. Replay the fixed diagnostic operands from the
-            # input pages, just as eager projection interception does before the authored step.
-            math = execution.math.parameter_overlay
-            assert math is not None
-            before = read_batch(context, "input", math.resource).for_resource(math.resource)
-            private = read_batch(context, "private", math.resource).for_resource(math.resource)
-            for field in range(len(math.buffers) * len(math.targets)):
-                pool, sources = before.field_slots(field)
-                _, destinations = private.field_slots(field)
-                for source, destination in zip(sources, destinations, strict=True):
-                    if source != destination:
-                        pool[destination].copy_(pool[source])
-            value = replace(value, overlay_updates={})
-        return execute_part(context, result.operands(value, reference), task, complete=complete)
-
-    with patch.object(execution, "retire", snapshot), patch.object(execution, "execute_part", part):
-        if session.hidden_taps is None:
-            result.tokens = _tokens(handle)
+def _run(handle: VllmLlm, prompts: tuple[int, ...], params: SamplingParams) -> _Run:
+    """Generate the key groups `prompts` (indices into _KEY_GROUPS, also their prompt identities)."""
+    seen = max((event.sequence for event in handle.trace_snapshot().events), default=0)
+    outputs = handle.generate([_KEY_GROUPS[index] for index in prompts], params, prompt_indices=prompts)
+    tokens = {
+        (prompt, sample): tuple(output.token_ids)
+        for prompt, request in zip(prompts, outputs, strict=True)
+        for sample, output in enumerate(request.outputs)
+    }
+    trace = handle.trace_snapshot()
+    assert not trace.dropped
+    values: dict[tuple[int, int, str], torch.Tensor] = {}
+    for event in trace.events:
+        if event.sequence <= seen or event.tensor_data is None:
+            continue
+        if event.kind is TraceEventKind.RETIRE:
+            (identity,) = event.identities
+            values[identity.prompt_index, identity.sample_index, event.tensor_name or ""] = event.tensor()
         else:
-            taps = session.hidden_taps
-            publish = taps.publish
+            for identity, position, value in zip(event.identities, event.positions, event.tensor(), strict=True):
+                values[identity.prompt_index, identity.sample_index, f"export {event.tensor_name} @{position}"] = value
+    return _Run(tokens, values)
 
-            def hidden(value: StepInput, resources: tuple[PackedHiddenResourceBinding, ...]) -> StepInput:
-                return result.hidden(
-                    publish(value, resources), None if session.custom_forward is not None else reference, taps
-                )
 
-            with patch.object(taps, "publish", hidden):
-                result.tokens = _tokens(handle)
-    return result
+def _isolation_skip(plan: PlanBundle) -> str | None:
+    """Why a request's outputs may legitimately depend on the requests generated with it."""
+    graph = plan.semantic_graph
+    written = {
+        effect.resource for task in graph.tasks for effect in task.effects if effect.kind is not StateEffectKind.READ
+    }
+    shared = sorted(
+        str(state.resource)
+        for state in graph.states
+        if state.scope is StateScope.INSTANCE and state.resource in written
+    )
+    if shared:
+        return (
+            f"InstanceState {', '.join(shared)} is written while generating; solo and batched runs train it differently"
+        )
+    if any(task.read_distance for task in plan.schedule.tasks):
+        return "publish_lag reads see versions by step count, which batching changes"
+    return None
 
 
 class _Eviction:
@@ -338,11 +286,11 @@ class _Eviction:
         return allocation
 
 
-def _preemption(handle: VllmLlm, reference: _Generation) -> _Generation:
+def _preemption(handle: VllmLlm, params: SamplingParams) -> _Run:
     manager = handle.require_llm().llm_engine.engine_core.engine_core.scheduler.kv_cache_manager
     eviction = _Eviction()
     with patch.object(manager, "allocate_slots", new=eviction.wrap(manager.allocate_slots)):
-        result = _state_tokens(handle, reference)
+        result = _run(handle, _REVERSED, params)
     if eviction.request is None or not any(request.num_preemptions for request in eviction.requests.values()):
         raise ContractError(("[preempted] no KV eviction occurred; report a pLLM GPU checker bug",))
     return result
@@ -468,17 +416,34 @@ def _sequence_permutation(workload: Workload, config: ModelConfig) -> None:
         ) from error
 
 
+_ISOLATION = (
+    "vLLM runs batch-invariant kernels here, so the output depends on the requests generated alongside: "
+    "keep workload methods and custom kernels row-local and batch-invariant, else report a pLLM routing bug"
+)
+
+
 def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
+    """Run each key group alone, then all of them batched (reversed, chunked, mixed) and once more with a forced
+    eviction, and compare what every request observed."""
     passed: list[str] = []
     skipped: list[CheckSkip] = []
     failures: list[str] = []
     report = explain(workload, config)
+    requirements = workload.backend_requirements()
+    params = SamplingParams(
+        n=min(2, requirements.sample_limit or 2), temperature=0.8, seed=17, max_tokens=16, ignore_eos=True
+    )
+    batched = None
     with pllm.make_llm(config, workload=workload) as handle:
         try:
             check_probe(workload, config, handle)
             passed.append("explain/probe")
         except ContractError as error:
             failures.extend(error.failures)
+        if requirements.feeds:
+            reason = "a fed state's values follow another process's timing; its protocol tests cover it"
+            return CheckResult(tuple(passed), (CheckSkip("GPU schedules", reason),))
+        handle.select_trace(_TRACE)
         sync = SynchronizationCheck(handle)
         sites = handle.runner.require_session().model_sites
         overlay = handle.runner.require_session().forward_overlay
@@ -492,17 +457,26 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
                 patch.object(overlay, "prepare", sync.overlay) if overlay is not None else nullcontext(),
                 patch.object(handle.runner.require_session(), "prepare_input", sync.input),
             ):
-                baseline = _state_tokens(handle)
+                solo = _run(handle, (0,), params).merged(_run(handle, (1,), params)).merged(_run(handle, (2,), params))
+                batched = _run(handle, _REVERSED, params)
             if (
                 max(len(sync.checked), len(sync.input_checked)) < 8
-                or workload.backend_requirements().input_token_history >= 0
+                or requirements.input_token_history >= 0
                 and sync.token_checked < 8
             ):
                 raise ContractError(("[host syncs] fewer than eight steady decode steps; report a pLLM checker bug",))
             passed.append("host syncs: eight steady decode steps")
         except (RuntimeError, ContractError) as error:
             failures.append(f"[host syncs] {error}; remove host reads/synchronization from the named per-step path")
-            baseline = None
+            solo = None
+        isolation = _isolation_skip(handle.attachment.plan)
+        if isolation is not None:
+            skipped.append(CheckSkip("solo vs batched", isolation))
+        elif solo is not None and batched is not None:
+            differences = solo.differences(batched, "solo vs batched", _ISOLATION)
+            failures.extend(differences)
+            if not differences:
+                passed.append("solo vs batched: reversed, chunked and mixed batches match each key group alone")
         if report.preemption == "reset" and report.recompute_rejection:
             skipped.append(CheckSkip("preempted", report.recompute_rejection))
         elif (
@@ -510,27 +484,29 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
             and handle.attachment.plan.semantic_graph.trains_on_batch
         ):
             skipped.append(CheckSkip("preempted", "instance training needs a caller-provided host batch"))
-        else:
+        elif batched is not None:
             try:
                 with (
                     patch.object(execution, "execute_anchor", sync.anchor),
                     patch.object(execution, "execute_part", sync.part),
                 ):
-                    replayed = _preemption(handle, baseline or _Generation())
-                if baseline is not None:
-                    baseline.compare(replayed)
-                    passed.append("preempted: fixed per-token inputs, token IDs and terminal request state")
+                    evicted = _preemption(handle, params)
+                differences = batched.differences(evicted, "preempted", "report a pLLM recompute bug")
+                failures.extend(differences)
+                if not differences:
+                    passed.append("preempted: a forced eviction and recompute match the batched run")
             except (RuntimeError, ContractError) as error:
                 failures.append(f"[preempted] {error}")
-    if (
-        HiddenPhase.DECODE in workload.backend_requirements().exact_phases
-        and not report.eager_reason
-        and baseline is not None
-    ):
+    if HiddenPhase.DECODE in requirements.exact_phases and not report.eager_reason and batched is not None:
         try:
             with pllm.make_llm(replace(config, cuda_graphs=False), workload=workload) as eager:
-                baseline.compare_states(_state_tokens(eager, baseline), "exact decode")
-            passed.append("exact decode: eager terminal request state on fixed per-token inputs")
+                eager.select_trace(_TRACE)
+                differences = batched.differences(
+                    _run(eager, _REVERSED, params), "exact decode", "the captured graph differs from eager execution"
+                )
+            failures.extend(differences)
+            if not differences:
+                passed.append("exact decode: eager execution matches the captured graphs")
         except (RuntimeError, ContractError) as error:
             failures.append(f"[exact decode] {error}")
     if failures:
@@ -539,20 +515,23 @@ def _workload_checks(workload: Workload, config: ModelConfig) -> CheckResult:
 
 
 def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload | None = None) -> CheckResult:
-    """Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
+    """Load real engines to check planning, eight steady decode anchors, schedule independence and neutral sampling.
 
+    The reference is the workload itself: three prompts are generated one at a time, then together in reverse
+    order (chunked, prefill mixed with decode), then together again while vLLM's KV allocator fails once so a
+    request is evicted and recomputed. Every request's token IDs must match bitwise, its exports and terminal
+    request state within dtype tolerance (chunking and recompute reorder a request's own sums). Exact-decode
+    workloads also compare eager execution with the captured graphs. The check's engines run vLLM's
+    batch-invariant kernels (VLLM_BATCH_INVARIANT=1), removed again when it returns. Instance states written while
+    generating and publish_lag reads make solo and batched runs legitimately differ: that comparison is reported
+    as a skip, as are declared replay rejections.
     Neutral checks compare greedy and seeded token IDs bitwise when model kernels match vanilla.
     Inductor model hooks can change fusion: those compare teacher-forced full-vocabulary distributions
     on greedy and seeded continuations, with mean/P99 KL <= .001/.01 nats (both directions) and
     mean/P99 TV <= .01/.05. Successful checks report the comparison and measured distances.
-    Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
-    and replayed per token, as in the CPU script, to exclude base-model rounding differences; custom forwards
-    regenerate their readouts. Untrained early exits may need VLLM_BATCH_INVARIANT=1 to exclude
-    batch-width rounding during eviction. Causal batches also check that permuting sequences and
-    weights preserves an AdamW update.
+    Causal batches also check that permuting sequences and weights preserves an AdamW update.
     Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
     with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
-    Declared replay rejections are reported as explicit skips.
     Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
     """
     if (
@@ -562,6 +541,11 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
     if config.max_num_seqs < 2 or config.max_model_len < 32:
         raise ValueError("check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script")
+    with batch_invariance():
+        return _gpu_checks(workload, config, neutral)
+
+
+def _gpu_checks(workload: Workload, config: ModelConfig, neutral: Workload | None) -> CheckResult:
     passed: list[str] = []
     skipped: list[CheckSkip] = []
     failures: list[str] = []

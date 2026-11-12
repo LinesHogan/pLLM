@@ -683,12 +683,13 @@ pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind',
 ### `pllm.io.TraceSelection`
 
 ```text
-pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
+pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, states: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
 ```
 
 Explicit observations only; empty filters match all, disabled flags retain nothing.
 
 Tensor payloads keep at most max_tensor_bytes (a flat prefix if truncated).
+`states` records each retiring request's newest state fields as RETIRE events (testing.check_on_gpu compares them).
 Kernel profiling uses Kineto for a finite number of task calls, synchronizes,
 and measures real device events, not host operators or CUDA stream spans.
 
@@ -901,20 +902,23 @@ Model execution, host inputs and shared training exceptions are reported as expl
 pllm.testing.check_on_gpu(workload: 'Workload', config: 'ModelConfig', *, neutral: 'Workload | None' = None) -> 'CheckResult'
 ```
 
-Load real engines to check planning, eight steady decode anchors, replay and neutral sampling.
+Load real engines to check planning, eight steady decode anchors, schedule independence and neutral sampling.
 
+The reference is the workload itself: three prompts are generated one at a time, then together in reverse
+order (chunked, prefill mixed with decode), then together again while vLLM's KV allocator fails once so a
+request is evicted and recomputed. Every request's token IDs must match bitwise, its exports and terminal
+request state within dtype tolerance (chunking and recompute reorder a request's own sums). Exact-decode
+workloads also compare eager execution with the captured graphs. The check's engines run vLLM's
+batch-invariant kernels (VLLM_BATCH_INVARIANT=1), removed again when it returns. Instance states written while
+generating and publish_lag reads make solo and batched runs legitimately differ: that comparison is reported
+as a skip, as are declared replay rejections.
 Neutral checks compare greedy and seeded token IDs bitwise when model kernels match vanilla.
 Inductor model hooks can change fusion: those compare teacher-forced full-vocabulary distributions
 on greedy and seeded continuations, with mean/P99 KL <= .001/.01 nats (both directions) and
 mean/P99 TV <= .01/.05. Successful checks report the comparison and measured distances.
-Forced KV allocation failure exercises vLLM's real eviction/recompute path. Tap and projection inputs are recorded
-and replayed per token, as in the CPU script, to exclude base-model rounding differences; custom forwards
-regenerate their readouts. Untrained early exits may need VLLM_BATCH_INVARIANT=1 to exclude
-batch-width rounding during eviction. Causal batches also check that permuting sequences and
-weights preserves an AdamW update.
+Causal batches also check that permuting sequences and weights preserves an AdamW update.
 Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
 with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
-Declared replay rejections are reported as explicit skips.
 Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
 
 ### `pllm.testing.check_distribution`

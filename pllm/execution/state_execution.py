@@ -956,6 +956,12 @@ class StateExecution:
                 if any(row.identity in retiring for row in context.selection.rows):
                     self.cancel_step(context)
         self.arena.collect_completed(wait=wait)
+        if self.trace.records_states:
+            stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+            for identity in identities:
+                for ref in self.latest((identity,)):
+                    for index, value in enumerate(self.snapshot(ref, stream)):
+                        self.trace.retired_state(identity, f"state {int(ref.layout_id)}.{index}", value)
         refs = self.directory.retire(identities)
         self.trace.record(TraceEventKind.RETIRE, 0, identities=identities, refs=refs)
         return refs
