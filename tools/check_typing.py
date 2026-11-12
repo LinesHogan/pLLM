@@ -17,6 +17,7 @@ UNTYPED_BOUNDARIES = {
     ROOT / "pllm/usage.py",
     ROOT / "pllm/workload.py",
     ROOT / "pllm/execution/freeze.py",
+    ROOT / "pllm/execution/method_dependencies.py",
     ROOT / "pllm/workload_transport.py",
 }
 KERNELS = ROOT / "pllm/kernels"

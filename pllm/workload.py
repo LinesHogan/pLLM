@@ -40,6 +40,7 @@ from pllm.execution.freeze import (
     reachable_functions,
 )
 from pllm.execution.host_runtime import HostConfig
+from pllm.execution.method_dependencies import check_dependencies
 from pllm.execution.method_effects import (
     CustomResidual,
     Effect,
@@ -410,9 +411,9 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
     _declare_result_helpers(context, candidates, seeds)
     _reject_result_cycles(context)
     _freeze_helpers(context, candidates, seeds)
-    context.bindings = tuple(
-        (key, fingerprint(value)) for key, value in sorted(values.items()) if not isinstance(value, Workload)
-    )
+    configuration = {key: value for key, value in sorted(values.items()) if not isinstance(value, Workload)}
+    check_dependencies(configuration)
+    context.bindings = tuple((key, fingerprint(value)) for key, value in configuration.items())
     for name, member in members.items():
         if _property(member):
             values[name] = object.__getattribute__(owner, name)
@@ -544,6 +545,7 @@ def _freeze_helpers(context: WorkloadContext, candidates: dict[str, FunctionType
         if name in reachable:
             function = context.method(name)
             with context.declaring(name):
+                check_dependencies(function)
                 context.signature.append((name, fingerprint(function)))
             object.__setattr__(context.owner, name, freeze(function))
 

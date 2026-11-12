@@ -11,7 +11,7 @@ from torch import nn
 
 import pllm
 from pllm import testing
-from pllm.execution.freeze import fingerprint
+from pllm.execution.method_dependencies import check_dependencies
 
 
 def fill_probe(fields, generator):
@@ -185,7 +185,7 @@ def test_pretrained_boundary_messages_and_import_first_export(tmp_path):
     for captured in (nn.Linear(4, 1), torch.ones(4)):
         factory = lambda m: captured
         with pytest.raises(ValueError, match="pretrained="):
-            fingerprint(factory)
+            check_dependencies(factory)
     assert testing.check(workload, config).passed
     imported = replace(workload, state=replace(state, init=pllm.Imported()))
     tap = testing.final_hidden_binding(1)

@@ -6,7 +6,6 @@ import sys
 import typing
 
 import pytest
-import torch
 
 import pllm
 from pllm.backends.vllm.prefix_cache import CachePolicy
@@ -51,9 +50,6 @@ def test_literal_lookups_have_stable_identity(expression):
         ('getattr(x, name, "dtype")', 'getattr(obj, "field")'),
         ("getattr(x.method(1, 2), name)", 'getattr(obj, "field")'),
         ("hasattr(x, name)", 'hasattr(obj, "field")'),
-        ("setattr(x, name, 1)", "return the value instead"),
-        ('setattr(x, "dtype", name)', "declare pllm.RequestState/pllm.InstanceState"),
-        ('lambda: setattr(x, "dtype", name)', "return a state update"),
         ("vars()", "vars(obj)"),
         ("globals()", "config fields"),
         ("locals()", "local variables directly"),
@@ -96,22 +92,6 @@ def test_standard_module_names(module, member):
 def test_opaque_namespace_explains_config_boundary():
     with pytest.raises(ValueError, match="sys:.*compute other values outside the workload"):
         fingerprint(eval("lambda: namespace.version", {"namespace": sys}))
-
-
-@pytest.mark.parametrize(
-    "expression",
-    (
-        "torch.ops.mylab.add(x)",
-        'getattr(torch, "ops").mylab.add(x)',
-        "torch.ops.mylab",
-        "op(x)",
-        "namespace.add(x)",
-    ),
-)
-def test_dispatcher_lookup_needs_the_op_object(expression):
-    namespace = {"torch": torch, "op": torch.ops.kernel_test.add, "namespace": torch.ops.kernel_test}
-    with pytest.raises(ValueError, match="call the op object.*sign its source"):
-        fingerprint(eval(f"lambda x: {expression}", namespace))
 
 
 def test_triton_source_changes_workload_and_cache_identity():

@@ -29,6 +29,7 @@ import torch
 from triton.runtime import JITFunction
 
 from pllm.contracts.codec import boundary_digest
+from pllm.execution.method_dependencies import OP_ACCESS, check_op_access, global_names
 from pllm.execution.torch_private import CustomOpDef, custom_op, dispatcher_namespace
 
 G = TypeVar("G", bound=Callable[..., object])
@@ -53,7 +54,7 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
     namespace = dispatcher_namespace(value)
     if namespace is not None:
         if namespace not in ("", "aten", "prims"):
-            raise ValueError(_OP_ACCESS)
+            raise ValueError(OP_ACCESS)
         return boundary_digest(str(value), torch.__version__)
     module = getattr(value, "__module__", None)
     name = getattr(value, "__qualname__", None)
@@ -63,8 +64,8 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
         return fingerprint(value.__func__, seen)
     if isinstance(value, FunctionType):
         closure = getclosurevars(value)
-        _check_op_access(value.__code__, {**value.__globals__, **closure.nonlocals})
-        globals_used = _global_names(value.__code__)
+        check_op_access(value.__code__, {**value.__globals__, **closure.nonlocals})
+        globals_used = global_names(value.__code__)
         imports = _builtin_dependencies(value)
         dependencies = {
             **{key: value.__globals__[key] for key in globals_used if key in value.__globals__},
@@ -124,12 +125,6 @@ def fingerprint(value: object, seen: frozenset[int] = frozenset()) -> str:
             f"{value.__qualname__}: workload methods may reference torch and pllm classes and the author's "
             "nn.Module subclasses, enums and dataclasses"
         )
-    if isinstance(value, (torch.nn.Module, torch.Tensor)):
-        raise ValueError(
-            f"{type(value).__name__}: a workload cannot hold a module or tensor; save its weights and declare "
-            "pllm.InstanceState(init=pllm.FromModule(<factory>, pretrained=path)), or field state with "
-            "init=pllm.Pretrained(path)"
-        )
     if is_dataclass(value):
         return boundary_digest(
             type(value).__qualname__,
@@ -174,66 +169,7 @@ def _code(code: CodeType) -> CodeType:
     )
 
 
-def _global_names(code: CodeType) -> set[str]:
-    names = {str(instruction.argval) for instruction in get_instructions(code) if instruction.opname == "LOAD_GLOBAL"}
-    for value in code.co_consts:
-        if isinstance(value, CodeType):
-            names.update(_global_names(value))
-    return names
-
-
-_OP_ACCESS = (
-    "call the op object you defined with torch.library.custom_op (from mykernels import gated_add), "
-    "not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims "
-    "only for built-in operators"
-)
-
-
-def _builtin_op_access(instructions: tuple[Instruction, ...]) -> bool:
-    return bool(
-        instructions
-        and instructions[0].opname in ("LOAD_ATTR", "LOAD_METHOD")
-        and instructions[0].argval in ("aten", "prims")
-    )
-
-
-def _check_op_access(code: CodeType, globals_used: dict[str, object]) -> None:
-    """Reject dispatcher lookups whose implementation a module version cannot identify."""
-    instructions = tuple(get_instructions(code))
-    aliases: dict[str, object] = {}
-    imported = ""
-    for index, item in enumerate(instructions):
-        tail = instructions[index + 1 :]
-        if item.opname == "IMPORT_NAME":
-            imported = str(item.argval)
-            if imported == "torch" and tail and tail[0].opname == "STORE_FAST":
-                aliases[str(tail[0].argval)] = torch
-        if item.opname == "IMPORT_FROM" and item.argval == "ops" and imported == "torch":
-            raise ValueError(_OP_ACCESS)
-        dependency = (
-            globals_used.get(str(item.argval))
-            if item.opname in ("LOAD_GLOBAL", "LOAD_DEREF")
-            else aliases.get(str(item.argval))
-            if item.opname == "LOAD_FAST"
-            else None
-        )
-        if dependency is torch and tail:
-            if tail[0].opname == "STORE_FAST":
-                aliases[str(tail[0].argval)] = torch
-            if tail[0].argval == "ops" and not _builtin_op_access(tail[1:]):
-                raise ValueError(_OP_ACCESS)
-            if tail[0].argval in ("__dict__", "_ops"):
-                raise ValueError(_OP_ACCESS)
-        if dependency is torch.ops and not _builtin_op_access(tail):
-            raise ValueError(_OP_ACCESS)
-    for value in code.co_consts:
-        if isinstance(value, CodeType):
-            _check_op_access(value, globals_used)
-
-
 _REJECTED_BUILTINS = {
-    "setattr": "setattr() creates hidden mutable state; return the value instead, or declare "
-    "pllm.RequestState/pllm.InstanceState and return a state update",
     "globals": "globals() exposes unsigned globals; pass the needed values as workload config fields",
     "locals": "locals() exposes the runtime namespace; name the needed local variables directly",
     "eval": "eval() hides code dependencies; write the expression in a Python helper function",
@@ -371,7 +307,7 @@ def freeze(function: G) -> G:
         return cast(G, MethodType(freeze(function.__func__), function.__self__))
     if not isinstance(function, FunctionType):
         raise TypeError(f"{function!r}: workload operations must be Python functions")
-    globals_used = _global_names(function.__code__)
+    globals_used = global_names(function.__code__)
     global_values = dict(function.__globals__)
     for key in globals_used & global_values.keys():
         value = global_values[key]
