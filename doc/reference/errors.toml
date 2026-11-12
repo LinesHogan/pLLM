@@ -1,0 +1,1007 @@
+# pLLM 的报错：原文、原因、改法，英文与中文各一列。
+#
+# 这是报错表唯一的出处：tools/check_docs.py --write-generated 从它生成 doc/reference/errors.md（中文）和
+# doc/agent/pitfalls.md 的报错表（英文），docs 检查确认生成的表是最新的、每条原文仍在 pLLM 的源码里。
+# message 写报错原文，`...` 代表随用户代码变化的部分（方法名、状态名、尺寸）；改了报错的提交同时改这里的那一行。
+
+[[section]]
+en = "Method inputs and declarations"
+zh = "声明与输入"
+
+[[section.error]]
+message = '''...: give every input a source as its default, e.g. ...'''
+why = '''pLLM decides what a method reads from its parameter defaults; the annotation is only for you.'''
+fix = '''Give every parameter after `self` a marker default: `h: torch.Tensor = pllm.hidden(0)`.'''
+why_zh = '''pLLM 只从参数默认值知道每个输入读什么，不按参数名猜'''
+fix_zh = '''给 `self` 之后的每个参数写来源，如 `h: torch.Tensor = pllm.hidden(0)`'''
+
+[[section.error]]
+message = '''the workload has no effect on the model: add @pllm.train, ...'''
+why = '''Nothing schedules a method whose result goes nowhere.'''
+fix = '''Add the decorator that says where the result goes. An undecorated method only runs as a `rows=` selector or as a `pllm.result` producer for a decorated one.'''
+why_zh = '''没有去处的计算不会被安排'''
+fix_zh = '''给方法加效果装饰器，或声明 `ActivationPatch` / `Adapter`；不带装饰器的方法只作为 `rows=` 选择器或 `pllm.result` 的来源运行'''
+
+[[section.error]]
+message = '''a method takes one pLLM decorator of each kind; split stacked effects into one method per effect'''
+why = '''One method has one destination; a second decorator would overwrite the first.'''
+fix = '''One method per effect; share math through a module-level helper function or `pllm.result(name)`. `@pllm.on` and `@pllm.differentiate` may sit next to an effect decorator.'''
+why_zh = '''一个方法只有一个去处，后一个装饰器会覆盖前一个'''
+fix_zh = '''一个效果一个方法，用模块级函数或 `pllm.result` 共享计算；`@pllm.on`、`@pllm.differentiate` 可以和效果装饰器并存'''
+
+[[section.error]]
+message = '''property ... needs a return annotation; annotate state declarations with -> pllm.RequestState or -> pllm.InstanceState, and other properties with their return type'''
+why = '''pLLM reads declarations from annotations without calling the property.'''
+fix = '''Annotate state properties `-> pllm.RequestState` / `-> pllm.InstanceState`, model-site properties `-> pllm.model.Adapter` / `-> pllm.model.ActivationPatch`, other properties with their type.'''
+why_zh = '''pLLM 不执行 getter 也要认出哪些属性是声明'''
+fix_zh = '''给 property 写返回类型：状态写 `-> pllm.RequestState` / `-> pllm.InstanceState`，模型改写写 `-> pllm.model.Adapter` / `-> pllm.model.ActivationPatch`'''
+
+[[section.error]]
+message = '''... is not a declared state of ...'''
+why = '''A method names a state the workload does not declare.'''
+fix = '''Check the spelling; a state whose shape depends on settings is a typed property.'''
+why_zh = '''方法读的状态名不存在'''
+fix_zh = '''检查拼写；形状依赖设置的状态写成带类型的 property'''
+
+[[section.error]]
+message = '''pllm.parameter(..., ...) names no declared field; declared: ...'''
+why = '''The field name is not one the state declares.'''
+fix = '''Use a listed name. A `shape=` state has the single field `"value"`; an `init=pllm.FromModule(...)` state is read with `pllm.module(state)`.'''
+why_zh = '''字段名不存在'''
+fix_zh = '''用报错列出的名字；`shape=` 声明的状态只有字段 `"value"`；`FromModule` 状态用 `pllm.module` 读'''
+
+[[section.error]]
+message = '''...: pllm.module needs a state declared with init=pllm.FromModule(...)'''
+why = '''Only a module state can be called like a module.'''
+fix = '''Declare `init=pllm.FromModule(lambda m: nn.Linear(...))`, or read fields with `pllm.parameter`.'''
+why_zh = '''只有模块状态能当模块调用'''
+fix_zh = '''用 `pllm.parameter` 读字段，或改用 `init=pllm.FromModule(...)`'''
+
+[[section.error]]
+message = '''... names no method of ...'''
+why = '''A `rows=`, `pllm.result` or setting refers to a method that does not exist.'''
+fix = '''Check the method name.'''
+why_zh = '''`rows=`、`pllm.result` 或设置引用的方法不存在'''
+fix_zh = '''检查方法名'''
+
+[[section.error]]
+message = '''... and ... both declare ...; compose them as fields instead of inheriting from both'''
+why = '''With multiple inheritance, declarations of the same name overwrite each other.'''
+fix = '''Hold both workloads as dataclass fields (components).'''
+why_zh = '''多重继承时同名声明会互相覆盖'''
+fix_zh = '''把两个负载声明成字段（组件）'''
+
+[[section.error]]
+message = '''...: components are independent; to share state, put both methods in one workload'''
+why = '''A component must behave as it does alone, so it cannot read another component's state.'''
+fix = '''Put the methods that share state in one workload.'''
+why_zh = '''组件必须和单独运行时一样，不能读别的组件的状态'''
+fix_zh = '''共享状态的方法写进同一个负载'''
+
+[[section.error]]
+message = '''...: a workload cannot hold a module or tensor; save its weights and declare ...'''
+why = '''A workload is a declaration hashed into its identity; tensors belong in state that pLLM places and pages.'''
+fix = '''Save the tensor to safetensors and declare state with `init=pllm.Pretrained(path)` or `init=pllm.FromModule(factory, pretrained=path)`, or import it with `init=pllm.Imported()`.'''
+why_zh = '''负载只是声明，会被哈希成它的身份；张量要放进由 pLLM 分配显存的状态'''
+fix_zh = '''把张量存成 safetensors，用 `init=pllm.Pretrained(path)` 或 `init=pllm.FromModule(factory, pretrained=path)` 声明状态，或用 `init=pllm.Imported()` 导入'''
+
+[[section.error]]
+message = '''...: workload methods may use only torch, math, pllm, triton, typing, collections.abc and builtins modules; ...'''
+why = '''Method code is frozen and hashed; other modules (numpy, your utilities) cannot be traced or shipped to workers.'''
+fix = '''Compute such values outside and pass them as workload fields (plain numbers, tuples, strings).'''
+why_zh = '''方法代码会被冻结和哈希；别的模块（numpy、你的工具函数）无法追踪，也无法送进子进程'''
+fix_zh = '''在外面算好，作为负载字段（数字、元组、字符串）传进来'''
+
+[[section.error]]
+message = '''...: workload methods may reference torch and pllm classes and the author's nn.Module subclasses, enums and dataclasses'''
+why = '''A method referenced a mutable global or class attribute (for example a counter).'''
+fix = '''Keep per-request memory in `pllm.RequestState`, progress in `pllm.version(state)`, settings in frozen dataclass fields.'''
+why_zh = '''方法引用了可变的全局变量或类属性（例如计数器）'''
+fix_zh = '''每请求的记忆放进 `pllm.RequestState`，进度用 `pllm.version(state)`，设置写成冻结 dataclass 的字段'''
+
+[[section.error]]
+message = '''key_fields=...: use names from ...'''
+why = '''Request state is keyed by a fixed set of request facts.'''
+fix = '''Use `"request_id"`, `"prompt_index"`, `"sample_index"` or `"route"`.'''
+why_zh = '''请求状态只能按固定几种请求属性分组'''
+fix_zh = '''用 `"request_id"`、`"prompt_index"`、`"sample_index"` 或 `"route"`'''
+
+[[section.error]]
+message = '''request key fields must be closed, sorted, and unique'''
+why = '''`key_fields` lists each name once, in the order `request_id`, `prompt_index`, `sample_index`, `route`.'''
+fix = '''Reorder or deduplicate, e.g. `key_fields=("prompt_index",)`.'''
+why_zh = '''`key_fields` 每个名字只写一次，按 `request_id`、`prompt_index`、`sample_index`、`route` 的顺序'''
+fix_zh = '''调整顺序或去掉重复，例如 `key_fields=("prompt_index",)`'''
+
+[[section.error]]
+message = '''pllm.residual(after=...): use "layer" or "attention"'''
+why = '''The residual stream is readable after a whole layer or after its attention.'''
+fix = '''Pass `after="layer"` (the default) or `after="attention"`.'''
+why_zh = '''残差流只能在整层之后或 attention 之后读'''
+fix_zh = '''`after="layer"`（默认）或 `after="attention"`'''
+
+[[section.error]]
+message = '''pllm.input_tokens(history=) needs a nonnegative integer'''
+why = '''`history` counts tokens before the current one.'''
+fix = '''Pass `history=0` or more.'''
+why_zh = '''`history` 是当前 token 之前的 token 数'''
+fix_zh = '''传大于等于 0 的整数'''
+
+[[section.error]]
+message = '''pllm.attention needs a nonnegative layer and fact='aux' or 'lse''''
+why = '''Attention facts exist per layer and are either the auxiliary output or the log-sum-exp.'''
+fix = '''Pass a layer index `>= 0` and `fact="aux"` or `fact="lse"`.'''
+why_zh = '''attention 的量按层存在，只有辅助输出和 log-sum-exp 两种'''
+fix_zh = '''层号大于等于 0，`fact="aux"` 或 `fact="lse"`'''
+
+[[section.error]]
+message = '''... reads tokens="all" rows; only @pllm.export methods read them, and without pllm.result inputs. Export the rows, or read tokens="prefill" or "decode"'''
+why = '''`tokens="all"` gives one row per computed token, which no other effect can align with requests.'''
+fix = '''Export those rows, or read `tokens="decode"` / `tokens="prefill"`.'''
+why_zh = '''`tokens="all"` 每个算出的 token 一行，别的效果无法按请求对齐'''
+fix_zh = '''只在 `@pllm.export` 里读它，其他方法读 `tokens="decode"` 或 `tokens="prefill"`'''
+
+[[section]]
+en = "Phases: when a value exists"
+zh = "阶段：值什么时候存在"
+
+[[section.error]]
+message = '''a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase'''
+why = '''A `@pllm.on(phase)` or the effect's default phase places the method before its input exists.'''
+fix = '''Before sampling read `pllm.layer_logits((-1,))`; read sampler results in `@pllm.train` or `@pllm.on(pllm.Phase.AFTER_SAMPLE)`.'''
+why_zh = '''值在产生它的阶段之前不存在，例如采样结果在采样之后才有'''
+fix_zh = '''采样前读 logits 用 `pllm.layer_logits((-1,))`；读采样结果的方法放进 `@pllm.train` 或 `@pllm.on(pllm.Phase.AFTER_SAMPLE)`'''
+
+[[section.error]]
+message = '''sampler method ... reads pllm...() through ..., which is available only in Phase.AFTER_SAMPLE.'''
+why = '''`pllm.base_logits()` and `pllm.sampled_tokens()` exist only after the sampler has drawn.'''
+fix = '''Before sampling read `pllm.layer_logits((-1,))` (the model's logits) or `pllm.final_hidden()`.'''
+why_zh = '''`pllm.base_logits()` 和 `pllm.sampled_tokens()` 在采样之后才存在'''
+fix_zh = '''采样前读 `pllm.layer_logits((-1,))`（模型的 logits）或 `pllm.final_hidden()`'''
+
+[[section.error]]
+message = '''...: sampled tokens are readable only beside @pllm.add_logits, by the train operation or by read-only operations that feed it'''
+why = '''Sampler feedback goes only to the training method of a workload that also adds logits, and to read-only helpers feeding that training.'''
+fix = '''Add the `@pllm.add_logits` method the feedback trains, or take tokens from `RequestOutput` on the host. Training that does not need the drawn token reads `pllm.final_hidden()` or `pllm.layer_logits((-1,))`.'''
+why_zh = '''采样反馈只交给同时有 `@pllm.add_logits` 的负载的训练方法，以及喂给它的只读辅助方法'''
+fix_zh = '''加上反馈要训练的 `@pllm.add_logits` 方法，或在宿主上从 `RequestOutput` 取 token；不需要采样结果的训练读 `pllm.final_hidden()` 或 `pllm.layer_logits((-1,))`'''
+
+[[section.error]]
+message = '''...: an export and the helpers it reads run read-only in Phase.AFTER_FORWARD on hidden rows, state and results; read the value from a helper without state writes or phase overrides'''
+why = '''Exports run after the forward; they cannot read sampler feedback and their helpers cannot write or move phase.'''
+fix = '''Export hidden rows, state or results only; sampled token ids are in each `RequestOutput`.'''
+why_zh = '''导出在 forward 之后运行，读不到采样反馈，它读的辅助方法也不能写状态或改阶段'''
+fix_zh = '''只导出 hidden、状态或结果；采样出的 token 在每个 `RequestOutput` 里'''
+
+[[section.error]]
+message = '''tensor inputs need one phase; hidden inputs become available after model forward'''
+why = '''`@pllm.on(Phase.BEFORE_FORWARD)` on a method that reads this step's hidden rows.'''
+fix = '''Remove the `@pllm.on`; effects have correct default phases.'''
+why_zh = '''读本步 hidden 的方法被 `@pllm.on(Phase.BEFORE_FORWARD)` 放到了 forward 之前'''
+fix_zh = '''去掉 `@pllm.on`，效果的默认阶段就是对的'''
+
+[[section.error]]
+message = '''...; results can only flow one way within a step, remove one of the reads'''
+why = '''Results of one step form a graph without cycles: two methods read each other's result.'''
+fix = '''Break the cycle; pass a value to the next step through state (`@pllm.write`) instead.'''
+why_zh = '''两个方法在同一步互读对方的结果，没有先后'''
+fix_zh = '''去掉一个读取；要传到下一步就经过状态（`@pllm.write`）'''
+
+[[section]]
+en = "Method bodies"
+zh = "方法体"
+
+[[section.error]]
+message = '''while shape tracing method ...; methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values'''
+why = '''PyTorch raises "Tensor.item() cannot be called on meta tensors" and pLLM adds this note. pLLM traces methods on shape-only tensors to plan memory and capture graphs; host reads have no value there and would stall the engine.'''
+fix = '''Remove `.item()`, `.tolist()`, `.cpu()`, `float(tensor)`, `print(tensor)` and `if tensor ...:`; use masks and `torch.where`; watch values with `@pllm.export`.'''
+why_zh = '''PyTorch 先报 "Tensor.item() cannot be called on meta tensors"，pLLM 附上这条说明。方法在构建时只按形状追踪，运行时在 CUDA graph 里重放'''
+fix_zh = '''去掉 `.item()`、`.tolist()`、`.cpu()`、`print(tensor)`、按张量值的 `if`；用掩码和 `torch.where`，看数值用 `@pllm.export`'''
+
+[[section.error]]
+message = '''methods run inside CUDA graphs, so outputs need shapes fixed by the inputs; return a fixed-size tensor and a tensor mask instead of ...'''
+why = '''An output whose shape depends on the data (dropping rows by a condition, `ctx.new_dynamic_size()`) cannot be captured in a graph.'''
+fix = '''Return a fixed-size tensor and a mask.'''
+why_zh = '''输出形状随数据变化（按条件删行、`ctx.new_dynamic_size()`）无法录进 graph'''
+fix_zh = '''返回固定大小的张量加掩码'''
+
+[[section.error]]
+message = '''methods run inside CUDA graphs, so Python cannot branch on tensor values (if, while or break on a tensor); ...'''
+why = '''An `if`, `while` or `break` on a tensor (often in a `@pllm.custom_forward` loop) makes each step compute something different.'''
+fix = '''Loop a fixed number of times and select rows with `torch.where`; in a `custom_forward` use `layers(..., active=mask)` so finished rows stay unchanged (needs `tokens="decode"`).'''
+why_zh = '''按张量值的 `if`、`while`、`break`（多见于 `@pllm.custom_forward` 的循环）让每步算的东西随数据变化'''
+fix_zh = '''循环固定次数，用 `torch.where` 选行；`custom_forward` 里用 `layers(..., active=mask)` 让已停下的行保持不变（需 `tokens="decode"`）'''
+
+[[section.error]]
+message = '''... cannot compile as one full graph: ...'''
+why = '''The method contains an operation that cannot be compiled as one graph.'''
+fix = '''Use traceable tensor operations; give your own operators a fake implementation; or set `ExecutionOptions(allow_numerical_transforms=False)`.'''
+why_zh = '''方法里有不能整图编译的操作'''
+fix_zh = '''用可追踪的张量操作；自写算子给出 fake 实现；或 `ExecutionOptions(allow_numerical_transforms=False)`'''
+
+[[section]]
+en = "Effects and results"
+zh = "效果与结果"
+
+[[section.error]]
+message = '''... both declare @pllm.guide_sampling; keep at most one guidance method'''
+why = '''The sampler applies one guidance per step (components included); how to combine two predictions is the algorithm's choice.'''
+fix = '''Keep one `@pllm.guide_sampling` that combines the predictions. Several `@pllm.add_logits` methods may coexist; their sum applies before guidance.'''
+why_zh = '''采样器每步只按一个预测加权（组件也算在内）；两个预测怎样合成是算法的选择'''
+fix_zh = '''在一个方法里合成一个预测；其余修正用 `@pllm.add_logits`，多个可以并存'''
+
+[[section.error]]
+message = '''@pllm.add_logits method ... must return [rows, vocab_size] = ...; got ...'''
+why = '''The result is added to the full-vocabulary logits.'''
+fix = '''Return `[rows, vocab]`: read `pllm.layer_logits((-1,))` and return `logits[:, -1]`-shaped tensors, or project hidden states to the vocabulary.'''
+why_zh = '''返回值会加到整个词表的 logits 上'''
+fix_zh = '''返回 `[rows, vocab]`：读 `pllm.layer_logits((-1,))` 返回 `logits[:, -1]` 形状的张量，或把 hidden 投影到词表'''
+
+[[section.error]]
+message = '''@pllm.guide_sampling method ... must return a hidden-state prediction [rows, hidden_size] = ...; got ...'''
+why = '''pLLM projects the prediction with the model's LM head and pushes sampling away from it.'''
+fix = '''Return `[rows, hidden_size]` (e.g. a prediction of `pllm.final_hidden()`); to add logits directly, use `@pllm.add_logits`.'''
+why_zh = '''pLLM 用模型的 LM head 把预测投影成 logits，再让采样远离它'''
+fix_zh = '''返回 `[rows, hidden_size]` 的预测；想直接加 logits 用 `@pllm.add_logits`'''
+
+[[section.error]]
+message = '''tensor export needs positive every, max_rows and max_cols, with max_cols * 8 <= ... bytes (32 KiB), so one row fits an export event'''
+why = '''One export event carries whole rows of 8-byte values, at most 32 KiB.'''
+fix = '''Lower `max_cols` to at most 4096; compress wider rows in the method (e.g. top-k ids) or split them into several exports.'''
+why_zh = '''导出值按每个 8 字节传回，一行必须装进一个 32 KiB 的导出事件'''
+fix_zh = '''`max_cols` 不超过 4096；更宽的向量先在方法里压缩（如 top-k 编号）或拆成几个导出'''
+
+[[section.error]]
+message = '''export overflow must be 'drop' or 'block''''
+why = '''A full export queue either drops events or blocks.'''
+fix = '''Pass `"drop"` (the default) or `"block"`.'''
+why_zh = '''导出队列满时只有丢弃和阻塞两种行为'''
+fix_zh = '''`"drop"`（默认）或 `"block"`'''
+
+[[section.error]]
+message = '''@pllm.write needs distinct field names and no rows=; it writes every row'''
+why = '''A write publishes a whole new version of the state.'''
+fix = '''Keep rows you do not want to change with `torch.where`.'''
+why_zh = '''写入发布整份新版本'''
+fix_zh = '''用 `torch.where` 保留不想改的行'''
+
+[[section.error]]
+message = '''write must return a tuple matching its declared fields'''
+why = '''`@pllm.write` returns one tensor per declared field.'''
+fix = '''Return a tuple, even for one field: `return (new_value,)`.'''
+why_zh = '''`@pllm.write` 每个声明的字段返回一个张量'''
+fix_zh = '''总是返回元组，只有一个字段也写 `return (new_value,)`'''
+
+[[section.error]]
+message = '''... and ... both write state ... from the same version; let one method write it'''
+why = '''Two writers of one state in one step would each overwrite the other's version.'''
+fix = '''One writer per state: one `@pllm.write` method (writing all its fields) or one `@pllm.train`, not both.'''
+why_zh = '''同一版本只能有一个写入者，否则两个写入互相覆盖'''
+fix_zh = '''合并成一个方法：一个写全部字段的 `@pllm.write`，或一个 `@pllm.train`'''
+
+[[section.error]]
+message = '''StateImport supplies one imported resource per workload; ... are imported'''
+why = '''One `StateImport` fills one state per call.'''
+fix = '''Merge the imported states into one state with several fields.'''
+why_zh = '''一次导入只写一个状态'''
+fix_zh = '''把要导入的状态合并成一个多字段的状态'''
+
+[[section.error]]
+message = '''... requires publish_lag=...; the engine uses publish_lag=...; all components must use the engine-wide lag'''
+why = '''There is one timeline of state versions per engine.'''
+fix = '''Use one `publish_lag` for the engine and every component.'''
+why_zh = '''引擎只有一条状态版本的时间线，也就只有一个 `publish_lag`'''
+fix_zh = '''引擎和各组件统一设置'''
+
+[[section]]
+en = "State and training"
+zh = "状态与训练"
+
+[[section.error]]
+message = '''@pllm.train reads ..., which trains with ...; declare ... with optimizer=...'''
+why = '''The batch fields a training method reads pick the training mode, and each mode has one optimizer.'''
+fix = '''Put the optimizer the message names on the state: request rows and `WeightedRowBatch` / `CausalTrainBatch` use `pllm.AdamW(lr)`, `WeightedCEBatch` uses `pllm.SGD(lr)`.'''
+why_zh = '''训练方式由方法读的输入决定，优化器写在状态上'''
+fix_zh = '''给状态加报错里说的优化器：请求行和 `WeightedRowBatch` / `CausalTrainBatch` 用 `pllm.AdamW(lr)`，`WeightedCEBatch` 用 `pllm.SGD(lr)`'''
+
+[[section.error]]
+message = '''training methods return one loss per row; pLLM reduces the selected rows per state'''
+why = '''Only pLLM knows which rows of a step are padding and which state each row belongs to.'''
+fix = '''Return a `[rows]` loss; do not `.mean()` it. `reduction="mean"` (default) or `"sum"` reduces per state.'''
+why_zh = '''只有 pLLM 知道一步里哪些行是填充、哪些行属于哪份状态'''
+fix_zh = '''返回 `[rows]` 的 loss，不要自己 `.mean()`；按状态归约由 `reduction="mean"`（默认）或 `"sum"` 决定'''
+
+[[section.error]]
+message = '''rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows='''
+why = '''Training next to guidance (or alone) updates and publishes every running request's state each step.'''
+fix = '''Remove `rows=` from `@pllm.train`; select rows on the sampler method (`@pllm.guide_sampling(rows="method")`), or use `reduction="sum"` with zero weights.'''
+why_zh = '''这条训练路径每步给每个状态做一次更新并发布新版本，不支持按行跳过'''
+fix_zh = '''去掉训练方法上的 `rows=`，在 `@pllm.guide_sampling(rows=...)` 上选行，或用 `reduction="sum"` 把要排除的行的 loss 乘 0'''
+
+[[section.error]]
+message = '''... trains on ... but ... on ...; pLLM funds one training mode per workload, so move one of them to a separate workload'''
+why = '''Request-row training and host-batch training reserve different memory and run at different times.'''
+fix = '''Put them in two workloads; state only the host reads can train with `pllm.host.make_host`.'''
+why_zh = '''请求行训练和宿主批训练的显存预留和运行时机不同，一个负载只有一种'''
+fix_zh = '''分到两个负载；只给宿主读的状态可以用 `pllm.host.make_host` 单独训练'''
+
+[[section.error]]
+message = '''carry fields ride on the training transition; give the state an optimizer'''
+why = '''Carry fields are published together with a training update.'''
+fix = '''Give the state an optimizer.'''
+why_zh = '''carry 字段随训练更新一起发布'''
+fix_zh = '''给状态加优化器'''
+
+[[section.error]]
+message = '''pllm.carry writes into the training method's own state'''
+why = '''A carry is published with the state being trained.'''
+fix = '''Use a carry field of the trained state.'''
+why_zh = '''carry 只随被训练的状态一起发布'''
+fix_zh = '''改用被训练状态的 carry 字段'''
+
+[[section.error]]
+message = '''every @pllm.differentiate result must feed a @pllm.train loss'''
+why = '''A differentiable result exists only to carry gradients into a training loss.'''
+fix = '''Read the result in a `@pllm.train` method through `pllm.result`, or remove `@pllm.differentiate`.'''
+why_zh = '''可微结果只为把梯度传进训练的 loss 而存在'''
+fix_zh = '''在 `@pllm.train` 方法里经 `pllm.result` 读它，或去掉 `@pllm.differentiate`'''
+
+[[section.error]]
+message = '''the @pllm.train loss of ... must differentiate only its own state'''
+why = '''Gradients flow back into a state other than the one the method trains.'''
+fix = '''Check which differentiable results the loss reads; each training method updates only its own `state=`.'''
+why_zh = '''梯度沿可微结果流进了别的状态'''
+fix_zh = '''检查 loss 读的可微结果，每个训练方法只更新自己的 `state=`'''
+
+[[section.error]]
+message = '''...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns'''
+why = '''Gradients of `b @ a` vanish when both factors are zero.'''
+fix = '''Initialize A randomly and B at zero with `init=pllm.Computed(function)`.'''
+why_zh = '''两个因子都为零时梯度恒为零'''
+fix_zh = '''用 `init=pllm.Computed(...)` 让 A 随机、B 为零'''
+
+[[section.error]]
+message = '''host-batch training returns one scalar and owns its reduction; remove reduction='''
+why = '''A host batch's lengths, weights and normalization are known only to you.'''
+fix = '''Remove `reduction=`; reduce inside the method (`(weights * error).sum() / weights.sum().clamp_min(1)`).'''
+why_zh = '''宿主批次的长度、权重和归一化方式只有你知道'''
+fix_zh = '''去掉 `reduction=`，在方法里自己归约并返回一个标量'''
+
+[[section.error]]
+message = '''training on WeightedRowBatch or CausalTrainBatch fields takes one AdamW step over the whole batch: remove rows=, update_rows=, steps=, reset=, @pllm.differentiate and pllm.carry'''
+why = '''These batches always train as one whole batch, one step per batch.'''
+fix = '''Remove the listed settings; skip samples with weight 0.'''
+why_zh = '''这两种批次每批整体走一步'''
+fix_zh = '''去掉列出的设置；跳过样本用权重 0'''
+
+[[section.error]]
+message = '''steps= and reset= apply to training on WeightedCEBatch fields (pllm.batch); remove them to train on request rows'''
+why = '''Repeated SGD steps from a reset point exist only for `WeightedCEBatch`.'''
+fix = '''Remove `steps=` and `reset=`.'''
+why_zh = '''从同一起点做多步 SGD 只用于加权交叉熵批次'''
+fix_zh = '''去掉 `steps=` 和 `reset=`'''
+
+[[section.error]]
+message = '''training on WeightedCEBatch fields restarts each state before its SGD steps: give @pllm.train(reset=...) naming a method that sets the starting values'''
+why = '''Each batch runs several SGD steps from the same starting point.'''
+fix = '''Write a method that returns the starting values and name it in `reset=`.'''
+why_zh = '''每批从同一起点做多步 SGD'''
+fix_zh = '''写一个给出起始值的方法，在 `reset=` 里引用它'''
+
+[[section.error]]
+message = '''pllm.batch fields ... must all come from one batch: WeightedRowBatch ..., CausalTrainBatch ... or WeightedCEBatch ...'''
+why = '''A training method reads one kind of host batch.'''
+fix = '''Read fields of one batch kind only.'''
+why_zh = '''一个方法只读一种宿主批次'''
+fix_zh = '''只读同一种批次的字段'''
+
+[[section.error]]
+message = '''causal training needs a BF16 model whose embedding and LM head are not quantized'''
+why = '''Whole-model backward is written for BF16 and differentiates the embedding and LM head.'''
+fix = '''Use a BF16 base whose embedding and LM head are not quantized.'''
+why_zh = '''整模型反向按 BF16 写，且要对 embedding 与 LM head 求导'''
+fix_zh = '''换 BF16、embedding 与 LM head 未量化的底座'''
+
+[[section]]
+en = "Loading and placing state"
+zh = "加载与放置状态"
+
+[[section.error]]
+message = '''pllm.Pretrained(...) for state ... does not exist; save it with safetensors.torch.save_file before make_llm'''
+why = '''The file named by `pllm.Pretrained` is not on disk.'''
+fix = '''Save it with `safetensors.torch.save_file` before `pllm.explain` or `make_llm`.'''
+why_zh = '''`pllm.Pretrained` 指向的文件不存在'''
+fix_zh = '''在 `pllm.explain` 或 `make_llm` 之前用 `safetensors.torch.save_file` 存好'''
+
+[[section.error]]
+message = '''pllm.Pretrained needs a .safetensors file; save it with safetensors.torch.save_file'''
+why = '''pLLM loads pretrained state only from safetensors files.'''
+fix = '''Convert `.pt` / `.bin` files with `safetensors.torch.save_file`.'''
+why_zh = '''pLLM 只从 safetensors 文件加载状态'''
+fix_zh = '''用 `safetensors.torch.save_file` 转存 `.pt` / `.bin` 文件'''
+
+[[section.error]]
+message = '''... has no tensor ... for state ...; it holds .... Name the fields like the saved tensors, or save the tensors under the field names'''
+why = '''The tensor names in the file differ from the state's field names.'''
+fix = '''Rename the fields or save the tensors under the field names.'''
+why_zh = '''文件里的张量名和状态的字段名对不上'''
+fix_zh = '''统一两边的名字：改字段名，或按字段名重新保存'''
+
+[[section.error]]
+message = '''tensor ... in checkpoint ... has shape ...; adjust the declared field shape to match it'''
+why = '''The saved tensor's shape differs from the declared field shape.'''
+fix = '''Change the declared shape, or save a tensor of the declared shape.'''
+why_zh = '''保存的张量形状和声明的字段形状不同'''
+fix_zh = '''改声明的形状，或保存成声明的形状'''
+
+[[section.error]]
+message = '''... cannot load module state ...: ...; save the file with safetensors.torch.save_file(module.state_dict(), path) from the same module class'''
+why = '''`pllm.FromModule` loads strictly; the file's keys or shapes do not match the module the factory builds.'''
+fix = '''Save `module.state_dict()` of the same module class.'''
+why_zh = '''`pllm.FromModule` 严格加载，文件里的键或形状和工厂造出的模块不一致'''
+fix_zh = '''用同一个模块类的 `module.state_dict()` 保存'''
+
+[[section.error]]
+message = '''...: a pllm.ModelCheckpoint state is read-only; write to a separate state'''
+why = '''Base-model tensors are shared by every request and never change.'''
+fix = '''Write deltas or new values into a separate `RequestState` or `InstanceState`.'''
+why_zh = '''底座权重被所有请求共享，不会改变'''
+fix_zh = '''增量或新值写进另一个 `RequestState` 或 `InstanceState`'''
+
+[[section.error]]
+message = '''...: declare one fed state per workload'''
+why = '''One feed fills one state per call.'''
+fix = '''Merge the fed values into one `init=pllm.Fed(...)` state with several fields.'''
+why_zh = '''一次投喂只写一个状态'''
+fix_zh = '''把要投喂的值合并进一个多字段的 `init=pllm.Fed(...)` 状态'''
+
+[[section.error]]
+message = '''placement="host" needs a read-only InstanceState of gathered fields; use placement="device" for mutable state'''
+why = '''Host tables are read in bounded gathers that overlap the forward; they cannot be written.'''
+fix = '''Use `placement="host"` only for frozen pretrained tables of an `InstanceState`.'''
+why_zh = '''主机内存里的表按行读取、与 forward 重叠，不能写'''
+fix_zh = '''`placement="host"` 只用于没有优化器的只读 `InstanceState` 表'''
+
+[[section.error]]
+message = '''...: gather host rows in a helper and read pllm.result in the model site; or use placement="device"'''
+why = '''A model site runs in the middle of a layer, where a PCIe read would stall the forward.'''
+fix = '''Gather in an undecorated helper that reads only `pllm.input_tokens` and the table; the model site reads `pllm.result("helper")`.'''
+why_zh = '''模型站点在某一层中间运行，在那里读主机内存会卡住 forward'''
+fix_zh = '''在只读 `pllm.input_tokens` 和表的无装饰器方法里查表，模型站点用 `pllm.result("方法名")` 读结果'''
+
+[[section]]
+en = "Model sites and custom forwards"
+zh = "改模型与 forward 结构"
+
+[[section.error]]
+message = '''... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream'''
+why = '''A custom forward may run a layer several times or not at all, so a layer's MLP output has no single value.'''
+fix = '''Read `pllm.residual(layer)` or `pllm.layer_logits(...)`, or compute what you need inside the custom forward.'''
+why_zh = '''custom forward 里一层可能跑多遍或不跑，"这一层的输出"不唯一'''
+fix_zh = '''读 `pllm.residual(layer)` 或 `pllm.layer_logits(...)`，或在 custom forward 里自己算'''
+
+[[section.error]]
+message = '''Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. ...'''
+why = '''Skipping layers for prompt tokens would leave approximate K/V that every later token reads.'''
+fix = '''Use `tokens="decode"` for early exit; prompts run the full model.'''
+why_zh = '''prompt 的近似 K/V 会被之后所有 token 读到'''
+fix_zh = '''早退用 `tokens="decode"`，prompt 按完整模型运行'''
+
+[[section.error]]
+message = '''@pllm.custom_forward methods take (self, layers, marker inputs...) and no other pLLM decorator; use layers.save instead of @write'''
+why = '''A custom forward is an effect of its own.'''
+fix = '''Save position state with `layers.save`.'''
+why_zh = '''custom forward 自己就是一个效果'''
+fix_zh = '''位置状态用 `layers.save`'''
+
+[[section.error]]
+message = '''...: use pllm.parameter or pllm.module after layers; read plain settings from self'''
+why = '''Parameters after `layers` are state reads.'''
+fix = '''Read plain settings from `self`.'''
+why_zh = '''`layers` 之后的参数只能读状态'''
+fix_zh = '''普通设置从 `self` 读'''
+
+[[section.error]]
+message = '''index a tap inside the Layers slice that produced it'''
+why = '''`layers(...)` returns outputs indexed by absolute layer; `out[-1]` is the model's last layer, which a partial slice did not run.'''
+fix = '''Index the slice's own layers: `layers(stop=12)[11]`. `[-1]` is right only when the slice runs to the end.'''
+why_zh = '''`layers(...)` 的输出按绝对层号索引；`[-1]` 是模型最后一层，没跑到底的切片没有它'''
+fix_zh = '''用切片范围内的层号，如 `layers(12, 16)[15]`；只有跑到最后一层的切片才用 `[-1]`'''
+
+[[section.error]]
+message = '''PositionState is read and written by layers.load/save inside a @pllm.custom_forward method'''
+why = '''Position state means something only inside a custom forward.'''
+fix = '''Add a custom forward, or remove the `PositionState`.'''
+why_zh = '''位置状态只在 custom forward 里有意义'''
+fix_zh = '''加一个 custom forward，或去掉它'''
+
+[[section.error]]
+message = '''layer ... already has a custom residual (...); one method owns a sublayer's residual update'''
+why = '''One method decides how a sublayer's stream updates.'''
+fix = '''Merge the two methods into one.'''
+why_zh = '''一个子层的残差更新只由一个方法决定'''
+fix_zh = '''合并成一个方法'''
+
+[[section.error]]
+message = '''@pllm.custom_residual rewrites every row of its sites: remove rows= and @pllm.differentiate'''
+why = '''A residual rewrite acts on every row of its layer.'''
+fix = '''Select rows with a mask inside the method.'''
+why_zh = '''残差改写作用于这一层的每一行'''
+fix_zh = '''在方法里用掩码'''
+
+[[section.error]]
+message = '''@pllm.custom_residual(state=...) needs one attention or MLP site of one layer, chunk=, and a pllm.RequestState with one field, its carry, and no optimizer'''
+why = '''A stateful sublayer keeps one carried memory per request and updates it chunk by chunk.'''
+fix = '''Complete the declaration as the message lists.'''
+why_zh = '''带状态的子层每个请求一份携带量、按块更新'''
+fix_zh = '''按报错补齐声明'''
+
+[[section.error]]
+message = '''... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward'''
+why = '''A stateful sublayer needs exactly one visit per token.'''
+fix = '''Use two workloads, or carry the memory in `pllm.PositionState` inside the custom forward.'''
+why_zh = '''带状态的子层每个 token 必须恰好经过一次'''
+fix_zh = '''分成两个负载，或在 custom forward 里用 `pllm.PositionState` 保存记忆'''
+
+[[section.error]]
+message = '''...: take the site tensors ... first, without defaults, then markers'''
+why = '''pLLM passes the site tensors positionally, in order.'''
+fix = '''Write `x, y` (or `v`) first, then inputs with marker defaults.'''
+why_zh = '''位置张量由 pLLM 按顺序传入'''
+fix_zh = '''先写 `x, y`（或 `v`），再写带默认值的输入'''
+
+[[section.error]]
+message = '''...: take q and kv first, without defaults, then markers'''
+why = '''pLLM passes the query and the paged KV positionally.'''
+fix = '''Write `q, kv` first, then inputs with marker defaults.'''
+why_zh = '''query 和分页 KV 由 pLLM 按顺序传入'''
+fix_zh = '''先写 `q, kv`'''
+
+[[section.error]]
+message = '''...: return attention with q's shape and model dtype'''
+why = '''The output feeds the model's own output projection.'''
+fix = '''Return a tensor with `q`'s shape and dtype.'''
+why_zh = '''输出要接回原生的输出投影'''
+fix_zh = '''返回与 `q` 同形同 dtype 的张量'''
+
+[[section.error]]
+message = '''keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources'''
+why = '''Deeper layers have not run yet for the current token.'''
+fix = '''Point `source` at an earlier layer, or use a custom forward.'''
+why_zh = '''更深的层在当前 token 还没算到'''
+fix_zh = '''源选更早的层，或用 custom forward'''
+
+[[section.error]]
+message = '''kv.attend topk needs integer positions [rows, k] or [rows, heads, k], padded with -1'''
+why = '''Top-K entries are logical token positions.'''
+fix = '''Pass integer positions of that shape; pad missing ones with -1.'''
+why_zh = '''top-K 是逻辑位置'''
+fix_zh = '''按形状给整数位置，不足的用 -1 补'''
+
+[[section.error]]
+message = '''static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)'''
+why = '''A layout splits the KV cache into several groups; these features need one group.'''
+fix = '''Drop the layout (`keep=` / `window=` / `source=`) or the custom forward.'''
+why_zh = '''KV 布局把 KV cache 分成几组，这些功能需要一组'''
+fix_zh = '''去掉布局（`keep=` / `window=` / `source=`）或 custom forward'''
+
+[[section.error]]
+message = '''... reads RequestState ..., but @pllm.custom_attention runs for every scheduled token with instance-wide inputs; ...'''
+why = '''Attention reads have no per-request state.'''
+fix = '''Read an `InstanceState` and select per request inside the math.'''
+why_zh = '''attention 的读法没有每请求的状态'''
+fix_zh = '''读 `InstanceState`，在数学里按请求选择'''
+
+[[section.error]]
+message = '''declare one @pllm.train_in_forward method per workload; ... already is one'''
+why = '''One method drives every projection hook of a workload.'''
+fix = '''Train all targets in one method (`targets` is a tuple).'''
+why_zh = '''一个方法驱动负载的全部投影钩子'''
+fix_zh = '''在一个方法里训练所有目标（`targets` 是元组）'''
+
+[[section.error]]
+message = '''a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet combine with a pllm.model.Adapter; ...'''
+why = '''The training method owns the projection hooks the adapter would also use.'''
+fix = '''Train the adapter's state in the `@pllm.train_in_forward` method itself, or use two workloads.'''
+why_zh = '''前向内训练方法占用了 Adapter 也要用的投影钩子'''
+fix_zh = '''在 `@pllm.train_in_forward` 方法里训练这个状态，或分成两个负载'''
+
+[[section.error]]
+message = '''... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...'''
+why = '''A `@pllm.train_in_forward` method without an optimizer returns the correction added to the projection's output; pLLM checks it once at declaration on maximum-shape operands.'''
+fix = '''Return `output` shaped `[rows, out_features]` of the target, in the input dtype or float32.'''
+why_zh = '''没有优化器的 `@pllm.train_in_forward` 返回加到投影输出上的修正，pLLM 在声明时按最大形状检查一次'''
+fix_zh = '''返回 `[rows, out_features]`、输入 dtype 或 float32 的修正'''
+
+[[section.error]]
+message = '''... must return changed (bool) and update_count and trained_rows (int64) as 0-d tensors on the input's device'''
+why = '''The counters stay on the device so no step synchronizes with the host.'''
+fix = '''Build them as 0-d device tensors (`x.new_ones((), dtype=torch.bool)`), or return `pllm.UpdateOutput.unchanged(output)`.'''
+why_zh = '''计数留在设备上，每步才不和宿主同步'''
+fix_zh = '''用 0 维设备张量（`x.new_ones((), dtype=torch.bool)`），或返回 `pllm.UpdateOutput.unchanged(output)`'''
+
+[[section.error]]
+message = '''layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead'''
+why = '''An MoE layer has no single dense MLP projection.'''
+fix = '''Rewrite the attention query or value projection.'''
+why_zh = '''MoE 层没有统一的稠密 MLP 投影'''
+fix_zh = '''改 attention 的 query 或 value 投影'''
+
+[[section.error]]
+message = '''layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)'''
+why = '''Qwen3.5 linear-attention layers have no standard q/k/v projections.'''
+fix = '''Target a full-attention layer (`layer_types` in the model config).'''
+why_zh = '''Qwen3.5 的线性 attention 层没有标准的 q/k/v 投影'''
+fix_zh = '''改写全注意力层（见模型配置的 `layer_types`）'''
+
+[[section.error]]
+message = '''gated attention interleaves each head's query rows with its output-gate rows; overlay the value projection instead'''
+why = '''Qwen3.5 gated attention packs each head's query rows with its gate rows, so there is no separate query projection.'''
+fix = '''Rewrite `v_proj`.'''
+why_zh = '''Qwen3.5 的门控 attention 把每个头的 query 行和门控行交错存放，切不出单独的 query 投影'''
+fix_zh = '''改写 `v_proj`'''
+
+[[section.error]]
+message = '''per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP'''
+why = '''Per-head deltas are not split along the tensor-parallel shards.'''
+fix = '''Use `"dense"` or `"low_rank"` under TP, or `tensor_parallel_size=1`.'''
+why_zh = '''按头的增量没有按张量并行切分'''
+fix_zh = '''多卡时用 `"dense"` 或 `"low_rank"`，或单卡'''
+
+[[section.error]]
+message = '''pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host'''
+why = '''`make_host` compiles without a model.'''
+fix = '''Use `make_llm`, or keep only `pllm.batch` training for `make_host`.'''
+why_zh = '''`make_host` 没有模型'''
+fix_zh = '''用 `pllm.make_llm`，或 `make_host` 的负载只保留 `pllm.batch` 训练'''
+
+[[section.error]]
+message = '''pllm.layer_logits reads the model's LM head; compile this workload with make_llm'''
+why = '''`make_host` compiles without a model, so there is no LM head.'''
+fix = '''Use `make_llm`.'''
+why_zh = '''`make_host` 没有模型，也就没有 LM head'''
+fix_zh = '''用 `pllm.make_llm`'''
+
+[[section]]
+en = "Custom operators"
+zh = "自写算子"
+
+[[section.error]]
+message = '''... mutates ...; kernels called from workload math must return new tensors (mutates_args=()); change state only through pLLM effects'''
+why = '''Workload inputs are shared read-only views, so an operator must not write into them.'''
+fix = '''Declare `mutates_args=()` and return new tensors; change state through `@pllm.write` or `@pllm.train`.'''
+why_zh = '''方法的输入是共享的只读视图，算子不能写它们'''
+fix_zh = '''声明 `mutates_args=()`、返回新张量；改状态用 `@pllm.write` 或 `@pllm.train`'''
+
+[[section.error]]
+message = '''... has no fake implementation; add @....register_fake'''
+why = '''pLLM plans memory from shapes, which it gets from the fake implementation.'''
+fix = '''Register one with `@op.register_fake` returning an empty tensor of the output's shape and dtype.'''
+why_zh = '''pLLM 按形状规划显存，形状从 fake 实现得到'''
+fix_zh = '''用 `@op.register_fake` 注册一个返回同形同 dtype 空张量的函数'''
+
+[[section.error]]
+message = '''call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims only for built-in operators'''
+why = '''pLLM records the operator's source in the workload's identity, which it can only find from the op object.'''
+fix = '''Import and call the op object.'''
+why_zh = '''pLLM 要把算子的源码记进负载的身份，只有从算子对象才找得到'''
+fix_zh = '''导入并直接调用算子对象'''
+
+[[section.error]]
+message = '''... trains through ..., which has no autograd formula; add ....register_autograd(...)'''
+why = '''A `@pllm.train` loss backpropagates through an operator without a gradient.'''
+fix = '''Register one with `op.register_autograd(...)`.'''
+why_zh = '''`@pllm.train` 的反向经过了没有梯度公式的算子'''
+fix_zh = '''用 `op.register_autograd(...)` 补上'''
+
+[[section.error]]
+message = '''... runs in a per-token cell under torch.vmap; register a batching rule (register_vmap) or call it with over="span"'''
+why = '''A per-token custom forward runs under `torch.vmap`, which needs a batching rule for the operator.'''
+fix = '''Register one with `op.register_vmap(...)`, or use `over="span"`.'''
+why_zh = '''逐 token 的 custom forward 在 `torch.vmap` 下运行，算子要有批处理规则'''
+fix_zh = '''用 `op.register_vmap(...)` 注册，或改用 `over="span"`'''
+
+[[section]]
+en = "Engine settings, models and parallelism"
+zh = "引擎设置、模型与并行"
+
+[[section.error]]
+message = '''pLLM runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...'''
+why = '''pLLM is aligned with these two vLLM versions only.'''
+fix = '''Install vLLM 0.27.1 or 0.32.0.'''
+why_zh = '''pLLM 只对这两个版本做过对齐'''
+fix_zh = '''安装 0.27.1 或 0.32.0'''
+
+[[section.error]]
+message = '''choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads'''
+why = '''pLLM admits exact vLLM model classes whose layer structure it knows.'''
+fix = '''Use a listed family (see [rules.md, Support matrix](rules.md#support-matrix)).'''
+why_zh = '''pLLM 只接受它认识层结构的 vLLM 模型类'''
+fix_zh = '''换成列出的模型家族，见[支持矩阵](support-matrix.md)'''
+
+[[section.error]]
+message = '''pLLM runs vLLM's own model classes, not subclasses of them'''
+why = '''A subclass may change the projection layout or the logits.'''
+fix = '''Use the listed model class itself.'''
+why_zh = '''子类可能改变投影布局或 logits'''
+fix_zh = '''用列出的模型类本身'''
+
+[[section.error]]
+message = '''... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model'''
+why = '''DeepSeek V2/V3 and gpt-oss have MLA or MoE projections pLLM cannot rewrite.'''
+fix = '''Use read-only features on these models, or a dense family.'''
+why_zh = '''DeepSeek V2/V3 和 gpt-oss 的 MLA、MoE 投影 pLLM 不能改写'''
+fix_zh = '''在这些模型上只用读取、ESamp、采样引导和激活补丁，或换稠密模型'''
+
+[[section.error]]
+message = '''... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model'''
+why = '''Qwen3.5 keeps linear-attention state outside the KV pages, so it cannot be rebuilt from them.'''
+fix = '''Use a Qwen2, Llama, Qwen3 or Qwen3-MoE model for custom forwards and custom attention.'''
+why_zh = '''Qwen3.5 的线性 attention 状态不在 KV 页里，无法从 KV 重建'''
+fix_zh = '''custom forward 和定制 attention 用 Qwen2、Llama、Qwen3 或 Qwen3-MoE'''
+
+[[section.error]]
+message = '''projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks'''
+why = '''On CPU, pLLM derives projection shapes only for dense Qwen2, Qwen3 and Llama configs.'''
+fix = '''Run `pllm.explain` on a dense config of the same sizes, and check the target model with `make_llm`.'''
+why_zh = '''CPU 上 pLLM 只能推出稠密 Qwen2、Qwen3、Llama 配置的投影形状'''
+fix_zh = '''CPU 检查用同尺寸的稠密配置，目标模型在 `make_llm` 时检查'''
+
+[[section.error]]
+message = '''disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...'''
+why = '''vLLM keys cached K/V by tokens, not by state, so a cached prefix would hold K/V computed under another request's state.'''
+fix = '''Keep `enable_prefix_caching=False` (the default).'''
+why_zh = '''vLLM 按 token 而不是按状态缓存 K/V，缓存的前缀可能是在别的请求的状态下算出的'''
+fix_zh = '''保持 `enable_prefix_caching=False`（默认）'''
+
+[[section.error]]
+message = '''...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False'''
+why = '''`cuda_graphs=True` demands vLLM's whole-model graphs, and the named feature runs the forward without them.'''
+fix = '''Remove that feature, or use `cuda_graphs="auto"` (the default); `diagnostics().eager_reason` then names the cause.'''
+why_zh = '''`cuda_graphs=True` 要求整模型进图，而报错点名的写法需要 eager'''
+fix_zh = '''去掉那个写法，或用 `cuda_graphs="auto"`（默认），原因会写进 `diagnostics().eager_reason`'''
+
+[[section.error]]
+message = '''CUDA-graph overlays do not support adapters backed by shared InstanceState'''
+why = '''This is an `eager_reason`, not an exception: an Adapter reading shared instance state runs the forward eagerly.'''
+fix = '''Keep the state per request (`RequestState`) to stay in CUDA graphs.'''
+why_zh = '''这是 `eager_reason` 而不是异常：读共享实例状态的 Adapter 让 forward 退回 eager'''
+fix_zh = '''要留在 CUDA graph 里，把状态改成每请求一份（`RequestState`）'''
+
+[[section.error]]
+message = '''@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2'''
+why = '''Custom attention is built on vLLM's FlashAttention 2 backend.'''
+fix = '''Set the two environment variables the message names.'''
+why_zh = '''定制 attention 建立在 vLLM 的 FlashAttention 2 后端上'''
+fix_zh = '''按报错设置两个环境变量'''
+
+[[section.error]]
+message = '''@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto'''
+why = '''Your read function reads K/V in the model dtype.'''
+fix = '''Keep `kv_cache_dtype="auto"`.'''
+why_zh = '''你的读法按模型精度读 K/V'''
+fix_zh = '''保持 `kv_cache_dtype="auto"`'''
+
+[[section.error]]
+message = '''@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads'''
+why = '''Your read function sees all heads at once.'''
+fix = '''Use `tensor_parallel_size=1`.'''
+why_zh = '''定制读法要看到完整的头'''
+fix_zh = '''单卡'''
+
+[[section.error]]
+message = '''multi-GPU needs vLLM 0.32.0; otherwise use tensor_parallel_size=1'''
+why = '''pLLM supports tensor parallelism only on vLLM 0.32.0.'''
+fix = '''Use the 0.32.0 environment, or one GPU.'''
+why_zh = '''pLLM 只在 vLLM 0.32.0 上支持张量并行'''
+fix_zh = '''换到 0.32.0，或单卡'''
+
+[[section.error]]
+message = '''... runs on one GPU only; set tensor_parallel_size=1'''
+why = '''`causal_model` training, state feeds and `@pllm.custom_residual` run on one GPU only.'''
+fix = '''Use `tensor_parallel_size=1`.'''
+why_zh = '''`causal_model` 训练、状态投喂和 `@pllm.custom_residual` 只支持单卡'''
+fix_zh = '''单卡'''
+
+[[section.error]]
+message = '''TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local @pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1'''
+why = '''Under TP each rank holds its shard of the delta; only shard-local updates keep shards consistent.'''
+fix = '''With TP, start adapter state from `Zeros` / `Computed` and update it only in `@pllm.train_in_forward`; otherwise use one GPU.'''
+why_zh = '''多卡时增量按分片存放，只有分片内的更新能保持各卡一致'''
+fix_zh = '''多卡时 Adapter 状态从 `Zeros` / `Computed` 开始、只在 `@pllm.train_in_forward` 里更新；否则单卡'''
+
+[[section.error]]
+message = '''TP projection update is not shard-local at ...; ...'''
+why = '''The update math needs other ranks' shards (for example training replicated A from column-sharded outputs).'''
+fix = '''Rewrite the update to use only the local shard, or use `tensor_parallel_size=1`.'''
+why_zh = '''更新的数学要用到别的卡上的分片'''
+fix_zh = '''改成只用本卡分片的更新，或单卡'''
+
+[[section.error]]
+message = '''worker processes cannot send ... defined in __main__ or a notebook; move it into an importable .py module, ...'''
+why = '''Workers rebuild the workload by importing its class.'''
+fix = '''Put the class in an importable `.py` module, or keep `multiprocessing=False` and `tensor_parallel_size=1`.'''
+why_zh = '''子进程按导入路径重建负载，找不到 `__main__` 或 notebook 里的类'''
+fix_zh = '''把类放进可导入的 `.py` 模块，或 `multiprocessing=False` 且单卡'''
+
+[[section.error]]
+message = '''worker processes receive the workload by pickling (...); hold module-level functions instead of lambdas or closures, or use tensor_parallel_size=1 with multiprocessing=False'''
+why = '''A workload field holds a lambda or closure, which cannot be pickled.'''
+fix = '''Use module-level functions, constants or plain values.'''
+why_zh = '''负载字段里有 lambda 或闭包，无法 pickle'''
+fix_zh = '''改成模块级函数、常量或普通值'''
+
+[[section.error]]
+message = '''the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; run both processes from the same installed sources and do not rewrite pretrained files while the engine starts'''
+why = '''The driver and the worker see different code or weight files, so their plans would differ.'''
+fix = '''Run both from the same installed sources; do not rewrite pretrained files while the engine starts.'''
+why_zh = '''主进程和 worker 看到的代码或权重文件不同，计划会不一致'''
+fix_zh = '''两边用同一份安装好的源码；启动期间不要改写权重文件'''
+
+[[section.error]]
+message = '''check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script'''
+why = '''The GPU check runs a fixed multi-request script.'''
+fix = '''Raise those settings for the check.'''
+why_zh = '''GPU 检查跑一段固定的多请求脚本'''
+fix_zh = '''检查时调大这两个设置'''
+
+[[section]]
+en = "Memory budgets"
+zh = "显存预算"
+
+[[section.error]]
+message = '''pLLM execution needs ... bytes at its peak but only ... fit; lower ...'''
+why = '''The planned execution peak exceeds `execution_peak_budget_bytes`. Reported in `pllm.explain(...).budget_errors` and raised by `make_llm`.'''
+fix = '''Follow the message: lower `max_num_batched_tokens` or `max_num_seqs`, raise the budget, or declare `placement="host"` for read-only tables.'''
+why_zh = '''计划的执行峰值超过 `execution_peak_budget_bytes`；`pllm.explain(...).budget_errors` 会列出，`make_llm` 会报错'''
+fix_zh = '''按报错调小 `max_num_batched_tokens` 或 `max_num_seqs`、调大预算，或把只读大表声明为 `placement="host"`'''
+
+[[section.error]]
+message = '''ExecutionOptions.state_page_budget_bytes=... exceeds the ... bytes free on the device; lower it, or lower gpu_memory_utilization ...'''
+why = '''The state-page budget is larger than the memory left on the device.'''
+fix = '''Lower the budget, or lower `gpu_memory_utilization` so vLLM leaves more memory free.'''
+why_zh = '''状态页预算超过了设备上剩下的显存'''
+fix_zh = '''调小预算，或调低 `gpu_memory_utilization` 给 pLLM 留出显存'''
+
+[[section.error]]
+message = '''workload needs cuda_graph_pool_budget_bytes >= ... for its conservative task capture reservations; got ...; leave it unset to size from the workload'''
+why = '''The CUDA graph pool budget is smaller than the workload's task captures need.'''
+fix = '''Leave `cuda_graph_pool_budget_bytes` unset, or raise it above the number in the message.'''
+why_zh = '''CUDA graph 池预算小于负载的任务捕获所需'''
+fix_zh = '''不设 `cuda_graph_pool_budget_bytes`，或调到报错给出的字节数以上'''
+
+[[section.error]]
+message = '''custom-forward CUDA graphs need ... bytes; raise ExecutionOptions.cuda_graph_pool_budget_bytes above ...'''
+why = '''The layer-slice graphs of a custom forward need more capture memory than the budget.'''
+fix = '''Raise `cuda_graph_pool_budget_bytes` to the number in the message.'''
+why_zh = '''custom forward 按层切片的 graph 需要的捕获显存超过预算'''
+fix_zh = '''把 `cuda_graph_pool_budget_bytes` 调到报错给出的字节数'''
+
+[[section.error]]
+message = '''raise execution_peak_budget_bytes to fund the custom forward's workspace and graphs'''
+why = '''`execution_peak_budget_bytes` cannot hold the custom forward's workspace, graphs and intermediate values.'''
+fix = '''Raise the budget, or leave it unset.'''
+why_zh = '''`execution_peak_budget_bytes` 装不下 custom forward 的工作区、graph 和中间值'''
+fix_zh = '''调大预算，或不设'''
+
+[[section.error]]
+message = '''training on CausalTrainBatch/WeightedRowBatch inputs cannot be funded under ExecutionOptions.execution_peak_budget_bytes yet; leave execution_peak_budget_bytes unset'''
+why = '''The peak of host-batch training is not yet counted in this budget.'''
+fix = '''Leave `execution_peak_budget_bytes` unset.'''
+why_zh = '''宿主批训练的峰值还不能纳入这个预算'''
+fix_zh = '''不设 `execution_peak_budget_bytes`'''
+
+[[section.error]]
+message = '''...: host batch shapes ... exceed the planned ...; raise ExecutionOptions(max_host_training_rows=N) for more training rows per state, or HostConfig(max_input_rows=N) for a host workload'''
+why = '''pLLM reserves training memory for the declared maximum batch size.'''
+fix = '''Raise `ExecutionOptions(max_host_training_rows=N)`, or `HostConfig(max_input_rows=N)` for `make_host`.'''
+why_zh = '''pLLM 按声明的最大批次预留训练显存'''
+fix_zh = '''调大 `ExecutionOptions(max_host_training_rows=N)`，`make_host` 时调大 `HostConfig(max_input_rows=N)`'''
+
+[[section.error]]
+message = '''positive batch, tokens, rounds, warmup and capture/state capacities required'''
+why = '''A `BenchmarkOptions` count or budget is below 1.'''
+fix = '''Pass positive `--batch`, `--tokens`, `--rounds`, `--warmup` and budgets.'''
+why_zh = '''`BenchmarkOptions` 的某个数量或预算小于 1'''
+fix_zh = '''`--batch`、`--tokens`、`--rounds`、`--warmup` 和各预算都传正整数'''
+
+[[section]]
+en = "Requests and run time"
+zh = "请求与运行时"
+
+[[section.error]]
+message = '''vLLM preempted a request and would recompute its history; ...'''
+why = '''The workload changes the model's computation from state that a replay cannot rebuild (see [Preemption and recompute](#preemption-and-recompute)).'''
+fix = '''Give vLLM more KV cache (`gpu_memory_utilization`) or fewer concurrent sequences (`max_num_seqs`), or remove what the message names.'''
+why_zh = '''负载用重放无法重建的状态改变了模型的计算（例如导入、可变实例状态）'''
+fix_zh = '''调大 `gpu_memory_utilization` 或调小 `max_num_seqs`，避免抢占；或去掉报错点名的写法'''
+
+[[section.error]]
+message = '''routes= needs a request state keyed by "route" and one value per prompt'''
+why = '''`routes=` picks a state copy per prompt, so it needs a route-keyed state and one non-empty route per prompt.'''
+fix = '''Declare `key_fields=("route",)` and pass one route per prompt.'''
+why_zh = '''`routes=` 为每个 prompt 选一份状态，需要按路由分组的状态和每个 prompt 一个非空路由'''
+fix_zh = '''声明 `key_fields=("route",)`，每个 prompt 传一个路由'''
+
+[[section.error]]
+message = '''a route-keyed request state requires per-prompt routes'''
+why = '''A request without a route does not know which state copy to use.'''
+fix = '''Pass `routes=` to `generate`.'''
+why_zh = '''没有路由值的请求不知道该用哪份状态'''
+fix_zh = '''`generate` 时传 `routes=`'''
+
+[[section.error]]
+message = '''RequestIdentity ... is missing a field required by ...'''
+why = '''A request lacks a value for a declared key field (an empty route, a negative prompt index).'''
+fix = '''Give every request a valid value for each key field.'''
+why_zh = '''请求缺少声明的键字段值（空路由、负的 prompt 编号）'''
+fix_zh = '''给每个请求的每个键字段一个合法值'''
+
+[[section.error]]
+message = '''batch, sample_index, prompt_indices and routes need workload= in make_llm'''
+why = '''A plain engine has nothing to feed.'''
+fix = '''Pass `workload=` to `make_llm`.'''
+why_zh = '''没装负载的引擎没有东西可喂'''
+fix_zh = '''`make_llm` 时传 `workload=`'''
+
+[[section.error]]
+message = '''state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer'''
+why = '''`llm.feed(...)` hands out an in-process handle.'''
+fix = '''Use one in-process engine; run the producer in a spawned process.'''
+why_zh = '''`llm.feed(...)` 给出的是进程内的句柄'''
+fix_zh = '''用单进程引擎，生产者放在 spawn 出的进程里'''
+
+[[section.error]]
+message = '''completions carry each sample's final hidden row, which only a workload collects; ...'''
+why = '''`generate_completions` and `generate_feedback` hand each sample's final hidden row to the host, and only an installed workload captures it.'''
+fix = '''Pass `workload=pllm.workloads.DummyWorkload()` to `make_llm` when nothing should train.'''
+why_zh = '''`generate_completions` 和 `generate_feedback` 要把每个样本最终位置的 hidden 交给宿主，只有装了负载的引擎才会采集'''
+fix_zh = '''只做重试或打分、不训练时，给 `make_llm` 传 `workload=pllm.workloads.DummyWorkload()`'''
+
+[[section]]
+en = "Contract check errors"
+zh = "testing.check 的 ContractError"
+note = '''`pllm.testing.check` raises `pllm.testing.ContractError`; its `failures` list every discrepancy with a `[contract]` prefix and the request, token and method involved.'''
+note_zh = '''`pllm.testing.check` 发现问题时抛 `pllm.testing.ContractError`，`failures` 里每一行以契约名开头，并写明涉及的请求、token 和方法。'''
+
+[[section.error]]
+message = '''method ... mixes rows: equal inputs for this request produced different outputs. Dimension 0 holds request rows; reduce features (dim=-1), not requests (dim=0).'''
+why = '''The method computes across rows (`mean(0)`, `softmax(dim=0)`, batch norm, sorting rows), or keeps mutable state on `self`, so one request's result depends on others.'''
+fix = '''Make every row depend only on its own inputs: reduce along `dim=-1`.'''
+why_zh = '''方法跨行计算（`mean(0)`、`softmax(dim=0)`、BatchNorm、行排序），或在 `self` 上保存了可变状态'''
+fix_zh = '''只沿 `dim=-1` 计算，让每行只依赖自己的输入'''
+
+[[section.error]]
+message = '''method ... mutates borrowed input ... in place; inputs and parameters are read-only views. ...'''
+why = '''Inputs and parameters are shared with other methods and with pLLM's state versions.'''
+fix = '''Use out-of-place math (`h * 2`, not `h.mul_(2)`), or `clone()` first; change state only through `@pllm.write` or `@pllm.train`.'''
+why_zh = '''输入和参数与别的方法、别的状态版本共享'''
+fix_zh = '''用非原地运算（`h * 2` 而不是 `h.mul_(2)`）或先 `clone()`；改状态用 `@pllm.write` 或 `@pllm.train`'''
+
+[[section.error]]
+message = '''[neutral] ...: add_logits must return exactly zero'''
+why = '''With strength 0 the workload still changes the logits.'''
+fix = '''Multiply the whole result by the strength setting and pass the strength-0 workload as `neutral=`.'''
+why_zh = '''强度为零时加法必须精确为零'''
+fix_zh = '''让强度乘在整个结果上'''
+
+[[section.error]]
+message = '''[neutral] guide_sampling still declares a sampler stage; set its beta to zero.'''
+why = '''The neutral workload still guides. Often the [setting trap](#silent-traps-code-that-runs-but-does-something-else): `beta=beta` reads the class default.'''
+fix = '''Make `beta` a method of the workload (`beta=strength`).'''
+why_zh = '''`neutral=` 的负载仍在引导采样，常见原因是装饰器写了 `beta=beta`，读到的是类的默认值'''
+fix_zh = '''用设置方法：`beta=strength`，`def strength(self) -> float: return self.beta`'''
+
+[[section.error]]
+message = '''pLLM misrouted rows before ...: its per-request inputs already differ.'''
+why = '''Usually your code: tensor math that mixes different states' rows, or an index computed from `pllm.index` used across states.'''
+fix = '''Rule out your code first; if the method is row-local, report the message as a framework bug.'''
+why_zh = '''多半是自己的代码：原地写参数，或混用不同状态的行'''
+fix_zh = '''先排除自己的代码；排除后这是框架的 bug，把报错报告给我们'''
+
+[[section.error]]
+message = '''[device equivalence] ...: ...'''
+why = '''`check_on_gpu` found the GPU kernel's results outside the tolerance of its CPU reference for that dtype.'''
+fix = '''Compare the kernel with the reference: accumulation precision (float32 intermediates) and indexing.'''
+why_zh = '''`check_on_gpu` 发现 GPU 算子与 CPU 参考实现的差异超出该 dtype 的容差'''
+fix_zh = '''对照参考实现检查算子：累加精度（中间结果用 float32）和索引'''

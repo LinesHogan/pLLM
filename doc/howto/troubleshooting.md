@@ -109,57 +109,7 @@ with pllm.make_llm(config, workload=workload) as llm:
 
 ## 常见报错速查（报错 → 原因 → 改法）
 
-本节汇总编写与构建负载时最常见的报错信息。每条规则均源自底层的连续批处理、CUDA Graph 捕获或自动求导机制。完整的报错目录请参阅 [报错目录](../reference/errors.md)。
-
-| 报错（原文） | 为什么 | 改法 |
-| :--- | :--- | :--- |
-| `...: give every input a source as its default, e.g. ...` | pLLM 只从参数默认值知道每个输入读什么，不按参数名猜：猜错不会报错，只会悄悄读错数据 | 给 `self` 之后的每个参数写来源，如 `h: torch.Tensor = pllm.hidden(0)` |
-| `the workload has no effect on the model: add @pllm.train, ...` | pLLM 只安排有去处的计算；没有效果装饰器的方法不会运行 | 给方法加效果装饰器；只当选择器用的方法要被某个效果的 `rows=` 引用 |
-| `a method takes one pLLM decorator of each kind; split stacked effects into one method per effect` | 后一个装饰器会覆盖前一个，其中一个效果悄悄失效；不同效果的默认时机也不同 | 每个效果一个方法，用 `pllm.result(name)` 共享计算 |
-| `... both declare @pllm.guide_sampling; keep at most one guidance method` | 采样器每步只按一个预测重新加权；两个预测怎样合成是算法的选择 | 在一个方法里合成一个预测；其余修正用 `@pllm.add_logits` |
-| `tensor export needs positive every, max_rows and max_cols, with max_cols * 8 <= ... bytes (32 KiB), so one row fits an export event` | 导出值按每个 8 字节传回，一行必须装进一个 32 KiB 的导出事件 | `max_cols` 不超过 4096；更宽的向量先在方法里压缩（如 top-k 编号） |
-| `property ... needs a return annotation; ...` | pLLM 不执行 getter 也要认出哪些属性是状态 | 写返回类型，如 `-> pllm.RequestState` |
-| `pllm.parameter(..., ...) names no declared field; declared: ...` | 字段名不存在 | `shape=` 声明的状态只有字段 `"value"`；`FromModule` 状态用 `pllm.module(state)` 读 |
-| `@pllm.train reads ..., which trains with ...; declare ... with optimizer=...` | 训练方式由方法读的输入决定，优化器写在状态上 | 给状态加报错里说的优化器 |
-| `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 这条训练路径每步给每个状态做一次更新并发布新版本，不支持按行跳过 | 在 `@pllm.guide_sampling(rows=...)` 上选行，或用 `reduction="sum"` 并把要排除的行的 loss 乘 0 |
-| `... pLLM funds one training mode per workload, so move one of them to a separate workload` | 请求行训练和宿主批训练的更新时机、显存预留不同，一个负载只有一种 | 分到两个引擎；只给宿主读的状态可以用 `pllm.host.make_host` 单独训练 |
-| `a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase` | 值在产生它的阶段之前不存在，例如采样结果在采样之后才有 | 采样前读 logits 用 `pllm.layer_logits((-1,))`；读采样结果的方法放进 `@pllm.train` 或 `@pllm.on(pllm.Phase.AFTER_SAMPLE)` |
-| PyTorch 的 "Tensor.item() cannot be called on meta tensors"，附注 `while shape tracing method ...; methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values` | 构建时方法只按形状追踪（没有数值），运行时在 CUDA graph 里重放 | 去掉 `.item()`、`print(tensor)`、按张量值的 `if`；用掩码和 `torch.where`，看数值用 `@pllm.export` |
-| `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | custom forward 里一层可能跑多遍或不跑，"这一层的输出"不唯一 | 读 `pllm.residual(layer)` 或 `pllm.layer_logits(...)` |
-| `Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. ...` | prompt 是之后每个 token 都要读的上下文，跳层留下的近似 K/V 会影响整个生成 | `@pllm.custom_forward(tokens="decode")` |
-| `worker processes cannot send ... defined in __main__ or a notebook; move it into an importable .py module, ...` | 子进程按导入路径重建负载，找不到 `__main__` 或 notebook 里的类 | 把类放进 `.py` 模块，或 `multiprocessing=False` |
-| `... mixes rows: equal inputs for this request produced different outputs. ...` | 方法跨行计算（`mean(0)`、行排序），或在 `self` 上保存了可变状态 | 只沿 `dim=-1` 计算 |
-| `... mutates borrowed input ... in place; inputs and parameters are read-only views. ...` | 输入和参数与别的方法、别的版本共享 | 返回新张量；改状态用 `@pllm.write` 或 `@pllm.train` |
-| `training methods return one loss per row; pLLM reduces the selected rows per state` | 只有 pLLM 知道一步里哪些行属于哪份状态 | 返回 `[rows]` 的 loss，不要自己 `.mean()` |
-| `guide_sampling still declares a sampler stage; set its beta to zero.` | `neutral=` 的负载仍在引导采样，常见原因是装饰器写了 `beta=beta` | 用设置方法：`beta=strength`，`def strength(self) -> float: return self.beta` |
-| `add_logits must return exactly zero` | 强度为零时加法必须精确为零 | 让强度乘在整个结果上 |
-| `host-batch training returns one scalar and owns its reduction; remove reduction=` | 宿主批次的长度、权重和归一化方式只有你知道 | 在方法里自己归约，去掉 `reduction=` |
-| `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | 两个因子都为零时梯度恒为零 | A 随机、B 为零 |
-| `pLLM misrouted rows ...` | 先排除自己的代码：原地写参数，或混用不同状态的行；排除后这是框架的 bug | 把报错信息报告给我们 |
-
---- | :--- | :--- |
-| `...: give every input a source as its default, e.g. ...` | 静态编译期需要通过参数默认值确定每个输入的来源与依赖拓扑，普通无默认值的参数无法知晓输入来自哪个张量。 | 为 `self` 之后的每个参数提供输入源默认值，例如 `h: torch.Tensor = pllm.hidden(0)` 或 `w: torch.Tensor = pllm.parameter(...)`。 |
-| `the workload has no effect on the model: add @pllm.train, ...` | 方法未挂载指示结果去向的效果装饰器，孤立的张量计算不会对模型推理或状态产生任何影响。 | 为方法添加效果装饰器（如 `@pllm.train`、`@pllm.add_logits`、`@pllm.guide_sampling`、`@pllm.export` 等）；若该方法仅用作行选择器，需在效果方法中用 `rows=` 引用它。 |
-| `a method takes one pLLM decorator of each kind; split stacked effects into one method per effect` | 不同的效果装饰器在引擎中具有不同的执行时机（anchor）、执行流（lane）和张量形状约定，框架不支持在一个函数上叠加多个异构效果。 | 拆分为多个独立方法，每个方法只带一个装饰器；若需复用前序计算的中间结果，通过 `pllm.result(name)` 传递。 |
-| `... both declare @pllm.guide_sampling; keep at most one guidance method` | 采样引导会在采样器内部修改候选 token 的概率分布，为了保证采样算法语义唯一且收敛确定，一个负载内至多允许一个引导方法。 | 一个负载（含组合的子组件）中只保留一个 `@pllm.guide_sampling` 方法；如果需要多次干预未归一化的 logits，声明多个可共存的 `@pllm.add_logits`。 |
-| `tensor export needs positive every, max_rows and max_cols, with max_cols * 8 <= ... bytes (32 KiB), so one row fits an export event` | 异步导出采用单事件不超过 32 KiB 的定长无锁环形页缓冲区，避免数据拷回 CPU 阻塞 GPU 主计算流。 | 将 `max_cols` 调小至最多 4096 列（BF16/FP16 下 $4096 \times 2 \le 32768$ 字节）；超出 `max_rows` 的行会被截断丢弃，应适当调大 `max_rows` 或在 `generate` 时控制并发。 |
-| `property ... needs a return annotation; ...` | 编译期规划器依赖属性的返回类型注解来区分状态的作用域（`RequestState` 还是 `InstanceState`）以分配合适的显存池。 | 为状态属性声明明确的返回类型注解，例如 `@property def my_state(self) -> pllm.RequestState:`。 |
-| `pllm.parameter(..., ...) names no declared field; declared: ...` | 借用状态张量时必须精确匹配状态声明中的具名字段，以确保张量指针正确绑定到预留显存。 | 检查状态名与字段名是否一致；若状态用 `shape=` 声明，则它只包含唯一字段 `"value"`；若使用 `init=pllm.FromModule(...)`，应使用 `pllm.module(state)` 访问。 |
-| `@pllm.train reads ..., which trains with ...; declare ... with optimizer=...` | 在线训练需要为状态维护动量等优化器变量，框架要求状态显式绑定对应的优化器配置以分配优化器显存。 | 在报错提示的状态声明中添加指定的优化器参数，例如 `optimizer=pllm.AdamW(lr=1e-3)`。 |
-| `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 独立请求训练以及伴随 `@pllm.guide_sampling` 的训练采用无条件更新路径（每步无条件为所有选定状态执行优化器更新并发布版本，以与下一步前向重叠），该路径未实现行掩码条件更新。 | 移除训练方法上的 `rows=` 和 `update_rows=`；如需按请求过滤，可在采样引导方法上设置 `rows=`，或在训练中将无需更新行的损失乘以 0 并采用 `reduction="sum"`（注意 `reduction="mean"` 下权重为 0 的行仍会计入分母）。 |
-| `... pLLM funds one training mode per workload, so move one of them to a separate workload` | 请求行训练（每步按请求更新私有参数）与宿主批训练（跨请求聚合为单批次更新）采用完全不同的显存排布与调度流，单负载只支持其中一种模式。 | 将请求行在线训练与宿主批训练拆分到不同的负载中，不要在同一个负载中混用。 |
-| `a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase` | 计算图存在因果时序约束，例如采样产生的 token（`pllm.sampled_tokens()`）和基座 logits（`pllm.base_logits()`）在采样阶段之前尚未产生，无法在前序阶段读取。 | 将依赖后序产物的方法移到对应阶段（如 `@pllm.on(pllm.Phase.AFTER_SAMPLE)` 或 `@pllm.train`），或者在采样前改读最后一层的投影 logits `pllm.layer_logits((-1,))`。 |
-| PyTorch 的 "Tensor.item() cannot be called on meta tensors"，附带 note：`while shape tracing method ...; methods run inside CUDA graphs: use tensor operations such as torch.where, not .item() or Python branches on tensor values` | 方法在静态编译期通过 `meta` 张量追踪形状，并在 GPU 解码时捕获为 CUDA Graph；向主机同步提取标量（如 `.item()`、`.tolist()`、`print` 或基于张量值的 `if` 分支）会触发同步并中断图捕获，`meta` 张量也无实际数值。 | 移除方法内部的 `.item()`、`.tolist()`、`print(tensor)` 和 `if tensor ...:` 分支，改用张量掩码与 `torch.where`；如需观测张量数值，使用 `@pllm.export` 异步回传。 |
-| `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | 自定义前向（`@pllm.custom_forward`）接管了层循环与早退，原生单遍前向被切断或重排，模型不再产生全局唯一的块输出或最终隐藏状态（`pllm.hidden` / `pllm.final_hidden`）。 | 改用 `pllm.residual(layer)` 或 `pllm.layer_logits(...)` 读取各层最后访问的残差流，或者直接在自定义前向内部计算所需特征。 |
-| `Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. ...` | Prefill 阶段生成的 KV cache 会被后续所有解码步读取；如果在 prompt 上按 token 跳层，留下的残缺或近似 KV 会永久污染后续所有 token 的注意力计算。 | 对早退或跳层逻辑（`active=`）设置 `@pllm.custom_forward(tokens="decode")`；Prefill 阶段默认执行完整模型前向以保证 KV 精度。 |
-| `worker processes cannot send ... defined in __main__ or a notebook; move it into an importable .py module, ...` | 启用张量并行或多进程 Worker 时，Python 的 `pickle` 无法跨进程序列化定义在主入口 `__main__` 或 Notebook 单元格中的临时类。 | 将负载类定义放入独立的 Python 模块文件（`.py`）中并进行 `import`，或者在单卡测试阶段设置 `multiprocessing=False`。 |
-| ContractError `method ... mixes rows: equal inputs for this request produced different outputs. Dimension 0 holds request rows; reduce features (dim=-1), not requests (dim=0).` | 连续批处理中张量的第 0 维拼接了不同并发请求，沿第 0 维做归约（如 `mean(0)`、`sum(0)`、BatchNorm 或跨行排序）会导致当前请求的结果受其他请求干扰，破坏了请求隔离性。 | 沿特征维度归约（如 `mean(-1)`、`dim=-1`），确保每行的计算仅依赖当前请求；避免在负载实例中保存跨请求或跨步的可变 Python 状态（如 `self.count += 1`）。 |
-| ContractError `pLLM misrouted rows ... Report this message as a framework bug.` | 框架发现状态、采样或导出目的地的行与输入行产生了非预期的路由错位。 | 先排查代码中的未定义行为：是否对输入或参数执行了原地写入（如 `w.add_(1)`），或在张量运算中混淆了不同状态的行索引；排除上述问题后再向框架提交 issue。 |
-| ContractError `[neutral] ...: add_logits must return exactly zero` / `[neutral] guide_sampling still declares a sampler stage; set its beta to zero.` | 中性基线契约要求当干预强度设为 0 时，负载必须完全无害，数学上不能对模型的原始 logits 或采样分布产生任何微小扰动。 | 确保强度参数直接乘在整个干预输出上（如 `return self.beta * delta`），并在引导采样方法中将 beta 设为返回 0.0 的动态方法（如 `def strength(self) -> float: return self.beta`），传入 `neutral=Workload(beta=0.0)`。 |
-| `method ... mutates borrowed input ... in place; inputs and parameters are read-only views. Use out-of-place tensor math or clone() before writing; publish state changes through @pllm.write or @pllm.train.` | 传入方法的张量是只读借用视图，在底层可能与其他方法或前序状态版本共享显存地址；原地修改（如 `add_`、`mul_`、`copy_` 或 `out=`）会静默破坏其他请求的数据和 CUDA Graph 重放。 | 改用非原地算子（如 `y = x + 1`），或在修改前显式调用 `.clone()`；状态更新必须统一通过 `@pllm.write` 或 `@pllm.train` 发布。 |
-| `training methods return one loss per row; pLLM reduces the selected rows per state` | 请求训练方法需要为批次中每一行独立求导；在方法内部提前调用 `.mean()` 返回标量会导致框架无法区分各行的损失归属，无法实现逐请求的掩码更新。 | 请求训练方法返回形状为 `[rows]` 的一维损失向量（每行一个标量损失）；跨行的归约（`reduction="mean"` 或 `"sum"`）由 `@pllm.train` 框架自动处理。 |
-| `host-batch training returns one scalar and owns its reduction; remove reduction=` | 宿主批训练处理的是跨请求汇聚的整个宿主批次，天然由用户在方法内归约为单一标量损失，不接受框架层二次设置 `reduction=` 参数。 | 在宿主批训练方法中自行完成损失归约并返回单个标量张量，同时在 `@pllm.train` 中移除 `reduction=` 参数。 |
-| `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | 低秩适配器（$W = BA$）中若两个矩阵均全零初始化，由链式法则可知两侧导数恒为 0，模型参数将永远无法更新。 | 使用 `init=pllm.Computed(...)` 将其中一个低秩矩阵初始化为随机分布（如高斯初始化），另一个初始化为零。 |
+每条报错的原文、原因和改法按主题列在[报错目录](../reference/errors.md)；`...` 代表随你的代码变化的部分。
 
 ---
 
@@ -175,9 +125,11 @@ with pllm.make_llm(config, workload=workload) as llm:
 | **导出数据丢失行或不完整<br>（`dropped_rows > 0`）** | `@pllm.export` 具有**零阻塞保证**：为不阻塞 GPU 计算流，采用有界锁页环形缓冲区（队列上限 256 个事件，每个 $\le 32\text{ KiB}$）。当消费拉取不及时队列满时，默认直接丢弃（`overflow="drop"`，记入 `export_dropped`）；当单步有效行数超过 `max_rows`，或单次 `generate` 传入的 prompt 数超过 `max_rows` 时，超出部分会被截断（记入 `event.dropped_rows`）。 | 调大 `@pllm.export(max_rows=...)`，确保覆盖最大并发序列数或分块大小；调大导出间隔 `every=...`（如每 4 步导出一次）；确保消费进程及时读取；单次 `generate` 传入的 prompt 数量不要超过 `max_rows`。 |
 | **`make_llm` 报 OOM 或图捕获预算报错点名字节数** | pLLM 为确保在线训练与状态发布完全进 CUDA Graph，会在初始化时预留固定显存池。若默认预算叠加 vLLM 权重与 KV cache 超出了物理显存容量，就会导致分配失败。`pllm.explain` 会在 `budget_errors` 中列出超标字节数。 | 对照 `pllm.explain` 的 `memory` 与 `state` 行调整 `ExecutionOptions` 参数：<br>- `state_page_budget_bytes`：状态页显存预算（调小以限制状态显存，或将大只读表设为 `placement="host"`）；<br>- `execution_peak_budget_bytes`：执行峰值预算（包含任务工作区与重叠缓冲区）；<br>- `cuda_graph_pool_budget_bytes`：CUDA Graph 显存池预算（若使用复杂切片或多个自定义方法捕获显存不足，需适当调大）；<br>- `max_host_training_rows`：主机批训练最大并行行数（调小以降低显存峰值）；<br>适当调低 `gpu_memory_utilization` 或 `max_num_seqs`。 |
 | **抢占时抛出异常<br>（Preemption Rejection）** | 当显存紧张触发抢占、vLLM 试图逐出并重算序列历史时，仅当请求状态以 `request_id` 为键（私有独立副本）、且无跨请求可变实例状态、无外部导入（`Imported`）或主机外部输入时，框架才能够无害重算历史；任何其他带有覆盖（overlay）或可变共享状态的算法，由于历史无法复原，框架会拒绝重算并抛出异常。 | 提高 `gpu_memory_utilization`（如从 0.85 提至 0.90）为 KV cache 预留更多显存，从根源上避免触发抢占；调低并发序列数 `max_num_seqs`；避免在算法中依赖跨请求的可变 `InstanceState`。详见 [性能与显存](../explain/performance.md)。 |
+| **旁路训练（`side`）没有和前向重叠** | `execution_peak_budget_bytes` 介于 `explain` 的 `memory` 行给出的两个阈值之间时，pLLM 把旁路任务改成主 stream 内联执行，lane 从 `side` 变为 `main`；`publish_lag=0` 也会让训练与 forward 串行。 | 看 `explain` 的 `member` 行和 `timing` 行；保持默认 `publish_lag=1`，或把预算调到重叠阈值以上。见[让负载更快](faster.md)第 3 节。 |
+| **长序列递推或在线训练出现 NaN / 发散** | 累加器、carry 或 `pllm.scan` 的系数是低精度（BF16）时，舍入误差随步数累积。 | 看 `explain` 的 `state` 行里各字段的 `dtype`；用 `pllm.Field(..., dtype=torch.float32)` 显式指定，`pllm.scan` 的系数用 FP32；运行时查 `llm.diagnostics().numeric_health`。 |
 | **采样器里抛出没有说明的 `AssertionError`** | `@pllm.guide_sampling` 返回的宽度不等于 hidden 宽度（Qwen2.5-0.5B 为 896）。`@pllm.add_logits` 的词表宽度在构建时就检查，guide_sampling 的宽度目前不在 CPU 上检查。 | 核对 `@pllm.guide_sampling` 返回值的最后一维等于模型的 `hidden_size`。 |
 | **宿主批训练某几轮特别慢** | 训练批次的形状（序列数、长度）第一次出现时，pLLM 要为它编译训练步。 | 形状稳定后不再重编；测吞吐时用固定形状的批次并排除预热轮（见[公平地测吞吐](measure-throughput.md)）。 |
-| **单进程内创建多个引擎导致崩溃或显存冲突** | 每个 pLLM 引擎会在 GPU 端独占分配图显存池、状态页和 vLLM KV cache。前一个引擎若未完全释放，显存将被锁死，导致后续引擎无法分配连续显存块。 | 使用上下文管理器 `with pllm.make_llm(...) as llm:`，退出时自动释放资源；或显式调用 `llm.close()` 释放 GPU 显存与后台 Worker 进程后再创建新引擎。 |
+| **单进程内创建多个引擎导致崩溃或显存冲突** | 每个 pLLM 引擎会在 GPU 端独占分配图显存池、状态页和 vLLM KV cache。前一个引擎若未完全释放，显存将被锁死，导致后续引擎无法分配连续显存块。 | 使用上下文管理器 `with pllm.make_llm(...) as llm:`，退出时自动释放资源；或显式调用 `llm.close()` 释放 GPU 显存与后台 Worker 进程后再创建新引擎。用了 `@pllm.train_in_forward(visibility="exact")` 的引擎关闭时暂不能归还全部显存，之后的引擎在新的子进程里启动。 |
 
 ---
 

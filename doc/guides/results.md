@@ -423,20 +423,7 @@ print(testing.check(RunningMean(), CONFIG).passed)
 
 ## 6. 常见错误与排查
 
-下表列出声明与使用这四种效果时最常见的错误信息（逐字引用自源码）：
-
-| 错误信息（源码逐字引用） | 触发原因 | 解决方法 |
-| :--- | :--- | :--- |
-| `tensor export needs positive every, max_rows and max_cols, with max_cols * 8 <= ... bytes (32 KiB), so one row fits an export event` | `@pllm.export` 的 `max_cols` 超过了单行 32 KiB 的物理上限（例如传了 8192），或者参数小于等于 0。 | 将 `max_cols` 调小至至多 4096，确保一行数据不超 32 KiB；每步多出的行会在 `event.dropped_rows` 中计数。 |
-| `... both declare @pllm.guide_sampling; keep at most one guidance method` | 在同一个工作负载或子组件中声明了两个或更多 `@pllm.guide_sampling` 方法。 | 一个负载至多保留一个采样引导方法；若需要叠加多种前向偏置，使用多个 `@pllm.add_logits` 在过滤前累加。 |
-| `write must return a tuple matching its declared fields` | `@pllm.write` 方法返回了单个裸张量而非元组，或者元组元素个数与 `fields` 数量不匹配。 | 确保方法始终返回元组形式，即使只有一个字段也要写成 `return (new_tensor,)`。 |
-| `export overflow must be 'drop' or 'block'` | `@pllm.export` 的 `overflow=` 参数传入了不支持的值。 | 仅传入 `"drop"`（默认，队列满时丢弃旧事件不阻塞前向）或 `"block"`（阻塞等待队列腾空）。 |
-| `a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase` | 在 `@pllm.add_logits` 或其他采样前方法中读取了 `pllm.base_logits()` 或 `pllm.sampled_tokens()`。 | 采样前不可读取采样后才物化的反馈；读取当前步模型 logits 请改用 `pllm.layer_logits((-1,))`，读取隐藏状态改用 `pllm.final_hidden()`。 |
-| `@pllm.add_logits method ... must return [rows, vocab_size] = ... got ... Read logits=pllm.layer_logits((-1,)) and return logits[:, -1], or project hidden states to the model's vocabulary.` | `@pllm.add_logits` 方法返回的张量形状与期望的 `[rows, vocab_size]` 不匹配。 | 检查返回张量维度，确保第 0 维为请求行数，最后一维等于模型的词表大小 `vocab_size`。 |
-| `@pllm.guide_sampling method ... must return a hidden-state prediction [rows, hidden_size] = ...; got ...` | `@pllm.guide_sampling` 返回的是隐状态预测，pLLM 用模型的 LM head 把它投影成 logits；返回形状不是 `[rows, hidden_size]`。 | 返回 `[rows, hidden_size]` 的预测；想直接加 logits 用 `@pllm.add_logits`。 |
-| `[neutral] guide_sampling still declares a sampler stage; set its beta to zero.` | 在静态契约检查 `testing.check(..., neutral=...)` 中，传入的中性配置未能将采样引导的 $\beta$ 置为 0。 | 确保中性负载实例的 `beta` 方法或属性返回精确的 `0.0`。 |
-| `...: add_logits must return exactly zero` | 在静态契约检查中，传入的中性配置下 `@pllm.add_logits` 方法未能返回严格全零的张量。 | 确保中性负载实例将偏置强度乘数置为 0，使张量数学计算结果精确为全零。 |
-| `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 在独立请求训练中错误地给 `@pllm.train` 配置了 `rows=` 或 `update_rows=` 参数。 | 移除训练方法上的 `rows=` 参数，转而在采样引导方法 `@pllm.guide_sampling(rows=...)` 上声明行选择器。 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[效果与结果](../reference/errors.md#效果与结果)、[阶段](../reference/errors.md#阶段值什么时候存在)几节。
 
 ---
 

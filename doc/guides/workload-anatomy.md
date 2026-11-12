@@ -1,8 +1,6 @@
 # 负载的组成
 
-在 Hugging Face 的 `generate` 里实验一个推理期算法，通常只需要注册一个 `forward hook`，或者在解码循环外面包一层张量运算。但把同样的算法放进真实的 vLLM 服务时，几十个并发请求会被连续批处理（continuous batching）拼进同一个张量，模型前向又被捕获进 CUDA graph——Python hook 既不知道张量的哪一行属于哪个请求，在 CUDA graph 重放时甚至根本不会被调用。
-
-pLLM 把**算法声明**与**引擎调度**拆开：你写一个 `pllm.Workload` 子类，用声明回答三个问题——**读什么**、**存什么**、**结果去哪**——再在方法体里写普通的 PyTorch 张量数学。pLLM 在构建引擎时只读一次这些声明，自动规划每个方法在什么时机、哪条 CUDA stream 上运行，替你管理每个请求的状态显存并将计算捕获进 CUDA graph。
+pLLM 把**算法声明**与**引擎调度**拆开（为什么不用 hook，见[核心概念](../explain/core-concepts.md)）：你写一个 `pllm.Workload` 子类，用声明回答三个问题——**读什么**、**存什么**、**结果去哪**——再在方法体里写普通的 PyTorch 张量数学。pLLM 在构建引擎时只读一次这些声明，自动规划每个方法在什么时机、哪条 CUDA stream 上运行，替你管理每个请求的状态显存并将计算捕获进 CUDA graph。
 
 先看一个最小的可运行负载：不存任何状态，只读取模型第 12 层之后的残差流，算出每个请求当前 token 的 L2 范数并导出到 CPU。
 
@@ -352,17 +350,7 @@ print(testing.check_on_gpu(GatedDistill(), GPU_CONFIG, neutral=GatedDistill(beta
 
 ## 常见报错
 
-写负载时最常见的报错，几乎都能对应到上面某一节的规则：
-
-| 你看到的报错（节选） | 对应的规则 |
-| --- | --- |
-| `...: give every input a source as its default, e.g. ...` | [三类声明](#负载类与三类声明)第 1 条：每个输入写来源默认值 |
-| `the workload has no effect on the model: add @pllm.train, ...` | 第 2 条：产出结果的方法要有效果装饰器 |
-| PyTorch 的 "Tensor.item() cannot be called on meta tensors"，附注 `while shape tracing method ...` | [方法体](#方法体里写什么)第 3 条：不做同步、不按张量的值分支 |
-| `... mixes rows: equal inputs for this request produced different outputs. ...` | 第 1 条：只在 `dim=-1` 上归约 |
-| `... mutates borrowed input ... in place; inputs and parameters are read-only views. ...` | 第 2 条：不原地修改输入 |
-
-每条报错的完整原文、原因和改法见[排查报错](../howto/troubleshooting.md)。
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[声明与输入](../reference/errors.md#声明与输入)、[方法体](../reference/errors.md#方法体)、[testing.check 的 ContractError](../reference/errors.md#testingcheck-的-contracterror)几节。
 
 ---
 

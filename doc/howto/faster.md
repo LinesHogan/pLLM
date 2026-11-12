@@ -4,7 +4,7 @@
 
 这篇操作指南是一份按排查优先级排序的优化清单。自回归解码与离线训练不同：GPU 每步只为每个并发请求生成 1 个 token，计算强度（FLOPs/字节）极低，算力通常过剩，真正的瓶颈集中在三个物理制约：**GPU 时间线气泡（主机同步或算子发射阻塞）**、**显存与总线搬运带宽（全词表投影、状态读写、PCIe 传输）**，以及 **KV Cache 显存容量**。
 
-关于这些物理制约的底层推导与硬件模型，参见 [性能与显存](../explain/performance.md)；阅读执行报告的字段定义，参见 [看成本：pllm.explain](../guides/explain.md)。
+关于这些物理制约的底层推导与硬件模型，参见 [性能与显存](../explain/performance.md)；阅读执行报告的字段定义，参见 [看成本：pllm.explain](../guides/explain.md)；改完之后怎样公平地测，参见 [公平地测吞吐](measure-throughput.md)。
 
 > [!NOTE] 基准测试环境与标尺数字
 > 除非另有说明，本文引用的实测数字都来自同一基准环境：**单卡 RTX 4090（24 GiB）、`Qwen/Qwen2.5-7B-Instruct`（BF16）、vLLM 0.32.0、128 条并发序列（8 条 prompt $\times$ 16 个采样分支）、每条生成 256 个 token、开启 CUDA Graph；`pllm.benchmark.throughput` 预热 1 轮后取 3 轮中位数**。吞吐百分比均相对于同样设置下原生 vLLM（开启 CUDA Graph）的吞吐（约 $5,894\text{ tok/s}$，按 128 行折算单步约 $21.7\text{ ms}$）。同样设置换成 0.5B 模型，一步只有约 $3.0\text{ ms}$；下文在结论随模型大小改变的地方给出两者对照。
@@ -140,7 +140,7 @@ memory   peak 1512728864 bytes funded by pLLM [per-rank tensor reservations; exc
          below 1512728864 bytes tasks run inline; below 1333743904 bytes planning fails
 ```
 
-检查你配置的 `execution_peak_budget_bytes` 是否低于第一行提示的重叠阈值（上例是[性能与显存](../explain/performance.md)第 2 节的 `Distill` 在 7B、128 并发下的输出：`1512728864 bytes`）。
+检查你配置的 `execution_peak_budget_bytes` 是否低于第一行提示的重叠阈值（上例是[负载的组成](../guides/workload-anatomy.md)里的 `Distill` 在 7B、128 并发下的输出：`1512728864 bytes`）。
 
 ### 意味着什么
 
@@ -172,7 +172,7 @@ overlap_config = pllm.ModelConfig(
 * **7B**：纯在线训练（$\beta=0$）时，`publish_lag=1` 为原生 vLLM 吞吐的 **97.4%**，`publish_lag=0` 为 **97.2%**；训练 + 引导采样（$\beta=0.1$）时为 **96.4%** 和 **96.1%**。每步训练只有约 0.6 ms GPU 时间，相对 21.7 ms 的一步，串行等待的代价在噪声附近。
 * **0.5B（同样设置，只换模型）**：纯在线训练时 `publish_lag=1` 为 **91.9%**，`publish_lag=0` 为 **89.8%**。步越短，重叠越值钱。
 
-代价是显存预留增加，但只落在读落后版本的状态上：有方法读落后 `publish_lag` 步的版本时，每个请求槽位要多留 `publish_lag` 份旧版本的参数（优化器字段不随旧版本保留；公式见 [4.1 节](../explain/performance.md#41-分页状态池与每字段页数公式pages)）。对 7B 上的 `Distill`（`predict` 读落后的版本），128 并发下参数字段从 256 页增至 384 页，状态预留从约 95 MiB 增至约 110 MiB；`ESamp`（$\beta=0$）没有落后读者，两种设置都是每个字段 256 页。
+代价是显存预留增加，但只落在读落后版本的状态上：有方法读落后 `publish_lag` 步的版本时，每个请求槽位要多留 `publish_lag` 份旧版本的参数（优化器字段不随旧版本保留；公式见[性能与显存 3.1 节](../explain/performance.md#31-分页状态池与每字段页数公式pages)）。对 7B 上的 `Distill`（`predict` 读落后的版本），128 并发下参数字段从 256 页增至 384 页，状态预留从约 95 MiB 增至约 110 MiB；`ESamp`（$\beta=0$）没有落后读者，两种设置都是每个字段 256 页。
 
 ---
 
@@ -387,46 +387,47 @@ def _fused_step_fake(x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 ---
 
-## 8. 公平地测量吞吐
+## 8. 只在需要的层上改写残差
 
 ### 看什么
 
-使用基准测试工具：`pllm.benchmark.throughput(llm, prompts, sampling)` 与 `pllm.benchmark.compare(workload, options)`，观察结果中的 `tokens_per_second` 与 `vanilla_tokens_per_second`。
+`pllm.explain` 的 `forward` 行与挂了 `@pllm.custom_residual` 或 `ActivationPatch` 的层数。
 
 ### 意味着什么
 
-不严谨的测试条件会得出虚假的加速比：
-* 若对比的原生 vLLM 运行在 eager 模式，会得出虚高加速比；
-* 若未排除首轮预热（warmup），CUDA Graph 录制和 JIT 编译会拉低统计吞吐；
-* 并发数、序列长度或采样参数（如 `ignore_eos`）不一致会导致实际计算量不对等。
+挂了残差改写的模型图里，vLLM 录的是原始算子而不是 Inductor 融合后的算子，即使恒等改写也要付这份代价（7B、128 并发下约 3%，见[性能与显存 4.4 节](../explain/performance.md#44-模型层内残差改写)）；改写本身的计算按层数累加。
 
 ### 怎么改
 
-遵循公平测试准则（详见 [公平地测吞吐](measure-throughput.md)）：
-1. **同配置对比**：同一张 GPU、同一模型权重、相同 CUDA Graph 模式。
-2. **固定工作量**：使用相同批次的输入 `prompts`、固定的 `max_tokens`，并设置 `SamplingParams(ignore_eos=True)` 确保生成的总 token 数严格相等。
-3. **排除预热**：至少运行 1 次未计时的 warmup，正式测试测量 3 轮以上取中位数。
+用 `layers=` 只挂真正需要改写的层；评估改写本身的代价时，和 eager 模式的原生 vLLM 对比，或直接跑 `testing.check_on_gpu`（它会建一个设置相同的原生引擎）。带状态的子层要更大的 CUDA graph 捕获池，按报错给出的字节数调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)`。
 
-```python
-# check-docs: skip: requires GPU engine and vLLM runtime
-from vllm import SamplingParams
-from pllm.benchmark import throughput
+---
 
-prompts = ["Explain gradient descent:"] * 8
-timed = SamplingParams(max_tokens=256, temperature=0.8, seed=0, ignore_eos=True)
+## 9. 让跳层真的省下时间
 
-with pllm.make_llm(config) as plain:
-    vanilla_tps = throughput(plain, prompts, timed, warmup=1, rounds=3)
+### 看什么
 
-with pllm.make_llm(config, workload=FastLoRA()) as llm:
-    workload_tps = throughput(llm, prompts, timed, warmup=1, rounds=3)
+`@pllm.custom_forward(tokens="decode")` 里 `layers(..., active=mask)` 的跳过比例，以及吞吐是否随它变化。
 
-print(f"相对原生吞吐: {workload_tps / vanilla_tps:.2%}")
+### 意味着什么
+
+decode 的矩阵乘受权重带宽限制：一批里只要还有一行要跑某层，这层的权重就要整份读一遍。部分行跳过只省下它们的 attention 读取；只有整批都跳过一段层时，才省下读权重的时间（原因与实测见[性能与显存 4.5 节](../explain/performance.md#45-前向内训练线性扫描与自适应深度)）。
+
+### 怎么改
+
+把跳层的判断设计成让整批更常一起跳（例如固定的层段、按步而不是按行的阈值），或者用在上下文很长、attention 读取占大头的场景；prompt 不跳层，`active=` 只用于 `tokens="decode"`。
+
+---
+
+## 10. 采样器：打开 FlashInfer 采样
+
+128 行以上的大批次、或负载改了 logits 时，vLLM 默认采样器的耗时会变得可观。装了 FlashInfer 时，在启动前设环境变量换成它的融合采样算子：
+
+```bash
+export VLLM_USE_FLASHINFER_SAMPLER=1
 ```
 
-### 代价是什么
-
-规范的基准测试需要多花费数分钟执行时间，但能提供可信、可复现的真实加速数据。
+它同时改变原生与负载两边的采样耗时，所以对比吞吐时两边要在同一设置下测，并在报告里写明（见[公平地测吞吐](measure-throughput.md)）。
 
 ---
 
@@ -441,4 +442,6 @@ print(f"相对原生吞吐: {workload_tps / vanilla_tps:.2%}")
 | **5. KV 显存** | `kv_capacity` / `kv_cache_blocks` | 显存容量真正释放 | 采用滑动窗口或跨层共享等静态几何布局；认清动态 Top-K 不省显存容量 |
 | **6. 状态精度** | `state` 各字段 `dtype` | 只读 auto 为 BF16，敏感变量显式 FP32 | 累加器、动量与 carry 显式声明 `torch.float32`，其余字段保持 `auto` |
 | **7. 算子融合** | `custom_ops` 报告 / 剖析器小算子 | 融合进图，吞吐 $\ge 95\%$ | 用 `@torch.library.custom_op` 接入 Triton 融合 kernel，直接调用算子对象 |
-| **8. 公平测量** | `throughput` 中位数对比 | 同硬件、同请求数、同 ignore_eos | 遵循 [公平地测吞吐](measure-throughput.md) 流程，对齐基准条件 |
+| **8. 残差改写** | `forward` 行 / 挂载层数 | 只挂需要的层 | `layers=` 限定层；和 eager 原生或 `check_on_gpu` 对比改写本身的代价 |
+| **9. 跳层** | 跳过比例与吞吐 | 整批一起跳 | 按层段或按步决定跳层；只在 decode 上用 `active=` |
+| **10. 采样器** | 采样耗时 | 融合采样 | `VLLM_USE_FLASHINFER_SAMPLER=1`，两边同设置 |

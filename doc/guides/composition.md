@@ -158,19 +158,9 @@ except ValueError as e:
 运行这段代码会直接抛出 `ValueError`：
 `a.predict and b.predict both declare @pllm.guide_sampling; keep at most one guidance method`。报错明确点名了冲突的双方 `a.predict` 和 `b.predict`。
 
-### 常见组合冲突一览
+### 其他组合冲突
 
-下表列出常见的组合冲突、构建期报错信息以及背后的原因与解决建议：
-
-| 常见报错（节选） | 冲突原因与解决办法 |
-| --- | --- |
-| `... and ... both declare @pllm.guide_sampling; keep at most one guidance method` | **每个负载最多声明一个采样引导方法**。采样器后置过滤只支持一套打分与挑选逻辑；若只需微调不同 token 的概率偏置，改用支持多个并存的 `@pllm.add_logits`。 |
-| `... trains on ... but ... on ...; pLLM funds one training mode per workload, so move one of them to a separate workload` | **每个负载只资助一种训练调度**。连续批处理中的逐请求行在线训练（`rows of running requests`）与全批次宿主训练（`WeightedRowBatch` / `CausalTrainBatch`）具有完全不同的执行图生命周期，不能混在同一个负载内；请将它们拆分到独立的引擎中运行。 |
-| `a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet combine with a pllm.model.Adapter; train the adapter's state in that method or use two workloads` | **就地前向更新与 Adapter 互斥**。`@pllm.train_in_forward` 接管了其目标投影的所有钩子进行就地前向更新，无法与独立的 `Adapter` 叠加；直接在该方法内训练该状态，或拆为两个负载。 |
-| `... components are independent; to share state, put both methods in one workload` | **组件之间严格禁止跨界读写状态**。组件状态必须私有以保证独立运行与组合运行的轨迹逐位一致；需要共享状态的方法必须写在同一个 `Workload` 类中。 |
-| `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | **自定义前向结构与块输出读取互斥**。`@pllm.custom_forward` 可能跳层或循环执行某些层，各层的固定块输出 `pllm.hidden` 没有唯一定义；改用 `pllm.residual` 或 `pllm.layer_logits` 读取每层最后一次访问的激活流。 |
-
-完整的规则矩阵与所有被拒绝的边界组合详见[组合规则](../reference/composition-rules.md)与[报错目录](../reference/errors.md)。
+其余组合冲突的报错见报错目录的[效果与结果](../reference/errors.md#效果与结果)、[改模型与 forward 结构](../reference/errors.md#改模型与-forward-结构)两节；哪些写法可以并存、哪些被拒绝及原因见[组合规则](../reference/composition-rules.md)。
 
 ---
 

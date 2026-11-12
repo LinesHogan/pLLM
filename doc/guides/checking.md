@@ -252,17 +252,7 @@ execution.retire(rows, wait=True)
 
 ## 常见报错
 
-在运行正确性检查时，最常见的报错信息及原因如下表所示：
-
-| 你看到的报错（节选） | 触发原因与改法 |
-| --- | --- |
-| `... mixes rows: equal inputs for this request produced different outputs. Dimension 0 holds request rows; reduce features (dim=-1), not requests (dim=0).` | 方法体跨请求行做了归约（例如误写了 `h.mean(dim=0)` 或 `softmax(dim=0)`）。第 0 维是并发打包的请求行，不同行属于不同请求；必须改为沿特征维归约（`dim=-1`）。 |
-| `... mutates borrowed input ... in place; inputs and parameters are read-only views. Use out-of-place tensor math or clone() before writing; publish state changes through @pllm.write or @pllm.train.` | 方法体原地修改了借用的输入张量（例如 `w.add_(1)` 或 `h.mul_(2)`）。输入和参数都是只读视图；改用非原地张量运算（如 `w + 1`）或在切片赋值前 `.clone()`，并通过 `@pllm.write` 或 `@pllm.train` 发布状态。 |
-| `training methods return one loss per row; pLLM reduces the selected rows per state` | 请求行训练方法返回了 0 维标量（在方法末尾自己做了 `.mean()`）。pLLM 需要每行各自的 loss（形状 `[rows]`）来屏蔽未选中行或填充槽位，并按状态独立归约；去掉方法末尾跨行的归约。 |
-| `[neutral] guide_sampling still declares a sampler stage; set its beta to zero.` | 零强度对照 `neutral=` 的采样引导未完全关闭。不能在类体里直接写 `beta=beta`（读到的是类的默认值），必须定义方法 `def strength(self) -> float: return self.beta` 并传给装饰器 `@pllm.guide_sampling(beta=strength)`。 |
-| `...: add_logits must return exactly zero` | 零强度对照 `neutral=` 的 logits 修正方法没有返回全零张量。在零强度实例下，`@pllm.add_logits` 方法的返回值必须精确为零（如乘以 `self.scale` 且零强度时 scale 为 0）。 |
-
-关于其他编译与准入报错的详细列表，请参阅[排查报错](../howto/troubleshooting.md)。
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[testing.check 的 ContractError](../reference/errors.md#testingcheck-的-contracterror)一节。其余构建时的报错按主题列在[报错目录](../reference/errors.md)。
 
 ---
 

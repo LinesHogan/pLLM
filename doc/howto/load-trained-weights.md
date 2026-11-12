@@ -376,19 +376,4 @@ print(pllm.explain(PromptLoRA(), CONFIG).states[0].name)
 
 ## 常见报错与排查
 
-在加载离线权重时，如果配置违反了上述物理限制，pLLM 会在启动前明确抛出异常。下表列出常见错误信息及修正方案：
-
-| 报错信息 | 产生原因 | 解决办法 |
-| --- | --- | --- |
-| `pllm.Pretrained(...) for state ... does not exist; save it with safetensors.torch.save_file before make_llm` | `pllm.Pretrained` 指向的文件路径在本地磁盘上不存在。 | 检查文件路径，确保在调用 `pllm.explain` 或 `pllm.make_llm` 之前已用 `save_file` 完成落盘。 |
-| `pllm.Pretrained needs a .safetensors file; save it with safetensors.torch.save_file` | 文件扩展名不是 `.safetensors`（例如传入了 `.pt` 或 `.bin` 文件）。 | 使用 `safetensors.torch.save_file` 将权重导出为标准的 safetensors 格式。 |
-| `... has no tensor ... for state ...; it holds .... Name the fields like the saved tensors, or save the tensors under the field names` | safetensors 文件内的张量键名与负载状态声明的 `fields` 字段名不匹配。 | 统一双方命名，或在重命名后重新导出权重文件。对于 Adapter，键名需包含 `_0, _1` 等后缀。 |
-| `tensor ... in checkpoint ... has shape ...; adjust the declared field shape to match it` | 文件中存储的张量形状与状态声明的形状（shape 元组或形状函数计算值）不一致。 | 调整状态中的形状声明，或在保存权重时确保张量维度符合模型对应结构。 |
-| `...: a workload cannot hold a module or tensor; save its weights and declare pllm.InstanceState(init=pllm.FromModule(<factory>, pretrained=path)), or field state with init=pllm.Pretrained(path)` | 工厂函数或负载类中闭包捕获了已经实例化的 `nn.Module` 或 `torch.Tensor` 对象。 | 移除对外部实例的引用，改为在工厂函数内按尺寸构造全新模块，并用 `pretrained=` 加载权重。 |
-| `... cannot load module state ...: ...; save the file with safetensors.torch.save_file(module.state_dict(), path) from the same module class` | `pllm.FromModule` 严格加载失败，文件中的 state_dict 键或参数形状与模块类定义不匹配。 | 确认 safetensors 文件是由完全相同的模块类通过 `module.state_dict()` 导出的。 |
-| `...: a pllm.ModelCheckpoint state is read-only; write to a separate state` | 试图通过 `@pllm.write` 或在线训练修改声明为 `pllm.ModelCheckpoint` 的底座权重状态。 | 底座权重为静态只读共享；如需修改，请将增量或新参数写入独立的 `RequestState` 或 `InstanceState`。 |
-| `placement="host" needs a read-only InstanceState of gathered fields; use placement="device" for mutable state` | 在 `RequestState` 或配置了优化器/carry 的可变状态上声明了 `placement="host"`。 | 只有无优化器的只读 `InstanceState` 才能存放在主机内存；可变或每请求状态请移除 `placement="host"`。 |
-| `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | 可训练的低秩 `Adapter` 使用了默认的全零初始化（`pllm.Zeros()`）。 | 低秩因子 $A$ 和 $B$ 同时为 0 导致反向梯度恒为 0；请使用 `init=pllm.Computed(fn)` 将 $A$ 设为随机小值、$B$ 设为全零。 |
-| `...: declare one fed state per workload` | 在同一个 workload 内部声明了两个或更多 `init=pllm.Fed(...)` 状态。 | 单个负载仅支持一条有界背压跨进程流；将多个特征字段合并放入同一个 `Fed` 状态的字典中。 |
-
-更多排查方法与诊断工具，请参阅 [排查报错](troubleshooting.md)、[看成本：pllm.explain](../guides/explain.md) 以及 [核心概念](../explain/core-concepts.md)。
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[加载与放置状态](../reference/errors.md#加载与放置状态)一节。

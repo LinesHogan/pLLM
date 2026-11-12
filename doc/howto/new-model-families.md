@@ -183,18 +183,7 @@ with pllm.make_llm(slice_config, workload=ObserveResidual()) as llm:
 
 ## 6. 常见准入报错与排查
 
-更换模型家族时，如果负载超出了目标架构的能力边界，pLLM 会抛出对应的校验异常。对照下表排查原因与改法：
-
-| 你看到的报错 | 原因与应对方式 |
-| --- | --- |
-| `choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads` | 传入了未在准入名单中的模型架构。pLLM 需要与具体的 vLLM 架构对齐内部残差流与子层归一化位置，目前请选择列表中的模型架构。 |
-| `pLLM runs vLLM's own model classes, not subclasses of them` | 传入了原生类的派生子类。派生子类可能改变投影布局或 logits 计算，pLLM 拒绝子类准入；请使用原生模型类。 |
-| `... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model` | 试图在只读模型（如 DeepSeek V2/V3 或 gpt-oss）上运行 LoRA 权重改写、整模型因果训练或 forward 重放。这些模型采用压缩的潜在 KV（MLA）或多专家稀疏路由，缺乏单一稠密投影矩阵；请将负载限制在只读观测、ESamp、激活补丁或采样引导阶段。 |
-| `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model` | 在 Qwen3.5 混合模型上使用了 `@pllm.custom_forward` 或 `@pllm.custom_attention`。Gated DeltaNet 层的循环隐藏状态独立于分页 KV 缓存，无法从 KV 中重算历史状态；重放 forward 或自定义 attention 请使用全注意力稠密模型或 Qwen3-MoE。 |
-| `layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead` | 试图在 MoE 模型的专家层上挂载 LoRA 改写。每个 token 被动态路由到不同专家，不存在单一稠密的 MLP 矩阵；请将参数改写挂载到注意力的 query 或 value 投影上。 |
-| `layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)` | 试图在 Qwen3.5 的 Gated DeltaNet 层上挂载 q/k/v 投影的 LoRA 改写。该层属于线性循环注意力，没有标准的 q/k/v 投影矩阵；请将改写目标设在全注意力（full_attention）层上。 |
-| `gated attention interleaves each head's query rows with its output-gate rows; overlay the value projection instead` | 试图在 Qwen3.5 的门控全注意力层上挂载 `q_proj` 改写。该层将每个头的 query 行与 output-gate 行交错打包，无法直接切出独立的 query 投影；请改写 `v_proj`。 |
-| `projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks` | 在 CPU 上调用 `pllm.explain` 且负载包含参数改写时，使用了非稠密架构的配置。CPU 阶段的配置解析目前覆盖稠密 Qwen2、Qwen3 和 Llama；非稠密架构的投影排布推导在 `make_llm` 时判定，在 CPU 做预检时请使用稠密配置。 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[引擎设置、模型与并行](../reference/errors.md#引擎设置模型与并行)、[改模型与 forward 结构](../reference/errors.md#改模型与-forward-结构)几节。
 
 ---
 

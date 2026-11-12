@@ -329,14 +329,7 @@ print(pllm.explain(ManualFastWeights(), CONFIG).eager_reason)
 - **能够无缝重算的负载**：
   若请求状态以 `request_id` 为键（`key_fields` 包含 `request_id`），负载中**没有可变的实例状态**，也**没有外部 feed、导入或宿主输入**，重算历史就能完全复现原来的状态，引擎直接重算。`pllm.explain` 的 `preempt` 行会写明你的负载属于哪一种。
 - **会直接报错中断的负载**：
-  任何依赖外部逐步输入、含有可变 `InstanceState`、或存在跨步状态依赖的 overlay / 激活修改负载，在发生抢占时**无法保证重算状态与历史严格一致**，此时引擎会直接抛出运行时错误：
-
-| 错误信息 | 原因 | 解决方法 |
-| --- | --- | --- |
-| `vLLM preempted a request and would recompute its history; ... To avoid preemption, give vLLM more KV cache (gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)` | 请求被 vLLM 抢占，但负载包含外部导入、可变实例状态或跨步状态依赖，无法保证历史重算的一致性。 | 调大 `gpu_memory_utilization` 或调小 `max_num_seqs`，避免因 KV 显存耗尽触发驱逐与抢占。 |
-| `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | 带优化器的 `low_rank` 状态使用了默认的全零初始化（`pllm.Zeros`），导致反向传播初始梯度恒为零。 | 为状态指定非零初值，例如 `init=pllm.Computed(...)`（如高斯随机初始化 A，B 置零）。 |
-| `per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP` | 在张量并行配置（`tensor_parallel_size > 1`）下声明了 `"per_head"` 投影算子。 | 在张量并行下改用 `"dense"` 或 `"low_rank"` 算子，或设置 `tensor_parallel_size=1`。 |
-| `CUDA-graph overlays do not support adapters backed by shared InstanceState` | `pllm.model.Adapter` 引用了所有请求共享的 `InstanceState`，导致前向传播退回 eager 模式。 | 若不需要跨请求共享，将状态改为 `RequestState`；若必须共享且需要 CUDA graph，避免使用此类 Adapter。 |
+  任何依赖外部逐步输入、含有可变 `InstanceState`、或存在跨步状态依赖的 overlay / 激活修改负载，在发生抢占时**无法保证重算状态与历史严格一致**，此时引擎会直接抛出运行时错误，原文和改法见报错目录的[请求与运行时](../reference/errors.md#请求与运行时)一节。
 
 > **历史 KV 的因子保留**：在因果自回归模型中，已写入的旧 KV 缓存保留的是计算当时所使用的有效权重；后续 step 更新 Adapter 因子不会回溯重算历史前缀的 KV。
 

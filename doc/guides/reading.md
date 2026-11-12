@@ -249,17 +249,7 @@ tap      lm_head[0], prefill,decode: 29171840 bytes shared by top1
 
 ## 常见报错与排查
 
-在声明输入来源时，若违反了上述规则，规划器会抛出明确的异常。下表列出了常见的报错信息与对应的排查规则：
-
-| 报错信息（节选自源码） | 原因与修改方式 |
-| :--- | :--- |
-| `... reads tokens="all" rows; only @pllm.export methods read them, and without pllm.result inputs. Export the rows, or read tokens="prefill" or "decode"` | 只有 `@pllm.export` 方法可以读取 `tokens="all"`。其他方法（如训练或修改 logits）必须按请求对齐，改用 `tokens="decode"` 或 `tokens="prefill"`。 |
-| `tensor inputs need one phase; hidden inputs become available after model forward` | 同一个方法中混合了不同阶段的输入（如同时读取了 `tokens="prefill"` 和 `tokens="decode"`），或者在前向传播之前试图读取前向产生的 hidden。确保一个方法只处理一个阶段的数据。 |
-| `... which is available only in Phase.AFTER_SAMPLE. Read feedback in @pllm.train or a read-only ...` | 在采样前的方法中读取了 `pllm.base_logits()` 或 `pllm.sampled_tokens()`。采样前若需读取 logits 请改用 `pllm.layer_logits((-1,))`，若需读取 hidden 请改用 `pllm.final_hidden()`。 |
-| `pllm.residual(after=...): use "layer" or "attention"` | `pllm.residual` 的 `after=` 参数仅支持 `"layer"`（整层之后）或 `"attention"`（注意力之后）。 |
-| `pllm.input_tokens(history=) needs a nonnegative integer` | `history` 必须是非负整数（$\ge 0$）。 |
-| `pllm.attention needs a nonnegative layer and fact='aux' or 'lse'` | `pllm.attention` 的层号必须是非负整数，且 `fact` 只能为 `"aux"` 或 `"lse"`。 |
-| `pllm.layer_logits reads the model's LM head; compile this workload with make_llm` | `pllm.layer_logits` 依赖模型运行时的完整 LM head 权重，无法在脱离模型的宿主独立编译（`make_host`）中使用。 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[声明与输入](../reference/errors.md#声明与输入)、[阶段](../reference/errors.md#阶段值什么时候存在)几节。
 
 ---
 

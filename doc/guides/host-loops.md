@@ -341,13 +341,7 @@ with pllm.make_llm(gpu_config, workload=TTRL()) as llm:
 
 ## 常见错误与排查
 
-| 错误信息 | 原因 | 解决办法 |
-| :--- | :--- | :--- |
-| `host-batch training returns one scalar and owns its reduction; remove reduction=` | 宿主批训练方法传入了非默认的 `reduction=`（如 `"sum"`）。宿主批次的完整序列长度与权重仅在宿主侧已知，损失归约必须在方法内部自行完成并返回标量。 | 去掉 `@pllm.train` 上的 `reduction=`，在方法代码中完成除以长度或样本数的归约。 |
-| `training on WeightedRowBatch or CausalTrainBatch fields takes one AdamW step over the whole batch: remove rows=, update_rows=, steps=, reset=, @pllm.differentiate and pllm.carry` | 宿主批训练（`WeightedRowBatch` 或 `CausalTrainBatch`）指定了逐请求训练特有的参数（如 `rows=`、`steps=`、`reset=` 等）。宿主批训练每次对整批执行一步 AdamW。 | 从 `@pllm.train` 装饰器中移除 `rows=`、`update_rows=`、`steps=`、`reset=` 等参数。 |
-| `...: add init=pllm.Computed(...) (e.g. random A, zero B); with both low_rank factors at zero every gradient is zero and the adapter never learns` | 低秩适配器（LoRA）的状态字段未显式指定初始化，默认全零（`pllm.Zeros()`）。当 $A$ 与 $B$ 两个因子均为零时，梯度恒为零，优化器无法更新参数。 | 在声明 `InstanceState` 时传入 `init=pllm.Computed(...)`，将 $A$ 因子随机初始化、$B$ 因子初始化为零。 |
-| `...: host batch shapes ... exceed the planned ...; raise ExecutionOptions(max_host_training_rows=N) for more training rows per state, or HostConfig(max_input_rows=N) for a host workload` | 送入引擎的批次序列数超过了启动时声明的显存预算上限。框架在启动时按声明的上限预留训练显存。 | 在 `ModelConfig` 中调大 `execution=pllm.ExecutionOptions(max_host_training_rows=N)`，或宿主端调大 `HostConfig(max_input_rows=N)`。 |
-| `causal training needs a BF16 model whose embedding and LM head are not quantized` | 因果批训练要求基座模型为 BF16，且词表嵌入与 LM head 未量化。反向传播需要以 BF16 精度穿透嵌入与输出层。 | 使用未量化词表嵌入与 LM head 的 BF16 基座模型。 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[状态与训练](../reference/errors.md#状态与训练)、[显存预算](../reference/errors.md#显存预算)几节。
 
 ---
 

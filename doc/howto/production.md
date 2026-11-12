@@ -239,16 +239,4 @@ vLLM 提供了前缀缓存功能（Prefix Caching，`enable_prefix_caching=True`
 
 ## 常见报错与排查
 
-在部署到多进程、多卡张量并行或调整生产配置时，若遇到准入拒绝或运行时异常，对照下表排查：
-
-| 报错信息 | 产生原因与排查方法 |
-| :--- | :--- |
-| `worker processes cannot send ... defined in __main__ or a notebook; move it into an importable .py module, or use tensor_parallel_size=1 with multiprocessing=False` | **原因**：设置了 `multiprocessing=True`，但负载类定义在 `__main__`、Notebook 单元格或函数内部，子进程无法通过模块路径导入该类。<br>**排查**：将负载类移入一个在 `sys.path` 中的 `.py` 文件中，并通过 `from your_module import YourWorkload` 导入；或在单进程调试时设为 `multiprocessing=False`。 |
-| `worker processes receive the workload by pickling (...); hold module-level functions instead of lambdas or closures, or use tensor_parallel_size=1 with multiprocessing=False` | **原因**：负载实例字段或配置中包含了无法被 `pickle` 序列化的 lambda 匿名函数或闭包对象。<br>**排查**：将配置改写为顶级具名函数、常量或原生数据类型，避免在类属性中捕获闭包。 |
-| `the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; run both processes from the same installed sources and do not rewrite pretrained files while the engine starts` | **原因**：驱动端与 worker 子进程导入的源码或预训练权重不一致，导致推导出的执行计划产生分歧。<br>**排查**：确保所有进程运行自同一套安装好的源码，且不要在引擎启动过程中修改 `.py` 文件或覆写预训练权重文件。 |
-| `multi-GPU needs vLLM 0.32.0; otherwise use tensor_parallel_size=1` | **原因**：配置了 `tensor_parallel_size > 1`，但运行环境不是 vLLM 0.32.0。<br>**排查**：换到 vLLM 0.32.0 环境；在 vLLM 0.27.1 下请保持 `tensor_parallel_size=1`。 |
-| `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | **原因**：在张量并行模式下声明了 `@pllm.custom_attention`。<br>**排查**：多卡下注意力头被切分，单卡无法看到全量注意力头。自定义注意力读取目前需在 `tensor_parallel_size=1` 下运行。 |
-| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | **原因**：负载包含残差改写或注意力改写，同时开启了 `enable_prefix_caching=True`。<br>**排查**：保持 `ModelConfig(enable_prefix_caching=False)`。模型改写使得 KV Cache 与请求状态相关联，无法跨请求按 prompt 文本复用。 |
-| `vLLM preempted a request and would recompute its history; ... To avoid preemption, give vLLM more KV cache (gpu_memory_utilization) or fewer concurrent sequences (max_num_seqs)` | **原因**：KV Cache 耗尽触发抢占，但负载的状态转移不可重放（如包含可变实例状态或外部投喂），无法安全重算历史。<br>**排查**：调高 `gpu_memory_utilization` 扩充 KV Cache 空间，或调小 `max_num_seqs` 降低并发以避免发生抢占。 |
-
-关于更多报错排查，参考[报错目录](../reference/errors.md)。
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[引擎设置、模型与并行](../reference/errors.md#引擎设置模型与并行)、[请求与运行时](../reference/errors.md#请求与运行时)几节。

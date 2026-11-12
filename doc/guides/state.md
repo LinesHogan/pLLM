@@ -1,6 +1,6 @@
 # 状态
 
-在推理期算法中，算法往往需要跨 decode 步或跨请求保留并演化数值：例如探针的权重矩阵、每个请求独有的适配器网络、跨请求共享的大表，或记录生成过程的滑动统计量。在普通 PyTorch 中，直觉通常是直接修改模块属性或给对象赋新值；但在 vLLM 与 pLLM 中，每一步连续批处理会重新组织张量行，方法作为录制好的 CUDA Graph 重放，借来的张量视图禁止原地修改。
+探针的权重、每个请求自己的适配器、跨请求共享的大表、生成过程的滑动统计量：推理期算法里要跨步或跨请求保留的值，在 pLLM 里都声明成状态。
 
 **状态（State）是 pLLM 中唯一可变的东西**。只要某个值需要在步与步之间、请求与请求之间存活，就必须显式声明为状态。声明状态后，pLLM 负责分配显存、按版本安全发布、处理 CUDA Graph 捕获，并在后台重叠训练与前向。
 
@@ -8,13 +8,9 @@
 
 ## 1. 为什么状态是唯一可变的东西
 
-在编写算法时，可能会尝试在方法内部写入 `self.mean += 1`，或者对输入张量直接执行原地操作 `w.add_(1)`。在 pLLM 体系下，这些做法会被拒绝或完全失效，其原因如下：
-
-1. **CUDA Graph 捕获与回放**：在解码阶段，方法会被捕获进 CUDA Graph。在后续步骤的图回放期间，Python 解释器根本不会再次执行方法体中的 Python 语句。任何写在 Python 实例属性上的变量（如普通字典或列表）都不会随 GPU 上的每步前向而更新。
-2. **借用视图为只读**：传给方法的输入参数（如 `pllm.hidden`）和参数视图（如 `pllm.parameter`）都是借来的只读张量视图。直接在原地修改它们（如 `w.add_(1)` 或 `h.mul_(2)`）会破坏 CUDA Graph 内部的张量复用，也会污染其他并发请求或后续步骤读取的数据，因此被创作契约严格禁止并在检查时报错。
-3. **连续批处理动态排布**：每一步前向拼入批次的请求及其对应的张量行都在动态变化。没有框架的统一显存管理，普通张量无法知晓哪一行对应哪条请求。
-
-因此，任何需要跨步演化的值，都必须显式声明为 pLLM 状态，并只能通过 `@pllm.train`（优化器更新）或 `@pllm.write`（自定义计算更新）来发布新版本。
+方法体在 CUDA graph 里回放，Python 赋值（`self.mean += 1`）不会每步执行；输入和参数是共享的只读视图，不能原地改；
+行的排列每步都变。所以要跨步存活的值都声明成状态，只经 `@pllm.train` 或 `@pllm.write` 发布新版本。完整的规则与原因见
+[方法体里写什么](workload-anatomy.md#方法体里写什么)。
 
 ---
 
@@ -364,13 +360,7 @@ print(pllm.explain(StepMemory(), CONFIG))
 
 ## 12. 常见错误
 
-| 报错（节选） | 原因 | 改法 |
-| :--- | :--- | :--- |
-| `... mutates borrowed input ... in place; inputs and parameters are read-only views. ...` | 在方法里原地改了 `pllm.parameter` 读到的视图 | 返回新值，经 `@pllm.write` 或 `@pllm.train` 发布 |
-| `@pllm.train reads ..., which trains with ...; declare ... with optimizer=...` | 训练的状态没有优化器 | 按报错给状态加优化器 |
-| `carry fields ride on the training transition; give the state an optimizer` | carry 字段随训练更新一起发布 | 给状态加优化器 |
-
-其余与状态有关的报错见[报错目录](../reference/errors.md)。
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[状态与训练](../reference/errors.md#状态与训练)、[加载与放置状态](../reference/errors.md#加载与放置状态)几节。
 
 ---
 

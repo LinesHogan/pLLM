@@ -256,20 +256,9 @@ print(f"状态名称: {plan.states[0].name}, 作用域: {plan.states[0].scope}")
 
 **原因**：路由键是状态声明的一部分，请求用哪份副本完全由它决定。没有路由值的请求不知道该用哪份；悄悄给它一份默认副本，会把不相干的请求混进同一份训练状态（例如两个租户共用了一个适配器），所以准入时直接拒绝。
 
-### 常见错误目录
+### 其他报错
 
-下表列出了与路由键相关的核心报错信息及其排查方式：
-
-| 报错信息 | 触发原因 | 解决办法 |
-| :--- | :--- | :--- |
-| `routes= needs a request state keyed by "route" and one value per prompt` | 调用 `llm.generate(prompts, ..., routes=...)` 时，负载未声明 `key_fields=("route",)`，或者 `routes` 的长度与 `prompts` 的数量不相等，或者包含了空字符串。 | 检查状态声明是否包含 `key_fields=("route",)`，并确保为输入的每个 prompt 都提供了一个非空的有效路由字符串。 |
-| `a route-keyed request state requires per-prompt routes` | 负载中声明了带有 `"route"` 的 `RequestState`，但在调用 `llm.generate` 时未传入 `routes=` 参数。 | 在宿主代码中通过 `routes=tuple(route_of(p) for p in prompts)` 传入路由值。 |
-| `RequestIdentity ... is missing a field required by ...` | 底层请求准入时缺少声明的键字段值（例如声明了 `"route"` 却传入了空字符串，或声明了 `"prompt_index"` 却传入了负数）。 | 检查请求身份构造或宿主路由生成函数，确保所有声明的键字段均具有合法非空值。 |
-| `request key fields must be closed, sorted, and unique` | 声明 `key_fields` 时字段顺序不符合规范，或者包含重复字段。规范顺序必须严格按照 `("request_id", "prompt_index", "sample_index", "route")` 的子序列排列。 | 调整字段顺序，例如写为 `key_fields=("prompt_index",)` 或 `key_fields=("route",)`。 |
-| `key_fields=...: use names from ...` | 在 `RequestState` 的 `key_fields` 中传入了未知的键名称。 | 仅使用支持的合法字段名：`"request_id"`、`"prompt_index"`、`"sample_index"` 或 `"route"`。 |
-| `batch, sample_index, prompt_indices and routes need workload= in make_llm` | 在调用 `pllm.make_llm` 时未传入 `workload=`（即作为原生 vLLM 实例启动），但在调用 `generate` 时传入了 `routes=` 等专属于负载的参数。 | 在启动引擎时显式传入负载：`pllm.make_llm(CONFIG, workload=workload)`。 |
-
-更多报错排查指南参见 [排查报错](troubleshooting.md) 与 [报错目录](../reference/errors.md)。
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[请求与运行时](../reference/errors.md#请求与运行时)、[声明与输入](../reference/errors.md#声明与输入)几节。
 
 ---
 

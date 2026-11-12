@@ -344,21 +344,7 @@ print(testing.check(StepLoopWorkload(), CONFIG).passed)
 
 ## 常见报错与排查
 
-在编写或运行改写 forward 结构的负载时，如果违反了前向契约，引擎在声明期或准入期会给出明确的报错信息：
-
-| 报错信息（节选自源码） | 触发原因 | 正确改法 |
-| --- | --- | --- |
-| `...: take the site tensors ... first, without defaults, then markers` | `@pllm.custom_residual` 方法没有把位置张量（如 `x, y`）写在最前面，或为其赋予了默认值 | 将位置张量作为前两个位置参数（不赋默认值），标记参数（如 `pllm.parameter`）写在后面 |
-| `... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward` | 将带有 `state=` 的状态化残差记忆子层与 `@pllm.custom_forward` 放在了同一个负载中 | 将两者解耦：状态子层按单 token 线性步进，与层循环/跳层互斥 |
-| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | 在开启前缀缓存（`enable_prefix_caching=True`）的同时使用了改写模型站点的装饰器 | 设置 `ModelConfig(enable_prefix_caching=False)` |
-| `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | 在多卡张量并行（`tensor_parallel_size > 1`）下启用了 `@pllm.custom_attention` | 将张量并行大小设为 `1` |
-| `@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2` | 注意力后端未配置为 FlashAttention 2 | 保持默认或配置环境变量 `VLLM_ATTENTION_BACKEND=FLASH_ATTN` |
-| `@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto` | 在量化 KV 缓存（如 FP8、INT4）的环境下使用了自定义 attention | 将 `kv_cache_dtype` 保持为默认的 `"auto"`（非量化） |
-| `static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)` | 在静态 KV 布局（滑动窗口/共享）下声明了 `PositionState` 或 `@pllm.custom_forward` | 静态布局要求独立的 KV 组，与需要单一全局 KV 组的自定义前向互斥 |
-| `Use @pllm.custom_forward(tokens="decode") for active=: skipped prompt tokens would leave approximate K/V that every later token reads. Prompt rows run the full model by default; add an unmasked tokens="prefill" method only to change prompt computation (prefer over="span").` | 在包含 prompt 阶段（`tokens="all"` 或 `tokens="prefill"`）的自定义前向中传入了 `active=` 掩码 | 将装饰器指定为 `@pllm.custom_forward(tokens="decode")`，让 prompt 阶段保持运行完整模型 |
-| `... reads block or model outputs, which a @pllm.custom_forward does not produce; use pllm.residual or pllm.layer_logits to read each layer's last visited stream` | 自定义前向负载中声明了读取 `pllm.hidden` 或 `pllm.final_hidden` 的方法 | 改用 `pllm.residual(layer)` 或 `pllm.layer_logits((layer,))` 读取每层最后一次访问的流 |
-| `index a tap inside the Layers slice that produced it` | 索引 `LayerOutputs` 时使用了超出该分段起始/终止范围的绝对层号 | 使用该分段范围内的绝对层号（例如 `layers(12, 16)[15]`），或使用 `[-1]` 取最后运行的一层 |
-| `custom-forward CUDA graphs need ... bytes; raise ExecutionOptions.cuda_graph_pool_budget_bytes above ...` | 自定义前向分段 CUDA graph 捕获内存超出预算 | 调大 `ExecutionOptions(cuda_graph_pool_budget_bytes=...)` 至报错提示的字节数 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[改模型与 forward 结构](../reference/errors.md#改模型与-forward-结构)、[显存预算](../reference/errors.md#显存预算)几节。
 
 ---
 

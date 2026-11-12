@@ -102,7 +102,7 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
   - `CUDA-graph pool reservation`：为这段计算捕获 CUDA graph 要预留的私有显存池；这部分显存要从 KV cache 那里分走，所以列出来。
   - `estimate / step`：这段计算每步（按 `max_num_seqs` 行算）的 FLOP、状态读写字节和采样器字节估计。`predict` 的 `projection FLOP` 与 `sampler` 字节来自用 LM head 投影预测并引导采样。
 - **`tap`**：从模型里取出的 hidden（第 0 层、第 27 层）和预留的缓冲大小（各 1837056 字节）；第 0 层的那份由 `loss` 和 `predict` 共用。
-- **`state`**：`distiller` 是请求级状态，每个字段各有一个页池，`x N pages` 是这个字段预留的页数；一个版本的全部字段共 344080 字节，总预留 102764592 字节（约 98 MiB）；`[exact]` 表示这是精确值。字段 0 是参数，预留 384 = 3 × 128 页：每个并发请求要同时留住这一步读的版本、`predict` 落后一步要读的旧版本和训练正在写的新版本。字段 1–3 是 AdamW 的步数和一、二阶矩，只有训练自己读，旧版本不必保留它们，所以每个请求只留最新版本和正在写的新版本，共 256 页（见[性能说明 4.1 节](../explain/performance.md#41-分页状态池与每字段页数公式pages)）。
+- **`state`**：`distiller` 是请求级状态，每个字段各有一个页池，`x N pages` 是这个字段预留的页数；一个版本的全部字段共 344080 字节，总预留 102764592 字节（约 98 MiB）；`[exact]` 表示这是精确值。字段 0 是参数，预留 384 = 3 × 128 页：每个并发请求要同时留住这一步读的版本、`predict` 落后一步要读的旧版本和训练正在写的新版本。字段 1–3 是 AdamW 的步数和一、二阶矩，只有训练自己读，旧版本不必保留它们，所以每个请求只留最新版本和正在写的新版本，共 256 页（见[性能说明 3.1 节](../explain/performance.md#31-分页状态池与每字段页数公式pages)）。
 - **`memory`**：由 `execution_peak_budget_bytes` 约束的 pLLM 执行峰值（含状态页、任务工作区与结果、图池和 anchor 预留），为 1330848404 字节（约 1269 MiB）。第二行说明：预算低于 1330848404 字节时，旁路任务改成在主 stream 上内联运行（不再重叠）；低于 1168476308 字节时规划失败。
 - **`host`**：负载的张量数学里没有 GPU 到 CPU 的同步（`0 syncs`）。
 - **`timing`**：时机设置及其后果；`(default)` 表示你没改过默认值。

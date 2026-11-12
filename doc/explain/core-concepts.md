@@ -86,12 +86,9 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 对你写代码的直接影响
 
-因为方法是在构建期用 `meta` 张量追踪一次、并在运行期作为 CUDA Graph 在 GPU 上回放，你的方法体需要遵守四条规则：
-
-- **不要在方法里调用 `.item()`、`.tolist()`、`.cpu()` 或 `print(tensor)`**：`meta` 张量没有实际数值，这类操作在 `explain` 和 `make_llm` 阶段就会抛出 `RuntimeError: Tensor.item() cannot be called on meta tensors`。想把中间结果拿回 CPU 观察，使用异步有界的 `@pllm.export`（见 [结果去哪](../guides/results.md)）。
-- **不要对张量的值写 Python `if` / `while` 分支**：写 `if h.norm() > 1:` 同样会尝试把张量转成 Python `bool`。条件逻辑需要写成张量掩码与 `torch.where`（例如 `torch.where(mask, a, b)`）。对负载配置项的固定 Python 循环（如 `@pllm.custom_forward` 里的 `for _ in range(self.loops):`）会在追踪时展开，可以正常使用。
-- **不要在 `self` 上保存可变 Python 状态**：负载类是冻结的（`@dataclass(frozen=True)`）。方法不是每步被 Python 调用的函数，写 `self.count += 1` 或往 Python 字典里塞张量不会在解码步之间生效。跨步数据只放在 `pllm.RequestState` 或 `pllm.InstanceState` 中，步数进展通过 `pllm.version(state)` 读取。
-- **把方法入参视为只读借用视图**：传入方法的激活与状态张量可能正与同一步的其他方法共享，或指向已发布的状态版本。不要做原地修改（如 `h.mul_(2)` 或 `w.add_(1)`）；始终返回新张量，并通过 `@pllm.write` 或 `@pllm.train` 发布状态修改。
+方法体的四条规则（不跨行、输入只读、不同步也不按张量的值分支、不在 `self` 上存状态）都来自这里：方法在构建时用
+`meta` 张量追踪一次，运行时作为 CUDA graph 回放。规则本身、例子和改法见
+[负载的组成：方法体里写什么](../guides/workload-anatomy.md#方法体里写什么)。
 
 ---
 
@@ -122,29 +119,9 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 对你写代码的直接影响
 
-- **只沿特征维（`dim=-1`）归约，绝不跨行（`dim=0`）归约**：写下 `h - h.mean(0)`、`softmax(dim=0)`、批归一化（BatchNorm）或按行排序，都会让某一个请求的输出取决于“这一步恰好和谁拼在同一个 batch 里”。所有均值、范数、归一化都应沿 `dim=-1` 计算（如 `h.float().norm(dim=-1, keepdim=True)`）。
-- **逐行训练方法返回形状为 `[rows]` 的一维 loss，不要自己对整批求均值**：在请求行上的 `@pllm.train` 方法里，不同行属于不同请求（而且为了复用固定尺寸的 CUDA Graph，未满 batch 的尾部还带有指向哑槽位的填充行）。因此方法体应返回每行各自的 loss（如 `.square().mean(-1)`，形状 `[rows]`）；由 pLLM 负责屏蔽无效行，并按每份状态副本归约属于它的选中行（默认 `reduction="mean"`，可选 `"sum"`）。只有读取 `pllm.batch(...)` 的宿主批训练才由方法自己归约并返回单个标量。
-- **用 `pllm.testing.check` 在 CPU 上验证行独立性**：你不靠肉眼排查是否误写了跨行耦合。[`pllm.testing.check`](../guides/checking.md) 会在 CPU 上用真实的规划器与执行器跑三个请求的多种固定调度，逐一检验这些契约：
-
-```python
-print(testing.check(Distill(), CONFIG, neutral=Distill(beta=0.0)))
-```
-
-```text
-status  contract / reason
-PASS    tensor_parallel_size=1: admission
-PASS    compile
-PASS    row permutation
-PASS    request isolation
-PASS    mixed prefill/decode
-PASS    chunking / tokens=
-PASS    publish_lag
-PASS    preempted
-PASS    neutral
-SKIP    timing-dependent values: publish_lag counts engine steps: ...
-```
-
-只要某一个请求的结果在打乱行顺序（`row permutation`）、改变其他请求输入（`request isolation`）、混合 prefill 与 decode（`mixed prefill/decode`）、切分 prompt（`chunking / tokens=`）或抢占重放（`preempted`）时发生变化，`testing.check` 就会抛出 `ContractError` 并指出是哪个方法混了行。
+一个请求的结果不能取决于这一步恰好和谁拼在一起，所以方法只沿特征维（`dim=-1`）计算，逐行训练返回 `[rows]` 的
+loss、由 pLLM 按状态归约。规则见[方法体里写什么](../guides/workload-anatomy.md#方法体里写什么)；
+[`pllm.testing.check`](../guides/checking.md) 在 CPU 上打乱行序、改变别的请求、切分 prompt、模拟抢占，检查每个请求的结果不变。
 
 ---
 
@@ -199,8 +176,9 @@ pLLM 把引擎的每一步划分为有序的时间轴**锚点（anchors）**。�
 
 ### 对你写代码的直接影响
 
-- **数据只能在产生它的阶段及之后被读取**：如果一个方法在某项输入诞生之前就去读它，pLLM 会在构建期报错：`a task reads a value (sampled tokens, hidden states or another task's result) that exists only after its phase ends; declare it in a later phase`。最常见的例子是 `pllm.sampled_tokens()` 和 `pllm.base_logits()`：它们在采样结束后的 `token.commit` 才存在，因此只能用于 `@pllm.train` 或带 `@pllm.on(pllm.Phase.AFTER_SAMPLE)` 的方法；如果你想在采样前的 `@pllm.add_logits` 或 `@pllm.export` 里读取模型最后一层的 logits，应使用 `pllm.layer_logits((-1,))`。
-- **把可提前的计算拆成独立辅助方法以获得流重叠**：如果你用 `placement="host"` 把大查找表放在主机内存里，希望跨 PCIe 的按行读取与模型前向重叠，就需要把查表写成一个不带效果装饰器的独立方法（只读 `pllm.input_tokens` 和 `pllm.parameter`），再让 `@pllm.add_logits` 或 `@pllm.custom_residual` 用 `pllm.result("lookup")` 读取它的返回值。如果把查表和 `pllm.hidden(0)` 写在同一个方法里，该方法就必须等到前向结束后的 `state.publish` 才能启动，失去与前向重叠的机会（详见 [性能与显存](performance.md)）。
+一个值只能在产生它的阶段及之后读：采样结果只给 `@pllm.train` 或 `AFTER_SAMPLE` 的方法，采样前读 logits 用
+`pllm.layer_logits((-1,))`（见[方法什么时候运行](../guides/workload-anatomy.md#方法什么时候运行)）。只依赖 token
+和只读表的计算拆成独立的辅助方法，才能排到步首、与 forward 重叠（见[性能与显存](performance.md)）。
 
 ---
 
@@ -250,8 +228,8 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 
 ### 对你写代码的直接影响
 
-- **用 `pllm.version(state)` 判断状态是否已经更新过**：`pllm.version("distiller")` 返回 `int64 [rows]` 张量，记录每行的状态副本已经发布了多少次可读更新（首次更新前为 `0`）。在教程 03 中，通过选择器方法 `def trained(self, versions: torch.Tensor = pllm.version("distiller")) -> torch.Tensor: return versions > 0` 搭配 `@pllm.guide_sampling(beta=strength, rows="trained")`，就能让刚起步、还没完成第一次训练更新的请求先按原模型采样。
-- **需要严格无滞后顺序时，显式设置 `publish_lag=0`**：如果你的算法在数学上要求第 $n$ 步的更新必须在第 $n+1$ 步立刻生效，可以在 `ModelConfig` 中传入 `execution=pllm.ExecutionOptions(publish_lag=0)`，主动用旁路重叠换取严格步序。
+`pllm.version(state)` 告诉方法状态已经更新过几次，可以用来让还没训练过的请求先按原模型采样；算法要求下一步立刻看到
+更新时设 `ExecutionOptions(publish_lag=0)`，代价是训练不再与 forward 重叠。写法见[在线训练](../guides/training.md)。
 
 ---
 

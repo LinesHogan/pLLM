@@ -19,7 +19,7 @@
 - **原因**：自回归生成的耗时与生成的 token 数量直接成正比。若不设置 `ignore_eos=True`，某个算法可能因为输出退化或倾向于输出简短回答而更早遇到 EOS 终止符；一个只生成了 50 个 token 就提早停机的请求，算出来的“每秒 token 数”不仅毫无参考价值，还会荒谬地把算法缺陷包装成“速度更快”。`ignore_eos=True` 强制所有请求生成满指定的 `tokens` 长度，保证两边执行的解码步数与生成的 token 总数绝对相等。此外，相同的采样参数保证了采样器内部的计算复杂度与状态分配完全对齐。
 
 ### 1.3 双方均开启 CUDA Graph 并保持引擎参数一致
-- **规则**：实验组与原生对照组必须具有完全一致的 `ModelConfig`：**双方均必须开启 CUDA Graph**（若使用 eager 模式，则双方均必须在 `--eager` 下运行），保持相同的 `max_num_seqs`、`gpu_memory_utilization`，并且**禁用前缀缓存（prefix caching off）**。
+- **规则**：实验组与原生对照组必须具有完全一致的 `ModelConfig`：**双方均必须开启 CUDA Graph**（若使用 eager 模式，则双方均必须在 `--eager` 下运行），保持相同的 `max_num_seqs`、`gpu_memory_utilization`，并且**禁用前缀缓存（prefix caching off）**；采样器设置（`VLLM_USE_FLASHINFER_SAMPLER`，见[让负载更快](faster.md#10-采样器打开-flashinfer-采样)）也要相同，并写进报告。
 - **原因**：
   1. 原生 vLLM 在解码期默认开启 CUDA Graph，通过预录制的图消除逐步发射算子的 CPU 开销。若将未捕获 CUDA Graph 的算法与开了图的原生 vLLM 对比，测出的主要不是算法本身的算力，而是 Python CPU 发射与 GPU 执行的巨大基础落差（在解码阶段，仅 CPU 发射开销就足以使吞吐下降约一半，详见 [性能与显存](../explain/performance.md)）。
   2. `gpu_memory_utilization`（基准统一默认为 0.25）与 `max_num_seqs` 决定了留给 KV Cache 和状态池的可用显存；显存余量不同会导致调度器规划出不同的批次行为。
@@ -297,40 +297,13 @@ python -m tools.benchmark_esamp --model Qwen/Qwen2.5-7B-Instruct --gpu-memory-ut
 
 ---
 
-## 7. 实用加速技巧：何时启用 `VLLM_USE_FLASHINFER_SAMPLER`
+## 7. 常见报错与排查
 
-### 采样器瓶颈的成因
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[显存预算](../reference/errors.md#显存预算)一节。
 
-在标准基准设置中，每个 Prompt 会采样 16 个候选（`sampling_n=16`），8 个 Prompt 构成了 128 条并发请求的大批次。此外，许多算法（如 ESamp、DoLa 或对比解码）会修改 logits 或挂载采样引导（`@pllm.guide_sampling`）。
-
-在面对大批次并发与自定义 logits 偏置时，vLLM 原生的采样内核可能会花费可观的时间处理 CPU 调度、logits 拷贝与 GPU 归约。若采样内核本身耗时过大，整个生成的吞吐会被采样器拖慢，反而掩盖了算法模型前向本身的真实性能。
-
-### 开启 FlashInfer Sampler
-
-如果运行环境中安装了 FlashInfer，建议在运行基准测试前通过环境变量开启融合采样加速：
-
-```bash
-export VLLM_USE_FLASHINFER_SAMPLER=1
-```
-
-启用后，vLLM 用 FlashInfer 的采样算子代替默认实现。它会改变两边（原生与负载）的采样耗时，所以两边要在同一设置下测，并在报告里写明是否打开。
-
----
-
-## 8. 常见报错与排查
-
-在配置与执行吞吐基准时，常见错误通常源于参数配置超出物理限制或违反了测试契约：
-
-| 报错信息 | 触发原因 | 正确做法 |
-| :--- | :--- | :--- |
-| `positive batch, tokens, rounds, warmup and capture/state capacities required` | `BenchmarkOptions` 中传入了小于 1 的批次、token 数、轮次、预热数或显存预算。 | 检查传入参数，确保 `--batch`、`--tokens`、`--rounds`、`--warmup` 及各预算参数均为正整数。 |
-| `workload needs cuda_graph_pool_budget_bytes >= ... for its conservative task capture reservations; got ...; leave it unset to size from the workload` | 手动指定的 `--cuda-graph-pool-budget-mib` 小于算法任务捕获所需的保守显存。 | 调大该参数至报错提示的数值以上，或在构造 `ExecutionOptions` 时不要显式设小该上限。 |
-| `ExecutionOptions.state_page_budget_bytes=... exceeds the ... bytes free on the device; lower it, or lower gpu_memory_utilization ...` | 设定的状态页显存预算超过了设备上的实际剩余可用显存。 | 调小 `--state-page-budget-mib`，或者适当降低 `--gpu-memory-utilization` 以便 vLLM 为系统留出更多可用显存。 |
-| `raise execution_peak_budget_bytes to fund the custom forward's workspace and graphs` | 设定的 `--execution-peak-budget-mib` 无法容纳改写 forward 的工作区、图保留与中间值。 | 增大该参数的显存上限，或留空不作人为约束。 |
-
-此外，如果 `compare` 抛出 `AssertionError`：
-- 若错误发生在断言 `min(report.loss_count, report.update_count, report.trained_rows) > 0`，说明你在非训练负载中误传了 `require_training=True`。请移除非训练负载中的该参数；
-- 若错误发生在输出 token 校验，说明模型因未设置 `ignore_eos=True` 而提前退出了某些请求，破坏了等效工作量契约。
+`compare` 抛出 `AssertionError` 时：
+- 断言 `min(report.loss_count, report.update_count, report.trained_rows) > 0` 失败，说明给不训练的负载传了 `require_training=True`，去掉它；
+- 输出 token 的校验失败，说明没有设 `ignore_eos=True`，有的请求提前结束，两边的工作量不再相等。
 
 ---
 

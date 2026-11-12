@@ -409,16 +409,7 @@ print(f"eager_reason: {report.eager_reason!r}")
 
 ## 常见错误与排查
 
-在编写在线训练负载时，常见的构建期拒绝与运行期错误如下表所示：
-
-| 报错信息 | 触发原因与排查修复 |
-| :--- | :--- |
-| `training methods return one loss per row; pLLM reduces the selected rows per state` | 训练方法返回了标量（如调用了 `.mean()` 将行轴压平）。**修复**：仅在特征维归约（`dim=-1`），保留第 0 维，返回 `[rows]` 的逐行损失。 |
-| `@pllm.train reads ... which trains with ... declare ... with optimizer=...` | 状态上缺少优化器声明，或声明的优化器与训练模式不匹配。**修复**：为对应的 `RequestState` 声明 `optimizer=pllm.AdamW(lr)`。 |
-| `rows= and update_rows= on request training require a model effect without sampler guidance, or @pllm.add_logits; standalone training and @pllm.guide_sampling update every selected state, so remove rows= and update_rows=` | 独立在线训练或配合 `@pllm.guide_sampling` 的训练使用了行选择器，该路径要求无条件更新。**修复**：移除训练方法上的 `rows=`，改在采样方法上筛选，或使用 `reduction="sum"` 配合零权重。 |
-| `every @pllm.differentiate result must feed a @pllm.train loss` | 上游声明了 `@pllm.differentiate` 的中间结果没有被任何 `@pllm.train` 方法消费。**修复**：确保中间结果经由 `pllm.result` 最终输入至损失函数，或移除未使用的可微标记。 |
-| `host-batch training returns one scalar and owns its reduction; remove reduction=` | 宿主批次训练方法传入了非默认的 `reduction=`。**修复**：宿主批训练自行管理归约，从 `@pllm.train` 中移除 `reduction=` 参数。 |
-| `the @pllm.train loss of ... must differentiate only its own state` | 训练方法通过导数链条反向传播到了其他不属于当前声明 `state` 的外部状态。**修复**：检查上游方法的 `parameters=True` 声明，确保导数边仅汇聚到当前训练的状态。 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[状态与训练](../reference/errors.md#状态与训练)、[阶段](../reference/errors.md#阶段值什么时候存在)几节。
 
 ---
 

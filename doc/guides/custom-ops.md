@@ -162,17 +162,7 @@ PyTorch 算子:   5755 token/s，为原生 vLLM 的 98%
 
 ## 常见报错与排查
 
-在接入和运行自定义算子时，常见错误、触发原因及排查方案如下：
-
-| 报错信息 | 触发原因 | 解决方法 |
-| :--- | :--- | :--- |
-| `... mutates ...; kernels called from workload math must return new tensors (mutates_args=()); change state only through pLLM effects` | 算子试图原地修改输入张量（未指定 `mutates_args=()` 或修改了参数内容） | 保持纯函数语义，将结果写入新张量并返回；状态修改通过 `@pllm.write` 等效果发布 |
-| `... has no fake implementation; add @....register_fake` | 算子未注册 meta 形状推导函数，显存规划器无法推导其输出尺寸 | 使用 `@op.register_fake` 注册形状推导函数，返回同形状、同 dtype 的空张量 |
-| `methods run inside CUDA graphs, so outputs need shapes fixed by the inputs; return a fixed-size tensor and a tensor mask instead of ctx.new_dynamic_size()` | 算子输出了依赖数据内容的动态形状（如使用了 `ctx.new_dynamic_size()`） | CUDA graph 必须固定形状：返回静态最大尺寸的张量并配合布尔掩码（mask） |
-| `call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims only for built-in operators` | 在负载方法内通过 `torch.ops.<ns>.<op>` 分发调用算子 | 在方法体内直接调用自定义算子对象（如 `my_op(...)`），以便框架记录源码指纹 |
-| `... trains through ..., which has no autograd formula; add ....register_autograd(...)` | 在 `@pllm.train` 反向传播链路上调用了未注册梯度的算子 | 使用 `op.register_autograd(...)` 为算子补充反向梯度传播函数 |
-| `... runs in a per-token cell under torch.vmap; register a batching rule (register_vmap) or call it with over="span"` | 在逐 token（`over="token"`）单元中调用了未注册 vmap 规则的算子 | 使用 `op.register_vmap(...)` 注册批处理规则，或将单元改为 `over="span"` 调度 |
-| `[device equivalence] ...: ...` | GPU 核函数与 CPU 参考实现的数值差异超出了对应 dtype 的容差上限 | 检查核函数的计算逻辑、累加精度（如中间步骤转 float32）与 CPU 实现是否对齐 |
+这一页的写法被拒绝时的报错原文、原因和改法，见报错目录的[自写算子](../reference/errors.md#自写算子)、[方法体](../reference/errors.md#方法体)几节。
 
 ## 自测
 
