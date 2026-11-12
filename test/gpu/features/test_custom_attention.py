@@ -103,10 +103,9 @@ def test_native_lse_and_selected_oracle(heads, kv_heads, dim):
         for invalid in (q.repeat_interleave(2, dim=-1), q[:, :1], q[:1]):
             with pytest.raises(ValueError, match="keep packed rows and head_dim unchanged"):
                 kv.attend(invalid)
-        scores = page_bounds(q, keys, table, starts, positions)
-        torch.testing.assert_close(
-            scores, page_bounds(q.cpu(), keys.cpu(), table.cpu(), starts.cpu(), positions.cpu()), check_device=False
-        )
+        scores = page_bounds(q, keys, table, kv.requests, positions)
+        cpu_scores = page_bounds(*(tensor.cpu() for tensor in (q, keys, table, kv.requests, positions)))
+        torch.testing.assert_close(scores, cpu_scores, check_device=False)
         selected, _ = Quest().select(q, kv, layer=0)
         pages = scores.topk(2, -1).indices.cpu()
         expected = torch.empty_like(q, dtype=torch.float32)

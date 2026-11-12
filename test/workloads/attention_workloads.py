@@ -14,7 +14,7 @@ def _page_bound(
     Q,
     K,
     TABLE,
-    START,
+    REQUEST,
     POS,
     OUT,
     H: tl.constexpr,
@@ -27,13 +27,10 @@ def _page_bound(
     KS2: tl.constexpr,
     QS0: tl.constexpr,
     QS1: tl.constexpr,
-    N: tl.constexpr,
-    NS: tl.constexpr,
     BD: tl.constexpr,
 ):
     row, head, page = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    request = tl.sum((row >= tl.load(START + tl.arange(0, N), tl.arange(0, N) < NS, other=2147483647)).to(tl.int32)) - 1
-    block = tl.load(TABLE + request * P + page)
+    block = tl.load(TABLE + tl.load(REQUEST + row) * P + page)
     token, dim = tl.arange(0, B), tl.arange(0, BD)
     valid = page * B + token <= tl.load(POS + row)
     key = tl.load(
@@ -50,9 +47,12 @@ def _page_bound(
 
 @torch.library.custom_op("cattn_test::page_bounds", mutates_args=(), device_types="cuda")
 def page_bounds(
-    q: torch.Tensor, keys: torch.Tensor, table: torch.Tensor, starts: torch.Tensor, positions: torch.Tensor
+    q: torch.Tensor, keys: torch.Tensor, table: torch.Tensor, requests: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
-    """Quest-style min/max page bounds; each query sees only its causal prefix."""
+    """Quest-style min/max page bounds; each query sees only its causal prefix.
+
+    ``requests`` and ``positions`` are ``kv.requests`` and ``kv.positions``, which also map CUDA-graph padding rows.
+    """
     rows, heads, dim = q.shape
     pages, block = table.shape[1], keys.shape[1]
     out = q.new_empty((rows, heads, pages), dtype=torch.float32)
@@ -60,7 +60,7 @@ def page_bounds(
         q,
         keys,
         table,
-        starts,
+        requests,
         positions,
         out,
         heads,
@@ -70,21 +70,18 @@ def page_bounds(
         block,
         *keys.stride()[:3],
         *q.stride()[:2],
-        triton.next_power_of_2(len(starts)),
-        len(starts),
         triton.next_power_of_2(dim),
     )
     return out
 
 
 @page_bounds.register_fake
-def _fake(q, keys, table, starts, positions):
+def _fake(q, keys, table, requests, positions):
     return q.new_empty((len(q), q.shape[1], table.shape[1]), dtype=torch.float32)
 
 
 @page_bounds.register_kernel("cpu")
-def _cpu(q, keys, table, starts, positions):
-    requests = (torch.arange(len(q))[:, None] >= starts[1:][None, :]).sum(-1)
+def _cpu(q, keys, table, requests, positions):
     pages = keys[table[requests].long()].float()
     causal = (
         torch.arange(table.shape[1] * keys.shape[1]).reshape(table.shape[1], keys.shape[1])[None]
@@ -130,7 +127,7 @@ class Quest(pllm.Workload):
 
     @pllm.custom_attention(layers=(0, 1))
     def select(self, q, kv, layer=pllm.depth()):
-        scores = page_bounds(q, kv.key_cache, kv.block_table, kv.query_start, kv.positions)
+        scores = page_bounds(q, kv.key_cache, kv.block_table, kv.requests, kv.positions)
         count = min(2, scores.shape[-1])
         pages = scores.topk(count, dim=-1).indices
         rank = torch.arange(count, device=q.device)[None, None, :]
