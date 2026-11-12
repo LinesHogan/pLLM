@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-import vllm
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -47,11 +46,7 @@ CONFIG = pllm.ModelConfig(
         SharedWindowAttention(),
     ),
 )
-def test_attention_contracts(workload, monkeypatch, request):
-    if isinstance(workload, Quest) and vllm.__version__ == "0.32.0":
-        # Reproduces with plain generate calls too: three prompts, n=2, one forced eviction (vLLM 0.32 only).
-        reason = "Quest's paged reads hit an illegal address in the full CUDA graph after a forced KV eviction"
-        request.applymarker(pytest.mark.xfail(strict=True, reason=reason))
+def test_attention_contracts(workload, monkeypatch):
     if any(layout.keep == "none" for layout in workload.backend_requirements().kv_layouts):
         monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     result = check_on_gpu(workload, CONFIG, neutral=workload if isinstance(workload, Monitor) else None)

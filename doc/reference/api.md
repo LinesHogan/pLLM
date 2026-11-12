@@ -908,10 +908,10 @@ The reference is the workload itself: three prompts are generated one at a time,
 order (chunked, prefill mixed with decode), then together again while vLLM's KV allocator fails once so a
 request is evicted and recomputed. Every request's token IDs must match bitwise, its exports and terminal
 request state within dtype tolerance (chunking and recompute reorder a request's own sums). Exact-decode
-workloads also compare eager execution with the captured graphs. The check's engines run vLLM's
-batch-invariant kernels (VLLM_BATCH_INVARIANT=1), removed again when it returns. Instance states written while
-generating and publish_lag reads make solo and batched runs legitimately differ: that comparison is reported
-as a skip, as are declared replay rejections.
+workloads also compare eager execution with the captured graphs. The check runs in a child process whose
+engines use vLLM's batch-invariant kernels (VLLM_BATCH_INVARIANT=1); a crash there is reported as a failed
+check with the child's output. Instance states written while generating and publish_lag reads make solo and
+batched runs legitimately differ: that comparison is reported as a skip, as are declared replay rejections.
 Neutral checks compare greedy and seeded token IDs bitwise when model kernels match vanilla.
 Inductor model hooks can change fusion: those compare teacher-forced full-vocabulary distributions
 on greedy and seeded continuations, with mean/P99 KL <= .001/.01 nats (both directions) and
@@ -919,7 +919,7 @@ mean/P99 TV <= .01/.05. Successful checks report the comparison and measured dis
 Causal batches also check that permuting sequences and weights preserves an AdamW update.
 Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
 with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
-Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
+Needs a CUDA device; multiprocessing and parallel workers are unsupported.
 
 ### `pllm.testing.check_distribution`
 
