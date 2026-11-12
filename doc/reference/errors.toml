@@ -818,18 +818,11 @@ why_zh = '''更新的数学要用到别的卡上的分片'''
 fix_zh = '''改成只用本卡分片的更新，或单卡'''
 
 [[section.error]]
-message = '''worker processes cannot send ... defined in __main__ or a notebook; move it into an importable .py module, ...'''
-why = '''Workers rebuild the workload by importing its class.'''
-fix = '''Put the class in an importable `.py` module, or keep `multiprocessing=False` and `tensor_parallel_size=1`.'''
-why_zh = '''子进程按导入路径重建负载，找不到 `__main__` 或 notebook 里的类'''
-fix_zh = '''把类放进可导入的 `.py` 模块，或 `multiprocessing=False` 且单卡'''
-
-[[section.error]]
-message = '''worker processes receive the workload by pickling (...); hold module-level functions instead of lambdas or closures, or use tensor_parallel_size=1 with multiprocessing=False'''
-why = '''A workload field holds a lambda or closure, which cannot be pickled.'''
-fix = '''Use module-level functions, constants or plain values.'''
-why_zh = '''负载字段里有 lambda 或闭包，无法 pickle'''
-fix_zh = '''改成模块级函数、常量或普通值'''
+message = '''other processes receive the workload by pickling (...); hold plain values, tensors and functions instead of locks, open files or live handles, or use tensor_parallel_size=1 with multiprocessing=False'''
+why = '''A workload field (or something a function in it captures) holds a lock, open file or live handle, which cannot be pickled.'''
+fix = '''Hold plain values, tensors and functions; open handles inside the method instead.'''
+why_zh = '''负载字段（或其中函数捕获的变量）持有锁、打开的文件或活动句柄，无法 pickle'''
+fix_zh = '''字段只放普通值、张量和函数；句柄在方法内打开'''
 
 [[section.error]]
 message = '''the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; run both processes from the same installed sources and do not rewrite pretrained files while the engine starts'''

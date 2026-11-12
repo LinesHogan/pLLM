@@ -33,7 +33,7 @@
 - **冻结状态**：没有优化器的状态：到处可读，只能由导入或写入改变。
 - **版本**：状态每次更新都发布一个新版本；读的一方读已发布的版本，在途的请求保留开始时的版本。
   `pllm.version(state)` 是每行的状态已更新的次数。
-- **`publish_lag`**：第 n 步算出的更新从第 n + 1 + `publish_lag` 步起被读到；默认 1，换来训练和下一步 forward 的重叠。
+- **`publish_lag`**：某一步算出的更新，从它之后负载实际运行的第 1 + `publish_lag` 步起被读到；负载读不到任何行的步（只有提示中段或重算的历史）被引擎跳过，不计数。默认 1，换来训练和下一步 forward 的重叠。
 - **carry 字段**：`carry=` 声明、随训练更新一起发布但不被优化器更新的字段，由 `pllm.carry` 写入。
 - **位置状态（`pllm.PositionState`）**：每个 KV 块一个 hidden 宽的向量，只在 `@pllm.custom_forward` 里用
   `layers.load` / `layers.save` 读写。

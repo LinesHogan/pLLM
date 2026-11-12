@@ -12,6 +12,7 @@ from vllm.forward_context import override_forward_context
 import pllm
 from pllm.backends.vllm.adaptive_depth import AdaptiveSlice
 from pllm.backends.vllm.architecture import hidden_binding
+from pllm.backends.vllm.compat import enable_batch_invariance
 from pllm.backends.vllm.custom_forward import ProgramWave
 from pllm.backends.vllm.custom_forward_attention import BatchAttentionBuffers
 from pllm.backends.vllm.hidden_taps import HiddenTaps
@@ -19,7 +20,7 @@ from pllm.contracts.hidden_locator import HiddenSite
 from pllm.execution.step_capture import capture_graph
 from pllm.execution.token_program_executor import execute_segment
 from pllm.execution.torch_private import cuda_graph_pool_bytes
-from pllm.testing import check_on_gpu
+from pllm.testing_gpu import run_gpu_checks
 from pllm.workloads.dola import DoLaWorkload
 
 
@@ -88,7 +89,11 @@ class ReadoutExit(Exit, DoLaWorkload):
 
 
 def replay_contracts(config):
-    """Check real eviction and frozen-stream DoLa inputs beside C2 rewrites on Qwen2.5-0.5B."""
+    """Check real eviction and frozen-stream DoLa inputs beside C2 rewrites on Qwen2.5-0.5B.
+
+    test_adaptive_depth starts this mode with VLLM_BATCH_INVARIANT=1, so the checks run here, where the taps are
+    observed."""
+    _kernels = enable_batch_invariance()
     snapshots, current = [], []
     prepare, read = HiddenTaps.prepare, HiddenTaps.read
     sources = tuple(hidden_binding(layer, HiddenSite.RESIDUAL, 24).tap for layer in (21, 22, 23))
@@ -115,7 +120,7 @@ def replay_contracts(config):
         ("mixed", ReadoutExit(rule="mixed", exit_layer=22, layers=(0, 21, 22), plausibility=0.99)),
     ):
         with patch.object(HiddenTaps, "prepare", prepared), patch.object(HiddenTaps, "read", observed):
-            result = check_on_gpu(workload, config)
+            result = run_gpu_checks(workload, config, None)
         assert any(value.startswith("preempted:") for value in result.passed), result
         assert rule == "loop" or snapshots
         for actual, expected in snapshots:

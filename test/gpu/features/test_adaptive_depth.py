@@ -1,5 +1,6 @@
 """Native conditional-depth contracts in isolated engines, in both supported vLLM environments."""
 
+import os
 import subprocess
 import sys
 
@@ -35,5 +36,6 @@ def test_conditional_depth_native_kv_and_sync_debug(rule, batch, value):
             "0.5",
             *(["--value-rewrite"] if value else []),
         ],
+        env={**os.environ, "VLLM_BATCH_INVARIANT": "1"} if rule == "contracts" else None,
         check=True,
     )

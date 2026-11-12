@@ -316,7 +316,7 @@ class Combined(pllm.Workload):
 
 写负载最快的方式不是每次都启动完整的 GPU 引擎，而是先在 CPU 上花几秒钟看完执行计划、跑完调度契约检查，最后再上 GPU：
 
-1. **写负载**：需要开启多进程引擎（`ModelConfig(multiprocessing=True)`）时，把负载类放在可导入的 `.py` 模块里（不要留在 `__main__` 或 notebook 单元格里），因为 worker 子进程通过模块路径导入类并重新校验声明；单进程脚本或调试时直接定义即可（详见[上生产](../howto/production.md)）。
+1. **写负载**：脚本、notebook 单元格或 `.py` 模块里定义都可以；开启多进程引擎（`ModelConfig(multiprocessing=True)`）时，负载字段要能 pickle（不放锁、打开的文件等句柄），worker 子进程据此重建负载并重新校验声明（详见[上生产](../howto/production.md)）。
 2. **在 CPU 上看成本（`pllm.explain`）**：只读取模型的 `config.json` 元数据，不加载模型权重、不分配 GPU 显存，直接打印模型是否保持 CUDA graph、每个方法在哪个时机和哪条 stream 上运行、状态预留多少字节、方法内是否有 GPU→CPU 同步。详见[看成本：pllm.explain](explain.md)。
 3. **在 CPU 上查契约（`pllm.testing.check`）**：用真实的规划器和执行器在 CPU 上跑三个请求的固定调度，验证行重排、请求隔离、混合预填充与解码、分块预填充、抢占重算、版本可见性（`publish_lag`）、组件独立性以及零强度等价（`neutral=`）。详见[检查正确性](checking.md)。
 4. **在 GPU 上运行（`pllm.make_llm`）**：加载模型生成，并通过 `llm.diagnostics()` 检查实际运行指标。

@@ -149,7 +149,8 @@ class StepDriver:
         if not admitted:
             return
         if execution.directory.request_states:
-            execution.admit(admitted, self._stream())
+            device = execution.device
+            execution.admit(admitted, torch.cuda.current_stream(device) if device.type == "cuda" else None)
         for identity in admitted:
             self.labeler.admit(identity)
             self.admitted[identity.request_id] = identity
@@ -357,10 +358,6 @@ class StepDriver:
 
     def _staged(self, value: StepInput) -> StepInput:
         return replace(value, batch=self._host_batch, import_rows=self._import_rows)
-
-    def _stream(self) -> torch.cuda.Stream | None:
-        device = self.execution.device
-        return torch.cuda.current_stream(device) if device.type == "cuda" else None
 
     # Host-sync check (pllm.testing.check_on_gpu).
 

@@ -464,27 +464,26 @@ def _projection_step(driver: StepDriver, context: StateTaskContext, value: StepI
                 )
 
 
-@dataclass(frozen=True)
-class _CheckModel:
-    """The CPU stand-ins for what the model forward runs: a custom forward's anchor and residual methods."""
-
-    forward_anchor: AnchorId | None = None
-    sites: Callable[[Mapping[tuple[TaskSymbol, str], torch.Tensor]], None] | None = None
-
-
-def _drive_step(driver: StepDriver, value: StepInput, feedback: SamplerFeedback, run: _Run, model: _CheckModel) -> bool:
-    """One step in VllmSession's order: begin, the CPU model's forward, after_forward, sample, commit. False when the
-    driver skipped it because the workload reads none of its rows."""
+def _drive_step(
+    driver: StepDriver,
+    value: StepInput,
+    feedback: SamplerFeedback,
+    run: _Run,
+    forward_anchor: AnchorId | None,
+    sites: Callable[[Mapping[tuple[TaskSymbol, str], torch.Tensor]], None] | None,
+) -> bool:
+    """One step in VllmSession's order: begin, the CPU model's forward (a custom forward's anchor, residual methods),
+    after_forward, sample, commit. False when the driver skipped it because the workload reads none of its rows."""
     execution = driver.execution
     run.timing.begin(execution, value)
     observed = len(run.operations)
     context = driver.begin(replace(value, hidden=None, hidden_readiness=None, operands=()), None)
     if context is not None and execution.arena.plan.semantic_graph.updates_in_forward:
         _projection_step(driver, context, value, run)
-    if context is not None and model.forward_anchor is not None:
-        driver.anchor(context, model.forward_anchor)
-    if model.sites is not None:
-        model.sites({} if context is None else context.results)
+    if context is not None and forward_anchor is not None:
+        driver.anchor(context, forward_anchor)
+    if sites is not None:
+        sites({} if context is None else context.results)
     driver.after_forward(value, None)
     if driver.step is None:
         run.timing.skip()
@@ -649,9 +648,7 @@ def _run(
                     forward.prepare(value, tokens)
                 if declaration.sites.rewrites:
                     sites = partial(_site_step, declaration, facts, value, tokens, run)
-            if not _drive_step(
-                driver, value, _feedback(value, shape, perturbed), run, _CheckModel(forward_anchor, sites)
-            ):
+            if not _drive_step(driver, value, _feedback(value, shape, perturbed), run, forward_anchor, sites):
                 continue
             if forward is not None:
                 run.values.update(
@@ -1111,7 +1108,7 @@ def _unchecked_effects(
         skipped.append(
             CheckSkip(
                 "timing-dependent values",
-                "publish_lag counts engine steps: mixed/preempted values reading different permitted versions are not compared; every version read is checked",
+                "publish_lag counts the steps the workload runs: mixed/preempted values reading different permitted versions are not compared; every version read is checked",
             )
         )
     return skipped

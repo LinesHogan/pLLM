@@ -3,6 +3,7 @@
 import multiprocessing as mp
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
+from threading import Lock
 from unittest.mock import Mock
 
 import pytest
@@ -48,7 +49,7 @@ class TemplateHolder(DummyWorkload):
     extra: FakeTemplate = FakeTemplate(1)
 
 
-def test_workload_transport_round_trips_workloads_and_rejects_what_the_worker_cannot_import() -> None:
+def test_workload_transport_round_trips_workloads_and_rejects_unpicklable_fields() -> None:
     # Built-ins and user workloads travel identically; module-level function replacements are imported by the worker.
     for workload in (
         DummyWorkload(),
@@ -60,7 +61,7 @@ def test_workload_transport_round_trips_workloads_and_rejects_what_the_worker_ca
     restored = decode_workload(encode_workload(TemplateHolder(extra=FakeTemplate(2))))
     assert isinstance(restored, TemplateHolder) and restored.extra == FakeTemplate(3)
     with pytest.raises(ValueError):
-        encode_workload(replace(DummyWorkload(), transform=lambda hidden: hidden))
+        encode_workload(replace(DummyWorkload(), transform=lambda hidden, lock=Lock(): hidden))
 
 
 def _plan() -> PlanBundle:

@@ -220,7 +220,7 @@ class VllmLlm:
             raise ValueError(
                 "state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer"
             )
-        return self.runner.require_session().feed(name)
+        return self.runner.require_session().driver.feed(name)
 
     def diagnostics(self) -> StateDiagnostics:
         """Read exact workload health and vLLM's allocated KV blocks/max-length concurrency."""

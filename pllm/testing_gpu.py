@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 # Diagnostics deliberately inspect the installed session and in-process engine.
+import os
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from multiprocessing import get_context
+from multiprocessing.connection import Connection
+from traceback import format_exc
 from typing import Concatenate, ParamSpec
 from unittest.mock import patch
 
 import torch
+import vllm.envs as vllm_envs
 from vllm import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request
 
 import pllm
 from pllm.backends.vllm.checkpoint import load_options
-from pllm.backends.vllm.compat import batch_invariance
+from pllm.backends.vllm.compat import enable_batch_invariance
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.backends.vllm.overlay_graph import GraphOptions, graph_options
 from pllm.backends.vllm.runtime import VllmLlm, probe_backend, vllm_engine
@@ -30,6 +35,7 @@ from pllm.execution.trace import TraceEventKind, TraceSelection
 from pllm.explanation import explain, explain_facts
 from pllm.testing_contracts import CheckResult, CheckSkip, ContractError, affects_model, check_contracts
 from pllm.workload import Workload
+from pllm.workload_transport import decode_workload, encode_workload
 
 _Allocation = ParamSpec("_Allocation")
 
@@ -195,11 +201,6 @@ def _preemption(handle: VllmLlm, params: SamplingParams) -> _Run:
     return result
 
 
-def _neutral_tokens(workload: Workload, config: ModelConfig) -> tuple[tuple[tuple[int, ...], ...], ...]:
-    with pllm.make_llm(config, workload=workload) as handle:
-        return (_tokens(handle), _tokens(handle, 0.8))
-
-
 @contextmanager
 def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm]:
     """Load vanilla vLLM with the workload's checkpoint and graph/compile options."""
@@ -255,19 +256,10 @@ def _neutral(workload: Workload, config: ModelConfig) -> str:
         compilation = graph_options(config, requirements).get("compilation_config")
         if compilation is not None and compilation.backend == "inductor":
             return _neutral_distribution(workload, config)
-    observed = _neutral_tokens(workload, config)
+    with pllm.make_llm(config, workload=workload) as handle:
+        observed = _tokens(handle), _tokens(handle, 0.8)
     with plain_model(workload, config) as vanilla:
-        expected = tuple(
-            tuple(
-                tuple(output.outputs[0].token_ids)
-                for output in vanilla.generate(
-                    CHECK_PROMPTS,
-                    SamplingParams(temperature=temp, seed=17, max_tokens=16, ignore_eos=True),
-                    use_tqdm=False,
-                )
-            )
-            for temp in (0, 0.8)
-        )
+        expected = _tokens(vanilla), _tokens(vanilla, 0.8)
     if observed != expected:
         raise ContractError(
             (
@@ -402,10 +394,10 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     order (chunked, prefill mixed with decode), then together again while vLLM's KV allocator fails once so a
     request is evicted and recomputed. Every request's token IDs must match bitwise, its exports and terminal
     request state within dtype tolerance (chunking and recompute reorder a request's own sums). Exact-decode
-    workloads also compare eager execution with the captured graphs. The check's engines run vLLM's
-    batch-invariant kernels (VLLM_BATCH_INVARIANT=1), removed again when it returns. Instance states written while
-    generating and publish_lag reads make solo and batched runs legitimately differ: that comparison is reported
-    as a skip, as are declared replay rejections.
+    workloads also compare eager execution with the captured graphs. The check runs in a child process whose
+    engines use vLLM's batch-invariant kernels (VLLM_BATCH_INVARIANT=1); a crash there is reported as a failed
+    check with the child's output. Instance states written while generating and publish_lag reads make solo and
+    batched runs legitimately differ: that comparison is reported as a skip, as are declared replay rejections.
     Neutral checks compare greedy and seeded token IDs bitwise when model kernels match vanilla.
     Inductor model hooks can change fusion: those compare teacher-forced full-vocabulary distributions
     on greedy and seeded continuations, with mean/P99 KL <= .001/.01 nats (both directions) and
@@ -413,7 +405,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     Causal batches also check that permuting sequences and weights preserves an AdamW update.
     Workloads with custom ops replay CPU-script method and cell inputs on CUDA and compare outputs
     with dtype-default tolerances. The fake decoder excludes model arithmetic from that comparison.
-    Run in an isolated process with a CUDA device; multiprocessing and parallel workers are unsupported.
+    Needs a CUDA device; multiprocessing and parallel workers are unsupported.
     """
     if (
         config.multiprocessing
@@ -422,11 +414,54 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
     if config.max_num_seqs < 2 or config.max_model_len < 32:
         raise ValueError("check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script")
-    with batch_invariance():
-        return _gpu_checks(workload, config, neutral)
+    context = get_context("spawn")
+    received, sent = context.Pipe(duplex=False)
+    payload = encode_workload(workload), None if neutral is None else encode_workload(neutral), config
+    child = context.Process(target=_check_in_child, args=(*payload, sent), name="pllm-check-on-gpu")
+    # The child inherits this environment when it starts; the parent's is restored right after. Graphs compiled
+    # with batch-invariant kernels get their own vLLM cache: 0.27.1 fails loading the other mode's cached graphs.
+    child_environment = {
+        "VLLM_BATCH_INVARIANT": "1",
+        "VLLM_CACHE_ROOT": os.path.join(vllm_envs.VLLM_CACHE_ROOT, "batch-invariant"),
+    }
+    previous = {name: os.environ.get(name) for name in child_environment}
+    os.environ.update(child_environment)
+    try:
+        child.start()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                del os.environ[name]
+            else:
+                os.environ[name] = value
+    sent.close()
+    try:
+        outcome = received.recv()
+    except EOFError:
+        child.join()
+        outcome = (f"[GPU check process] exited with code {child.exitcode} before reporting; its output shows why",)
+    child.join()
+    if isinstance(outcome, CheckResult):
+        return outcome
+    raise ContractError(outcome)
 
 
-def _gpu_checks(workload: Workload, config: ModelConfig, neutral: Workload | None) -> CheckResult:
+def _check_in_child(workload: str, neutral: str | None, config: ModelConfig, results: Connection) -> None:
+    """Run the check with batch-invariant kernels and send its result, or every failure, to the parent."""
+    _kernels = enable_batch_invariance()  # registered while the library lives
+    try:
+        results.send(
+            run_gpu_checks(decode_workload(workload), config, None if neutral is None else decode_workload(neutral))
+        )
+    except ContractError as error:
+        results.send(error.failures)
+    except BaseException:
+        results.send((f"[GPU check process] {format_exc()}",))
+
+
+def run_gpu_checks(workload: Workload, config: ModelConfig, neutral: Workload | None) -> CheckResult:
+    """check_on_gpu's checks in this process, which enabled batch invariance (enable_batch_invariance) before its
+    first engine; check_on_gpu runs them in a child process started that way."""
     passed: list[str] = []
     skipped: list[CheckSkip] = []
     failures: list[str] = []

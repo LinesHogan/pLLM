@@ -48,7 +48,7 @@ class VersionChecks:
                 for row, index in zip(selection.rows, group.state_indices, strict=True):
                     ref = selection.refs[int(index)]
                     if task.read_origin == "boundary" and lag:
-                        # The oldest input of the last L engine steps bounds visibility.
+                        # The oldest input of the last L steps the workload ran bounds visibility.
                         for before in self.history[-lag:]:
                             if ref.lineage_id in before:
                                 ref = before[ref.lineage_id]

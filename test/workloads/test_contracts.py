@@ -305,11 +305,10 @@ class PromptMask(pllm.Workload):
 )
 def test_schedule_contracts(workload, neutral, error, model_config, request):
     if isinstance(workload, OverRIDEWorkload):
-        # The engine skips a step whose rows are all prompt endings (no tapped decode row), so a method reading
-        # sampler feedback sees a prompt ending only when the step also holds decode rows ([mixed] differs).
-        request.applymarker(
-            pytest.mark.xfail(strict=True, reason="sampler feedback on prompt endings is batch-dependent")
-        )
+        # Expected: a method reading sampler feedback sees the prompt's last row whether or not decode rows share
+        # the step. Today the engine skips a step of prompt endings only, so [mixed] differs.
+        reason = "sampler feedback reaches a prompt's last row only when decode rows share its step"
+        request.applymarker(pytest.mark.xfail(strict=True, reason=reason))
     cuda_initialized = torch.cuda.is_initialized()
     if error:
         with pytest.raises(testing.ContractError, match=error) as caught:

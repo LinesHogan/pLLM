@@ -31,7 +31,6 @@ from pllm.backends.vllm.sampler import (
 )
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
-from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import HostBatch
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity
@@ -42,9 +41,8 @@ from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.host_runtime import CompletionRows
 from pllm.execution.overlay_task import ProjectionTask
 from pllm.execution.state_execution import StateDiagnostics
-from pllm.execution.state_feed import Feed
 from pllm.execution.step_capture import StepCapture
-from pllm.execution.step_driver import StepDriver
+from pllm.execution.step_driver import StepDriver, StepOpen
 from pllm.execution.step_input import StepInput, gather_input_tokens
 
 if TYPE_CHECKING:
@@ -89,8 +87,6 @@ class VllmSession:
         self.trace = deployment.execution.trace
         probe = attachment.probe
         self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
-        self._hidden_phases = frozenset(resource.phase for resource in probe.hidden_resources)
-        self._trains_on_batch = plan.semantic_graph.trains_on_batch
         self.hidden_taps = taps
         self._layer_logits = None
         if probe.layer_logits:
@@ -118,7 +114,6 @@ class VllmSession:
         )
         # The overlay prepared for each model forward; a custom forward drives its program overlay itself.
         self.forward_overlay = None if program_overlay else self.parameter_overlay
-        self._in_forward_overlay = plan.semantic_graph.updates_in_forward and not program_overlay
         in_forward = attachment.spec.in_forward
         self._transition_task = None if in_forward is None else plan.scheduled(in_forward).task_id
         self.activation_patch = (
@@ -186,11 +181,6 @@ class VllmSession:
         execution = deployment.execution
         execution.admit_instances(torch.cuda.current_stream(execution.device))
 
-    @property
-    def parameter_phases(self) -> tuple[HiddenPhase, ...]:
-        """Authored update phases used by hybrid model dispatch."""
-        return self.attachment.spec.overlay_phases
-
     def stage_input(
         self,
         batch: HostBatch[torch.Tensor] | None,
@@ -202,13 +192,6 @@ class VllmSession:
         """Stage request inputs, already validated by generate, and their optional completion destination."""
         self.driver.stage(identities, batch, samples_per_prompt)
         self.completion_rows = None if completion is None else CompletionRows(identities, completion)
-
-    def feed(self, name: str) -> Feed:
-        """Obtain the declared writer while the consumer is idle."""
-        return self.driver.feed(name)
-
-    def identity(self, request_id: str) -> RequestIdentity:
-        return self.driver.admitted[request_id]
 
     @property
     def attachment(self) -> BackendAttachment:
@@ -273,7 +256,7 @@ class VllmSession:
             return
         if adapter is not None:
             projection = None
-            if self._in_forward_overlay:
+            if self.driver.open is StepOpen.IN_FORWARD:
                 assert self._transition_task is not None
                 targets = tuple(item.target for item in self.attachment.spec.overlay_bindings)
                 projection = ProjectionTask(self.driver, context, rows, self._transition_task, targets)

@@ -41,7 +41,7 @@ check_result = testing.check(StreamMonitor(), CONFIG)
 # check-docs: skip: starts a GPU engine in multiprocessing mode
 from vllm import SamplingParams
 
-from my_project.workloads import StreamMonitor  # 多进程时负载类要从可导入的 .py 模块里来
+from my_project.workloads import StreamMonitor
 
 mp_config = pllm.ModelConfig(
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -55,10 +55,10 @@ with pllm.make_llm(mp_config, workload=StreamMonitor()) as llm:
 
 在多进程模式下，负载代码必须遵守以下约束：
 
-1. **负载类与模块级函数必须位于可导入的 `.py` 模块中**  
-   **原因**：Python 的 `pickle` 协议序列化类和函数时仅记录其导入路径（模块名与限定类名），而不包含函数体字节码。worker 子进程启动后会按路径重新 `import` 所在模块。如果类定义在 `__main__`、Notebook 单元格或函数局部作用域内，worker 子进程无法在文件系统中找到对应的模块路径，反序列化会直接失败。
-2. **负载字段必须支持 pickle 序列化（禁止 lambda 与闭包）**  
-   **原因**：标准 `pickle` 无法序列化动态构造的闭包环境与匿名函数（lambda）。负载实例的字段（超参数配置）应当使用原生数据类型（如 int、float、str、tuple 等）。
+1. **负载字段必须能 pickle（不放锁、打开的文件或活动句柄）**  
+   **原因**：负载用 cloudpickle 传给 worker 子进程：定义在 `__main__` 或 notebook 单元格里的类和函数（包括 lambda 与闭包）按值传过去，可导入模块里的按导入路径传。锁、文件、socket 这类绑定在本进程上的对象无法序列化，编码时会报错。
+2. **负载所在模块要能在 worker 里导入**  
+   **原因**：按导入路径传过去的类，worker 会重新 `import` 它所在的模块，所以那个模块要存在于 worker 的 Python 路径上。
 3. **模块必须具备导入安全性（import-safe）**  
    **原因**：worker 子进程被拉起时，在初始化 CUDA 运行时与 GPU 显存之前就会在顶层 `import` 你的模块。如果在模块顶层执行了分配 GPU 张量或触碰 CUDA 上下文的代码，子进程会在设备上下文就绪前崩溃。
 4. **两端计划逐字段校验（驱动端与 worker 必须运行相同源码）**  
@@ -162,7 +162,7 @@ with pllm.make_llm(config, workload=StreamMonitor()) as llm:
 - `max_model_len >= 32`。
 
 ```python
-# check-docs: skip: check_on_gpu requires a dedicated GPU process
+# check-docs: skip: check_on_gpu loads GPU engines
 testing.check_on_gpu(
     StreamMonitor(),
     pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=4, max_model_len=64),

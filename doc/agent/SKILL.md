@@ -233,7 +233,7 @@ PASS    chunking / tokens=
 PASS    publish_lag
 PASS    preempted
 PASS    neutral
-SKIP    timing-dependent values: publish_lag counts engine steps: ...
+SKIP    timing-dependent values: publish_lag counts the steps the workload runs: ...
 ```
 
 `pllm.testing.check` runs three requests through fixed schedules on CPU with the real planner and executor
