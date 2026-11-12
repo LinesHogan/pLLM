@@ -1,4 +1,4 @@
-"""Evidence 18: a spawned worker consumes the exact plan, without selection."""
+"""Evidence 18: a spawned worker rebuilds the shipped workload, plans it and binds it."""
 
 import multiprocessing as mp
 from dataclasses import dataclass, replace
@@ -11,15 +11,13 @@ import torch
 
 from examples.huber import HuberWorkload
 from pllm import ExecutionOptions
-from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.runtime import BackendInstall
+from pllm.backends.vllm.runner import BackendInstall, WorkloadModelRunner
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.compilation import PlanBundle
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.host import HostConfig
-from pllm.worker import GPUWorker
 from pllm.workload_transport import decode_workload, encode_workload
 from pllm.workloads.dummy import DummyWorkload
 from pllm.workloads.override import OverRIDEWorkload
@@ -78,48 +76,37 @@ def test_plan_bundle_codec_round_trips_and_rejects_injected_fields() -> None:
 
 def _worker(connection: Connection) -> None:
     try:
-        workload, _, _ = overlay_facts()
-        for imported in (workload, replace(workload, config=replace(workload.config, learning_rate=0.5))):
-            install = decode_boundary(connection.recv_bytes().decode(), BackendInstall)
-            runner = Mock()
-            try:
-                GPUWorker.install_workload(Mock(rank=0, workload_runner=runner), imported, install)
-                arena = runner.attach_workload.call_args.args[0].execution.arena
-                (resource,) = arena.plan.semantic_graph.states
-                write = arena.prepare_admission((resource.resource,))
-                arena.write_field(write, 0, LayoutFieldId(0)).fill_(3)
-                receipt = arena.publish(write)
-                (ref,) = receipt.after_refs
-                pin = arena.pin_exact(StateRefs.of((ref,)))
-                assert torch.all(arena.borrow_field(pin, ref, LayoutFieldId(0)) == 3)
-                connection.send_bytes(encode_boundary(ref).encode())
-            except ValueError as error:
-                assert "differs from the driver's" in str(error)
-                connection.send_bytes(b"rejected")
+        install = decode_boundary(connection.recv_bytes().decode(), BackendInstall)
+        runner = Mock()
+        WorkloadModelRunner.install_workload(
+            runner, decode_workload(install.definition), install.facts, install.options, install.generated_kv
+        )
+        arena = runner.attach_workload.call_args.args[0].execution.arena
+        (resource,) = arena.plan.semantic_graph.states
+        write = arena.prepare_admission((resource.resource,))
+        arena.write_field(write, 0, LayoutFieldId(0)).fill_(3)
+        receipt = arena.publish(write)
+        (ref,) = receipt.after_refs
+        pin = arena.pin_exact(StateRefs.of((ref,)))
+        assert torch.all(arena.borrow_field(pin, ref, LayoutFieldId(0)) == 3)
+        connection.send_bytes(encode_boundary(ref).encode())
     finally:
         connection.close()
 
 
 @pytest.mark.slow
-def test_worker_reconstructs_the_shipped_plan_and_rejects_source_drift() -> None:
+def test_worker_plans_and_binds_the_shipped_workload() -> None:
     workload, _, facts = overlay_facts()
-    facts, declaration = workload.specialize(facts, ExecutionOptions())
-    attachment = workload.plan_backend(facts, declaration)
-    policy = CachePolicy.for_attachment(attachment, "reuse")
-    wire = encode_boundary(BackendInstall(facts, attachment, "", policy)).encode()
+    wire = encode_boundary(BackendInstall(facts, ExecutionOptions(), encode_workload(workload), "reuse")).encode()
     context = mp.get_context("spawn")
     parent, child = context.Pipe()
     worker = context.Process(target=_worker, args=(child,))
     worker.start()
     child.close()
     try:
-        # A worker whose imported workload declares different math is rejected before attaching.
-        answers = []
-        for _ in range(2):
-            parent.send_bytes(wire)
-            assert parent.poll(20), "worker did not finish reconstruction"
-            answers.append(parent.recv_bytes().decode())
-        assert decode_boundary(answers[0], StateRef).version_id == 0 and answers[1] == "rejected"
+        parent.send_bytes(wire)
+        assert parent.poll(20), "worker did not finish installing"
+        assert decode_boundary(parent.recv_bytes().decode(), StateRef).version_id == 0
         worker.join(10)
         assert worker.exitcode == 0
     finally:

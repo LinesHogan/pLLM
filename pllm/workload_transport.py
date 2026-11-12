@@ -3,9 +3,9 @@ rebuilt in pllm.worker) and check_on_gpu's checking process.
 
 cloudpickle carries classes and functions from __main__ or a notebook by value (custom operators and @triton.jit
 functions are registered again from their Python functions) and importable ones by import path, so the receiving
-process imports the same sources the sender uses. An object that must not travel as bytes, such as
-a template model, defines `__reduce__` to rebuild itself there. The worker compares its declaration with the
-driver's plan, so source drift fails at install.
+process imports those modules itself, as in any Python multiprocessing: editing them between make_llm and the
+worker's start is the author's responsibility. An object that must not travel as bytes, such as a template model,
+defines `__reduce__` to rebuild itself there.
 """
 
 import io

@@ -9,10 +9,12 @@ from __future__ import annotations
 import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -36,14 +38,18 @@ from pllm.backends.vllm.position_state import POSITION_ENV, PositionCacheLayer
 from pllm.backends.vllm.prefix_cache import CachePolicy
 from pllm.backends.vllm.sampler import GuidedSampler
 from pllm.backends.vllm.session import VllmSession
+from pllm.backends.vllm.training import CausalTraining
+from pllm.config import ExecutionOptions
+from pllm.contracts.backend_attachment import BackendAttachment
 from pllm.contracts.codec import decode_boundary
 from pllm.contracts.kv_layout import KVLayout
+from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.ptts.slot_pools import SlotPools
 from pllm.execution.state_execution import StateDiagnostics
 
 if TYPE_CHECKING:
-    from pllm.workload import BackendDeployment
+    from pllm.workload import BackendDeployment, Workload
 
 
 class WorkloadModelRunner(OverlayGraphRunner):
@@ -88,6 +94,32 @@ class WorkloadModelRunner(OverlayGraphRunner):
         if not self.hidden_layouts:
             return
         self.hidden_taps = HiddenTaps(model, self.hidden_layouts, self.hidden_pools, self.device)
+
+    def install_workload(
+        self,
+        workload: Workload,
+        facts: BackendCompileFacts,
+        options: ExecutionOptions,
+        generated_kv: Literal["reuse", "isolate"],
+        rank: int = 0,
+    ) -> BackendInstalled:
+        """Specialize, plan and bind the workload in this process and attach it: the one install path, in process
+        or in each EngineCore worker."""
+        facts, declaration = workload.specialize(facts, options, causal=partial(CausalTraining, self.decoder))
+        attachment = workload.plan_backend(facts, declaration)
+        policy = CachePolicy.for_attachment(attachment, generated_kv)
+        declaration.tensor_parallel_rank = rank
+        self.attach_workload(
+            workload.bind_backend(
+                facts,
+                attachment,
+                declaration,
+                is_output_rank=rank == 0,
+                map_host=get_accelerator_view_from_cpu_tensor,
+            ),
+            policy,
+        )
+        return BackendInstalled(facts, attachment, policy)
 
     def attach_workload(
         self,
@@ -279,3 +311,22 @@ class WorkloadModelRunner(OverlayGraphRunner):
 class BackendWorkerState:
     process_id: int
     diagnostics: StateDiagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class BackendInstall:
+    """The probed facts, options and pickled workload a worker installs from."""
+
+    facts: BackendCompileFacts
+    options: ExecutionOptions
+    definition: str
+    generated_kv: Literal["reuse", "isolate"]
+
+
+@dataclass(frozen=True, slots=True)
+class BackendInstalled:
+    """What an install planned, for the driver's handle; tensor-parallel ranks must agree on it."""
+
+    facts: BackendCompileFacts
+    attachment: BackendAttachment
+    cache_policy: CachePolicy

@@ -8,19 +8,20 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import pickle
+from base64 import b64decode, b64encode
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from functools import partial
 from hashlib import sha256
+from traceback import format_exception
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 from vllm import RequestOutput, SamplingParams
 from vllm.entrypoints.llm import LLM
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from pllm.backends.vllm.admission import admit_workload
 from pllm.backends.vllm.checkpoint import load_options
@@ -34,8 +35,7 @@ from pllm.backends.vllm.overlay_graph import (
 )
 from pllm.backends.vllm.position_state import POSITION_ENV
 from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
-from pllm.backends.vllm.training import CausalTraining
+from pllm.backends.vllm.runner import BackendInstall, BackendInstalled, BackendWorkerState, WorkloadModelRunner
 from pllm.config import ModelConfig, ModelDType
 from pllm.contracts.backend_attachment import (
     BackendAttachment,
@@ -97,16 +97,6 @@ class BackendCommand(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class BackendInstall:
-    """The driver's specialized facts and plan; the worker binds them without probing again."""
-
-    facts: BackendCompileFacts
-    attachment: BackendAttachment
-    definition: str
-    cache_policy: CachePolicy
-
-
-@dataclass(frozen=True, slots=True)
 class BackendStage:
     identities: tuple[RequestIdentity, ...]
     batch: HostBatch[SharedTensor] | None
@@ -116,6 +106,30 @@ class BackendStage:
 
 
 FeedbackT = TypeVar("FeedbackT", bound=CompletionFeedback)
+ReplyT = TypeVar("ReplyT")
+
+
+def reported_call(call: Callable[[], ReplyT]) -> str:
+    """Run a worker command and return its result, or the exception it raised, pickled for the driver.
+
+    vLLM turns a worker exception into a bare message; the pickled exception keeps its type, and its note keeps
+    the worker's traceback."""
+    result: ReplyT | Exception
+    try:
+        result = call()
+    except Exception as error:
+        error.add_note("EngineCore worker traceback:\n" + "".join(format_exception(error)))
+        result = error
+    return b64encode(pickle.dumps(result)).decode("ascii")
+
+
+def reported_result(reply: str, expected: type[ReplyT]) -> ReplyT:
+    """Return a worker's result, or raise the exception the worker raised."""
+    result = pickle.loads(b64decode(reply))
+    if isinstance(result, Exception):
+        raise result
+    assert isinstance(result, expected)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -751,39 +765,28 @@ def create_vllm_llm(
             assert all(replace(probe, state_page_budget_bytes=budget) == facts for probe in probes), (
                 "TP workers disagree on model or planning facts"
             )
-            facts, declaration = workload.specialize(facts, config.execution)
-            attachment = workload.plan_backend(facts, declaration)
-            policy = CachePolicy.for_attachment(attachment, config.generated_kv)
-            handle = VllmLlm(
-                llm, None, attachment, facts, policy, requirements.sample_limit, eager_reason, compile_hooks=hooks
+            install = BackendInstall(facts, config.execution, definition or "", config.generated_kv)
+            replies = llm.collective_rpc(
+                "workload_command", timeout=30.0, args=(BackendCommand.INSTALL.value, encode_boundary(install))
             )
-            install = encode_boundary(BackendInstall(facts, attachment, definition or "", policy))
-            llm.collective_rpc("workload_command", timeout=30.0, args=(BackendCommand.INSTALL.value, install))
+            (installed, *others) = (reported_result(reply, BackendInstalled) for reply in replies)
+            assert all(other == installed for other in others), "TP workers planned different workloads"
+            runner = None
         else:
             runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
-            facts, declaration = workload.specialize(
-                probe_backend(requirements, runner),
-                config.execution,
-                causal=partial(CausalTraining, runner.decoder),
+            installed = runner.install_workload(
+                workload, probe_backend(requirements, runner), config.execution, config.generated_kv
             )
-            deployment = workload.bind_backend(
-                facts,
-                workload.plan_backend(facts, declaration),
-                declaration,
-                map_host=get_accelerator_view_from_cpu_tensor,
-            )
-            policy = CachePolicy.for_attachment(deployment.attachment, config.generated_kv)
-            runner.attach_workload(deployment, policy)
-            handle = VllmLlm(
-                llm,
-                runner,
-                deployment.attachment,
-                facts,
-                policy,
-                requirements.sample_limit,
-                eager_reason,
-                compile_hooks=hooks,
-            )
+        handle = VllmLlm(
+            llm,
+            runner,
+            installed.attachment,
+            installed.facts,
+            installed.cache_policy,
+            requirements.sample_limit,
+            eager_reason,
+            compile_hooks=hooks,
+        )
         construction.pop_all()
         return handle
 

@@ -23,8 +23,8 @@ import pllm
 from pllm.backends.vllm import runtime
 from pllm.backends.vllm.custom_forward import ProgramWave, VllmCustomForward
 from pllm.backends.vllm.position_state import PositionCacheProvider
-from pllm.backends.vllm.prefix_cache import CachePolicy
-from pllm.backends.vllm.runtime import BackendCommand, BackendInstall, BackendStage
+from pllm.backends.vllm.runner import BackendInstall, BackendInstalled
+from pllm.backends.vllm.runtime import BackendCommand, BackendStage, reported_result
 from pllm.config import KVOffload
 from pllm.contracts.codec import encode_boundary
 from pllm.contracts.request_identity import RequestIdentity
@@ -332,24 +332,17 @@ def isolated_multiturn():
             handle.llm.collective_rpc("end_native_steps")
             namespace = handle.cache_policy.namespace
             workload = ImportedStepLoop()
-            # The worker's install path: build against the driver's specialized facts.
             assert handle.compile_facts is not None
-            declaration = workload.funded_declaration(handle.compile_facts)
-            handle.backend_attachment = workload.plan_backend(handle.compile_facts, declaration)
-            handle.cache_policy = CachePolicy.for_attachment(handle.attachment, "isolate")
             handle.command(BackendCommand.DETACH)
+            install = BackendInstall(
+                handle.compile_facts, pllm.ExecutionOptions(), encode_workload(workload), "isolate"
+            )
             if multiprocessing:
-                handle.command(
-                    BackendCommand.INSTALL,
-                    encode_boundary(
-                        BackendInstall(
-                            handle.compile_facts, handle.attachment, encode_workload(workload), handle.cache_policy
-                        )
-                    ),
-                )
+                (reply,) = handle.command(BackendCommand.INSTALL, encode_boundary(install))
+                installed = reported_result(reply, BackendInstalled)
             else:
-                deployment = workload.bind_backend(handle.compile_facts, handle.attachment, declaration)
-                handle.runner.attach_workload(deployment, handle.cache_policy)
+                installed = handle.runner.install_workload(workload, install.facts, install.options, "isolate")
+            handle.backend_attachment, handle.cache_policy = installed.attachment, installed.cache_policy
             assert handle.cache_policy.namespace != namespace
             (changed,) = generate_ids(handle, [receiver])
             assert changed.num_cached_tokens == 0

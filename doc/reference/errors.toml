@@ -825,13 +825,6 @@ why_zh = '''负载字段（或其中函数捕获的变量）持有锁、打开�
 fix_zh = '''字段只放普通值、张量和函数；句柄在方法内打开'''
 
 [[section.error]]
-message = '''the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; run both processes from the same installed sources and do not rewrite pretrained files while the engine starts'''
-why = '''The driver and the worker see different code or weight files, so their plans would differ.'''
-fix = '''Run both from the same installed sources; do not rewrite pretrained files while the engine starts.'''
-why_zh = '''主进程和 worker 看到的代码或权重文件不同，计划会不一致'''
-fix_zh = '''两边用同一份安装好的源码；启动期间不要改写权重文件'''
-
-[[section.error]]
 message = '''check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script'''
 why = '''The GPU check runs a fixed multi-request script.'''
 fix = '''Raise those settings for the check.'''

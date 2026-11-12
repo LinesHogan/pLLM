@@ -4,27 +4,18 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
-from functools import partial
 
 import torch
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
 from pllm.backends.vllm import compat
-from pllm.backends.vllm.runner import BackendWorkerState, WorkloadModelRunner
-from pllm.backends.vllm.runtime import (
-    BackendCommand,
-    BackendInstall,
-    BackendStage,
-    probe_backend,
-)
-from pllm.backends.vllm.training import CausalTraining
+from pllm.backends.vllm.runner import BackendInstall, BackendWorkerState, WorkloadModelRunner
+from pllm.backends.vllm.runtime import BackendCommand, BackendStage, probe_backend, reported_call
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.host_batch import map_host_batch
 from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.trace import TraceSelection
-from pllm.workload import Workload
 from pllm.workload_transport import decode_workload
 
 
@@ -47,28 +38,6 @@ class GPUWorker(compat.Worker):
         assert isinstance(runner, WorkloadModelRunner)
         return runner
 
-    def install_workload(self, workload: Workload, install: BackendInstall) -> None:
-        """Bind the driver's plan to the workload this process imported, refusing drifted sources."""
-        runner = self.workload_runner
-        plan = install.attachment.plan
-        declaration = workload.funded_declaration(install.facts, causal=partial(CausalTraining, runner.decoder))
-        if (declaration.graph, declaration.layouts) != (plan.semantic_graph, plan.tensor_layout_request):
-            raise ValueError(
-                "the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; "
-                "run both processes from the same installed sources and do not rewrite pretrained files while the engine starts"
-            )
-        declaration.tensor_parallel_rank = self.rank
-        runner.attach_workload(
-            workload.bind_backend(
-                install.facts,
-                install.attachment,
-                declaration,
-                is_output_rank=self.rank == 0,
-                map_host=get_accelerator_view_from_cpu_tensor,
-            ),
-            install.cache_policy,
-        )
-
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
         operation = BackendCommand(command)
@@ -85,8 +54,15 @@ class GPUWorker(compat.Worker):
                     return encode_boundary(probe_backend(decode_boundary(payload, BackendRequirements), runner))
                 case BackendCommand.INSTALL:
                     install = decode_boundary(payload, BackendInstall)
-                    self.install_workload(decode_workload(install.definition), install)
-                    return encode_boundary(BackendWorkerState(os.getpid(), runner.require_session().diagnostics()))
+                    return reported_call(
+                        lambda: runner.install_workload(
+                            decode_workload(install.definition),
+                            install.facts,
+                            install.options,
+                            install.generated_kv,
+                            self.rank,
+                        )
+                    )
                 case BackendCommand.STAGE:
                     stage = decode_boundary(payload, BackendStage)
                     peer = stage.driver_pid

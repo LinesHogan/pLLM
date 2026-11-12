@@ -163,7 +163,6 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local @pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1` | 多卡时增量按分片存放，只有分片内的更新能保持各卡一致 | 多卡时 Adapter 状态从 `Zeros` / `Computed` 开始、只在 `@pllm.train_in_forward` 里更新；否则单卡 |
 | `TP projection update is not shard-local at ...; ...` | 更新的数学要用到别的卡上的分片 | 改成只用本卡分片的更新，或单卡 |
 | `other processes receive the workload by pickling (...); hold plain values, tensors and functions instead of locks, open files or live handles, or use tensor_parallel_size=1 with multiprocessing=False` | 负载字段（或其中函数捕获的变量）持有锁、打开的文件或活动句柄，无法 pickle | 字段只放普通值、张量和函数；句柄在方法内打开 |
-| `the EngineCore worker imported a workload (code or pretrained weights) that differs from the driver's; run both processes from the same installed sources and do not rewrite pretrained files while the engine starts` | 主进程和 worker 看到的代码或权重文件不同，计划会不一致 | 两边用同一份安装好的源码；启动期间不要改写权重文件 |
 | `check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script` | GPU 检查跑一段固定的多请求脚本 | 检查时调大这两个设置 |
 
 ## 显存预算
