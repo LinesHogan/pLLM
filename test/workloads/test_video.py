@@ -50,7 +50,7 @@ from pllm.workloads.video import VideoWorkload, frame_features
 
 @contextmanager
 def binding_case(*, alias=False, write_failure=False, runtime=False, missing=None):
-    b = TensorDeclaration("video.binding", "a" * 64, Dimensions(2, 0))
+    b = TensorDeclaration("video.binding", Dimensions(2, 0))
     features, ports = declare_parameters(
         b,
         "features",
@@ -199,7 +199,7 @@ def _session(b, execution):
             SimpleNamespace(compute_logits=lambda hidden: hidden, model=model),
             None,
             2,
-            cache_policy=CachePolicy.for_attachment(deployment.attachment, "isolate"),
+            cache_policy=CachePolicy.for_attachment(deployment.attachment, "isolate", 0),
         ),
         model,
         deployment,

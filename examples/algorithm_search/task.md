@@ -15,7 +15,7 @@ early_exit.py uses an active= loop over the last two layers. You may replace the
 algorithm or tune it. The leaderboard contains previous accuracy, throughput,
 explain and check feedback. A failed contract or throughput below 90% disqualifies
 a candidate. Highest accuracy wins; ties go to lower explain FLOPs. Vanilla is a
-valid candidate. Each proposal is scored once per pLLM fingerprint.
+valid candidate. Each proposal is scored once per source.
 
 Quality uses greedy generation, up to 512 tokens, a fixed zero-shot chat prompt,
 and exact numeric match of the last number in the response. Throughput uses the

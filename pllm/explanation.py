@@ -177,8 +177,6 @@ class ExplainResult:
     attention: tuple[AttentionCost, ...]
     kv_capacity: tuple[KVCapacity, ...]
     kernels: KernelEstimate
-    # Signs the declaration, method code and workload values; equal digests run the same workload.
-    workload_digest: str
     # Base forward plus every task's matmul and projection FLOPs per row; None when the base is unknown.
     flops_per_token_estimate: float | None
 
@@ -278,7 +276,7 @@ class ExplainResult:
             )
             lines.append(
                 f"op       {op.name}: {', '.join(op.call_sites)}; {flops} FLOP/row; "
-                f"{op.bytes_per_row:g} logical bytes/row [lower bound]; signature {op.signature}; "
+                f"{op.bytes_per_row:g} logical bytes/row [lower bound]; "
                 f"CPU reference={op.cpu_reference}, autograd={op.autograd}; host syncs unverified (fake only)"
             )
         for read in self.attention:
@@ -788,6 +786,5 @@ def explain_facts(
         binding.attention.costs,
         layout_capacity(shape, config, workload.backend_requirements().kv_layouts) if binding.attention.methods else (),
         _kernel_sum(tuple(costs.values()), tuple(sites.values())),
-        binding.graph.execution_parameters_digest,
         _flops_per_token(shape.base_forward_flops_per_token_estimate, tuple(costs.values())),
     )

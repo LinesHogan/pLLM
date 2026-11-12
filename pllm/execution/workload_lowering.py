@@ -17,7 +17,6 @@ import torch
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import ActivationPatchOperator, DecodeRefresh, DecodeWindow, MissingPolicy
-from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.host_batch import validate_host_batch
 from pllm.contracts.member import MemberDeclaration
@@ -41,7 +40,6 @@ from pllm.execution.binding_base import Field, layout_field, overlay_fields
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, State, When
-from pllm.execution.freeze import fingerprint
 from pllm.execution.host_runtime import HostConfig, bind_host
 from pllm.execution.method_effects import TRAINING_INPUTS, Effect, Gradient, Sampler
 from pllm.execution.method_inputs import Carried, Carry, InputMarker, Parameter, Result, method_inputs
@@ -89,8 +87,8 @@ class Operation:
 
     @property
     def identity(self) -> str:
-        """Identify a method implementation within its component's namespace."""
-        return f"python:{self.name}:{fingerprint(self.function)}"
+        """Identify a method implementation by its qualified method name, unique in the workload."""
+        return f"python:{self.name}"
 
     @property
     def transition_window(self) -> When:
@@ -138,17 +136,7 @@ class Operation:
         if arguments is None:
             arguments, carries = self.arguments()
         context, effect = self.context, self.effect
-        inputs, identity = {key: source.port(context) for key, source in arguments.items()}, fingerprint(self.function)
-        context.signature.append(
-            (
-                self.name,
-                boundary_digest(
-                    identity,
-                    tuple((key, fingerprint(source)) for key, source in arguments.items()),
-                    fingerprint(carries),
-                ),
-            )
-        )
+        inputs = {key: source.port(context) for key, source in arguments.items()}
         demand = self.gradient or Gradient((), effect.training)
         math = demand.contract(self, arguments)
         update = context.states[effect.state] if effect.training else None
@@ -208,15 +196,12 @@ class Operation:
             if not method:
                 continue
             if method not in selectors:
-                selector = self.context.method(method)
-                identity = fingerprint(selector)
-                self.context.signature.append((method, identity))
                 selectors[method] = declare_tensor(
                     self.context.binding,
                     self.context.selector_name(self.name, method),
-                    selector,
+                    self.context.method(method),
                     when=self.phase,
-                    identity=f"python:{identity}:{self.name}:{method}",
+                    identity=f"python:{self.name}:{method}",
                     inputs={
                         key: inputs[key] if arguments.get(key) == source else source.port(self.context)
                         for key, source in sources[self.context.selector_name(self.name, method)].items()
@@ -240,14 +225,12 @@ class WorkloadContext:
     prefix: str = ""
     components: tuple[WorkloadContext, ...] = ()
     # The owner's values, signed; the declared states and model values among them, by type.
-    bindings: tuple[tuple[str, str], ...] = ()
     state_definitions: dict[str, InstanceState] = field(default_factory=lambda: {})
     # Each declared pllm.model.Adapter as the projection delta it applies.
     adapters: dict[str, ProjectionDelta] = field(default_factory=lambda: {})
     activations: dict[str, ActivationPatch] = field(default_factory=lambda: {})
     position_definitions: dict[str, PositionState] = field(default_factory=lambda: {})
     # Ordered (name, digest) entries folded into the graph's execution parameters digest.
-    signature: list[tuple[str, str]] = field(default_factory=lambda: [])
     operations: list[Operation] = field(default_factory=lambda: [])
     custom_forwards: list[tuple[str, Tokens, Over]] = field(default_factory=lambda: [])
     positions: tuple[tuple[str, float], ...] = ()
@@ -392,9 +375,6 @@ class WorkloadContext:
         for name, state in self.state_definitions.items():
             with self.declaring(name):
                 declare_state(self, name, state)
-        self.signature.extend(
-            (name, fingerprint(value)) for name, value in {**self.activations, **self.adapters}.items()
-        )
 
     def attach_imports(self) -> None:
         """Make every imported-state reader consume the call's before-forward publication."""
@@ -592,16 +572,12 @@ class WorkloadContext:
                 for state in b.graph.states
             ),
             model_results=tuple(sorted(b.model_site_tasks)),
-            execution_parameters_digest=boundary_digest(
-                b.graph.execution_parameters_digest, self.signature, self.bindings
-            ),
         )
 
 
 def declare_state(context: WorkloadContext, name: str, definition: InstanceState) -> None:
     """Allocate tensor parameters; the layout of fields an adapter reads follows its targets."""
-    digest = definition.init.register(context.binding, name, definition.scope)
-    context.signature.append((name, boundary_digest(fingerprint(definition), tuple(definition.fields), digest)))
+    definition.init.register(context.binding, name, definition.scope)
     if name in context.in_forward_states:
         # The in-forward transition allocates the state and runs only the source's initializer.
         if not isinstance(definition.init, (Zeros, Computed, Pretrained)):
@@ -750,7 +726,7 @@ def model_declaration(name: str, facts: BackendCompileFacts, causal: CausalBinde
         facts.layer_count,
         facts.probe.tensor_parallel_size,
     )
-    b = TensorDeclaration(name, boundary_digest(dimensions, facts.initialization_seed), dimensions)
+    b = TensorDeclaration(name, dimensions)
     b.probe = facts.probe
     b.checkpoint = facts.checkpoint
     b.causal = causal
@@ -806,9 +782,7 @@ def reserve_resources(
 
 def host_declaration(name: str, config: HostConfig) -> TensorDeclaration:
     """An empty declaration for a host loop without a model (pllm.host.make_host), ready for lower_workload."""
-    return TensorDeclaration(
-        name, boundary_digest(config.hidden_size, config.seed), Dimensions(config.hidden_size, 0), host=True
-    )
+    return TensorDeclaration(name, Dimensions(config.hidden_size, 0), host=True)
 
 
 def bind_host_declaration(

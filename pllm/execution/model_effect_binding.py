@@ -80,7 +80,6 @@ def declare_parameter_overlay(
     function: Callable[..., UpdateOutput],
     arguments: Mapping[str, str],
     visibility: VisibilityKind,
-    equations_digest: str,
     invariants: Mapping[str, tuple[str, tuple[FieldView, ...]]],
     reads: tuple[State, ...],
 ) -> None:
@@ -137,7 +136,6 @@ def declare_parameter_overlay(
     source = VisibilitySource(
         visibility,
         "overlay",
-        equations_digest,
         (str(state.declaration.resource),) * len(targets),
         0,
         "carry" if visibility == "exact" else "transition",

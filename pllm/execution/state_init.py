@@ -47,10 +47,9 @@ class StateInit:
         """Where the values come from, as pllm.explain reports it."""
         return "zeros"
 
-    def register(self, binding: TensorDeclaration, name: str, scope: StateScope) -> str:
-        """Record the source of the state `name`; returns the digest of any file the values are read from."""
+    def register(self, binding: TensorDeclaration, name: str, scope: StateScope) -> None:
+        """Record the source of the state `name`."""
         binding.state_sources[name] = self.describe(scope)
-        return ""
 
     def initializer(self, binding: TensorDeclaration, name: str, fields: tuple[str, ...]) -> Initializer | None:
         """The function that fills the named fields of a newly allocated state; None leaves them at zero."""
@@ -109,11 +108,10 @@ class Pretrained(StateInit):
                 "mutable state"
             )
 
-    def register(self, binding: TensorDeclaration, name: str, scope: StateScope) -> str:
+    def register(self, binding: TensorDeclaration, name: str, scope: StateScope) -> None:
         file = PretrainedFile.read(self.path, name)
         binding.state_sources[name] = file.source
         binding.pretrained[name] = file
-        return file.sha256
 
     def initializer(self, binding: TensorDeclaration, name: str, fields: tuple[str, ...]) -> Initializer | None:
         return partial(binding.pretrained[name].initialize, fields)
@@ -182,10 +180,11 @@ class FromModule(StateInit):
     def describe(self, scope: StateScope) -> str:
         return "module init"
 
-    def register(self, binding: TensorDeclaration, name: str, scope: StateScope) -> str:
+    def register(self, binding: TensorDeclaration, name: str, scope: StateScope) -> None:
         if not self.pretrained:
-            return super().register(binding, name, scope)
-        return Pretrained(self.pretrained).register(binding, name, scope)
+            super().register(binding, name, scope)
+        else:
+            Pretrained(self.pretrained).register(binding, name, scope)
 
     def declare(self, context: WorkloadContext, name: str, state: InstanceState) -> None:
         context.binding.initial_values[name] = partial(

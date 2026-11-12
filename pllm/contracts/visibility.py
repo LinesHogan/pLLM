@@ -11,14 +11,13 @@ VisibilityKind = Literal["forward_pinned", "exact", "step_lag"]
 
 @dataclass(frozen=True, slots=True)
 class VisibilitySource:
-    """Internal equation identity and read domain; Rust derives the read-from map.
+    """A read policy and its read domain; Rust derives the read-from map.
 
     Overlays keep their chunk/tail mathematics inside the transition's own scan (chunk_size=0).
     """
 
     policy: VisibilityKind
     scope: Literal["overlay", "post_sampler"]
-    equations_digest: str
     resources: tuple[str, ...]
     chunk_size: int
     tail: Literal["transition", "carry"]
@@ -27,7 +26,7 @@ class VisibilitySource:
     @staticmethod
     def post_sampler(lag: int) -> "VisibilitySource":
         """Declare the retained-input boundary for the optional serial writer lane."""
-        return VisibilitySource("step_lag", "post_sampler", "retained-step-inputs@1", (), 0, "transition", lag)
+        return VisibilitySource("step_lag", "post_sampler", (), 0, "transition", lag)
 
     @property
     def in_forward(self) -> bool:

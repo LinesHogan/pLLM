@@ -1,4 +1,4 @@
-"""CPU evidence for selective hashes, stock admission, and signed role sensitivity."""
+"""CPU evidence for selective hashes, stock admission, and role sensitivity."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -19,7 +19,7 @@ from pllm.workloads.recirculation import RecirculationWorkload
 from pllm.workloads.step_loop import StepLoopWorkload
 from test.workloads.test_recirculation import FACTS
 
-POLICY = CachePolicy("a" * 64, True, "isolate")
+POLICY = CachePolicy(0, True, "isolate")
 HASH = get_hash_fn_by_name("sha256")
 init_none_hash(HASH)
 
@@ -117,17 +117,10 @@ class DecodeRoute(pllm.Workload):
     "workload,sensitive",
     ((StepLoopWorkload(), True), (RecirculationWorkload(), False), (GeneratedRoute(), True), (DecodeRoute(), True)),
 )
-def test_signed_sensitivity(workload, sensitive):
+def test_role_sensitivity(workload, sensitive):
     facts = replace(FACTS, probe=replace(FACTS.probe, position_states=workload.backend_requirements().position_states))
     attachment = workload.compile_backend(facts, ExecutionOptions()).attachment
-    policy = CachePolicy.for_attachment(attachment, "isolate")
-    assert policy.role_sensitive is sensitive
-    assert CachePolicy.for_attachment(attachment, "isolate") == policy
-    changed = replace(
-        attachment,
-        probe=replace(attachment.probe, position_states=(("history", 1.0),)),
-    )
-    assert CachePolicy.for_attachment(changed, "isolate").namespace != policy.namespace
+    assert CachePolicy.for_attachment(attachment, "isolate", 0).role_sensitive is sensitive
 
 
 @pytest.mark.parametrize("active", ("step", "admitted", "_pending"))

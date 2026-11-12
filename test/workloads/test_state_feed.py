@@ -147,31 +147,6 @@ def test_ordinary_state_ports_and_write_do_not_depend_on_declaration_order():
     execution.retire(())
 
 
-def test_write_field_and_feed_field_order_are_signed():
-    @dataclass(frozen=True)
-    class Fields(FeedWorkload):
-        @property
-        def target(self) -> pllm.InstanceState:
-            return pllm.InstanceState({"value": (2,), "second": (2,)})
-
-        @property
-        def activation(self) -> pllm.model.ActivationPatch:
-            return pllm.model.ActivationPatch("target", (0, 1), operator="add")
-
-        @pllm.write(state="target", fields=("value",))
-        def transform(self, value: torch.Tensor = SOURCE, previous: torch.Tensor = TARGET) -> tuple[torch.Tensor, ...]:
-            return (value + previous,)
-
-    first = Fields().build(facts_for()).graph.execution_parameters_digest
-    vars(Fields.transform).pop("__pllm_effect__")  # re-declare the same method with another field
-    pllm.write(state="target", fields=("second",))(Fields.transform)
-    assert Fields().build(facts_for()).graph.execution_parameters_digest != first
-    Fields.source = pllm.InstanceState({"value": (2,), "extra": (2,)}, init=pllm.Fed("ordered"))
-    first = Fields().build(facts_for()).graph.execution_parameters_digest
-    Fields.source = pllm.InstanceState({"extra": (2,), "value": (2,)}, init=pllm.Fed("ordered"))
-    assert Fields().build(facts_for()).graph.execution_parameters_digest != first
-
-
 def test_fed_buffer_fields_use_the_same_declared_ports():
     @dataclass(frozen=True)
     class BufferFeed(FeedWorkload):

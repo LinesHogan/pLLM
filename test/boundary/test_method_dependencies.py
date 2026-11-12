@@ -33,5 +33,5 @@ def test_setattr_explains_the_replacement(expression, replacement):
 )
 def test_dispatcher_lookup_needs_the_op_object(expression):
     namespace = {"torch": torch, "op": torch.ops.kernel_test.add, "namespace": torch.ops.kernel_test}
-    with pytest.raises(ValueError, match="call the op object.*sign its source"):
+    with pytest.raises(ValueError, match="call the op object.*receive the op"):
         check_dependencies(eval(f"lambda x: {expression}", namespace))

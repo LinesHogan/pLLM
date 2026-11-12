@@ -19,7 +19,6 @@ from pllm.contracts.semantic_graph import (
     TaskSymbol,
 )
 from pllm.execution.compile_facts import BackendCompileFacts
-from pllm.execution.freeze import fingerprint
 from pllm.execution.task_memory import example, meta_site_arguments, producers_first, task_example
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_program import TensorBatch, TensorOperation
@@ -43,7 +42,6 @@ class OpCost:
     call_sites: tuple[str, ...]
     flops_per_row: float | None
     bytes_per_row: float
-    signature: str
     cpu_reference: bool
     autograd: bool
 
@@ -68,7 +66,6 @@ def _op_cost(name: str, entries: list[tuple[str, float | None, float, CustomOpDe
         tuple(dict.fromkeys(entry[0] for entry in entries)),
         None if any(entry[1] is None for entry in entries) else max(entry[1] or 0 for entry in entries),
         max(entry[2] for entry in entries),
-        fingerprint(definition),
         op.cpu,
         op.autograd,
     )

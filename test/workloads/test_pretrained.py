@@ -133,7 +133,6 @@ def test_pretrained_equals_initialize_and_signs_file_bytes(tmp_path, state_type,
         torch.testing.assert_close(reference_root[0] if optimizer else torch.cat(reference_root), actual)
         initialized.retire(ids)
     save_file({key: value + 1 for key, value in values.items()}, path)
-    assert workload.build(facts).graph.execution_parameters_digest != binding.graph.execution_parameters_digest
     with pytest.raises(ValueError, match="changed after make_llm hashed it"):
         workload.bind_backend(facts, workload.plan_backend(facts, binding), binding)
 

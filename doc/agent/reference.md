@@ -665,7 +665,7 @@ requests fit, per TP rank).
 
 | Name | Meaning |
 | --- | --- |
-| `pllm.explain(workload, config)` | Plan on CPU from `config.json` without weights or CUDA: per method its timing anchor, CUDA stream lane and graph capture; why the forward is eager; state bytes; peak memory pLLM reserves; host syncs in your math; timing settings. `str()` prints a table; `dataclasses.asdict()` gives JSON-ready data (`eager_reason`, `members`, `states`, `peak_memory_bytes`, `budget_errors`, `exports`, ...). `workload_digest` signs the declaration, method code and workload values (equal digests run the same workload); `flops_per_token_estimate` is the base forward's dense projection and LM-head FLOPs per token plus every task's matmul and projection FLOPs per row (attention over the KV history excluded; `None` when the base is unknown). |
+| `pllm.explain(workload, config)` | Plan on CPU from `config.json` without weights or CUDA: per method its timing anchor, CUDA stream lane and graph capture; why the forward is eager; state bytes; peak memory pLLM reserves; host syncs in your math; timing settings. `str()` prints a table; `dataclasses.asdict()` gives JSON-ready data (`eager_reason`, `members`, `states`, `peak_memory_bytes`, `budget_errors`, `exports`, ...). `flops_per_token_estimate` is the base forward's dense projection and LM-head FLOPs per token plus every task's matmul and projection FLOPs per row (attention over the KV history excluded; `None` when the base is unknown). |
 | `pllm.testing.check(workload, config, *, neutral=None)` | Run fixed three-request schedules on CPU through the real planner and executor: row permutation, request isolation, mixed prefill/decode, chunked prompts, preemption replay, publish_lag versions, and with `neutral=` that the disabled workload adds exactly zero. Returns a `CheckResult`; raises `ContractError`. |
 | `pllm.testing.check_on_gpu(workload, config, *, neutral=None)` | Load real engines in a child process with batch-invariant kernels: planning, eight steady decode steps, each prompt alone versus all batched, forced KV eviction and recompute, and with `neutral=` greedy and seeded sampling bitwise equal to the plain model. Needs `multiprocessing=False`, `max_num_seqs >= 2`, `max_model_len >= 32`. |
 | `pllm.testing.check_distribution(workload, config, *, prompts=None, tokens=16, temperature=0, max_mean_kl=None, max_p99_kl=None, worst=5)` | Teacher-force the plain model's continuation through the workload with matching graph/compile settings. Full-vocabulary FP32 KL in both directions and TV; thresholds bound both KL directions. Returns numbers and pass/fail; no thresholds measures only. |
@@ -682,7 +682,7 @@ requests fit, per TP rank).
 `exports` (`name`, `rows`, `source_rows`, `columns`, `bytes`, `events`, `overflow`); `peak_memory_bytes`;
 `budget_errors`; `preemption` (`"keep"` or `"reset"`) and `recompute_rejection`; `workload_host_syncs`;
 `escape_hatches` (the `timing` lines); `kv_capacity` and `attention` (custom attention layers); `custom_ops`;
-`workload_digest`; `flops_per_token_estimate`.
+`flops_per_token_estimate`.
 
 ```python
 report = pllm.explain(ShallowDistiller(), CONFIG)

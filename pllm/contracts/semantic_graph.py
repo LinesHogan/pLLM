@@ -232,7 +232,6 @@ class ConditionalInputGroup:
 class SemanticGraph:
     workload_id: WorkloadId
     tasks: tuple[SemanticTask, ...]
-    execution_parameters_digest: str
     states: tuple[SemanticState, ...] = ()
     edges: tuple[SemanticEdge, ...] = ()
     input_groups: tuple[ConditionalInputGroup, ...] = ()

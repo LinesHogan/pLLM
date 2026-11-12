@@ -230,12 +230,11 @@ class TensorDeclaration:
     def __init__(
         self,
         name: str,
-        digest: str,
         dimensions: Dimensions,
         *,
         host: bool = False,
     ) -> None:
-        self.graph = SemanticGraph(WorkloadId(name), (), digest)
+        self.graph = SemanticGraph(WorkloadId(name), ())
         self.layouts = TensorLayoutRequest(())
         self.effects = BackendAttachmentSpec()
         self.operations: dict[TaskSymbol, TensorOperation] = {}

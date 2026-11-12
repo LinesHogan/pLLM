@@ -70,7 +70,6 @@ print(report.eager_reason == "", report.workload_host_syncs, [export.rows for ex
 | `escape_hatches` | `timing` 行：设置、取值、是否默认、后果 |
 | `custom_ops`、`attention`、`kv_capacity`、`kernels` | 对应的 `op`、`attention layer`、`KV layer`、`kernels` 行 |
 | `limitations` | `note` 行 |
-| `workload_digest` | 负载声明、方法代码和取值的摘要；相同即同一个负载 |
 | `flops_per_token_estimate` | 底座加所有方法每 token 的 FLOP 估计；底座未知时为 `None` |
 
 ## llm.diagnostics() 的字段

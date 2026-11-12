@@ -109,9 +109,7 @@ def test_peek_dense_reference_and_unchanged_cache(start, length):
     assert fa.call_args.kwargs["seqused_k"].tolist() == [start + length - 1]
 
 
-def test_solver_modes_change_cache_identity():
-    policies = [
-        CachePolicy.for_attachment(JacobiRecirculationWorkload(rounds=r).compile_backend(FACTS).attachment, "isolate")
-        for r in (1, 2, 3)
-    ]
-    assert len({policy.namespace for policy in policies}) == 3 and all(policy.role_sensitive for policy in policies)
+def test_solver_modes_are_role_sensitive():
+    for rounds in (1, 2, 3):
+        attachment = JacobiRecirculationWorkload(rounds=rounds).compile_backend(FACTS).attachment
+        assert CachePolicy.for_attachment(attachment, "isolate", 0).role_sensitive

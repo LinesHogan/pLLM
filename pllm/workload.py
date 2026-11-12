@@ -6,14 +6,14 @@ and pllm.testing."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import partial
 from graphlib import CycleError, TopologicalSorter
 from inspect import Parameter as SignatureParameter, signature
 from itertools import pairwise
-from types import FunctionType, MethodType
+from types import FunctionType
 from typing import Any, ClassVar, TypeVar
 
 import torch
@@ -32,12 +32,6 @@ from pllm.execution.backend_attachment import (
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
 from pllm.execution.declaration import When
-from pllm.execution.freeze import (
-    fingerprint,
-    members as _members,
-    owner_values,
-    reachable_functions,
-)
 from pllm.execution.host_runtime import HostConfig
 from pllm.execution.method_dependencies import check_dependencies
 from pllm.execution.method_effects import (
@@ -56,7 +50,6 @@ from pllm.execution.position_state import PositionState
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding, StateExecution
-from pllm.execution.state_init import Computed
 from pllm.execution.task_memory import custom_forward_capture_bytes
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.trace import TraceEvent
@@ -367,8 +360,6 @@ def read_workload(workload: Workload) -> WorkloadContext:
                 roles[role] = name
     root.operations = [operation for context in contexts for operation in context.operations]
     root.custom_forwards = [forward for context in contexts for forward in context.custom_forwards]
-    root.signature = [item for context in contexts for item in context.signature]
-    root.bindings = tuple(item for context in contexts for item in context.bindings)
     root.in_forward_states = {name for context in contexts for name in context.in_forward_states}
     for context in contexts:
         context.components = contexts
@@ -378,7 +369,6 @@ def read_workload(workload: Workload) -> WorkloadContext:
         context.position_definitions = root.position_definitions
         context.operations = root.operations
         context.custom_forwards = root.custom_forwards
-        context.signature = root.signature
         context.states = root.states
         context.parameters = root.parameters
         context.writes = root.writes
@@ -389,30 +379,20 @@ def read_workload(workload: Workload) -> WorkloadContext:
 
 
 def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
-    """Snapshot and sign reachable mathematics before evaluating state properties."""
+    """Copy the workload, read its operations and check its methods and config before evaluating state properties."""
     owner = deepcopy(workload)
     values, members = _values(owner), _members(owner)
     _check_base_collisions(owner)
-    context, candidates = WorkloadContext(owner, prefix=prefix), _candidates(owner, values, members)
-    seeds: list[FunctionType] = []
+    context = WorkloadContext(owner, prefix=prefix)
     for name, member in members.items():
         with context.declaring(name):
-            _read_operation(context, name, member, candidates, seeds)
-        if (getter := _property(member)) is not None:
-            seeds.append(getter)
-    for value in values.values():
-        if (state := _typed(value, InstanceState)) is not None and isinstance(state.init, Computed):
-            method = _typed(state.init.function, MethodType)
-            if (
-                function := _typed(state.init.function if method is None else method.__func__, FunctionType)
-            ) is not None:
-                seeds.append(function)
-    _declare_result_helpers(context, candidates, seeds)
+            _read_operation(context, name, member)
+    _declare_result_helpers(context)
     _reject_result_cycles(context)
-    _check_helpers(context, candidates, seeds)
-    configuration = {key: value for key, value in sorted(values.items()) if not isinstance(value, Workload)}
-    check_dependencies(configuration)
-    context.bindings = tuple((key, fingerprint(value)) for key, value in configuration.items())
+    for name in _helpers(owner, values, members):
+        with context.declaring(name):
+            check_dependencies(context.method(name))
+    check_dependencies({key: value for key, value in values.items() if not isinstance(value, Workload)})
     for name, member in members.items():
         if _property(member):
             values[name] = object.__getattribute__(owner, name)
@@ -424,9 +404,7 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
     return context
 
 
-def _read_operation(
-    context: WorkloadContext, name: str, member: object, candidates: dict[str, FunctionType], seeds: list[FunctionType]
-) -> None:
+def _read_operation(context: WorkloadContext, name: str, member: object) -> None:
     """Read decorator attributes once; marker values never drive runtime reflection."""
     if (function := _typed(member, FunctionType)) is None:
         return
@@ -449,7 +427,6 @@ def _read_operation(
                 f"{context.qualify(name)}: @pllm.custom_forward tokens overlap: {', '.join(sorted(overlap))}"
             )
         context.custom_forwards.append((name, tokens, markers["__pllm_over__"]))
-        seeds.append(function)
         return
     phase, marked, gradient, rows = (
         None if (on := markers.get("__pllm_phase__")) is None else _typed(on(context.owner), Phase),
@@ -460,22 +437,16 @@ def _read_operation(
     if phase is None and marked is None:
         return
     effect = marked or Effect()
-    seeds.extend(
-        _named_methods((*vars(effect).values(), *vars(gradient or Gradient((), False)).values(), rows), candidates)
-    )
     if (trained := _typed(effect, TrainInForward)) is not None:
         context.in_forward_states.add(trained.state)
     if (residual := _typed(effect, CustomResidual)) is not None and residual.state:
         context.in_forward_states.add(residual.state)
     when = phase.value if phase is not None else effect.phase or When.AFTER_SAMPLE
-    seeds.append(function)
     assert rows is not None
     context.operations.append(Operation(context, name, when, effect, gradient, rows, phase is not None))
 
 
-def _declare_result_helpers(
-    context: WorkloadContext, candidates: dict[str, FunctionType], seeds: list[FunctionType]
-) -> None:
+def _declare_result_helpers(context: WorkloadContext) -> None:
     """Declare implicit result producers, giving model-site consumers the pre-forward row domain."""
     pending = [(op.function, op.phase) for op in context.operations if not isinstance(op.effect, CustomResidual)]
     pending.extend(
@@ -505,14 +476,7 @@ def _declare_result_helpers(
             gradient = _typed(vars(helper).get("__pllm_gradient__"), Gradient)
             context.operations.append(Operation(context, source.operation, helper_phase, Effect(), gradient, ""))
             declared.add(source.operation)
-            seeds.append(candidates[source.operation])
-            seeds.extend(_named_methods(vars(gradient or Gradient((), False)).values(), candidates))
             pending.append((helper, phase))
-
-
-def _named_methods(values: Iterable[object], candidates: dict[str, FunctionType]) -> list[FunctionType]:
-    """The methods a decorator names by string (rows=, input_rows=, ...), which must be frozen with the workload."""
-    return [candidates[value] for value in values if type(value) is str and value in candidates]
 
 
 def _reject_result_cycles(context: WorkloadContext) -> None:
@@ -535,22 +499,8 @@ def _reject_result_cycles(context: WorkloadContext) -> None:
         raise ValueError(f"{chain}; results can only flow one way within a step, remove one of the reads") from None
 
 
-def _check_helpers(context: WorkloadContext, candidates: dict[str, FunctionType], seeds: list[FunctionType]) -> None:
-    """Check and sign the helpers reachable from operations, state properties or markers."""
-    reachable = reachable_functions(candidates, tuple(seeds)) | {
-        name for name, member in candidates.items() if any(member is seed for seed in seeds)
-    }
-    for name in candidates:
-        if name in reachable:
-            function = context.method(name)
-            with context.declaring(name):
-                check_dependencies(function)
-                context.signature.append((name, fingerprint(function)))
-
-
 def _namespace(context: WorkloadContext) -> None:
     """Qualify emitted names while retaining each method's bound owner and local configuration."""
-    context.bindings = tuple((context.qualify(key), value) for key, value in context.bindings)
     context.state_definitions = {context.qualify(key): value for key, value in context.state_definitions.items()}
     context.adapters = {
         context.qualify(key): replace(value, state=context.qualify(value.state))
@@ -583,8 +533,23 @@ def _namespace(context: WorkloadContext) -> None:
             )
 
 
+def _members(owner: object) -> dict[str, object]:
+    """Every class attribute of the owner's MRO, base classes first and subclasses overriding."""
+    return {name: item for cls in reversed(type(owner).__mro__) for name, item in vars(cls).items()}
+
+
 def _values(owner: object) -> dict[str, object]:
-    return owner_values(owner, (InstanceState, ActivationPatch, Adapter, PositionState, Workload))
+    """Authoring values: scalar and declaration class attributes plus instance and dataclass fields."""
+    markers = (InstanceState, ActivationPatch, Adapter, PositionState, Workload)
+    result: dict[str, object] = {
+        name: member
+        for name, member in _members(owner).items()
+        if not name.startswith("__") and isinstance(member, (str, int, float, bool, tuple, *markers))
+    }
+    result.update(vars(owner))
+    if is_dataclass(owner) and not isinstance(owner, type):
+        result.update((item.name, getattr(owner, item.name)) for item in fields(owner))
+    return result
 
 
 def _of_type(values: dict[str, object], expected: type[C]) -> dict[str, C]:
@@ -621,8 +586,8 @@ def _property(member: object) -> FunctionType | None:
     return getter if getter is not None and _return_type(getter) in declared else None
 
 
-def _candidates(owner: Workload, values: dict[str, object], members: dict[str, object]) -> dict[str, FunctionType]:
-    """Find helper methods in MRO order, excluding framework and value bindings."""
+def _helpers(owner: Workload, values: dict[str, object], members: dict[str, object]) -> dict[str, FunctionType]:
+    """The author's methods in MRO order, excluding framework methods and value bindings."""
     classes = type(owner).__mro__[: type(owner).__mro__.index(Workload)]
     names = dict.fromkeys(name for cls in classes for name in vars(cls))
     return {

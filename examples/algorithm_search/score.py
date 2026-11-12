@@ -73,14 +73,13 @@ def cpu(candidate: Path, known: Path, result: dict[str, Any]) -> None:
     neutral: object = submission.NEUTRAL
     if not isinstance(workload, pllm.Workload) or not isinstance(neutral, pllm.Workload):
         raise ValueError("define WORKLOAD and NEUTRAL as pllm.Workload instances")
-    report = pllm.explain(workload, config())
-    digests = report.workload_digest + pllm.explain(neutral, config()).workload_digest
-    result["fingerprint"] = hashlib.sha256(digests.encode()).hexdigest()
+    result["fingerprint"] = hashlib.sha256(candidate.read_bytes()).hexdigest()
     for line in known.read_text().splitlines() if known.exists() else ():
         record = json.loads(line)
         if record.get("fingerprint") == result["fingerprint"]:
             result.update(record, duplicate_of=record["fingerprint"], source=candidate.read_text())
             return
+    report = pllm.explain(workload, config())
     result.update(explain=str(report), explain_details=asdict(report), flops=report.flops_per_token_estimate)
     if report.budget_errors:
         raise ValueError(report.budget_errors)

@@ -154,7 +154,7 @@ def test_failed_shutdown_retains_the_shared_input_fd_until_close_retries() -> No
         wait_for_completion=fail,
     )
     owned = ref(engine.owned)
-    handle = runtime.VllmLlm(engine, None, overlay, facts, CachePolicy.for_attachment(overlay, "isolate"), None, "")
+    handle = runtime.VllmLlm(engine, None, overlay, facts, CachePolicy.for_attachment(overlay, "isolate", 0), None, "")
     del engine
     with pytest.raises(RuntimeError):
         handle.generate_completions(["test"], SamplingParams(max_tokens=1), group_id="ownership")

@@ -9,14 +9,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # Adapters to dynamically typed upstream APIs bypass the source gate. The author's own Python objects
-# (workload classes, settings, arbitrary fingerprinted values) are such an upstream for the authoring modules.
+# (workload classes, settings, arbitrary checked values) are such an upstream for the authoring modules.
 UNTYPED_BOUNDARIES = {
     ROOT / "pllm/execution/torch_private.py",
     ROOT / "pllm/execution/module_graph.py",
     ROOT / "pllm/contracts/codec.py",
     ROOT / "pllm/usage.py",
     ROOT / "pllm/workload.py",
-    ROOT / "pllm/execution/freeze.py",
     ROOT / "pllm/execution/method_dependencies.py",
     ROOT / "pllm/workload_transport.py",
 }

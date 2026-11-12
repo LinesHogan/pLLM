@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 import torch
 
-from pllm.contracts.codec import boundary_digest
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.kv_layout import Keep, KVLayout, expand_layouts
@@ -34,7 +33,6 @@ from pllm.execution.binding_base import SGD, Field, TargetRows
 from pllm.execution.causal_batch import declare_batch_train
 from pllm.execution.compile_facts import BackendRequirements
 from pllm.execution.declaration import Dimensions, LayoutField, Shape, When
-from pllm.execution.freeze import fingerprint
 from pllm.execution.method_inputs import (
     Attention,
     Batch,
@@ -155,7 +153,6 @@ class Write(Effect):
             raise ValueError("@pllm.write needs distinct field names and no rows=; it writes every row")
         for key in self.fields:
             context.parameter(self.state, key)
-        context.signature.append((operation.name, fingerprint(self)))
         call = operation.tensor()
         state = context.states[self.state]
         update = write_result(context.binding, call, state, self.fields, operation.transition_window)
@@ -344,14 +341,12 @@ class Train(Effect):
         context = operation.context
         sources = {key: source.batch(self.state, definition) for key, source in arguments.items()}
         reset = context.method(self.reset)
-        identity = boundary_digest(fingerprint(operation.function), fingerprint(reset), sources, self)
-        context.signature.append((operation.name, identity))
         context.train(
             declare_weighted_train(
                 context.binding,
                 operation.name,
                 context.states[self.state],
-                identity=f"{operation.identity}:{identity}",
+                identity=operation.identity,
                 optimizer=optimizer,
                 steps=self.steps,
                 reset=reset,
@@ -654,7 +649,6 @@ class TrainInForward(Effect):
             gradient=optimizer is not None,
             chunked=self.chunk is not None,
         )
-        identity = fingerprint(operation.function)
         function: Callable[..., UpdateOutput] = operation.function
         initialize = definition.init.initializer(context.binding, self.state, tuple(definition.fields))
         if self.chunk is not None:
@@ -682,26 +676,10 @@ class TrainInForward(Effect):
             function=function,
             arguments=bindings,
             visibility=self.visibility,
-            equations_digest=boundary_digest(context.signature, context.bindings, self.chunk, self.flush),
             invariants=invariants,
             reads=tuple(
                 context.states[name] for name in dict.fromkeys(resource for resource, _ in invariants.values())
             ),
-        )
-        context.signature.append(
-            (
-                operation.name,
-                boundary_digest(
-                    identity,
-                    bindings,
-                    effect.operator,
-                    effect.scale,
-                    effect.applied_fields,
-                    self.visibility,
-                    self.chunk,
-                    self.flush,
-                ),
-            )
         )
 
 
@@ -821,7 +799,6 @@ class CustomAttention(Effect):
         binding.attention.add(AttentionMethod(operation.name, layers, operation.function, tuple(inputs)))
         binding.attention.layouts += expand_layouts(self.layouts(), count)
         binding.model_reads(tuple(source.resource for _, source in inputs if isinstance(source, StateInput)))
-        context.signature.append((operation.name, boundary_digest(fingerprint(operation.function), self)))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -915,9 +892,6 @@ class CustomResidual(Effect):
                 for _, source in (*rewrite.inputs, *rewrite.read_inputs)
                 if isinstance(source, StateInput) and (memory is None or source != memory.carry)
             )
-        )
-        context.signature.append(
-            (operation.name, boundary_digest(fingerprint(operation.function), fingerprint(reader), self))
         )
 
     def memory(self, operation: Operation, places: tuple[Place, ...]) -> SiteMemory:

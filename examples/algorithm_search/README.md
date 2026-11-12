@@ -52,7 +52,7 @@ greedy generation with up to 512 tokens, model length 2048 and batch 8, with a
 fixed zero-shot Qwen chat prompt. The last number in the response is normalized
 and compared exactly to the GSM8K answer.
 
-The ledger embeds candidate source, pLLM's signed declaration fingerprint, git
+The ledger embeds candidate source, its SHA-256 fingerprint, git
 SHA, pinned model/dataset commits and dataset content hash, question IDs, seeds,
 runtime versions, agent CLI version/model, explain and check text, GPU type,
 answers and three-round timing samples. Highest accuracy passing all contracts

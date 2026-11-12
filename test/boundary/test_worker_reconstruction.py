@@ -77,7 +77,7 @@ def test_plan_bundle_codec_round_trips_and_rejects_injected_fields() -> None:
 def _worker(connection: Connection) -> None:
     try:
         install = decode_boundary(connection.recv_bytes().decode(), BackendInstall)
-        runner = Mock()
+        runner = Mock(installs=0)
         WorkloadModelRunner.install_workload(
             runner, decode_workload(install.definition), install.facts, install.options, install.generated_kv
         )

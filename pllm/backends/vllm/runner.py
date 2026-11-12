@@ -62,6 +62,8 @@ class WorkloadModelRunner(OverlayGraphRunner):
     position_states: tuple[tuple[str, float], ...] = ()
     position_layers: tuple[PositionCacheLayer, ...] = ()
     workload_session: VllmSession | None = None
+    # Workloads installed so far; each install caches prefixes under its own index.
+    installs: int = 0
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
@@ -107,7 +109,8 @@ class WorkloadModelRunner(OverlayGraphRunner):
         or in each EngineCore worker."""
         facts, declaration = workload.specialize(facts, options, causal=partial(CausalTraining, self.decoder))
         attachment = workload.plan_backend(facts, declaration)
-        policy = CachePolicy.for_attachment(attachment, generated_kv)
+        policy = CachePolicy.for_attachment(attachment, generated_kv, self.installs)
+        self.installs += 1
         declaration.tensor_parallel_rank = rank
         self.attach_workload(
             workload.bind_backend(

@@ -17,7 +17,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 from pllm.backends.vllm.kv_layout import LAYOUT_ENV, streamline_allocation
 from pllm.contracts.backend_attachment import BackendAttachment
-from pllm.contracts.codec import boundary_digest, decode_boundary, encode_boundary
+from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.kv_layout import KVLayout
 
 POLICY_KEY = "pllm.prefix_cache"
@@ -25,15 +25,17 @@ POLICY_KEY = "pllm.prefix_cache"
 
 @dataclass(frozen=True)
 class CachePolicy:
-    """Driver-owned cache identity, sent to the worker to reject mismatched requests."""
+    """One install's cache identity, carried by its requests: blocks cached under another install never match."""
 
-    namespace: str
+    namespace: int
     role_sensitive: bool
     generated_kv: Literal["reuse", "isolate"]
 
     @classmethod
-    def for_attachment(cls, attachment: BackendAttachment, policy: Literal["reuse", "isolate"]) -> "CachePolicy":
-        """Conservatively derive role dependence and stable mathematical identity from backend facts."""
+    def for_attachment(
+        cls, attachment: BackendAttachment, policy: Literal["reuse", "isolate"], install: int
+    ) -> "CachePolicy":
+        """Conservatively derive role dependence from the plan; `install` counts the engine's installs."""
         graph = attachment.plan.semantic_graph
         program = None if graph.custom_forward_task is None else graph.custom_forward_task.custom_forward
         sensitive = (
@@ -41,11 +43,7 @@ class CachePolicy:
             # Reading `layers.generated` or PositionState adds the position resource to the program source.
             or (program is not None and (program.rows != "all" or program.role_sensitive))
         )
-        return cls(
-            boundary_digest((attachment.probe.model_fingerprint, graph, attachment.probe.position_states)),
-            sensitive,
-            policy,
-        )
+        return cls(install, sensitive, policy)
 
     def sampling(self, params: SamplingParams) -> SamplingParams:
         """Copy caller options and carry this identity through EngineCore serialization."""

@@ -21,9 +21,7 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `... names no method of ...` | `rows=`、`pllm.result` 或设置引用的方法不存在 | 检查方法名 |
 | `... and ... both declare ...; compose them as fields instead of inheriting from both` | 多重继承时同名声明会互相覆盖 | 把两个负载声明成字段（组件） |
 | `...: components are independent; to share state, put both methods in one workload` | 组件必须和单独运行时一样，不能读别的组件的状态 | 共享状态的方法写进同一个负载 |
-| `...: a workload cannot hold a module or tensor; save its weights and declare ...` | 负载只是声明，会被哈希成它的身份；张量要放进由 pLLM 分配显存的状态 | 把张量存成 safetensors，用 `init=pllm.Pretrained(path)` 或 `init=pllm.FromModule(factory, pretrained=path)` 声明状态，或用 `init=pllm.Imported()` 导入 |
-| `...: workload methods may use only torch, math, pllm, triton, typing, collections.abc and builtins modules; ...` | 方法代码会被冻结和哈希；别的模块（numpy、你的工具函数）无法追踪，也无法送进子进程 | 在外面算好，作为负载字段（数字、元组、字符串）传进来 |
-| `...: workload methods may reference torch and pllm classes and the author's nn.Module subclasses, enums and dataclasses` | 方法引用了可变的全局变量或类属性（例如计数器） | 每请求的记忆放进 `pllm.RequestState`，进度用 `pllm.version(state)`，设置写成冻结 dataclass 的字段 |
+| `...: a workload cannot hold a module or tensor; save its weights and declare ...` | 负载只是声明，会在 make_llm 时被复制、在 worker 进程里重建；张量要放进由 pLLM 分配显存的状态 | 把张量存成 safetensors，用 `init=pllm.Pretrained(path)` 或 `init=pllm.FromModule(factory, pretrained=path)` 声明状态，或用 `init=pllm.Imported()` 导入 |
 | `key_fields=...: use names from ...` | 请求状态只能按固定几种请求属性分组 | 用 `"request_id"`、`"prompt_index"`、`"sample_index"` 或 `"route"` |
 | `request key fields must be closed, sorted, and unique` | `key_fields` 每个名字只写一次，按 `request_id`、`prompt_index`、`sample_index`、`route` 的顺序 | 调整顺序或去掉重复，例如 `key_fields=("prompt_index",)` |
 | `pllm.residual(after=...): use "layer" or "attention"` | 残差流只能在整层之后或 attention 之后读 | `after="layer"`（默认）或 `after="attention"` |
@@ -138,7 +136,7 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | --- | --- | --- |
 | `... mutates ...; kernels called from workload math must return new tensors (mutates_args=()); change state only through pLLM effects` | 方法的输入是共享的只读视图，算子不能写它们 | 声明 `mutates_args=()`、返回新张量；改状态用 `@pllm.write` 或 `@pllm.train` |
 | `... has no fake implementation; add @....register_fake` | pLLM 按形状规划显存，形状从 fake 实现得到 | 用 `@op.register_fake` 注册一个返回同形同 dtype 空张量的函数 |
-| `call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims only for built-in operators` | pLLM 要把算子的源码记进负载的身份，只有从算子对象才找得到 | 导入并直接调用算子对象 |
+| `call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so worker processes receive the op with its registration; use torch.ops.aten or torch.ops.prims only for built-in operators` | 算子对象会把算子定义带到 worker 进程；`torch.ops` 名字只能找到当前进程注册过的算子 | 导入并直接调用算子对象 |
 | `... trains through ..., which has no autograd formula; add ....register_autograd(...)` | `@pllm.train` 的反向经过了没有梯度公式的算子 | 用 `op.register_autograd(...)` 补上 |
 | `... runs in a per-token cell under torch.vmap; register a batching rule (register_vmap) or call it with over="span"` | 逐 token 的 custom forward 在 `torch.vmap` 下运行，算子要有批处理规则 | 用 `op.register_vmap(...)` 注册，或改用 `over="span"` |
 

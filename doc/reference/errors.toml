@@ -80,24 +80,10 @@ fix_zh = '''共享状态的方法写进同一个负载'''
 
 [[section.error]]
 message = '''...: a workload cannot hold a module or tensor; save its weights and declare ...'''
-why = '''A workload is a declaration hashed into its identity; tensors belong in state that pLLM places and pages.'''
+why = '''A workload is a declaration copied at make_llm and rebuilt in worker processes; tensors belong in state that pLLM places and pages.'''
 fix = '''Save the tensor to safetensors and declare state with `init=pllm.Pretrained(path)` or `init=pllm.FromModule(factory, pretrained=path)`, or import it with `init=pllm.Imported()`.'''
-why_zh = '''负载只是声明，会被哈希成它的身份；张量要放进由 pLLM 分配显存的状态'''
+why_zh = '''负载只是声明，会在 make_llm 时被复制、在 worker 进程里重建；张量要放进由 pLLM 分配显存的状态'''
 fix_zh = '''把张量存成 safetensors，用 `init=pllm.Pretrained(path)` 或 `init=pllm.FromModule(factory, pretrained=path)` 声明状态，或用 `init=pllm.Imported()` 导入'''
-
-[[section.error]]
-message = '''...: workload methods may use only torch, math, pllm, triton, typing, collections.abc and builtins modules; ...'''
-why = '''Method code is frozen and hashed; other modules (numpy, your utilities) cannot be traced or shipped to workers.'''
-fix = '''Compute such values outside and pass them as workload fields (plain numbers, tuples, strings).'''
-why_zh = '''方法代码会被冻结和哈希；别的模块（numpy、你的工具函数）无法追踪，也无法送进子进程'''
-fix_zh = '''在外面算好，作为负载字段（数字、元组、字符串）传进来'''
-
-[[section.error]]
-message = '''...: workload methods may reference torch and pllm classes and the author's nn.Module subclasses, enums and dataclasses'''
-why = '''A method referenced a mutable global or class attribute (for example a counter).'''
-fix = '''Keep per-request memory in `pllm.RequestState`, progress in `pllm.version(state)`, settings in frozen dataclass fields.'''
-why_zh = '''方法引用了可变的全局变量或类属性（例如计数器）'''
-fix_zh = '''每请求的记忆放进 `pllm.RequestState`，进度用 `pllm.version(state)`，设置写成冻结 dataclass 的字段'''
 
 [[section.error]]
 message = '''key_fields=...: use names from ...'''
@@ -681,10 +667,10 @@ why_zh = '''pLLM 按形状规划显存，形状从 fake 实现得到'''
 fix_zh = '''用 `@op.register_fake` 注册一个返回同形同 dtype 空张量的函数'''
 
 [[section.error]]
-message = '''call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so pLLM can sign its source; use torch.ops.aten or torch.ops.prims only for built-in operators'''
-why = '''pLLM records the operator's source in the workload's identity, which it can only find from the op object.'''
+message = '''call the op object you defined with torch.library.custom_op (from mykernels import gated_add), not torch.ops.<namespace>.<op>, so worker processes receive the op with its registration; use torch.ops.aten or torch.ops.prims only for built-in operators'''
+why = '''The op object carries the operator's definition to worker processes; a `torch.ops` name finds only what the current process registered.'''
 fix = '''Import and call the op object.'''
-why_zh = '''pLLM 要把算子的源码记进负载的身份，只有从算子对象才找得到'''
+why_zh = '''算子对象会把算子定义带到 worker 进程；`torch.ops` 名字只能找到当前进程注册过的算子'''
 fix_zh = '''导入并直接调用算子对象'''
 
 [[section.error]]

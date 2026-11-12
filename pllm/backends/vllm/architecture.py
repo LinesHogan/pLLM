@@ -211,7 +211,7 @@ class Decoder:
 
     @property
     def identity(self) -> str:
-        """Concrete implementation identity for backend fingerprints."""
+        """Concrete implementation identity for the model probe."""
         cls = type(self.model)
         return f"{cls.__module__}.{cls.__qualname__}"
 

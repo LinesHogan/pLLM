@@ -60,9 +60,6 @@ def test_inplace_ttt_matches_multitarget_oracle_and_cleans_versions() -> None:
     pllm.train_in_forward(state="dense_fast_weights", targets=targets, visibility="exact")
     declaration = workload.build(facts).graph
     assert next(task.visibility for task in declaration.tasks if task.visibility is not None) == visibility
-    changed = DenseUpdate(replace(config, chunk_size=3)).build(facts).graph
-    changed_visibility = next(task.visibility for task in changed.tasks if task.visibility is not None)
-    assert changed_visibility.equations_digest != visibility.equations_digest
     identities = (RequestIdentity("same", 0, 0), RequestIdentity("same", 0, 1))
     refs = execution.admit(identities)
     bases = torch.tensor(

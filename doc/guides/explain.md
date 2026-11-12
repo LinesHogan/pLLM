@@ -184,7 +184,7 @@ print(pllm.explain(MiniESamp(beta=0.5), small).budget_errors)
 
 ## 给程序/代理用
 
-如果你在写自动化脚本或让代理自动检查负载，不需要解析文本。`pllm.explain` 返回的对象可以用 `dataclasses.asdict(report)` 转成能够 `json.dumps` 的字典，包含 `eager_reason`、`members`（每个方法的任务）、`states`、`peak_memory_bytes`、`budget_errors`、`exports` 等字段；`workload_digest` 是负载声明、方法代码和取值的摘要（相同即同一个负载），`flops_per_token_estimate` 是基座与各任务合计的每 token FLOP 估计：
+如果你在写自动化脚本或让代理自动检查负载，不需要解析文本。`pllm.explain` 返回的对象可以用 `dataclasses.asdict(report)` 转成能够 `json.dumps` 的字典，包含 `eager_reason`、`members`（每个方法的任务）、`states`、`peak_memory_bytes`、`budget_errors`、`exports` 等字段；`flops_per_token_estimate` 是基座与各任务合计的每 token FLOP 估计：
 
 ```python
 import json
