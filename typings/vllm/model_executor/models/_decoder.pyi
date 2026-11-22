@@ -6,9 +6,10 @@ from typing import Generic, TypeVar
 from torch import Tensor
 from torch.nn import Module
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.phi3_long_rope_scaled_rope import Phi3LongRoPEScaledRotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.sequence import IntermediateTensors
 
@@ -17,7 +18,7 @@ class SiluAndMul(Module):
 
 class DecoderAttention(Module):
     o_proj: LinearBase
-    rotary_emb: RotaryEmbedding
+    rotary_emb: RotaryEmbedding | Phi3LongRoPEScaledRotaryEmbedding
     num_heads: int
     num_kv_heads: int
     head_dim: int
@@ -42,14 +43,14 @@ _Layer = TypeVar("_Layer", bound=Module, covariant=True)
 class DecoderLayer(Module, Generic[_Attention, _MLP]):
     self_attn: _Attention
     mlp: _MLP
-    input_layernorm: RMSNorm
-    post_attention_layernorm: RMSNorm
+    input_layernorm: RMSNorm | GemmaRMSNorm
+    post_attention_layernorm: RMSNorm | GemmaRMSNorm
     forward: Callable[[Tensor, Tensor, Tensor | None], tuple[Tensor, Tensor]]
 
 class DecoderModel(Module, Generic[_Layer]):
     embed_tokens: VocabParallelEmbedding
     layers: Sequence[_Layer]
-    norm: RMSNorm
+    norm: RMSNorm | GemmaRMSNorm
     do_not_compile: bool
     forward: Callable[[Tensor | None, Tensor, IntermediateTensors | None, Tensor | None], Tensor | IntermediateTensors]
 

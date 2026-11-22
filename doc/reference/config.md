@@ -34,11 +34,11 @@ print(pllm.explain(DummyWorkload(), config).eager_reason == "")
 | `kv_cache_memory_bytes` | `None` | KV 缓存的字节数；`None` 让 vLLM 按启动时测到的空闲显存自己定 | 同一张卡上还有别的进程在申请或释放显存时（启动测量会因此失败），或要固定 KV 大小时 |
 | `seed` | `0` | vLLM 的全局随机种子，也是 pLLM 状态初值（`pllm.Computed`、模块初始化）的种子；单个请求的采样种子写在 `SamplingParams(seed=...)` | 复现实验时固定 |
 | `trust_remote_code` | `False` | 允许加载模型仓库里的代码 | 只有需要远程 tokenizer 代码的模型（如 Kimi 切片） |
-| `enable_prefix_caching` | `False` | vLLM 的前缀缓存 | 只读、不改 forward 的负载可以打开；改模型或 forward 的负载（overlay、激活补丁、`custom_residual`、`custom_attention`）要求关闭，因为缓存里的 KV 是在别的状态下算出来的 |
+| `enable_prefix_caching` | `False` | vLLM 的前缀缓存 | 只读、只读不可变 `InstanceState`（非 `Imported`/`Fed`、无写入方法）的 `Adapter`、无状态 `@pllm.custom_residual`，以及 `last_tokens=0` 的静态 `ActivationPatch` 可以打开；使用 `RequestState`、可变/外部写入 `InstanceState`、`last_tokens > 0`、`@pllm.train_in_forward` 或 `@pllm.custom_attention` 时要求关闭 |
 | `enable_chunked_prefill` | `False` | vLLM 的分块 prefill | 长 prompt 与 decode 混跑时打开；prompt 行的训练按分块进行 |
 | `generated_kv` | `"isolate"` | pLLM：打开前缀缓存时，生成 token 的 KV 能否被后来的请求当作 prompt 前缀复用。负载区分 prompt 与生成 token 时（例如激活补丁只改生成的 token），同样的 token 在两种身份下算出的 KV 不同，`"isolate"` 禁止这种复用 | `"reuse"` 只在你确认生成部分的 KV 与它是不是 prompt 无关时使用 |
 | `revision` | `None` | 模型仓库的版本 | 固定检查点版本 |
-| `multiprocessing` | `False` | pLLM：把负载送进 vLLM 的 EngineCore 子进程 | 上生产时打开，要求见 [上生产](../howto/production.md) |
+| `multiprocessing` | `"auto"` | pLLM：是否将负载送进 vLLM 的 EngineCore 子进程（`"auto"` / `True` / `False`） | 默认 `"auto"` 对 `pllm.make_async_llm`、`pllm serve` 和 `tensor_parallel_size > 1` 自动开启子进程隔离，对单卡 `pllm.make_llm` 保持同进程；要求见 [上生产](../howto/production.md) |
 | `execution` | `ExecutionOptions()` | pLLM 的执行策略，见下一节 | — |
 | `cuda_graphs` | `"auto"` | pLLM：`"auto"` 能进 CUDA graph 就进，否则 eager 并把原因写进 `eager_reason`；`True` 要求进图，不能进就报错；`False` 一律 eager | 测吞吐时设 `True`，防止悄悄退回 eager |
 | `kv_offload` | `None` | 把完整的 KV 页卸载到 CPU 内存，见 `KVOffload` | KV 显存不够、又要保留长上下文时 |

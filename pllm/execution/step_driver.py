@@ -8,7 +8,7 @@ their own timeline with StateExecution.step instead.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Generator, Iterable
+from collections.abc import Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -19,15 +19,17 @@ import torch
 
 from pllm.contracts.backend_attachment import BackendAttachment
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.host_batch import HostBatch, StateImport
+from pllm.contracts.host_batch import HostBatch, StateImport, WeightedCEBatch, map_host_batch, validate_host_batch
 from pllm.contracts.packed_rows import PackedPhaseRowBatch, PackedSamplerRowBatch, RowLabeler
-from pllm.contracts.request_identity import RequestIdentity, prompt_rows
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField, prompt_rows
 from pllm.contracts.sampler import SamplerFeedback
-from pllm.contracts.semantic_graph import StateScope, TaskId
+from pllm.contracts.semantic_graph import HostServiceInputSource, StateScope, TaskId
 from pllm.execution.cuda_stream import CudaStreamReadiness
 from pllm.execution.model_sites import state_inputs
 from pllm.execution.preemption import preemption_policy
+from pllm.execution.ptts.request_state import RequestStateKey
 from pllm.execution.ptts.slot_pools import SlotPools, Slots
+from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import (
     HeldInput,
     ProjectionResiduals,
@@ -92,6 +94,14 @@ class ActiveStep:
     forward_done: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class TrainStep:
+    """Loss and owned parameter snapshots from a host batch update on an attached engine."""
+
+    loss: torch.Tensor | None
+    parameters: Mapping[str, torch.Tensor]
+
+
 class StepDriver:
     """Requests and steps of one attached workload, in the order the engine runs them.
 
@@ -105,6 +115,7 @@ class StepDriver:
         attachment: BackendAttachment,
     ) -> None:
         self.execution = execution
+        self.attachment = attachment
         self.open = StepOpen.of(attachment, execution.math)
         self.preemption: Literal["keep", "reset"] = preemption_policy(attachment, execution.math.model_sites)
         self._recompute_rejection = attachment.plan.schedule.recompute_rejection
@@ -119,6 +130,7 @@ class StepDriver:
         self.labeler = RowLabeler()
         self.admitted: dict[str, RequestIdentity] = {}
         self._pending: dict[str, RequestIdentity] = {}
+        self._online_imports: dict[str, StateImport[torch.Tensor]] = {}
         self._host_batch: HostBatch[torch.Tensor] | None = None
         self._import_rows: dict[str, int] = {}
         self.step: ActiveStep | None = None
@@ -138,32 +150,162 @@ class StepDriver:
     ) -> None:
         """Stage one generate call's requests and the host batch its first step trains on."""
         self._require_live()
-        # Planning reserves no admission pins for states written only from host batches: no request may hold one.
         assert not self.admitted, "generate stages a call's inputs after the previous call retired"
         self._host_batch = batch
         self._import_rows = prompt_rows(identities, samples_per_prompt)
         self._pending = {identity.request_id: identity for identity in identities}
+
+    def is_staged(self, request_id: str) -> bool:
+        """Whether `request_id` is staged and awaiting its first scheduled step."""
+        return request_id in self._pending
+
+    def stage_online(self, identity: RequestIdentity, *, import_key: str = "") -> None:
+        """Stage one newly arriving online request without disturbing already running requests."""
+        self._require_live()
+        if identity.request_id in self._pending or identity.request_id in self.admitted:
+            raise ValueError(f"duplicate online request {identity.request_id}")
+        for state in self.execution.directory.request_states:
+            RequestStateKey.project(identity, state.key_fields)
+        if import_key and (update := self._online_imports.pop(import_key, None)) is not None:
+            self._online_imports[identity.request_id] = update
+        self._pending[identity.request_id] = identity
+
+    def stage_online_import(self, request_id: str, update: StateImport[torch.Tensor]) -> None:
+        """Stage one request's import before the scheduler sees its internal id."""
+        self._require_live()
+        self._validate_batch(update, prompt_count=1)
+        if request_id in self._online_imports or request_id in self.admitted:
+            raise ValueError(f"duplicate online import for {request_id}")
+        self._online_imports[request_id] = update
+
+    def discard_online_import(self, request_id: str) -> None:
+        """Drop an import when submission is cancelled before admission."""
+        self._online_imports.pop(request_id, None)
+
+    def _stream(self) -> torch.cuda.Stream | None:
+        device = self.execution.device
+        return torch.cuda.current_stream(device) if device.type == "cuda" else None
+
+    def _validate_batch(self, batch: HostBatch[torch.Tensor], *, prompt_count: int = 0) -> None:
+        plan = self.attachment.plan
+        vocab_size = 0
+        if isinstance(batch, WeightedCEBatch):
+            # The weighted batch preparation task funds [states, rows, vocab] base logits.
+            consumers = {
+                task.symbol
+                for task in plan.semantic_graph.tasks
+                if any(
+                    isinstance(port.source, HostServiceInputSource) and port.source.schema == batch.schema
+                    for port in task.inputs
+                )
+            }
+            vocab_size = next(
+                (fact.input_shapes[1][-1] for fact in plan.timeline.task_resources if fact.task in consumers), 0
+            )
+        validate_host_batch(
+            batch,
+            plan.semantic_graph,
+            plan.tensor_layout_request,
+            plan.timeline,
+            SharedTensor.describe,
+            hidden_size=self.attachment.probe.hidden_size,
+            vocab_size=vocab_size,
+            import_fields=self.attachment.spec.import_fields,
+            prompt_count=prompt_count,
+        )
+
+    def _run_import(self, update: StateImport[torch.Tensor], identities: tuple[RequestIdentity, ...]) -> None:
+        value = StateImport(tuple(tensor.to(self.execution.device) for tensor in update.values))
+        self.execution.run_batch(
+            StepInput.of_batch(
+                value,
+                identities=identities,
+                import_rows={identity.request_id: 0 for identity in identities},
+                force_import=True,
+            ),
+            self._stream(),
+        )
+
+    def import_state(self, update: StateImport[torch.Tensor], *, route: str = "") -> int:
+        """Publish an instance or route update and return the published version."""
+        self._require_live()
+        if self.step is not None:
+            raise RuntimeError("submit state imports between model steps")
+        self._validate_batch(update, prompt_count=1)
+        state = self.attachment.plan.semantic_graph.host_state(StateImport.schema)
+        assert state is not None
+        identities: tuple[RequestIdentity, ...] = ()
+        if state.scope is StateScope.REQUEST:
+            if state.key_fields != (RequestKeyField.ROUTE,) or not route:
+                raise ValueError("import_state needs a nonempty route and RequestState keyed only by route")
+            identities = (RequestIdentity(f"__route__:{route}", 0, 0, route=route),)
+        elif route:
+            raise ValueError("omit route when importing InstanceState")
+        directory = self.execution.directory
+        temporary = bool(identities) and not directory.has_address(identities)
+        if temporary:
+            self.execution.admit(identities, self._stream())
+        try:
+            self._run_import(update, identities)
+            states = directory.states if identities else directory.instance_states
+            return self.execution.latest(identities)[states.index(state)].version_id
+        finally:
+            if temporary:
+                self.execution.retire(identities)
+
+    def train_batch(self, batch: HostBatch[torch.Tensor]) -> TrainStep:
+        """Train between model steps and snapshot the instance fields the batch updates."""
+        self._require_live()
+        if self.step is not None:
+            raise RuntimeError("submit training batches between model steps")
+        if isinstance(batch, StateImport) or self.attachment.plan.semantic_graph.training_mode not in (
+            "batch",
+            "weighted_batch",
+        ):
+            raise ValueError("train_batch needs a workload with a host batch training method")
+        if isinstance(batch, WeightedCEBatch) and batch.keys:
+            raise ValueError("use generate(batch=...) for training keyed request state")
+        self._validate_batch(batch)
+        value = map_host_batch(batch, lambda tensor: tensor.to(self.execution.device))
+        assert value is not None
+        stream = self._stream()
+        result = self.execution.run_batch(StepInput.of_batch(value), stream)
+        fields = self.attachment.spec.batch_fields
+        parameters: dict[str, torch.Tensor] = {}
+        for state, ref in zip(self.execution.directory.instance_states, self.execution.latest(()), strict=True):
+            views = [(name, view) for resource, name, view in fields if resource == state.resource]
+            if views:
+                tensors = self.execution.snapshot(ref, stream)
+                parameters.update((name, view.read(tensors[view.field]).clone()) for name, view in views)
+        return TrainStep(result.loss, parameters)
 
     def schedule(self, finished: Collection[str], preempted: Collection[str], new: Iterable[str]) -> None:
         """Before a step: retire finished requests, apply the preemption policy and admit newly scheduled ones."""
         self._require_live()
         execution = self.execution
         execution.arena.collect_completed()
-        self._retire(tuple(self.admitted[request] for request in sorted(self.admitted.keys() & finished)))
+        retired = tuple(self.admitted[request] for request in sorted(self.admitted.keys() & finished))
+        self._retire(retired)
+        for request in finished:
+            self._pending.pop(request, None)
+            self.discard_online_import(request)
         if self.preemption == "reset":
-            for request in finished:
-                self._pending.pop(request, None)
             self._preempt(preempted)
         admitted = tuple(self._pending[request] for request in new if request not in self.admitted)
         if not admitted:
+            if (retired or finished) and not self.admitted and not self._pending:
+                execution.release_history()
+                execution.arena.collect_completed()
             return
         if execution.directory.request_states:
-            device = execution.device
-            execution.admit(admitted, torch.cuda.current_stream(device) if device.type == "cuda" else None)
+            execution.admit(admitted, self._stream())
         for identity in admitted:
             self.labeler.admit(identity)
             self.admitted[identity.request_id] = identity
             self._pending.pop(identity.request_id)
+        for identity in admitted:
+            if (update := self._online_imports.pop(identity.request_id, None)) is not None:
+                self._run_import(update, (identity,) if self._request_import else ())
 
     def _preempt(self, requests: Collection[str]) -> None:
         identities = tuple(self.admitted[request] for request in sorted(self.admitted.keys() & requests))
@@ -199,6 +341,7 @@ class StepDriver:
         self.execution.release_history()
         self._retire(tuple(self.admitted[request] for request in sorted(self.admitted)))
         self._pending.clear()
+        self._online_imports.clear()
         self.execution.arena.collect_completed(wait=wait)
 
     def require_idle(self) -> None:

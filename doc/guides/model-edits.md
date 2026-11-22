@@ -147,13 +147,11 @@ pllm.model.Adapter(
 - **多目标字段展开规则**：
   当一个 `Adapter` 作用于多个 `targets` 时，状态中的 `pllm.Field` 形状回调 `lambda in_features, out_features: (...)` 会按目标投影的输入与输出宽度被依次调用。底层分配的私有字段将按照 targets 列表的顺序自动展开并命名为 `a_0`, `b_0`, `a_1`, `b_1`, ...。
 
-### RequestState 能进图，InstanceState 会退回 Eager
+### `RequestState` 与 `InstanceState` 都能进图
 
 - **`RequestState`**：每个请求独享一份状态页。`Adapter` 在 CUDA graph 内部通过 batch 中每一行所属的请求索引找到对应的私有因子地址并计算增量，全程无需重新捕获图，**留在 CUDA graph 内**。
-- **`InstanceState`**：所有请求共享同一份状态。如果使用 `Adapter` 读取 `InstanceState`，模型前向传播将**退回 eager 模式**。
-  在 [`explain.md`](explain.md) 中可以看到对应的提示：
-  `forward eager: CUDA-graph overlays do not support adapters backed by shared InstanceState`。
-  **原因**：这是当前实现的限制：录进 CUDA graph 的 Adapter 按每一行所属请求的状态寻址，读共享 `InstanceState` 的 Adapter 还没有进图的实现。它照样能跑，只是模型 forward 以 eager 运行，原因写在 `explain` 的 `forward` 行和 `eager_reason` 里。需要 CUDA graph 的吞吐时，用 `RequestState`（每个请求一份，可以用同样的初值）。
+- **`InstanceState`**：所有请求共享同一份状态（或按请求准入版本隔离的状态快照）。`Adapter` 通过统一的版本槽表在 CUDA graph 内部直接索引当前步骤绑定的状态页面，同样**留在 CUDA graph 内**，不会触发回退到 eager 模式。
+  （在开启 `cuda_graphs="auto"` 且存在其他不可进图写法如 `@pllm.custom_forward` 时，`explain` 与 `llm.diagnostics().eager_reason` 会给出对应原因。）
 
 ### 为什么可训练的低秩状态必须非零初始化
 
@@ -360,7 +358,7 @@ Prefix Caching 的基本假设是“相同的 token 序列产生完全相同的 
 </details>
 
 <details>
-<summary>3. 同样是 pllm.model.Adapter，为什么绑定到 RequestState 时能进 CUDA graph，绑定到 InstanceState 时会退回 eager 模式？</summary>
+<summary>3. 挂载到 InstanceState 上的 pllm.model.Adapter 会退回 eager 模式吗？</summary>
 
-录进 CUDA graph 的 Adapter 按每一行所属请求的状态寻址；读共享 `InstanceState` 的 Adapter 目前还没有进图的实现，所以模型 forward 以 eager 运行，原因写在 `eager_reason` 里。要 CUDA graph 的吞吐，就把状态声明成 `RequestState`。
+不会。无论绑定 `RequestState` 还是共享 `InstanceState`，`pllm.model.Adapter` 都通过统一的可进图覆盖表按每行或版本槽地址解析增量，保留在 vLLM 的 CUDA graph 内。只有在主动关闭 CUDA graph（`cuda_graphs=False`）或使用了切片捕获图写法（如 `@pllm.custom_forward`）时才不会保留整模型 CUDA graph。
 </details>

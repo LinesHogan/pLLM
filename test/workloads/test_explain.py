@@ -124,9 +124,7 @@ def test_builtin_explanations_are_cpu_only_and_json_ready(workload, model_config
             assert report.kv_capacity[0].bytes < full
         elif isinstance(workload, SharedAttention):
             assert sum(row.bytes for row in report.kv_capacity) == 5 * full
-    if isinstance(
-        workload, (WindowAttention, SinkAttention, SharedAttention, Residual, ReFTWorkload, PromptFactorsWorkload)
-    ):
+    if isinstance(workload, (WindowAttention, SinkAttention, SharedAttention, ReFTWorkload, PromptFactorsWorkload)):
         with pytest.raises(ValueError, match="disable prefix caching"):
             pllm.explain(workload, replace(model_config, enable_prefix_caching=True))
     if isinstance(workload, (Residual, Forward)):
@@ -225,7 +223,7 @@ def test_declared_flop_estimates(model_config):
     )
     assert "highest 4096 survivors/row" in str(bounded) and "tail unguided" in str(bounded)
     assert "smaller K is slower because overflow rows need top-K selection" in str(bounded)
-    if not compat.VLLM_027:
+    if compat.VLLM_TP_CAPABLE:
         sharded = replace(model_config, tensor_parallel_size=2)
         fallback = pllm.explain(ESampWorkload(ESampConfig(rank=2, intervention_beta=0.5)), sharded)
         prediction = next(task for member in fallback.members for task in member.tasks if task.name == "predict")
@@ -284,7 +282,7 @@ def test_tp_route_reports_and_cpu_check(workload, model_config):
     from pllm.backends.vllm import compat
 
     config = replace(model_config, tensor_parallel_size=2)
-    if compat.VLLM_027:
+    if not compat.VLLM_TP_CAPABLE:
         with pytest.raises(ValueError, match="vLLM 0.32.0"):
             pllm.explain(workload, config)
         with pytest.raises(testing.ContractError, match="vLLM 0.32.0"):
@@ -407,7 +405,7 @@ def test_tp_projection_shard_costs(model_config, kind, target):
     from pllm.backends.vllm import compat
     from test.tp_overlays import DenseTraining, LowRankTraining, ProjectionAdapter, SharedProjectionAdapter
 
-    if compat.VLLM_027:
+    if not compat.VLLM_TP_CAPABLE:
         pytest.skip("TP needs vLLM 0.32")
     workload = {
         "dense": ProjectionAdapter(),
@@ -464,7 +462,7 @@ def test_tp_projection_shard_costs(model_config, kind, target):
 def test_tp_projection_admission(model_config):
     from pllm.backends.vllm import compat
 
-    if compat.VLLM_027:
+    if not compat.VLLM_TP_CAPABLE:
         pytest.skip("TP needs vLLM 0.32")
     from test.tp_overlays import DenseChunkTraining, DenseGradientTraining, TensorConstantUpdate, TrainColumnA
 

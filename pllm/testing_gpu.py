@@ -413,7 +413,7 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
     multiprocessing "spawn" process, so a script that calls this at module level needs `if __name__ == "__main__":`.
     """
     if (
-        config.multiprocessing
+        config.uses_multiprocessing()
         or max(config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size) > 1
     ):
         raise ValueError("check_on_gpu needs multiprocessing=False and all parallel sizes=1")
@@ -423,7 +423,12 @@ def check_on_gpu(workload: Workload, config: ModelConfig, *, neutral: Workload |
         # The check's engines are small and fixed: size their KV cache instead of letting vLLM measure free memory,
         # which fails when an engine closed just before is still releasing it.
         shape = ModelShape.of_config(config)
-        token = 2 * shape.layer_count * shape.kv_heads * shape.head_dim * TensorDType(config.dtype).torch.itemsize
+        itemsize = TensorDType(config.dtype).torch.itemsize
+        token = (
+            shape.layer_count * (shape.kv_lora_rank + shape.qk_rope_head_dim) * itemsize
+            if shape.kv_lora_rank
+            else 2 * shape.layer_count * shape.kv_heads * shape.head_dim * itemsize
+        )
         config = replace(config, kv_cache_memory_bytes=config.max_num_seqs * config.max_model_len * token)
     context = get_context("spawn")
     received, sent = context.Pipe(duplex=False)

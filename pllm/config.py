@@ -112,7 +112,7 @@ class ModelConfig:
     enable_chunked_prefill: bool = False
     generated_kv: Literal["reuse", "isolate"] = "isolate"
     revision: str | None = None
-    multiprocessing: bool = False
+    multiprocessing: Literal["auto"] | bool = "auto"
     execution: ExecutionOptions = ExecutionOptions()
     # "auto" runs the model through vLLM's CUDA graphs when the workload supports them, else eagerly, with the reason
     # in diagnostics().eager_reason; True requires graphs (an unsupported workload raises), False runs eagerly.
@@ -125,9 +125,21 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size < 1:
             raise ValueError("tensor_parallel_size must be an integer >= 1")
+        if self.multiprocessing != "auto" and type(self.multiprocessing) is not bool:
+            raise ValueError('multiprocessing must be "auto", True or False')
         if self.dtype not in get_args(ModelDType):
             raise ValueError(f'dtype must be "bfloat16", "float16" or "float32"; got {self.dtype!r}')
         if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 1:
             raise ValueError("kv_cache_memory_bytes must be positive, or None to let vLLM size the KV cache")
         if self.generated_kv not in ("reuse", "isolate"):
             raise ValueError('generated_kv must be "reuse" or "isolate"')
+
+    def uses_multiprocessing(self, *, async_engine: bool = False) -> bool:
+        """Resolve 'auto' multiprocessing to False for TP=1 sync and True for TP>1 or async."""
+        if self.multiprocessing == "auto":
+            return async_engine or self.tensor_parallel_size > 1
+        if async_engine and not self.multiprocessing:
+            raise ValueError(
+                "online serving runs vLLM's async multiprocess engine; omit multiprocessing=False or set True"
+            )
+        return self.multiprocessing or self.tensor_parallel_size > 1

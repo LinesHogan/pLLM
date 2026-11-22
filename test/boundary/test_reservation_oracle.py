@@ -26,7 +26,7 @@ from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.host_batch import HOST_BATCH_SCHEMAS
+from pllm.contracts.host_batch import HOST_BATCH_SCHEMAS, CausalTrainBatch, HostBatch
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import AnchorId, HostServiceInputSource, ImplementationId, StateEffectKind
 from pllm.contracts.state_representation import StateDeviceKind
@@ -36,7 +36,9 @@ from pllm.execution.ptts.request_state import RequestStateDirectory
 from pllm.execution.state_execution import StateExecution, StateTaskContext
 from pllm.execution.step_driver import StepDriver
 from pllm.execution.step_input import StepInput
+from pllm.execution.tensor_declaration import StepResult
 from pllm.execution.tensor_frame import TensorFrame
+from pllm.execution.tensor_program import InvocationOutput
 from pllm.workloads import ESampConfig, ESampWorkload, OverRIDEConfig, OverRIDEWorkload, TLMConfig, TLMWorkload
 from pllm.workloads.tlm.workload import TLMMode
 from pllm.workloads.video import VideoWorkload
@@ -118,8 +120,8 @@ class StubMath:
     def prepare(self, value: StepInput, context) -> TensorFrame:
         return TensorFrame(value, value.rows.rows)
 
-    def output(self, context) -> None:
-        return None
+    def output(self, context) -> StepResult:
+        return StepResult(None, InvocationOutput(context.selection, (), context.publication))
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,8 @@ class Step:
     run: tuple[int, ...] | None = None  # None runs every live request
     new_generate: bool = False  # the step starts a generate call, whose host batch is staged
 
+    update: bool = False
+
 
 class Engine:
     """The real StepDriver over stubbed task bodies: each step is scheduled, begun, completed after the forward,
@@ -172,6 +176,18 @@ class Engine:
             for physical in sorted(bundle.schedule.tasks, key=lambda item: item.implementation_id)
             for task in (graph.tasks[physical.task_id],)
         )
+        schemas = {
+            port.source.schema
+            for task in graph.tasks
+            for port in task.inputs
+            if isinstance(port.source, HostServiceInputSource) and port.source.schema in HOST_BATCH_SCHEMAS
+        }
+        self.batch: HostBatch[torch.Tensor] | None = None
+        if schemas:
+            # Of the seven oracle workloads, the two TLM modes consume host batches.
+            assert schemas == {CausalTrainBatch.schema}
+            ids = torch.tensor([[0, 1]])
+            self.batch = CausalTrainBatch(ids, ids, torch.ones_like(ids))
         self.arena = PeakArena(bundle)
         sampler = next(anchor.ordinal for anchor in bundle.timeline.anchors if anchor.symbol == "sampler.pre_draw")
         directory = RequestStateDirectory(self.arena, graph.states)
@@ -188,7 +204,7 @@ class Engine:
             self.live = []
             return
         if step.new_generate:
-            driver.stage(tuple(map(_identity, call)), object())
+            driver.stage(tuple(map(_identity, call)), self.batch)
         # A request retired and admitted in one step was preempted; vLLM finished the others.
         driver.schedule(
             [_identity(i).request_id for i in step.retire if i not in step.admit],
@@ -204,6 +220,8 @@ class Engine:
         driver.after_forward(value, None)
         driver.sample(None, None)
         driver.commit()
+        if step.update and self.batch is not None:
+            driver.execution.run_batch(StepInput.of_batch(self.batch))
 
 
 def _identity(index: int) -> RequestIdentity:
@@ -217,9 +235,9 @@ def adversary(preemptible: bool) -> Iterator[Step | None]:
     yield Step(admit=tuple(range(SEQS)), new_generate=True)
     yield from (Step() for _ in range(4))
     yield None
-    yield Step(admit=(SEQS,), new_generate=True)
-    yield from (Step(admit=(i,)) for i in range(SEQS + 1, 2 * SEQS))
-    yield from (Step(), Step())
+    yield Step(admit=(SEQS,), new_generate=True, update=True)
+    yield from (Step(admit=(i,), update=True) for i in range(SEQS + 1, 2 * SEQS))
+    yield from (Step(update=True), Step(update=True))
     for i in range(2 * SEQS, 2 * SEQS + 4):
         yield Step(retire=(i - SEQS,), admit=(i,))
         yield Step()

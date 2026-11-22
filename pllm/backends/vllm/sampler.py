@@ -205,7 +205,7 @@ class GuidedSampler(compat.Sampler):
                 return logits
         return super()._copy_logits(logits, idx_mapping_np)
 
-    def _sample_random(
+    def _draw_random(
         self,
         processed_logits: torch.Tensor,
         expanded_idx_mapping: torch.Tensor,
@@ -214,6 +214,7 @@ class GuidedSampler(compat.Sampler):
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
         use_fused_sampler: bool,
+        has_topp_only_rows: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         match self._active_guidance:
             case SignedSamplerStages(guide=BoundedSamplerGuidance() as guidance):
@@ -240,10 +241,19 @@ class GuidedSampler(compat.Sampler):
             case SignedSamplerStages(guide=SignedSamplerGuidance() as guidance):
                 survivors = apply_top_k_top_p(processed_logits, top_k, top_p)
                 reweighted = self.reweight_finite_survivors(survivors, guidance)
-                return super()._sample_random(reweighted, expanded_idx_mapping, idx_mapping_np, pos, None, None, False)
+                return super()._draw_random(
+                    reweighted, expanded_idx_mapping, idx_mapping_np, pos, None, None, False, False
+                )
             case _:
-                return super()._sample_random(
-                    processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, use_fused_sampler
+                return super()._draw_random(
+                    processed_logits,
+                    expanded_idx_mapping,
+                    idx_mapping_np,
+                    pos,
+                    top_k,
+                    top_p,
+                    use_fused_sampler,
+                    has_topp_only_rows,
                 )
 
 

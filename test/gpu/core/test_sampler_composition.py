@@ -99,7 +99,7 @@ def test_additions_then_filtered_guidance(monkeypatch, capacity, passthrough):
             logits, hidden, weight, rows, weights, beta, limit, mapping, temperature, seeds, positions, p, fp64=fp64
         )
         torch.testing.assert_close(logits, expected, atol=0.02, rtol=0.004)
-        draw_args = {} if compat.VLLM_027 else {"is_drafting": False}
+        draw_args = {} if compat.GUMBEL_MODE == 0 else {"is_drafting": False}
         token = gumbel_sample(
             expected, mapping, temperature, seeds, positions, apply_temperature=False, use_fp64=fp64, **draw_args
         )

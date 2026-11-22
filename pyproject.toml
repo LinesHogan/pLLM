@@ -5,22 +5,24 @@ build-backend = "maturin"
 [project]
 name = "pllm"
 version = "0.1.0"
-description = "Auxiliary-workload compiler middle-end for the vLLM inference engine"
+description = "Run stateful and adaptive inference-time PyTorch algorithms inside vLLM with CUDA graphs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-    "cattrs>=25.3,<26",
-    "cloudpickle>=3.1,<4",
-    "torch>=2.13,<2.14",
-    "triton>=3.7,<3.8",
+    "cattrs>=23.2,<27",
+    "cloudpickle>=3.0,<4",
+    "torch>=2.13,<2.16",
+    "triton>=3.7,<4",
 ]
 
 [project.optional-dependencies]
-# pllm runs on exactly these vLLM releases; pllm/backends/vllm/compat.py holds their differences.
+# pllm runs on vLLM 0.27 through 0.34; pllm/backends/vllm/compat.py holds release differences.
 vllm027 = ["vllm==0.27.1"]
 vllm032 = ["vllm==0.32.0"]
+vllm034 = ["vllm==0.34.0"]
+vllm = ["vllm>=0.27.0,<0.35"]
 test = [
     "pytest==9.0.3",
     "maturin>=1.14,<2.0",
@@ -30,11 +32,21 @@ test = [
     "github-slugger==0.0.3",
 ]
 
+[project.scripts]
+pllm = "pllm.cli:main"
+
+[project.urls]
+Repository = "https://github.com/LinesHogan/pLLM"
+Documentation = "https://github.com/LinesHogan/pLLM/blob/main/doc/README.md"
+Issues = "https://github.com/LinesHogan/pLLM/issues"
+
 [tool.maturin]
 manifest-path = "rust/pllm_core/Cargo.toml"
 python-source = "."
 module-name = "pllm._core"
 features = ["pyo3/extension-module"]
+include = ["pllm/_skill/*.md"]
+exclude = ["blog/**", "doc/**", "test/**", "tools/**", "examples/**"]
 
 [tool.ruff]
 line-length = 120

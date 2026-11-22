@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from pllm.backends.vllm.checkpoint import CheckpointLoader as CheckpointLoader
+from pllm.backends.vllm.control import BackendCompletions, CompletionRows, control_key
 from pllm.backends.vllm.hidden_taps import (
     TAPS_ENV,
     HiddenTapAnnouncement,
@@ -43,6 +44,8 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachment
 from pllm.contracts.codec import decode_boundary
 from pllm.contracts.kv_layout import KVLayout
+from pllm.contracts.packed_rows import RowLabeler
+from pllm.contracts.request_identity import RequestIdentity
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.ptts.slot_pools import SlotPools
@@ -67,6 +70,10 @@ class WorkloadModelRunner(OverlayGraphRunner):
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)
+        self.completion_targets: dict[str, CompletionRows] = {}
+        self._completion_rows: dict[str, CompletionRows] = {}
+        if TAPS_ENV not in os.environ:
+            return
         assert self.sampler is not None
         self.sampler = self._guided_sampler = GuidedSampler(self.sampler)
         self.install_model_hooks()
@@ -90,8 +97,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
         model.compute_logits = self._compute_logits
         install_layouts(self.decoder, decode_boundary(os.environ.get(LAYOUT_ENV, "[]"), tuple[KVLayout, ...]))
         announcement = decode_boundary(os.environ.get(TAPS_ENV, "{}"), HiddenTapAnnouncement)
-        hidden_size = model.lm_head.weight.shape[1]
-        self.hidden_layouts = announcement.resolve(len(model.model.layers), hidden_size, model.config.vocab_size)
+        self.hidden_layouts = announcement.resolve_model(model)
         self.hidden_pools = {layout.tap: layout.create_pool(self.device) for layout in self.hidden_layouts}
         if not self.hidden_layouts:
             return
@@ -107,7 +113,12 @@ class WorkloadModelRunner(OverlayGraphRunner):
     ) -> BackendInstalled:
         """Specialize, plan and bind the workload in this process and attach it: the one install path, in process
         or in each EngineCore worker."""
-        facts, declaration = workload.specialize(facts, options, causal=partial(CausalTraining, self.decoder))
+        facts, declaration = workload.specialize(
+            facts,
+            options,
+            causal=partial(CausalTraining, self.decoder),
+            prefix_caching=self.vllm_config.cache_config.enable_prefix_caching is True,
+        )
         attachment = workload.plan_backend(facts, declaration)
         policy = CachePolicy.for_attachment(attachment, generated_kv, self.installs)
         self.installs += 1
@@ -151,9 +162,11 @@ class WorkloadModelRunner(OverlayGraphRunner):
             self.workload_session = None
             raise
 
-    def detach_workload(self) -> None:
+    def detach_workload(self, *, closing: bool = False) -> None:
+        """Drain the session at engine shutdown. Replacing it requires an idle driver."""
         session = self.require_session()
-        session.driver.require_idle()
+        if not closing:
+            session.driver.require_idle()
         session.close()
         self.workload_session = None
 
@@ -161,6 +174,45 @@ class WorkloadModelRunner(OverlayGraphRunner):
         session = self.workload_session
         assert session is not None
         return session
+
+    def stage_completions(self, command: BackendCompletions) -> None:
+        """Start collecting each request's final sampled hidden row."""
+        _ = self.decoder
+        for request_id, _ in command.requests:
+            if request_id in self.completion_targets:
+                raise ValueError(f"completion request {request_id} is already staged")
+        for key, length in command.requests:
+            target = self.completion_targets[key] = CompletionRows(length, key)
+            if length:
+                self._completion_rows[key] = target
+
+    def finish_completions(self, command: BackendCompletions, rank: int) -> bytes:
+        """Release this caller's targets and encode the output rank's sampled rows."""
+        rows: list[CompletionRows] = []
+        for key, _ in command.requests:
+            target = self.completion_targets.pop(key, None)
+            if target is not None:
+                self._completion_rows.pop(target.request_id, None)
+                rows.append(target)
+            elif not command.discard:
+                raise ValueError(f"completion request {key} was not staged")
+        return CompletionRows.encode(rows) if rank == 0 and not command.discard else b""
+
+    def _capture_completions(self, hidden: torch.Tensor, batch: InputBatch, sampled: SamplerOutput) -> None:
+        if not self._completion_rows.keys() & batch.req_ids:
+            return
+        labeler = RowLabeler()
+        for key, slot in zip(batch.req_ids, batch.idx_mapping_np, strict=True):
+            labeler.admit(RequestIdentity(key, 0, 0))
+            labeler.bind(key, int(slot), self.max_num_reqs)
+        rows = encode_mrv2_rows(
+            batch, self.req_states.prompt_len.np[batch.idx_mapping_np], labeler, step_id=0, keep=False
+        )
+        for index, offset in enumerate(rows.row_batch.token_offsets[rows.packed_indices]):
+            target = self._completion_rows.get(batch.req_ids[index])
+            if target is not None:
+                packed = int(rows.packed_indices[index])
+                target.record(int(offset), hidden[packed], sampled.sampled_token_ids[index])
 
     def _compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         session = self.workload_session
@@ -177,6 +229,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager[Any, bool | None] | None = None,
+        extensible: bool = False,
     ) -> None:
         """Validate the admitted allocation layout once before binding route state."""
         if self.position_states:
@@ -193,7 +246,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
                 self.cache_config.block_size,
             ):
                 raise ValueError("PositionState requires one KV group with whole allocation-block prefix hits")
-        super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context)
+        super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context, extensible)
 
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture and warm up with no hidden-slot destinations, including deferred capture."""
@@ -204,6 +257,13 @@ class WorkloadModelRunner(OverlayGraphRunner):
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         """Bind interned identities to vLLM slots only when requests enter its persistent state."""
         super().add_requests(scheduler_output)
+        if self.completion_targets:
+            for request in scheduler_output.scheduled_new_reqs:
+                target = self.completion_targets.get(control_key(request.sampling_params))
+                if target is not None:
+                    target.request_id = request.req_id
+                    target.prompt_length = len(request.prompt_token_ids or ())
+                    self._completion_rows[request.req_id] = target
         session = self.workload_session
         if session is not None:
             for request in scheduler_output.scheduled_new_reqs:
@@ -279,13 +339,15 @@ class WorkloadModelRunner(OverlayGraphRunner):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         session = self.workload_session
-        if session is None:
-            return super().sample(hidden_states, input_batch, grammar_output)
         try:
             sampled = super().sample(hidden_states, input_batch, grammar_output)
-            session.complete_sampler()
+            if self.completion_targets:
+                self._capture_completions(hidden_states, input_batch, sampled[0])
+            if session is not None:
+                session.complete_sampler()
         except Exception:
-            session.abort_active()
+            if session is not None:
+                session.abort_active()
             raise
         return sampled
 
@@ -306,7 +368,7 @@ class WorkloadModelRunner(OverlayGraphRunner):
 
     def shutdown(self) -> None:
         if self.workload_session is not None:
-            self.detach_workload()
+            self.detach_workload(closing=True)
         super().shutdown()
 
 

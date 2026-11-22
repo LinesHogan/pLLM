@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Self
 import torch
 from cattrs import structure
 from vllm.config import LoadConfig, ModelConfig as VllmModelConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -16,14 +17,25 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.model_executor.models import ModelRegistry
 
+from pllm.backends.vllm.architecture import (
+    DENSE_ARCHITECTURES,
+    HYBRID_NAMES,
+    KV_MOE_ARCHITECTURES,
+    hidden_binding,
+    moe_projection_error,
+    post_attention_norm_name,
+)
 from pllm.config import ModelConfig
+from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
 from pllm.contracts.parameter_overlay import Projection, ProjectionShape, expand_targets
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.architecture import Decoder
 
 
-_DENSE_ARCHITECTURES = ("Qwen2ForCausalLM", "Qwen3ForCausalLM", "LlamaForCausalLM")
+_DENSE_NAMES = tuple(cls.__name__ for cls in DENSE_ARCHITECTURES)
+_KV_MOE_NAMES = tuple(cls.__name__ for cls in KV_MOE_ARCHITECTURES)
 
 
 @dataclass(frozen=True)
@@ -32,16 +44,50 @@ class _ConfigShape:
     hidden_size: int
     num_hidden_layers: int
     vocab_size: int
-    intermediate_size: int
     num_attention_heads: int
+    intermediate_size: int = 0
     num_key_value_heads: int | None = None
     head_dim: int | None = None
     logit_scale: float = 1.0
     tie_word_embeddings: bool = False
+    final_logit_softcapping: float | None = None
+    mlp_only_layers: tuple[int, ...] = ()
+    decoder_sparse_step: int = 1
+    num_experts: int = 0
+    num_local_experts: int = 0
+    layer_types: tuple[str, ...] | None = None
+    attn_output_gate: bool = True
+    v_head_dim: int | None = None
+    kv_lora_rank: int | None = None
+    qk_nope_head_dim: int | None = None
+    qk_rope_head_dim: int | None = None
+
+    @property
+    def query_width(self) -> int:
+        """Features per query head before MLA absorption or dense attention."""
+        if self.kv_lora_rank:
+            return (self.qk_nope_head_dim or 0) + (self.qk_rope_head_dim or 0)
+        return self.head_dim or self.hidden_size // self.num_attention_heads
+
+    def routed_mlp(self, layer: int) -> str | None:
+        """Identify routed layers; Qwen MoE configs can also include dense layers."""
+        name = self.architectures[0]
+        if name == "Qwen3_5MoeForCausalLM":
+            return "Qwen3NextSparseMoeBlock"
+        if name == "MixtralForCausalLM":
+            return "MixtralDecoderLayer.block_sparse_moe"
+        if (
+            name in _KV_MOE_NAMES
+            and (self.num_experts or self.num_local_experts)
+            and layer not in self.mlp_only_layers
+            and (layer + 1) % self.decoder_sparse_step == 0
+        ):
+            return name.removesuffix("ForCausalLM") + "SparseMoeBlock"
+        return None
 
     def forward_flops(self) -> int | None:
         """Dense projection matmuls per token, excluding attention over the growing KV history."""
-        if self.architectures[0] not in _DENSE_ARCHITECTURES:
+        if self.architectures[0] not in _DENSE_NAMES:
             return None
         head = self.head_dim or self.hidden_size // self.num_attention_heads
         query = head * self.num_attention_heads
@@ -50,9 +96,9 @@ class _ConfigShape:
         return 2 * (parameters + self.hidden_size * pad_vocab_size(self.vocab_size))
 
     def projections(self, targets: tuple[Projection, ...], size: int) -> tuple[ProjectionShape, ...]:
-        if targets and self.architectures[0] not in _DENSE_ARCHITECTURES:
+        if targets and self.architectures[0] not in (*_DENSE_NAMES, *_KV_MOE_NAMES, *HYBRID_NAMES):
             raise ValueError(
-                "projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks"
+                "projection shapes for this architecture are decided at make_llm; use a dense or KV MoE config for CPU checks"
             )
         head = self.head_dim or self.hidden_size // self.num_attention_heads
         kv_heads = self.num_key_value_heads or self.num_attention_heads
@@ -70,6 +116,17 @@ class _ConfigShape:
         projections: list[ProjectionShape] = []
         heads = {"q_proj": self.num_attention_heads, "k_proj": kv_heads, "v_proj": kv_heads}
         for target in expanded:
+            assert target.layer is not None
+            if target.name not in heads and (routed := self.routed_mlp(target.layer)):
+                raise moe_projection_error(target.layer, routed)
+            if target.name in heads and self.architectures[0] in HYBRID_NAMES:
+                assert self.layer_types is not None
+                if self.layer_types[target.layer] != "full_attention":
+                    raise ValueError(
+                        f"layer {target.layer} is a Gated DeltaNet layer; choose a full-attention layer for q/k/v overlays"
+                    )
+                if target.name == "q_proj" and self.attn_output_gate:
+                    raise ValueError("gated attention interleaves query and output-gate rows; overlay k_proj or v_proj")
             inputs, outputs = sizes[target.name]
             partitions = _head_partitions(target.name, heads[target.name], size) if target.name in heads else size
             # down_proj is row-parallel and splits its input features; the others split their outputs.
@@ -101,7 +158,9 @@ def _head_rejection(model: VllmModelConfig, shape: _ConfigShape, architecture: s
     from pllm.backends.vllm.architecture import guidance_head_rejection
 
     # Ask vLLM which method its head would use, without allocating or loading base weights.
-    tied_embedding = architecture in ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM") and shape.tie_word_embeddings
+    tied_embedding = architecture == "Gemma2ForCausalLM" or (
+        architecture in ("Glm4ForCausalLM", "Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM") and shape.tie_word_embeddings
+    )
     with torch.device("meta"):
         head = (VocabParallelEmbedding if tied_embedding else ParallelLMHead)(
             shape.vocab_size, shape.hidden_size, params_dtype=model.dtype, disable_tp=True
@@ -113,8 +172,8 @@ def _head_rejection(model: VllmModelConfig, shape: _ConfigShape, architecture: s
         method = quantization.get_quant_method(head, prefix="model.embed_tokens" if tied_embedding else "lm_head")
         if method is not None:
             head.quant_method = method
-    scale = shape.logit_scale if architecture == "LlamaForCausalLM" else 1.0
-    return guidance_head_rejection(head, scale, model.head_dtype)
+    scale = shape.logit_scale if architecture in ("LlamaForCausalLM", "MistralForCausalLM", "Phi3ForCausalLM") else 1.0
+    return guidance_head_rejection(head, scale, model.head_dtype, shape.final_logit_softcapping)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +193,14 @@ class ModelShape:
     head_dim: int = 0
     intermediate_size: int = 0
     guidance_rejection: str | None = None
+    v_head_dim: int = 0
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
+
+    def hidden_binding(self, layer: int, site: HiddenSite) -> PackedHiddenResourceBinding:
+        """Map a declared site to the residual-add module for this decoder."""
+        return hidden_binding(layer, site, self.layer_count, post_attention_norm_name(self.architecture))
 
     @classmethod
     def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
@@ -152,7 +219,7 @@ class ModelShape:
         read_only = admit_architecture(info.architecture)
         if targets and read_only:
             raise ValueError(f"a parameter overlay {read_only}")
-        shape = structure(model.hf_text_config.to_dict(), _ConfigShape)
+        shape = structure({**model.hf_text_config.to_dict(), "architectures": [info.architecture]}, _ConfigShape)
         return cls(
             info.architecture,
             shape.hidden_size,
@@ -162,35 +229,45 @@ class ModelShape:
             shape.projections(targets, config.tensor_parallel_size),
             read_only,
             shape.forward_flops(),
-            shape.num_attention_heads,
-            shape.num_key_value_heads or shape.num_attention_heads,
-            shape.head_dim or shape.hidden_size // shape.num_attention_heads,
+            shape.num_attention_heads // config.tensor_parallel_size,
+            max(1, (shape.num_key_value_heads or shape.num_attention_heads) // config.tensor_parallel_size),
+            shape.query_width,
             shape.intermediate_size,
             _head_rejection(model, shape, info.architecture),
+            v_head_dim=shape.v_head_dim or 0,
+            kv_lora_rank=shape.kv_lora_rank or 0,
+            qk_nope_head_dim=shape.qk_nope_head_dim or 0,
+            qk_rope_head_dim=shape.qk_rope_head_dim or 0,
         )
 
     @classmethod
     def of_model(cls, decoder: Decoder, targets: tuple[Projection, ...], dtype: torch.dtype) -> Self:
         """Inspect the actual loaded projection slices, including architecture-specific admission."""
-        from pllm.backends.vllm.architecture import guidance_rejection
+        from pllm.backends.vllm.architecture import guidance_rejection, lm_head_module
         from pllm.backends.vllm.parameter_overlay import inspect_parameter_targets
 
         model = decoder.model
+        head = lm_head_module(model)
+        tp_size = get_tensor_model_parallel_world_size()
         layers = len(model.model.layers)
         shapes = inspect_parameter_targets(decoder, expand_targets(targets, layers), dtype)
-        config = structure(model.config.to_dict(), _ConfigShape)
+        config = structure({**model.config.to_dict(), "architectures": [type(model).__name__]}, _ConfigShape)
         return cls(
             type(model).__name__,
             model.config.hidden_size,
             layers,
             model.config.vocab_size,
-            model.lm_head.num_embeddings_padded,
+            head.num_embeddings_padded,
             shapes,
             decoder.read_only,
             config.forward_flops(),
-            config.num_attention_heads,
-            config.num_key_value_heads or config.num_attention_heads,
-            config.head_dim or config.hidden_size // config.num_attention_heads,
+            config.num_attention_heads // tp_size,
+            max(1, (config.num_key_value_heads or config.num_attention_heads) // tp_size),
+            config.query_width,
             config.intermediate_size,
-            guidance_rejection(model.lm_head, model.logits_processor),
+            guidance_rejection(head, model.logits_processor),
+            v_head_dim=config.v_head_dim or 0,
+            kv_lora_rank=config.kv_lora_rank or 0,
+            qk_nope_head_dim=config.qk_nope_head_dim or 0,
+            qk_rope_head_dim=config.qk_rope_head_dim or 0,
         )

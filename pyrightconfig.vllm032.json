@@ -1,5 +1,11 @@
 {
   "extends": "./pyrightconfig.json",
-  "defineConstant": {"VLLM_027": false},
+  "defineConstant": {
+    "VLLM_027": false,
+    "VLLM_028_030": false,
+    "VLLM_031": false,
+    "VLLM_033_PLUS": false,
+    "VLLM_034": false
+  },
   "venv": ".venv-vllm032"
 }

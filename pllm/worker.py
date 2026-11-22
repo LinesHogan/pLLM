@@ -9,12 +9,22 @@ import torch
 from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 
 from pllm.backends.vllm import compat
+from pllm.backends.vllm.control import (
+    BackendCompletions,
+    BackendImport,
+    BackendOnlineImport,
+    BackendTrain,
+    reported_call,
+    run_import_state,
+    run_train_batch,
+)
 from pllm.backends.vllm.runner import BackendInstall, BackendWorkerState, WorkloadModelRunner
-from pllm.backends.vllm.runtime import BackendCommand, BackendStage, probe_backend, reported_call
+from pllm.backends.vllm.runtime import BackendCommand, BackendStage, probe_backend
 from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.host_batch import map_host_batch
 from pllm.contracts.semantic_graph import TaskId
 from pllm.execution.compile_facts import BackendRequirements
+from pllm.execution.state_feed import encode_feed
 from pllm.execution.trace import TraceSelection
 from pllm.workload_transport import decode_workload
 
@@ -41,15 +51,30 @@ class GPUWorker(compat.Worker):
     def workload_command(self, command: str, payload: str) -> str:
         runner = self.workload_runner
         operation = BackendCommand(command)
-        assert not payload or operation in (
-            BackendCommand.PROBE,
-            BackendCommand.INSTALL,
-            BackendCommand.STAGE,
-            BackendCommand.PROFILE,
-            BackendCommand.SELECT_TRACE,
-        )
         with torch.inference_mode(False):
             match operation:
+                case BackendCommand.IMPORT_STATE:
+                    return reported_call(
+                        lambda: run_import_state(
+                            runner.require_session().driver, decode_boundary(payload, BackendImport)
+                        )
+                    )
+                case BackendCommand.TRAIN_BATCH:
+                    return reported_call(
+                        lambda: run_train_batch(runner.require_session().driver, decode_boundary(payload, BackendTrain))
+                    )
+                case BackendCommand.FEED:
+                    return reported_call(
+                        lambda: encode_feed(runner.require_session().driver.feed(decode_boundary(payload, str)))
+                    )
+                case BackendCommand.STAGE_ONLINE_IMPORT:
+                    return reported_call(lambda: self._online_import(decode_boundary(payload, BackendOnlineImport)))
+                case BackendCommand.STAGE_COMPLETIONS:
+                    return reported_call(lambda: runner.stage_completions(decode_boundary(payload, BackendCompletions)))
+                case BackendCommand.FINISH_COMPLETIONS:
+                    return reported_call(
+                        lambda: runner.finish_completions(decode_boundary(payload, BackendCompletions), self.rank)
+                    )
                 case BackendCommand.PROBE:
                     return encode_boundary(probe_backend(decode_boundary(payload, BackendRequirements), runner))
                 case BackendCommand.INSTALL:
@@ -96,5 +121,15 @@ class GPUWorker(compat.Worker):
                 case BackendCommand.SELECT_TRACE:
                     runner.require_session().trace.configure(decode_boundary(payload, TraceSelection))
                 case BackendCommand.DETACH:
-                    runner.detach_workload()
+                    runner.detach_workload(closing=bool(payload) and decode_boundary(payload, bool))
             return ""
+
+    def _online_import(self, command: BackendOnlineImport) -> None:
+        driver = self.workload_runner.require_session().driver
+        if command.update is None:
+            for key in command.request_ids:
+                driver.discard_online_import(key)
+        else:
+            update = command.update.update()
+            for key in command.request_ids:
+                driver.stage_online_import(key, update)

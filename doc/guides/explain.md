@@ -108,50 +108,61 @@ timing   publish_lag=1 (default): updates at step n become readable at n + 2; tr
 - **`timing`**：时机设置及其后果；`(default)` 表示你没改过默认值。
 - **`note`**：这份报告不知道的事（见下文的限制说明）。
 
-## 一个会退回 eager 的负载：共享的 LoRA
+## 一个改用切片图的负载：条件早退层（`custom_forward`）
 
-有些写法会让模型前向退回 eager 模式。例如把一份 LoRA 声明成所有请求共享的 `InstanceState`，再用 `pllm.model.Adapter` 加到第 12 层的 q/v 投影上。在启动引擎前用 `pllm.explain` 检查它，就能提前看到原因：
+`Adapter`（无论绑定在 `RequestState` 还是共享 `InstanceState` 上）与 `ActivationPatch` 都已经留在 vLLM 的整模型 CUDA graph 中；真正会把整模型 CUDA graph 拆成切片捕获图（并在 `eager_reason` 里说明）的写法是 `@pllm.custom_forward`。启动引擎前用 `pllm.explain` 即可提前看到池大小预留和切片说明：
 
 ```python
-class SharedLoRA(pllm.Workload):
-    lora = pllm.InstanceState({"a": pllm.Field(lambda inputs, outputs: (4, inputs)),
-                               "b": pllm.Field(lambda inputs, outputs: (outputs, 4))}, init=pllm.Imported())
-    apply = pllm.model.Adapter("lora", (pllm.model.Projection("q_proj", 12), pllm.model.Projection("v_proj", 12)),
-                               operator="low_rank")
+@dataclass(frozen=True)
+class LoopTail(pllm.Workload):
+    threshold: float = 0.0
+
+    @pllm.custom_forward(tokens="decode")
+    def forward(self, layers: pllm.model.Layers) -> torch.Tensor:
+        h = layers(stop=26)[25]
+        active = torch.ones_like(h[:, :1], dtype=torch.bool)
+        for layer in range(26, 28):
+            active = active & (h.float().square().mean(-1, keepdim=True) > self.threshold)
+            h = layers(layer, layer + 1, hidden=h, active=active)[layer]
+        return h
 
 
-print(pllm.explain(SharedLoRA(), config))
+print(pllm.explain(LoopTail(), config))
 ```
 
-输出的前几行如下（`timing` 与 `note` 行与上面相同）：
+输出的前几行如下（`timing` 与 `note` 行略）：
 
-```text
+```text not-output
 model    Qwen2ForCausalLM, hidden 3584, 28 layers, vocab 152064, bfloat16 [exact, config.json]
 parallel tensor_parallel_size=1; reservations are per rank
-forward  eager: CUDA-graph overlays do not support adapters backed by shared InstanceState
+forward  eager: @pllm.custom_forward schedules model slices and owns their wave graphs
 base     14140571648 FLOP/token [estimate: dense projections and LM head; excludes attention over KV history]
 member  effect  anchor / lane / graph  state reads (origin, distance)
-apply  Adapter  model site or inactive method
-  forward eager because apply: CUDA-graph overlays do not support adapters backed by shared InstanceState
+kernels  forward: ~11 (eager) / step
+forward  custom_forward  model.execute / main / eager  - (entry, 0)
+  CUDA-graph pool reservation: 4244635648 bytes [planned capture residency; cuda_graph_pool_budget_bytes caps the pool]
+  matmul/byte estimate / step: unavailable; profile this model-site or host-batch body with a loaded model
+  forward eager because forward: @pllm.custom_forward schedules model slices and owns their wave graphs
+kernels  total: ~11 (eager) / step [estimate: source operators; excludes base model]
 state  scope  bytes/root  reserved bytes [exact; state_page_budget_bytes]
-lora  instance  90112  180280  field 0: bfloat16 x 2 pages, ...
-preempt  state keep; replay rejection: not applicable to kept state
+memory   peak 4273995778 bytes funded by pLLM [per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace; execution_peak_budget_bytes]
+preempt  state reset; replay rejection: None
 host     0 syncs in traced workload math
 ```
 
 这里重点看两处变化：
 
-- **`forward eager`**：读共享 `InstanceState` 的 Adapter 目前不在 CUDA graph 里运行，整个模型前向会用 eager 模式；报告点名是 `apply` 这个声明导致的。启动引擎后 `llm.diagnostics().eager_reason` 会给出同样的原因，但现在你在启动前就看到了。把同一份 LoRA 声明成 `RequestState`（每个请求一份），前向就留在 CUDA graph 里。
-- **`model site or inactive method`**：Adapter 直接作用在模型的投影上，不是独立排进时间线的任务，所以没有 `anchor` 和 `lane`。
+- **`forward eager`**：`@pllm.custom_forward` 需要按条件控制各层段的执行顺序，因此外层包装函数走 eager 调度，而各层段内部依然捕获成波次 CUDA graph（显存预算计入 `CUDA-graph pool reservation`）；如果只是加减权重覆盖层，共享 `InstanceState` 或每请求 `RequestState` 上的 `Adapter` 都不会触发这一行。
+- **`model.execute / main / eager`**：切片执行替换的是模型主体前向本身，所以它挂在主路径的 `model.execute` 上。
 
 把两个负载放在一起对比：
 
 | 负载 | 模型前向与执行方式 |
 | --- | --- |
-| `MiniESamp` | CUDA graph，训练在旁路 stream 上与后续前向重叠 |
-| `SharedLoRA` | eager forward |
+| `MiniESamp` | vLLM 整模型 CUDA graph，训练在旁路 stream 上与后续前向重叠 |
+| `LoopTail` | 外层按切片条件调度，层段内部使用波次 CUDA graph |
 
-写之前就能权衡：要 CUDA graph 的吞吐，就避开会触发 eager 的写法；需要这些写法时，你知道代价在哪。
+写之前就能权衡：要整模型图的静态开销与最短调度，就优先用标准层站点和 `Adapter` / `ActivationPatch`；需要跨层动态路由或早退时，`pllm.explain` 会先把波次图池大小算清楚。
 
 ## 预算不够时，它告诉你改什么
 

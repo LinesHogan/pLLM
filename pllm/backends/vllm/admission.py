@@ -23,19 +23,13 @@ def eager_reasons(config: ModelConfig, requirements: BackendRequirements) -> Ite
         yield "cuda_graphs", "ModelConfig(cuda_graphs=False)"
     if requirements.custom_forward:
         yield "custom_forward", "@pllm.custom_forward schedules model slices and owns their wave graphs"
-    if requirements.instance_adapter:
-        yield "Adapter", "CUDA-graph overlays do not support adapters backed by shared InstanceState"
 
 
 def admit_workload(config: ModelConfig, requirements: BackendRequirements) -> str:
     """Reject unsupported engine settings and return the model forward eager reason."""
     compat.admit_parallel(config, requirements)
-    if model_hooks(requirements) and config.enable_prefix_caching:
-        raise ValueError(
-            "disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, "
-            "@pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: vLLM keys cached K/V by tokens, "
-            "not by state, so a cached prefix would carry K/V computed under another request's state"
-        )
+    if config.enable_prefix_caching:
+        requirements.check_prefix_cache()
     if any(layout.keep != "all" for layout in requirements.kv_layouts) and (
         requirements.custom_forward or requirements.position_states
     ):

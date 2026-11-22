@@ -108,7 +108,7 @@ def propose(directory: Path, ledger: Path, revision: str, args: argparse.Namespa
     (workspace / "leaderboard.jsonl").write_text(ledger.read_text())
     agent = AGENTS[args.agent]
     model = args.model or agent.model
-    # Kimi refreshes OAuth under a file lock; keep those writes in the private sandbox home.
+    # CLI OAuth token refreshes write lockfiles; keep those writes in the private sandbox home.
     for name in agent.auth_files:
         source, target = Path.home() / name, destination / "home" / name
         if source.exists():

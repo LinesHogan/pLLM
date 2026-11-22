@@ -40,6 +40,8 @@ def test_isolated_wheel_imports_and_executes_rust_codec(tmp_path: Path) -> None:
             name for name in archive.namelist() if name.startswith("pllm/") and Path(name).suffix in (".py", ".pyi")
         }
         assert packaged_sources == expected_sources
+        assert "pllm/_skill/SKILL.md" in archive.namelist()
+        assert "pllm/_skill/migration.md" in archive.namelist()
         (license_path,) = (name for name in archive.namelist() if name.endswith("/licenses/LICENSE"))
         assert b"Apache License" in archive.read(license_path)
     installed = tmp_path / "installed"
@@ -74,6 +76,7 @@ assert Path(pllm.__file__).resolve().is_relative_to(installed)
 assert Path(_core.__file__).resolve().is_relative_to(installed)
 distribution = importlib.metadata.Distribution.at(installed / sys.argv[2])
 assert not any(e.group == 'vllm.general_plugins' for e in distribution.entry_points)
+assert any(e.group == 'console_scripts' and e.name == 'pllm' for e in distribution.entry_points)
 requirements = [Requirement(value) for value in distribution.requires or ()]
 assert any(req.name == 'torch' and req.marker is None for req in requirements)
 request = json.dumps({'layouts': [{
@@ -83,6 +86,9 @@ request = json.dumps({'layouts': [{
 decision = _core.intern_tensor_layouts(request)
 assert json.loads(decision)['bindings'][0]['layout_id'] == 0
 assert callable(pllm.make_llm)
+assert callable(pllm.make_async_llm)
+from pllm.cli import main as cli_main
+assert cli_main(['skill', '--print']) == 0
 for workload in ('dummy', 'esamp', 'fttt', 'inplace_ttt', 'tlm',
                  'reft', 'recirculation', 'override', 'reward_head', 'lora'):
     module = importlib.import_module('pllm.workloads.' + workload)

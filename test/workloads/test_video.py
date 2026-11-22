@@ -328,8 +328,9 @@ def _hold_steps_reuse_the_settled_injection():
 
 
 def frames(count=4):
-    path = Path(os.environ.get("PLLM_VIDEO_FIXTURE", "/home/user/TLM/data/mllm_demo_data/1.mp4"))
-    if not path.is_file():
+    fixture = os.environ.get("PLLM_VIDEO_FIXTURE", "")
+    path = Path(fixture) if fixture else Path()
+    if not fixture or not path.is_file():
         pytest.skip("set PLLM_VIDEO_FIXTURE to a real video")
     result = list(video_frames(path, 2, count))
     assert len(result) == count

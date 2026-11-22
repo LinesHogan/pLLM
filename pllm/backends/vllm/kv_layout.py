@@ -14,8 +14,8 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, RSWASpec, SlidingWindowSpec
 
+from pllm.backends.vllm import compat
 from pllm.backends.vllm.architecture import Decoder
-from pllm.backends.vllm.compat import VLLM_027
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
 from pllm.contracts.kv_layout import KVCapacity, KVLayout, expand_layouts, storage_layout
@@ -53,7 +53,7 @@ def sink_spec(attention: Attention, window: int, vllm_config: VllmConfig) -> RSW
 
 def install_layouts(decoder: Decoder, layouts: tuple[KVLayout, ...]) -> None:
     """Declare native cache ownership before profiling or allocation, including shared chains."""
-    if not layouts:
+    if not layouts or all(layout.keep == "all" and not layout.sink for layout in layouts):
         return
     from pllm.backends.vllm.flashinfer_attention import install_window
 
@@ -101,12 +101,18 @@ def layout_capacity(shape: ModelShape, config: ModelConfig, layouts: tuple[KVLay
                 max_in_flight_tokens=2 * config.max_num_batched_tokens,
                 max_model_len=config.max_model_len,
             )
+        itemsize = TensorDType(config.dtype).torch.itemsize
+        block_bytes = (
+            PAGE_SIZE * (shape.kv_lora_rank + shape.qk_rope_head_dim) * itemsize
+            if shape.kv_lora_rank
+            else 2 * PAGE_SIZE * shape.kv_heads * shape.head_dim * itemsize
+        )
         result.append(
             KVCapacity(
                 layout,
                 PAGE_SIZE,
                 blocks,
-                2 * PAGE_SIZE * shape.kv_heads * shape.head_dim * TensorDType(config.dtype).torch.itemsize,
+                block_bytes,
             )
         )
     return tuple(result)
@@ -137,7 +143,7 @@ def allocation_blocks(
         return max((num_tokens + first.block_size - 1) // first.block_size - len(blocks), 0) * len(
             coordinator.single_type_managers
         )
-    kwargs = {} if VLLM_027 else {"prefill_end": prefill_end}
+    kwargs = {} if (compat.VLLM_027 or compat.VLLM_028_030) else {"prefill_end": prefill_end}
     return native(
         request_id,
         num_tokens,

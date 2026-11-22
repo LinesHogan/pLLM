@@ -30,9 +30,6 @@ Checks over README.md, doc/ and examples/:
    glossary (doc/reference/glossary.md) explains it in a bold term. Contributor vocabulary (PTTS, receipts,
    evidence numbers, milestones, local paths, commit hashes) has no glossary entry, so it always fails.
 
-The essays in doc/explain/highlights/ are dated articles: each names the commit and setup it was written against
-and is not kept current, so their code does not run and their vocabulary and numbers are not checked.
-
 Notebooks without any "cpu-check" cell are pending a rewrite and are skipped unless `--all` is given;
 the report lists them. Exit status is 1 when any check fails.
 """
@@ -51,12 +48,13 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache, partial
 from pathlib import Path
 from types import ModuleType
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, get_overloads
 from urllib.parse import unquote, urlsplit
 
 from github_slugger import GithubSlugger
@@ -67,6 +65,7 @@ CPU_TAG = "cpu-check"
 SKIP = re.compile(r"^\s*# check-docs: skip: (\S[^\n]*)$", re.M)
 MARKDOWN = MarkdownIt(options_update={"inline_definitions": True})
 AGENT_DOCS = ROOT / "doc" / "agent"
+SKILL_PACKAGE = ROOT / "pllm" / "_skill"
 EXECUTED_DOCS = (
     AGENT_DOCS,
     *(ROOT / "doc" / name for name in ("guides", "howto", "reference", "explain")),
@@ -85,7 +84,10 @@ CONFIG_CLASSES = (
 )
 # The API page's sections, by what a user wants to do; every public name is filed under exactly one.
 API_GROUPS = (
-    ("引擎与负载", ("make_llm", "explain", "Workload", "ModelConfig", "ExecutionOptions", "KVOffload")),
+    (
+        "引擎与负载",
+        ("make_llm", "make_async_llm", "explain", "Workload", "ModelConfig", "ExecutionOptions", "KVOffload"),
+    ),
     (
         "读什么：输入标记",
         (
@@ -132,7 +134,18 @@ API_GROUPS = (
     ),
     (
         "结果去哪：效果与时机",
-        ("export", "add_logits", "guide_sampling", "write", "train", "differentiate", "UpdateOutput", "on", "Phase"),
+        (
+            "export",
+            "add_logits",
+            "guide_sampling",
+            "write",
+            "train",
+            "differentiate",
+            "UpdateOutput",
+            "on",
+            "Phase",
+            "cfg",
+        ),
     ),
     (
         "改模型与 forward",
@@ -229,7 +242,6 @@ JARGON = re.compile(
 )
 GLOSSARY = ROOT / "doc" / "reference" / "glossary.md"
 DEV_DOCS = ROOT / "doc" / "dev"
-ESSAYS = ROOT / "doc" / "explain" / "highlights"
 MEASUREMENTS = ROOT / "doc" / "reference" / "measurements.toml"
 FIGURE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(?:\\text\{\s*)?(\\?%|tok/s|tokens?/s|ms)(?![\w/])")
 NATIVE = re.compile(r"原生|native|vanilla", re.I)
@@ -471,9 +483,11 @@ def broken_links(path: Path, texts: list[str], anchors: dict[Path, set[str]]) ->
         if not file.exists():
             failures.append(f"link {target} does not exist")
         elif link.fragment and file.suffix in (".md", ".ipynb"):
-            if file not in anchors:
-                anchors[file] = heading_anchors(document_markdown(file))
-            if unquote(link.fragment) not in anchors[file]:
+            headings = anchors.get(file)
+            if headings is None:
+                headings = heading_anchors(document_markdown(file))
+                anchors[file] = headings
+            if unquote(link.fragment) not in headings:
                 failures.append(f"link {target} has no heading anchor {unquote(link.fragment)}")
     return failures
 
@@ -563,8 +577,8 @@ def unmeasured_figures(text: str) -> list[str]:
 
 
 def user_document(path: Path) -> bool:
-    """Whether `path` is prose for users that must stay true: not doc/dev/, not a dated essay, not example code."""
-    return path.suffix != ".py" and not path.is_relative_to(DEV_DOCS) and not path.is_relative_to(ESSAYS)
+    """Whether `path` is prose for users that must stay true: not doc/dev/ and not example code."""
+    return path.suffix != ".py" and not path.is_relative_to(DEV_DOCS)
 
 
 @cache
@@ -613,7 +627,15 @@ def run_cells(directory: Path, blocks: list[Block], *, gpu: bool = False) -> tup
         return [], {}
     cells = json.dumps([(block.where, block.source) for block in blocks])
     # vLLM's log handler would otherwise write into whichever cell's stdout is captured when it is configured.
-    environment = {**os.environ, "PYTHONPATH": str(ROOT), "VLLM_CONFIGURE_LOGGING": "0"}
+    environment = {
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "HF_HUB_OFFLINE": "1",
+        **os.environ,
+        "PYTHONPATH": str(ROOT),
+        "VLLM_CONFIGURE_LOGGING": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     if not gpu:
         environment["CUDA_VISIBLE_DEVICES"] = ""
     completed = subprocess.run(
@@ -708,7 +730,8 @@ def signature(name: str, value: Callable[..., object]) -> str:
     is_class = inspect.isclass(value)
     if is_class and issubclass(value, Enum):
         return f"{name}: {' | '.join(member.name for member in value)}"
-    head = inspect.signature(value)
+    overloads = () if is_class else get_overloads(value)
+    head = inspect.signature(overloads[-1] if overloads else value)
     parameters = [
         parameter.replace(default=_Default(parameter.default))
         if parameter.default is not inspect.Parameter.empty
@@ -879,12 +902,37 @@ def stale_blocks(path: Path, text: str) -> list[str]:
     return failures
 
 
+def sync_skill_package() -> None:
+    """Mirror doc/agent/*.md into pllm/_skill/*.md for packaged distribution."""
+    SKILL_PACKAGE.mkdir(parents=True, exist_ok=True)
+    source_files = {path.name: path.read_bytes() for path in sorted(AGENT_DOCS.glob("*.md"))}
+    for existing in SKILL_PACKAGE.glob("*.md"):
+        if existing.name not in source_files:
+            existing.unlink()
+    for name, content in source_files.items():
+        target = SKILL_PACKAGE / name
+        if not target.exists() or target.read_bytes() != content:
+            target.write_bytes(content)
+
+
+def stale_skill_package() -> list[str]:
+    """Verify pllm/_skill/*.md matches doc/agent/*.md byte-for-byte."""
+    sources = {path.name: path.read_bytes() for path in sorted(AGENT_DOCS.glob("*.md"))}
+    packaged = (
+        {path.name: path.read_bytes() for path in sorted(SKILL_PACKAGE.glob("*.md"))} if SKILL_PACKAGE.exists() else {}
+    )
+    if sources == packaged:
+        return []
+    return ["pllm/_skill/*.md is out of sync with doc/agent/*.md; run tools/check_docs.py --write-generated"]
+
+
 def write_generated() -> None:
-    """Rewrite every generated block from its source (`--write-generated`)."""
+    """Rewrite every generated block and packaged skill mirror (`--write-generated`)."""
     for block in GENERATED:
         parts = block.split(block.path.read_text())
         assert parts is not None, f"{block.path} has no {block.name} markers"
         block.path.write_text(parts[0] + block.render(parts[1]) + parts[2])
+    sync_skill_package()
 
 
 def reference_failures(text: str) -> list[str]:
@@ -900,7 +948,7 @@ def reference_failures(text: str) -> list[str]:
 
 def runs_code(path: Path) -> bool:
     """Whether the Python blocks of a markdown document are executed."""
-    return path == ROOT / "README.md" or path.parent in EXECUTED_DOCS
+    return path in (ROOT / "README.md", ROOT / "README.en.md") or path.parent in EXECUTED_DOCS
 
 
 def check_file(
@@ -955,7 +1003,13 @@ def check_file(
 
 
 def documents() -> list[Path]:
-    paths = [ROOT / "README.md", *(ROOT / "doc").rglob("*.md"), *(ROOT / "doc").rglob("*.ipynb")]
+    paths = [
+        ROOT / "README.md",
+        *(path for path in (ROOT / "doc").rglob("*.md") if not path.is_relative_to(DEV_DOCS)),
+        *(path for path in (ROOT / "doc").rglob("*.ipynb") if not path.is_relative_to(DEV_DOCS)),
+    ]
+    if (ROOT / "README.en.md").exists():
+        paths.append(ROOT / "README.en.md")
     paths += (ROOT / "examples").rglob("*.py")
     return sorted(path for path in paths if ".ipynb_checkpoints" not in path.parts)
 
@@ -966,6 +1020,12 @@ def main() -> int:
     parser.add_argument("--gpu", action="store_true", help="also run the doc/agent blocks fenced ```python gpu")
     parser.add_argument("--write-generated", action="store_true", help="rewrite every generated block from its source")
     parser.add_argument("--write-outputs", action="store_true", help="store what cpu-check notebook cells print")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="worker threads for CPU checks (1 when --gpu or --write-outputs is set)",
+    )
     arguments = parser.parse_args()
     sys.path.insert(0, str(ROOT))
     if arguments.write_generated:
@@ -974,12 +1034,25 @@ def main() -> int:
     skipped: list[str] = []
     opt_outs: list[str] = []
     unexecuted: dict[str, Notebook] = {}
-    anchors: dict[Path, set[str]] = {}
     paths = documents()
-    for path in paths:
-        failures, checked = check_file(
-            path, arguments.all, arguments.gpu, anchors, write_outputs=arguments.write_outputs
-        )
+    anchors: dict[Path, set[str]] = {
+        path.resolve(): heading_anchors(document_markdown(path)) for path in paths if path.suffix in (".md", ".ipynb")
+    }
+    jobs = 1 if (arguments.gpu or arguments.write_outputs) else max(1, arguments.jobs)
+
+    def check_one(path: Path) -> tuple[list[str], bool]:
+        return check_file(path, arguments.all, arguments.gpu, anchors, write_outputs=arguments.write_outputs)
+
+    if jobs == 1 or len(paths) <= 1:
+        results = [check_one(path) for path in paths]
+    else:
+        source_strings()
+        measured_figures()
+        glossary_terms()
+        public_names()
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(check_one, paths))
+    for path, (failures, checked) in zip(paths, results, strict=True):
         name = str(path.relative_to(ROOT))
         if path.suffix == ".md" and runs_code(path):
             opt_outs.extend(
@@ -994,6 +1067,9 @@ def main() -> int:
         for failure in failures:
             print(f"{name}: {failure}")
         failed += bool(failures)
+    for failure in stale_skill_package():
+        print(f"pllm/_skill: {failure}")
+        failed += 1
     if skipped:
         print(f"skipped {len(skipped)} notebooks without {CPU_TAG} cells (pending rewrite): {', '.join(skipped)}")
     untagged = sum(len(notebook.untagged_cells) for notebook in unexecuted.values())

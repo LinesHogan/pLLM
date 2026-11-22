@@ -3,7 +3,8 @@
 set -uo pipefail
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 cd "$ROOT" || exit 1
-export PY=${PY:-/workspace/pllm/.venv/bin/python}
+_COMMON_ROOT=$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo "$ROOT/.git")/.." && pwd)
+export PY=${PY:-$_COMMON_ROOT/.venv/bin/python}
 export PATH="$(dirname "$PY"):$PATH" PYTHONPATH=$ROOT HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 VLLM_USE_FLASHINFER_SAMPLER=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 options=(); requested=(); listing=''; explain=no
@@ -21,8 +22,8 @@ Default: static checks + tier 0 CPU + tier 1 GPU core + affected tier 2 groups.
 Stages: ruff format pyright typing layers docs cpu gpu-core graph-replay enginecore-capture enginecore-io,
         plus feature group names from tools/verify_groups.py. Explicit stages run only those stages.
 TP stages are selected only under vLLM 0.32; with fewer than two visible GPUs they record exit=NOT_RUN (a failure).
-CPU tests hide CUDA. Local GPU work holds /tmp/pllm-gpu.lock, affinity 0-15; Slurm owns remote affinity.
-Logs, exit codes and per-stage wall seconds go to LOGS (default docs/cleanup/verify). No test retries.
+CPU tests hide CUDA. Local GPU work holds PLLM_GPU_LOCK (default /tmp/pllm-gpu.lock); set PLLM_CPU_AFFINITY for taskset.
+Logs, exit codes and per-stage wall seconds go to LOGS (default .verify). No test retries.
 A failing stage's log is also copied to <stage>.fail-<UTC time>.log, which reruns never overwrite.
 HELP
       exit 0 ;;
@@ -35,15 +36,17 @@ HELP
 done
 [ "$explain" = no ] || exec "$PY" tools/verify_groups.py "${options[@]}" --explain
 selection=$("$PY" tools/verify_groups.py "${options[@]}" --explain) || exit 1
-vllm032=no
-if "$PY" -c "import importlib.metadata as m; assert m.version('vllm').startswith('0.32')" 2>/dev/null; then vllm032=yes; fi
+vllm_tp_capable=no
+vllm_config=""
+if "$PY" -c "import importlib.metadata as m; v = m.version('vllm'); assert not v.startswith(('0.27.', '0.28.', '0.29.', '0.30.', '0.31.'))" 2>/dev/null; then vllm_tp_capable=yes; fi
+if "$PY" -c "import importlib.metadata as m; v = m.version('vllm'); assert v.startswith(('0.33.', '0.34.'))" 2>/dev/null; then vllm_config="pyrightconfig.vllm034.json"; elif "$PY" -c "import importlib.metadata as m; v = m.version('vllm'); assert not v.startswith('0.27.')" 2>/dev/null; then vllm_config="pyrightconfig.vllm032.json"; fi
 features=(); while IFS=$'\t' read -r group reason; do [ -z "$group" ] || features+=("$group"); done <<< "$selection"
 CPU_STAGES=(ruff format pyright typing layers docs cpu)
 GPU_STAGES=(gpu-core graph-replay enginecore-capture enginecore-io)
 for group in "${features[@]}"; do
   case "$group" in
     release) CPU_STAGES+=(release) ;;
-    tp) [ "$vllm032" = no ] || GPU_STAGES+=(tp tp-step-loop) ;;
+    tp) [ "$vllm_tp_capable" = no ] || GPU_STAGES+=(tp tp-step-loop) ;;
     *) GPU_STAGES+=("$group") ;;
   esac
 done
@@ -64,7 +67,7 @@ if [ "${#requested[@]}" -gt 0 ]; then
     *) stages=("${requested[@]}") ;;
   esac
 fi
-LOGS=${LOGS:-$ROOT/docs/cleanup/verify}; mkdir -p "$LOGS"
+LOGS=${LOGS:-$ROOT/.verify}; mkdir -p "$LOGS"
 printf '%s' "$selection" > "$LOGS/selection.tsv"
 if [ -n "$selection" ]; then printf 'Selected feature groups (group / reason):\n%s\n' "$selection"
 else echo 'Selected feature groups: none (no changed path maps to a feature group)'; fi
@@ -76,9 +79,9 @@ else
   head -1 "$ROOT/verification.txt" > "$LOGS/verification.txt"
 fi
 PROJECT=()
-if [ -f pyrightconfig.vllm032.json ] && [ "$vllm032" = yes ]; then PROJECT=(-p pyrightconfig.vllm032.json); fi
-CPU=(); GPU=()
-if [ -z "${SLURM_JOB_ID:-}" ]; then CPU=(taskset -c 0-15);  fi
+if [ -n "$vllm_config" ] && [ -f "$vllm_config" ]; then PROJECT=(-p "$vllm_config"); fi
+CPU=(); GPU=(); GPU_LOCK=${PLLM_GPU_LOCK:-/tmp/pllm-gpu.lock}
+if [ -z "${SLURM_JOB_ID:-}" ] && [ -n "${PLLM_CPU_AFFINITY:-}" ]; then CPU=(taskset -c "$PLLM_CPU_AFFINITY"); fi
 pytest_cpu() { env CUDA_VISIBLE_DEVICES='' "${CPU[@]}" "$PY" -m pytest -q -p no:cacheprovider --durations=0 "$@"; }
 pytest_gpu() { "${GPU[@]}" "${CPU[@]}" "$PY" -m pytest -q -p no:cacheprovider --durations=0 --tb=long "$@"; }
 smoke() { "${GPU[@]}" "${CPU[@]}" "$PY" "test/gpu/$1.py" "${@:2}"; }
@@ -127,16 +130,15 @@ run_stage() {
 # TP tests skip themselves without two GPUs and vLLM 0.32; a vacuous pass must not read as verified.
 host_lacks_tp() {
   case "$1" in
-    tp|tp-step-loop) [ "$vllm032" = no ] || [ "$("$PY" -c 'import torch; print(torch.cuda.device_count())')" -lt 2 ] ;;
+    tp|tp-step-loop) [ "$vllm_tp_capable" = no ] || [ "$("$PY" -c 'import torch; print(torch.cuda.device_count())')" -lt 2 ] ;;
     *) return 1 ;;
   esac
 }
 gpu_lock_held() {
-  [ -z "${PLLM_GPU_LEASE:-}" ] || return 0
   local descriptor
   # An outer flock passes its open file description; reopening the file would deadlock.
   for descriptor in /proc/$$/fd/*; do
-    if [ "$(readlink "$descriptor")" = /tmp/pllm-gpu.lock ] && flock -n "${descriptor##*/}"; then return 0; fi
+    if [ "$(readlink "$descriptor")" = "$GPU_LOCK" ] && flock -n "${descriptor##*/}"; then return 0; fi
   done
   return 1
 }
@@ -149,10 +151,10 @@ for stage in "${stages[@]}"; do
     continue
   fi
   gpu_lock=''
-  if [ -z "${SLURM_JOB_ID:-}" ] && ! gpu_lock_held; then
+  if [ -z "${SLURM_JOB_ID:-}" ] && [ -n "$GPU_LOCK" ] && ! gpu_lock_held; then
     case "$stage" in
       ruff|format|pyright|typing|layers|docs|cpu|release) ;;
-      *) exec {gpu_lock}>/tmp/pllm-gpu.lock; flock "$gpu_lock" ;;
+      *) exec {gpu_lock}>"$GPU_LOCK"; flock "$gpu_lock" ;;
     esac
   fi
   start=$(date +%s%N)

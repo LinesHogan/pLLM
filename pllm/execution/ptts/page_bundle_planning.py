@@ -6,9 +6,7 @@ from math import prod
 from pathlib import Path
 
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.host_batch import HOST_BATCH_SCHEMAS
 from pllm.contracts.semantic_graph import (
-    HostServiceInputSource,
     SchedulerTimeline,
     SemanticGraph,
     StateEffectKind,
@@ -115,18 +113,13 @@ def version_capacity(lineages: int, history: int, *, written: bool) -> int:
 
 
 def written_while_requests_run(graph: SemanticGraph, resource: StateResource) -> bool:
-    """Whether a task may write `resource` in a step whose requests already pinned it.
+    """Whether a task may write `resource` while requests pin an earlier instance version.
 
-    A writer fed by a host batch runs only in the first step of a generate call: VllmSession consumes the batch
-    there for instance states, and stage_input stages it only after the previous call retired every request.
+    Both step-driven updates and mid-flight control-plane updates (`import_state`, `train_batch`) can publish
+    a new version while in-flight requests hold an older instance state across decode steps.
     """
     return any(
-        effect.resource == resource
-        and effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
-        and not any(
-            isinstance(port.source, HostServiceInputSource) and port.source.schema in HOST_BATCH_SCHEMAS
-            for port in task.inputs
-        )
+        effect.resource == resource and effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
         for task in graph.tasks
         for effect in task.effects
     )

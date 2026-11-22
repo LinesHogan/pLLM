@@ -49,7 +49,7 @@ def test_bounded_guidance_draw_and_capture(fp64, capacity, dtype):
         beta = 0.5 * weights[index]
         expected[row, support] = (1 + beta) * logits[row, support].float() - beta * prediction[index, support]
     expected = expected.to(dtype)
-    draw_args = {} if compat.VLLM_027 else {"is_drafting": False}
+    draw_args = {} if compat.GUMBEL_MODE == 0 else {"is_drafting": False}
     reference = gumbel_sample(
         expected, mapping, temperature, seeds, positions, apply_temperature=False, use_fp64=fp64, **draw_args
     )

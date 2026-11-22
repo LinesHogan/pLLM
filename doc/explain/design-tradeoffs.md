@@ -273,7 +273,7 @@ pLLM 的高效与零拷贝能力建立在底层模型精细结构的不变性契
 
 ### pLLM 的选择
 
-pLLM 坚持**闭合失败（Fail-Closed）**原则：任何语义歧义、未声明的超额资源占用或不相容的组合，在构建阶段（`pllm.explain` 或 `pllm.make_llm`）立刻抛出异常明确拒绝，不悄悄换一条路径执行。唯一的自动退让是 CUDA graph：默认 `cuda_graphs="auto"` 下，个别暂时不能进 graph 的写法（例如读共享 `InstanceState` 的 `Adapter`）会让模型以 eager 运行，但原因写在 `explain` 的 `forward` 行和 `eager_reason` 里，设 `cuda_graphs=True` 则直接报错。昂贵的系统取舍必须由开发者在代码中显式声明：
+pLLM 坚持**闭合失败（Fail-Closed）**原则：任何语义歧义、未声明的超额资源占用或不相容的组合，在构建阶段（`pllm.explain` 或 `pllm.make_llm`）立刻抛出异常明确拒绝，不悄悄换一条路径执行。唯一的自动退让是 CUDA graph：默认 `cuda_graphs="auto"` 下，个别需要自定义切片调度的写法（例如 `@pllm.custom_forward` 改由 pLLM 按层切片独立捕获图）会让 vLLM 跳过整模型图，原因写在 `explain` 的 `forward` 行和 `eager_reason` 里，设 `cuda_graphs=True` 则直接报错。昂贵的系统取舍必须由开发者在代码中显式声明：
 - **存储位置**：大查找表是放 GPU 显存还是 CPU 主机内存（`placement="device"` 还是 `"host"`）；
 - **KV 物理布局**：是否牺牲某些位置释放显存（`keep="window"`、`sink=True` 还是 `keep="none", source=k`）；
 - **训练结果可见滞后**：参数更新是严格无滞后阻塞等待（`publish_lag=0`），还是隔步发布以与下一步前向完全异步重叠（`publish_lag=1`）。

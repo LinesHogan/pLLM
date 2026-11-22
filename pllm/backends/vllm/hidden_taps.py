@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from pllm.backends.vllm.architecture import hidden_binding
+from pllm.backends.vllm.architecture import CausalLM, hidden_binding, lm_head_module, post_attention_norm_name
 from pllm.config import ModelConfig
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, logit_layers
 from pllm.contracts.packed_hidden import (
@@ -93,7 +93,18 @@ class HiddenTapAnnouncement:
             requirements.layer_logits,
         )
 
-    def resolve(self, layer_count: int, hidden_size: int, vocab_size: int) -> tuple[HiddenTapLayout, ...]:
+    def resolve_model(self, model: CausalLM) -> tuple[HiddenTapLayout, ...]:
+        """Resolve the worker's tap widths and residual-add paths from its loaded decoder."""
+        return self.resolve(
+            len(model.model.layers),
+            lm_head_module(model).weight.shape[1],
+            model.config.vocab_size,
+            post_attention_norm_name(type(model).__name__),
+        )
+
+    def resolve(
+        self, layer_count: int, hidden_size: int, vocab_size: int, post_attn_norm: str = "post_attention_layernorm"
+    ) -> tuple[HiddenTapLayout, ...]:
         """Merge aliases and consumers before capture. Prompt endings and decode rows need one row per request;
         a tap any reader of every token shares needs one per scheduled token."""
         layers = logit_layers(self.layer_logits, layer_count)
@@ -107,7 +118,7 @@ class HiddenTapAnnouncement:
         )
         taps: dict[tuple[str, int], tuple[HiddenSite, set[HiddenPhase]]] = {}
         for source in sources:
-            binding = hidden_binding(source.layer, source.site, layer_count)
+            binding = hidden_binding(source.layer, source.site, layer_count, post_attn_norm)
             taps.setdefault(binding.tap, (binding.site, set()))[1].add(source.phase)
         layouts = tuple(
             HiddenTapLayout(

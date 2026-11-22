@@ -1,6 +1,6 @@
 """Print what vLLM's MRv2 model runner hands the attention backend, step by step, for a mixed batch.
 
-The appendix of doc/explain/highlights/01-attn-metadata.md explains the fields of `InputBatch`,
+The first section of doc/dev/vllm-backend-internals.md explains the fields of `InputBatch`,
 `CommonAttentionMetadata` and the backend's own metadata from a real run. Those are vLLM internals that
 may change in any release: after a vLLM upgrade, rerun this probe and compare its output with the tables.
 

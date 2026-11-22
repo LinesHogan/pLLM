@@ -1,0 +1,23 @@
+# pLLM (`pllm`)
+> Write inference-time LLM algorithms declaratively in Python/PyTorch; run inside vLLM (0.27–0.34) under continuous batching, CUDA graphs, and per-request paged state management.
+
+## Coding Agent Entry Points (Read These First)
+- [SKILL.md](doc/agent/SKILL.md): Core workflow, declarations, `explain` -> `testing.check` -> `make_llm` / `make_async_llm`
+- [migration.md](doc/agent/migration.md): Pre-flight audit and translation from HF hooks / `LogitsProcessor` / PEFT / PyTorch TTT loops to `pllm.Workload`
+- [reference.md](doc/agent/reference.md): Task-indexed API guide + generated signatures for every public symbol
+- [examples.md](doc/agent/examples.md): Nearest maintained example per algorithm family
+- [rules.md](doc/agent/rules.md): Invariants, refused combinations, engine/model/CUDA-graph support matrix, explicit cost choices
+- [pitfalls.md](doc/agent/pitfalls.md): Error catalog (`errors.toml` generated), anti-patterns, silent traps, shapes & dtypes
+
+Or via CLI after `pip install pllm`: `pllm skill --print` or `pllm skill --install claude|codex|cursor`.
+
+## User Guides & Howtos
+- [README (中文)](README.md) | [README (English)](README.en.md)
+- [Online Serving (AsyncVllmLlm & pllm serve)](doc/howto/online-serving.md)
+- [Production Deployment](doc/howto/production.md)
+- [Support Matrix](doc/reference/support-matrix.md)
+- [Capability Map](doc/guides/capability-map.md)
+- [API Reference](doc/reference/api.md)
+- [Config Reference](doc/reference/config.md)
+- [Error Reference](doc/reference/errors.md)
+- [Engineering Blog Series (EN/ZH)](blog/README.md)

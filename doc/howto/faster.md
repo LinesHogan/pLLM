@@ -40,10 +40,10 @@ forward  CUDA graphs: no effect needs eager
 
 ### 怎么改
 
-排查哪些负载声明破坏了整模型图：
-1. **共享可变实例状态上的适配器**：给共享可变的 `pllm.InstanceState` 绑定 `pllm.model.Adapter` 会迫使模型前向退回 eager（`forward eager: CUDA-graph overlays do not support adapters backed by shared InstanceState`）。替代方案是将状态声明为 `pllm.RequestState`（每个请求持有一份状态副本），或者使用静态只读参数；这样适配器就可以完整录入 CUDA Graph。
-2. **激活补丁与切片图**：`pllm.model.ActivationPatch` 在 CUDA Graph 内部执行，不会导致退回 eager。`@pllm.custom_forward` 则会将整模型图替换为切片捕获图（`eager_reason` 中会显式注明 `@pllm.custom_forward`）。
-3. **配置强制报错**：在配置中声明 `ModelConfig("Qwen/Qwen2.5-7B-Instruct", cuda_graphs=True)`。默认的 `cuda_graphs="auto"` 遇到暂时不能进图的写法时以 eager 运行（原因写在 `forward` 行和 `eager_reason` 里）；将其显式设为 `True` 后，任何导致退回 eager 的写法都会在 `explain` 或 `make_llm` 阶段直接抛出 `ValueError`，杜绝吞吐隐蔽下降。
+检查负载是否保持了整模型 CUDA Graph：
+1. **每请求与共享适配器均可进图**：无论 `pllm.model.Adapter` 绑定在 `pllm.RequestState`（每请求一份状态页）还是 `pllm.InstanceState`（共享或按准入版本隔离的状态槽），都会通过版本页表直接在 CUDA Graph 内部计算增量，不会破坏整模型捕获。
+2. **激活补丁与切片图**：`pllm.model.ActivationPatch` 同样留在 CUDA Graph 内部。会替换整模型图的是 `@pllm.custom_forward`（改用按层段捕获的切片图，原因写在 `eager_reason` 里）或未捕获/不可追踪算子。
+3. **配置强制报错**：在配置中声明 `ModelConfig("Qwen/Qwen2.5-7B-Instruct", cuda_graphs=True)`。默认的 `cuda_graphs="auto"` 遇到不能进整模型图的写法时以 eager 或切片模式运行（原因写在 `forward` 行和 `eager_reason` 里）；将其显式设为 `True` 后，任何破坏整模型图的声明都会在 `explain` 或 `make_llm` 阶段直接抛出 `ValueError`，杜绝吞吐隐蔽下降。
 
 ```python
 @dataclass(frozen=True)
@@ -79,7 +79,7 @@ assert report.eager_reason == ""
 
 ### 代价是什么
 
-将共享 `InstanceState` 改为每请求 `RequestState` 会增加适配器权重的显存预留（每个请求槽位要留住自己的副本和正在写的新版本；上例在 7B、128 并发下 `explain` 报每个字段 256 页，一个版本 88 KiB，共约 22 MiB；共享时每个字段只有 2 页（约 176 KiB），因为导入只在每次 `generate` 的第一步写，请求只会留住写之前或之后的版本），改写后模型的 CUDA graph 也要更大的捕获池（不够时启动报错并给出需要的字节数），但换来的是前向完全进图。图模式能挽回多少吞吐取决于步长：7B 上 eager 本来只慢约 2%，0.5B 上 eager 只有图模式的一半。设置 `cuda_graphs=True` 没有任何运行时性能开销。
+`RequestState` 会在每个请求槽位为独立状态预留版本页（例如 7B、128 并发下 `explain` 报每个字段 256 页，共约 22 MiB）；若算法只需跨请求共享（或随在线 `import_state` 版本推进），也可以把 `Adapter` 直接放在 `InstanceState` 上并同样留在 CUDA Graph 内（支持在途更新时预留 `2 + max_num_seqs = 130` 页，静态只读状态仅需 1 页）。两类适配器都会相应增大改写模型的 CUDA Graph 捕获池（不够时启动报错并给出需要的字节数）。如果改用 `@pllm.custom_forward` 或回退 eager，7B 上仅慢约 2%，而 0.5B 上 eager 只有图模式的一半；设置 `cuda_graphs=True` 没有任何运行时性能开销。
 
 ---
 

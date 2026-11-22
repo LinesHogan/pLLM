@@ -77,7 +77,7 @@ class MemberCost:
     name: str
     effect: str
     tasks: tuple[TaskCost, ...]
-    eager_reason: str
+    eager_reason: str | None
     host_batch: str
     training: str
     kernels: KernelEstimate
@@ -380,9 +380,7 @@ def _members(
             else ""
         )
         kernels = _kernel_sum(tasks, (sites.get(name, KernelEstimate()),))
-        result.append(
-            MemberCost(name, member.effect, tasks, reasons.get(member.effect, ""), host_batch, training, kernels)
-        )
+        result.append(MemberCost(name, member.effect, tasks, reasons.get(member.effect), host_batch, training, kernels))
     return tuple(result)
 
 
@@ -409,13 +407,9 @@ def _kernel_sum(tasks: tuple[TaskCost, ...], sites: tuple[KernelEstimate, ...]) 
 
 
 def _taps(
-    binding: TensorDeclaration, facts: BackendCompileFacts, layouts: tuple[HiddenTapLayout, ...]
+    binding: TensorDeclaration, facts: BackendCompileFacts, layouts: tuple[HiddenTapLayout, ...], shape: ModelShape
 ) -> tuple[TapCost, ...]:
-    from pllm.backends.vllm.architecture import hidden_binding
-
-    logit_taps = {
-        hidden_binding(layer, HiddenSite.RESIDUAL, facts.layer_count).tap for layer in facts.probe.layer_logits
-    }
+    logit_taps = {shape.hidden_binding(layer, HiddenSite.RESIDUAL).tap for layer in facts.probe.layer_logits}
     result: list[TapCost] = []
     for layout in layouts:
         users: set[str] = set()
@@ -423,7 +417,7 @@ def _taps(
             for port in task.inputs:
                 source = port.source
                 if isinstance(source, HiddenInputSource) and (
-                    hidden_binding(source.layer, source.site, facts.layer_count).tap == layout.tap
+                    shape.hidden_binding(source.layer, source.site).tap == layout.tap
                     or (source.site is HiddenSite.LAYER_LOGITS and layout.tap in logit_taps)
                 ):
                     users.update(binding.task_members.get(task.symbol, (task.symbol,)))
@@ -644,7 +638,7 @@ def _specialize(
 ) -> tuple[BackendCompileFacts, TensorDeclaration, tuple[str, ...]]:
     errors: tuple[str, ...] = ()
     try:
-        funded, binding = workload.specialize(facts, config.execution)
+        funded, binding = workload.specialize(facts, config.execution, prefix_caching=config.enable_prefix_caching)
     except ValueError as error:
         if (
             config.execution.execution_peak_budget_bytes is None
@@ -661,6 +655,7 @@ def _specialize(
                 state_page_budget_bytes=0,
                 cuda_graph_pool_budget_bytes=None,
             ),
+            prefix_caching=config.enable_prefix_caching,
         )
         errors = (str(error),)
     return (
@@ -683,6 +678,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
     A too-small declared execution/state budget returns the unrestricted plan with actionable budget_errors.
     """
     from pllm.backends.vllm.admission import admit_workload, model_hooks
+    from pllm.backends.vllm.architecture import post_attention_norm_name
     from pllm.backends.vllm.compile_facts import compile_facts
     from pllm.backends.vllm.hidden_taps import HiddenTapAnnouncement
     from pllm.backends.vllm.model_shape import ModelShape
@@ -691,7 +687,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
     reason = admit_workload(config, requirements)
     shape = ModelShape.of_config(config, requirements.parameter_targets)
     layouts = HiddenTapAnnouncement.declared(requirements, config).resolve(
-        shape.layer_count, shape.hidden_size, shape.vocab_size
+        shape.layer_count, shape.hidden_size, shape.vocab_size, post_attention_norm_name(shape.architecture)
     )
     facts = compile_facts(
         shape,
@@ -760,7 +756,7 @@ def explain_facts(
             AnchorCost(anchor.symbol, value)
             for anchor, value in zip(plan.timeline.anchors, plan.timeline.reserved_bytes, strict=True)
         ),
-        _taps(binding, facts, layouts),
+        _taps(binding, facts, layouts, shape),
         plan.schedule.peak_memory_bytes,
         "per-rank tensor reservations; excludes vLLM model-graph/activation pools and GPU-dependent BLAS workspace",
         threshold,

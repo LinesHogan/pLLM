@@ -294,7 +294,7 @@ def check_distribution(
     discarding the numbers or raising ContractError. NaN distances always fail.
     """
     if (
-        config.multiprocessing
+        config.uses_multiprocessing()
         or max(config.tensor_parallel_size, config.pipeline_parallel_size, config.data_parallel_size) > 1
     ):
         raise ValueError("check_distribution needs multiprocessing=False and all parallel sizes=1")

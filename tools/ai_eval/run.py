@@ -23,19 +23,13 @@ from tools.ai_eval.records import Metadata, Score, TaskResult  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-PYTHON = Path("/workspace/pllm/.venv/bin/python")
+PYTHON = Path(sys.executable)
 PROMPT = "Read TASK.md, README.md and relevant doc/ documents. Implement TASK.md in submission.py. Work autonomously."
 
 
-def agy_turns(event: dict[str, Any]) -> int:
-    """Count completed model responses, including calls, even if the session later times out."""
-    step = event.get("step_update", {})
-    return int(step.get("state") == "DONE" and step.get("step_type") == "agent_response")
-
-
-def kimi_turns(event: dict[str, Any]) -> int:
-    """Count Kimi's complete assistant messages, including tool calls."""
-    return int(event.get("role") == "assistant")
+def codex_turns(event: dict[str, Any]) -> int:
+    """Count completed Codex agent turns, even if the session later times out."""
+    return int(event.get("type") == "turn.completed")
 
 
 @dataclass(frozen=True)
@@ -45,34 +39,37 @@ class Agent:
     binary: Path
     model: str
     auth_files: tuple[str, ...]
-    arguments: tuple[str, ...]
+    env_vars: tuple[str, ...]
+    build_argv: Callable[[str], list[str]]
     count_turns: Callable[[dict[str, Any]], int]
 
     def argv(self, model: str) -> list[str]:
         """Build a non-interactive prompt command inside the sandbox."""
-        return ["/author", "--model", model, "--output-format", "stream-json", *self.arguments, PROMPT]
+        return self.build_argv(model)
 
 
 AGENTS = {
     "codex": Agent(
-        Path("/home/user/.local/bin/codex"),
+        Path(os.environ.get("CODEX_BIN") or shutil.which("codex") or (Path.home() / ".local/bin/codex")),
         "gpt-6.1-sol",
         (".codex/auth.json",),
-        ("--dangerously-skip-permissions", "--add-dir", "/workspace", "-p"),
-        agy_turns,
-    ),
-    "kimi": Agent(
-        Path("/home/user/.codex/auth.json"),
-        "gpt-6.1-sol",
-        (
-            ".codex/auth.json",
-            ".codex/auth.json",
-            ".codex/auth.json",
-            ".codex/auth.json",
-            ".codex/auth.json",
-        ),
-        ("--skills-dir", "/home/agent/empty-skills", "--prompt"),
-        kimi_turns,
+        ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        lambda model: [
+            "/author",
+            "exec",
+            "--model",
+            model,
+            "--json",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            "/workspace",
+            PROMPT,
+        ],
+        codex_turns,
     ),
 }
 TASKS = ("caa", "dola", "iti", "prompt_lora", "esamp", "memory", "looped_depth", "ttrl")
@@ -103,7 +100,6 @@ def prepare(destination: Path, revision: str) -> tuple[Path, str]:
     shutil.copyfile(workspace / "TASK.md", destination / "task.md")
     home = destination / "home"
     home.mkdir(mode=0o700)
-    (home / "empty-skills").mkdir()
     digest = hashlib.sha256()
     for path in sorted(workspace.rglob("*")):
         if path.is_file():
@@ -127,8 +123,27 @@ def sandbox(destination: Path, agent: Agent, model: str, *, authenticate: bool =
                 target = destination / "home" / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 command += ["--ro-bind", str(source), f"/home/agent/{name}"]
-    command += ["--ro-bind", str(agent.binary), "/author", "--chdir", "/workspace", "--clearenv"]
-    for key, value in {"HOME": "/home/agent", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "TERM": "dumb"}.items():
+    sandbox_path = "/usr/bin:/bin"
+    prefix = agent.binary.parent.parent
+    if agent.binary.parent.name == "bin" and (prefix / "lib" / "node_modules").is_dir():
+        command += [
+            "--ro-bind",
+            str(prefix),
+            "/opt/agent-runtime",
+            "--symlink",
+            f"/opt/agent-runtime/bin/{agent.binary.name}",
+            "/author",
+        ]
+        sandbox_path = f"/opt/agent-runtime/bin:{sandbox_path}"
+    else:
+        command += ["--ro-bind", str(agent.binary.resolve()), "/author"]
+    command += ["--chdir", "/workspace", "--clearenv"]
+    env = {"HOME": "/home/agent", "PATH": sandbox_path, "LANG": "C.UTF-8", "TERM": "dumb"}
+    if authenticate:
+        for var in agent.env_vars:
+            if var in os.environ:
+                env[var] = os.environ[var]
+    for key, value in env.items():
         command += ["--setenv", key, value]
     return command + agent.argv(model)
 
@@ -164,11 +179,16 @@ def provider_failure(path: Path) -> str:
         except json.JSONDecodeError:
             event = {}
         kind = event.get("event", event.get("type"))
-        if kind == "result":
+        if kind in ("result", "turn.completed"):
             result = event.get("result", event)
-            if result.get("status") == "SUCCESS" or result.get("is_error") is False:
+            if (
+                kind == "turn.completed"
+                or result.get("status") == "SUCCESS"
+                or result.get("subtype") == "success"
+                or result.get("is_error") is False
+            ):
                 return ""
-        elif event and kind != "error" and "error" not in event:
+        elif event and kind not in ("error", "turn.failed") and "error" not in event:
             continue
         match = pattern.search(line)
         if match:
@@ -241,10 +261,15 @@ def run_task(task: str, output: Path, args: argparse.Namespace) -> TaskResult:
 
 
 def score_task(task: str, destination: Path, gpu: bool) -> None:
-    """Use the trusted repo interpreter; optional CUDA execution always takes the shared GPU lock."""
+    """Use the trusted repo interpreter; optional CUDA execution serializes on PLLM_GPU_LOCK."""
     command = [str(PYTHON), str(HERE / "score.py"), task, str(destination)]
     if gpu:
-        command = ["flock", "/tmp/pllm-gpu.lock", "taskset", "-c", "0-15", *command, "--gpu"]
+        gpu_lock = os.environ.get("PLLM_GPU_LOCK", "/tmp/pllm-gpu.lock")
+        affinity = os.environ.get("PLLM_CPU_AFFINITY", "")
+        prefix: list[str] = ["flock", gpu_lock] if gpu_lock else []
+        if affinity:
+            prefix += ["taskset", "-c", affinity]
+        command = [*prefix, *command, "--gpu"]
     code, _ = execute(command, ROOT, destination / "scoring.log", 180)
     if code or not (destination / "score.json").exists():
         result: Score = {
@@ -300,7 +325,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", default="main")
     parser.add_argument("--agent", choices=AGENTS, default="codex")
-    parser.add_argument("--model", help="default: gpt-6.1-sol (codex), gpt-6.1-sol (kimi)")
+    parser.add_argument("--model", help="default: gpt-6.1-sol")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=TASKS)
     parser.add_argument("--timeout", type=int, default=900)

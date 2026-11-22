@@ -1,0 +1,32 @@
+{
+  "typeCheckingMode": "strict",
+  "include": [
+    "pllm",
+    "tools/benchmark_esamp.py",
+    "tools/benchmark_lora.py",
+    "tools/check_docs.py",
+    "examples",
+    "test/gpu/vllm_esamp_smoke.py",
+    "test/gpu/fttt_cuda_smoke.py",
+    "tools/verify_groups.py",
+    "tools/probe_attention_metadata.py",
+    "tools/toy_host_gather.py"
+  ],
+  "exclude": [
+    "**/__pycache__"
+  ],
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "stubPath": "typings",
+  "reportUnnecessaryIsInstance": "error",
+  "reportUnnecessaryComparison": "error",
+  "reportUnnecessaryCast": "error",
+  "defineConstant": {
+    "VLLM_027": false,
+    "VLLM_028_030": false,
+    "VLLM_031": false,
+    "VLLM_033_PLUS": true,
+    "VLLM_034": true
+  },
+  "pythonVersion": "3.11"
+}

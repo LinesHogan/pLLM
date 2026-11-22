@@ -5,7 +5,7 @@ from hashlib import sha256
 
 import torch
 
-from pllm.backends.vllm.architecture import hidden_binding, kv_rejection
+from pllm.backends.vllm.architecture import kv_rejection
 from pllm.backends.vllm.hidden_taps import HiddenTapLayout
 from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
@@ -74,7 +74,7 @@ def compile_facts(
     hidden_resources = tuple(
         sorted(
             (
-                AttachmentHiddenResource(hidden_binding(source.layer, source.site, shape.layer_count), source.phase)
+                AttachmentHiddenResource(shape.hidden_binding(source.layer, source.site), source.phase)
                 for source in requirements.hidden_inputs
             ),
             key=lambda resource: (*resource.resource_key, resource.phase is HiddenPhase.DECODE),
@@ -92,6 +92,11 @@ def compile_facts(
                 f"hidden_size={shape.hidden_size}",
                 f"layers={shape.layer_count}",
                 f"attention={shape.attention_heads}:{shape.kv_heads}:{shape.head_dim}",
+                *(
+                    (f"mla={shape.kv_lora_rank}:{shape.qk_nope_head_dim}:{shape.qk_rope_head_dim}:{shape.v_head_dim}",)
+                    if shape.kv_lora_rank
+                    else ()
+                ),
                 f"vocab_size={shape.vocab_size}",
                 *(f"hidden={resource.binding.tap}" for resource in hidden_resources),
                 f"layer_logits={layer_logits}",
@@ -105,6 +110,10 @@ def compile_facts(
         attention_heads=shape.attention_heads,
         kv_heads=shape.kv_heads,
         head_dim=shape.head_dim,
+        v_head_dim=shape.v_head_dim,
+        kv_lora_rank=shape.kv_lora_rank,
+        qk_nope_head_dim=shape.qk_nope_head_dim,
+        qk_rope_head_dim=shape.qk_rope_head_dim,
         intermediate_size=shape.intermediate_size,
         graph_mode=overlay_graph_mode,
         device_kind=StateDeviceKind.CUDA,

@@ -43,9 +43,10 @@
 
 | 写法 | 需要 | 原因 |
 | --- | --- | --- |
-| `@pllm.custom_residual`、`@pllm.custom_attention`、overlay、`ActivationPatch` | `enable_prefix_caching=False` | 缓存的 KV 是在别的改写下算出的 |
-| `@pllm.custom_attention` | `tensor_parallel_size=1`、FlashAttention 2、未量化 KV | 每张卡只看到自己的头；定制读法直接读 KV 页 |
-| 给 `@pllm.custom_residual` 喂 `pllm.input_tokens` 的方法 | `tensor_parallel_size=1` | 定制残差还不支持多卡 |
-| `cuda_graphs=True` | 没有需要 eager 的写法 | 见[支持矩阵](support-matrix.md#cuda-graph-与-eager) |
+| `@pllm.custom_attention`、写入模型的 `@pllm.train_in_forward`、`last_tokens > 0` 的 `ActivationPatch`，或读取 `RequestState` / 可变 `InstanceState` 的模型改写 | `enable_prefix_caching=False` | 缓存的 KV 依赖于每请求状态、动态参数或生成后段 token；只读负载、无状态 `@pllm.custom_residual` 与只读不可变 `InstanceState` 的静态改写可安全开启前缀缓存 |
+| `@pllm.custom_attention`、`@pllm.custom_residual`（无 `pllm.value` / `pllm.input_tokens`）、`ActivationPatch`、`FromModule`/`Pretrained`/`Computed`/`Imported`/`Zeros` 上的 dense/low-rank `Adapter` | 支持 `tensor_parallel_size > 1`（vLLM >= 0.32.0） | 按局部头、残差切片或投影行/列分片执行 |
+| `@pllm.custom_attention` | FlashAttention 2（或支持 MLA 的 DeepSeek V2/V3 潜变量读取）、未量化 KV；MLA 需 `keep='all'` 且不能使用 `window` 缓冲；`pllm.attention(...)` 事实读取需要 `tensor_parallel_size=1` | 定制读法直接访问分页 KV / MLA 潜变量页 |
+| `@pllm.custom_residual` 喂 `pllm.input_tokens` / `pllm.value`、`per_head` 适配器、侧链优化器/导出 | `tensor_parallel_size=1` | 需要全量 token/头视角或未在本地分片内闭环 |
+| `cuda_graphs=True` | 没有需要切片图或 eager 的写法（如 `@pllm.custom_forward`） | 见[支持矩阵](support-matrix.md#cuda-graph-与-eager) |
 
 更多按模型和并行方式的限制见[支持矩阵](support-matrix.md)。

@@ -13,8 +13,6 @@ host batches (`pllm.batch(...)`): `make_host(HostConfig(...), workload)` compile
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 from types import TracebackType
 from typing import TYPE_CHECKING
 
@@ -38,21 +36,13 @@ from pllm.contracts.host_batch import (
     WeightedRowBatch as WeightedRowBatch,
 )
 from pllm.execution.host_runtime import CompletionInput as CompletionInput, HostConfig as HostConfig
+from pllm.execution.step_driver import TrainStep as TrainStep
 from pllm.execution.step_input import StepInput
 from pllm.execution.tensor_declaration import StepResult
 
 if TYPE_CHECKING:
     from pllm.execution.state_execution import StateDiagnostics, StateExecution
     from pllm.workload import Workload
-
-
-@dataclass(frozen=True, slots=True)
-class TrainStep:
-    """One host training step: its loss (None when the train method skipped the update) and the trained state's
-    fields after the step, by name, as owned copies ready on the caller's current stream."""
-
-    loss: torch.Tensor | None
-    parameters: Mapping[str, torch.Tensor]
 
 
 class HostTrainer:

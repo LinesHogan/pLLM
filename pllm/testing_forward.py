@@ -8,7 +8,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pllm.execution.attention import DenseAttention, PagedKV
+    from pllm.execution.attention import AttentionRead, PagedKV
     from pllm.execution.attention_methods import Argument
     from pllm.execution.compile_facts import BackendCompileFacts
     from pllm.execution.tensor_declaration import TensorDeclaration
@@ -93,6 +93,28 @@ class CheckAttention:
             if isinstance(source, StateInput)
         }
         self.device_equivalence = device_equivalence
+        self.projections = {
+            layer: self._mla_weights(layer + facts.initialization_seed)
+            for layer in range(max(self.program.methods) + 1)
+            if self.probe.kv_lora_rank
+        }
+
+    def _mla_weights(self, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+        probe = self.probe
+        rng = torch.Generator().manual_seed(seed)
+        rank, heads = probe.kv_lora_rank, probe.attention_heads
+        dtype = probe.tensor_dtype.torch
+        key = torch.randn(heads, probe.qk_nope_head_dim, rank, generator=rng) * rank**-0.5
+        value = torch.randn(heads, rank, probe.v_head_dim or probe.head_dim, generator=rng) * rank**-0.5
+        return key.to(dtype), value.to(dtype)
+
+    def _token_kv(self, query: torch.Tensor, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if rank := self.probe.kv_lora_rank:
+            vector = query.flatten()
+            latent = vector.repeat((rank + len(vector) - 1) // len(vector))[:rank]
+            return latent.clone(), query[0, -self.probe.qk_rope_head_dim :].clone()
+        key = query[: self.probe.kv_heads].clone()
+        return key, (key.float() * 0.7 + layer * 0.01).to(query.dtype)
 
     def prepare(self, value: StepInput) -> None:
         """Stage sampled-to-packed indices for the fact snapshot tasks."""
@@ -128,25 +150,33 @@ class CheckAttention:
         for row, query in zip(rows, q, strict=True):
             if layout.layer != layer:
                 continue
-            key = query[:kv_heads].clone()
-            val = (key.float() * 0.7 + layer * 0.01).to(q.dtype)
-            self.cache[row.identity.request_id, layer, row.token_offset] = key, val
+            self.cache[row.identity.request_id, layer, row.token_offset] = self._token_kv(query, layer)
         domain = self.probe.causal_domain
         assert domain is not None
         pages = (domain.positions + CHECK_PAGE_SIZE - 1) // CHECK_PAGE_SIZE
-        keys, values = (q.new_zeros((len(groups) * pages, CHECK_PAGE_SIZE, kv_heads, dim)) for _ in (0, 1))
+        shape = (len(groups) * pages, CHECK_PAGE_SIZE)
+        if rank := self.probe.kv_lora_rank:
+            keys, values = q.new_zeros((*shape, rank)), q.new_zeros((*shape, self.probe.qk_rope_head_dim))
+        else:
+            keys, values = (q.new_zeros((*shape, kv_heads, dim)) for _ in (0, 1))
         for request, name in enumerate(requests):
             for position in range(lengths[request]):
                 cached = self.cache.get((name, layout.layer, position))
                 if cached is not None:
                     block, offset = request * pages + position // CHECK_PAGE_SIZE, position % CHECK_PAGE_SIZE
                     keys[block, offset], values[block, offset] = cached
+        table = torch.arange(len(groups) * pages, dtype=torch.int32).reshape(len(groups), pages)
+        seq_lens, query_start = torch.tensor(lengths, dtype=torch.int32), torch.tensor(starts, dtype=torch.int32)
+        if rank:
+            return PagedKV.from_latent(
+                keys, values, *self.projections[layer], table, seq_lens, query_start, len(rows), read
+            )
         return PagedKV(
             keys,
             values,
-            torch.arange(len(groups) * pages, dtype=torch.int32).reshape(len(groups), pages),
-            torch.tensor(lengths, dtype=torch.int32),
-            torch.tensor(starts, dtype=torch.int32),
+            table,
+            seq_lens,
+            query_start,
             len(rows),
             read,
             layout.window,
@@ -155,7 +185,7 @@ class CheckAttention:
 
     def layer(self, rows: Sequence[PackedPhaseRow], layer: int, hidden: torch.Tensor) -> torch.Tensor:
         """Execute the actual method over the whole scheduled batch, so cross-request reads fail isolation."""
-        from pllm.execution.attention import DenseAttention
+        from pllm.execution.attention import DenseAttention, LatentAttention
         from pllm.execution.model_sites import DepthInput, StateInput
 
         heads, dim = self.probe.attention_heads, self.probe.head_dim
@@ -163,7 +193,8 @@ class CheckAttention:
         q = hidden.repeat(1, (heads * dim + width - 1) // width)[:, : heads * dim].reshape(len(rows), heads, dim)
         trace = _CheckRead()
         kv = self.paged(rows, layer, q, trace)
-        trace.kernel = DenseAttention(kv, dim**-0.5, int(kv.seq_lens.max()))
+        kernel = LatentAttention if kv.is_latent else DenseAttention
+        trace.kernel = kernel(kv, dim**-0.5, int(kv.seq_lens.max()))
         method = self.program.methods.get(layer)
         if method is None:
             out = kv.attend(q)[0].flatten(1)
@@ -196,7 +227,7 @@ class _CheckRead:
     """Retain the first native read's LSE for the check decoder's fact writer."""
 
     def __init__(self) -> None:
-        self.kernel: "DenseAttention | None" = None
+        self.kernel: "AttentionRead | None" = None
         self.lse: torch.Tensor | None = None
 
     def __call__(self, q: torch.Tensor, window: int, topk: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -215,26 +246,26 @@ def _compare_attention_device(
     expected: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> None:
     """Run user kernels on identical CPU/CUDA paged inputs, under sync-debug."""
-    from pllm.execution.attention import DenseAttention, PagedKV
+    from pllm.execution.attention import DenseAttention, LatentAttention
     from pllm.execution.module_graph import ModuleCall
 
-    fields = tuple(
-        value.to("cuda") for value in (kv.key_cache, kv.value_cache, kv.block_table, kv.seq_lens, kv.query_start)
+    read = _CheckRead()
+    gpu = replace(
+        kv,
+        key_cache=kv.key_cache.cuda(),
+        value_cache=kv.value_cache.cuda(),
+        block_table=kv.block_table.cuda(),
+        seq_lens=kv.seq_lens.cuda(),
+        query_start=kv.query_start.cuda(),
+        prompt_lens=kv.prompt_lens.cuda() if kv.prompt_lens is not None else None,
+        latent_cache=kv.latent_cache.cuda() if kv.latent_cache is not None else None,
+        rope_cache=kv.rope_cache.cuda() if kv.rope_cache is not None else None,
+        w_uk_t=kv.w_uk_t.cuda() if kv.w_uk_t is not None else None,
+        w_uv=kv.w_uv.cuda() if kv.w_uv is not None else None,
+        read_attention=read,
     )
-    kernel = _CheckRead()
-    keys, values, table, lengths, starts = fields
-    gpu = PagedKV(
-        keys,
-        values,
-        table,
-        lengths,
-        starts,
-        kv.query_count,
-        kernel,
-        kv.storage_window,
-        kv.prompt_lens.to("cuda") if kv.prompt_lens is not None else None,
-    )
-    kernel.kernel = DenseAttention(gpu, q.shape[-1] ** -0.5, int(kv.seq_lens.max()))
+    kernel = LatentAttention if kv.is_latent else DenseAttention
+    read.kernel = kernel(gpu, q.shape[-1] ** -0.5, int(kv.seq_lens.max()))
     arguments = {
         name: value.to(torch.device("cuda")) if isinstance(value, (torch.Tensor, ModuleCall)) else value
         for name, value in kwargs.items()
@@ -246,5 +277,5 @@ def _compare_attention_device(
         actual = function(gpu_q, gpu, **arguments)
     finally:
         torch.cuda.set_sync_debug_mode(mode)
-        kernel.kernel = None
+        read.kernel = None
     torch.testing.assert_close(actual, expected, check_device=False)

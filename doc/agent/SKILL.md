@@ -5,29 +5,22 @@ description: Write, inspect and check a pllm.Workload, an inference-time LLM alg
 
 # Writing a pLLM workload
 
-pLLM runs inference-time algorithms inside vLLM (0.27.1 / 0.32.0) under continuous batching and CUDA
-graphs. You declare what to read, what state to own and what the result does, and write the tensor math;
-pLLM handles per-request state and memory, CUDA graph capture, overlap with the forward, and optimizer
-updates.
-
-It fits algorithms that read or add a computation at a point of the forward (steering, probes and SAEs,
-ReFT, logit edits, logit lens and DoLa, residual rewrites), change how a layer reads its KV or how KV is stored
-(attention monitors, Quest-style top-K reads, sliding-window and cross-layer KV layouts), look up tables keyed by
-token history (n-gram priors, Engram-style memory), keep state that evolves with tokens per request or per engine
-(generated LoRA, decode-time training such as ESamp, test-time learning, fast weights), rerun or skip layers per
-token (recurrent depth, early exit), or control a generate-score-update loop (TTRL). Kernels of your own enter as
-`torch.library.custom_op`. Out of scope: pretraining, new model architectures, controlling the decode loop
-itself (speculative decoding, MTP), and freeing KV memory by score (H2O, SnapKV: read-only selection works).
+pLLM runs inference-time algorithms inside vLLM (0.27 through 0.34) under continuous batching and CUDA
+graphs, for both batch evaluation (`pllm.make_llm`) and continuous online / OpenAI-compatible HTTP serving
+(`pllm.make_async_llm`, `pllm serve`). You declare what to read, what state to own and what the result does,
+and write the tensor math; pLLM handles per-request state and memory, CUDA graph capture, overlap with the
+forward, and optimizer updates.
 
 ## Where to look
 
-| File | Use it for |
+| Need | Read this file |
 | --- | --- |
-| this file | how a workload is built, which declaration fits which need, the workflow and how to report |
-| [reference.md](reference.md) | every public name grouped by task, each section with a runnable example; generated signatures at the end |
-| [pitfalls.md](pitfalls.md) | an error message or `ContractError` and its fix; anti-patterns; silent traps; preemption; shapes and dtypes; known issues |
-| [rules.md](rules.md) | the invariants and why they exist; refused combinations; support matrix (models, CUDA graphs, TP); the expensive choices you must write explicitly |
-| [examples.md](examples.md) | the nearest maintained example for a task, and which declarations it uses |
+| How a workload is built, the check -> GPU workflow, and how to report | this file (`pllm skill --print`) |
+| Porting an existing HF hooks / `LogitsProcessor` / PEFT / PyTorch TTT codebase | [migration.md](migration.md) (`pllm skill --print migration`) |
+| Every public name (`make_llm`, `make_async_llm`, markers, decorators) + generated signatures | [reference.md](reference.md) |
+| An error message or `ContractError`, shapes/dtypes, silent traps, preemption | [pitfalls.md](pitfalls.md) |
+| Invariants, refused combinations, model / engine / online-serving support matrix | [rules.md](rules.md) |
+| Nearest maintained example for an algorithm family | [examples.md](examples.md) |
 
 ## How a workload is put together
 
@@ -64,13 +57,9 @@ class Distill(pllm.Workload):
              f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return (f(shallow.float()) - deep.float()).square().mean(-1)  # [rows]
 
-    # A setting read from the instance is a method the decorator names. Writing `beta=beta` would pass the
-    # class default 0.5 forever (pitfalls.md, "A dataclass field named in the class body").
-    def strength(self) -> float:
-        return self.beta
-
-    # A hidden-state prediction that guides sampling with strength beta.
-    @pllm.guide_sampling(beta=strength)
+    # A setting read from the instance uses pllm.cfg("field") or a method the decorator names.
+    # Writing `beta=beta` would pass the class default 0.5 forever (pitfalls.md).
+    @pllm.guide_sampling(beta=pllm.cfg("beta"))
     def predict(self, shallow: torch.Tensor = pllm.hidden(0),
                 f: nn.Module = pllm.module("distiller")) -> torch.Tensor:
         return f(shallow.float())
@@ -81,7 +70,7 @@ CONFIG = pllm.ModelConfig("Qwen/Qwen2.5-0.5B-Instruct", max_num_seqs=8)
 
 | Declares | Written as | Names |
 | --- | --- | --- |
-| what a method reads | a parameter default | `pllm.hidden`, `pllm.residual`, `pllm.final_hidden`, `pllm.layer_logits`, `pllm.input_tokens`, `pllm.parameter`, `pllm.module`, `pllm.version`, `pllm.index`, `pllm.sample_index`, `pllm.result`, `pllm.base_logits`, `pllm.sampled_tokens`, `pllm.batch`, `pllm.operand`, `pllm.causal_model`, `pllm.depth`, `pllm.value`, `pllm.attention`, `pllm.carry` |
+| what a method reads | a parameter default | `pllm.hidden`, `pllm.residual`, `pllm.final_hidden`, `pllm.layer_logits`, `pllm.input_tokens`, `pllm.parameter`, `pllm.module`, `pllm.version`, `pllm.index`, `pllm.sample_index`, `pllm.result`, `pllm.base_logits`, `pllm.sampled_tokens`, `pllm.batch`, `pllm.operand`, `pllm.causal_model`, `pllm.depth`, `pllm.value`, `pllm.attention`, `pllm.carry`, `pllm.cfg` |
 | what the workload owns | a class attribute, or a property annotated with its type | `pllm.RequestState` (one copy per request), `pllm.InstanceState` (one shared copy), `pllm.PositionState`; starting values `init=pllm.Zeros()` / `Computed` / `Pretrained` / `ModelCheckpoint` / `FromModule` / `Fed` / `Imported`; optimizers `pllm.AdamW`, `pllm.SGD` |
 | what a result does | a method decorator, or a model-site attribute | `@pllm.export`, `@pllm.add_logits`, `@pllm.guide_sampling`, `@pllm.train`, `@pllm.write`, `@pllm.train_in_forward`, `@pllm.custom_residual`, `@pllm.custom_attention`, `@pllm.custom_forward`; `pllm.model.ActivationPatch`, `pllm.model.Adapter` |
 
@@ -131,10 +120,10 @@ Each rule names the choice, the tempting wrong one, and the reason.
 | memory per request | `pllm.RequestState` | dicts keyed by request id, `self.x` | Rows arrive packed and permuted, maybe in another process; pLLM admits, pages and frees request state. |
 | state shared by the `n` samples of a prompt, or by requests with a user key | `key_fields=("prompt_index",)`, or `("route",)` with `generate(routes=...)` | instance state plus bookkeeping | The key decides which requests share one copy; route copies survive between calls. |
 | frozen weights or tables | `InstanceState(init=pllm.Pretrained(path))`, `pllm.FromModule(factory, pretrained=path)`, `pllm.ModelCheckpoint(...)` | a tensor or module on the workload | The workload is hashed and shipped by import; state is placed and budgeted by pLLM. |
-| values the host computes per `generate` call | `init=pllm.Imported()` + `generate(batch=pllm.io.StateImport(...))` | a workload field changed between calls | Declarations are fixed when the engine is built. |
-| a continuous producer (video, sensors) | `init=pllm.Fed("ordered")` + `llm.feed(name)` | repeated imports | Feeds publish with backpressure from another process. |
+| values the host computes per `generate` / `stream` call | `init=pllm.Imported()` + `generate(batch=pllm.io.StateImport(...))`, `stream(..., state_import=...)`, or `llm.import_state(...)` | a workload field changed between calls | Declarations are fixed when the engine is built. |
+| a continuous producer (video, sensors) | `init=pllm.Fed("ordered")` + `llm.feed(state)` | repeated imports | Feeds publish with backpressure across processes and TP ranks. |
 | to add a vector or a low-rank edit to a layer's output from state | `pllm.model.ActivationPatch` | `@pllm.custom_residual` | The patch is declarative and runs in CUDA graphs; use a custom residual only when the update is your own function of `x` and `y`. |
-| a weight delta on projections (LoRA) | `pllm.model.Adapter` on a `RequestState` | an Adapter on an `InstanceState` (unless shared is the point) | Instance-state adapters make the forward eager. |
+| a weight delta on projections (LoRA) | `pllm.model.Adapter` on `RequestState` or `InstanceState` | manual weight slicing | Both `RequestState` and `InstanceState` adapters run inside vLLM's CUDA graphs. |
 | to train per request from activations during decode | `@pllm.train` returning `[rows]`, state with `optimizer=pllm.AdamW(lr)` | your own optimizer step in `@pllm.write` | pLLM masks, reduces, backpropagates, steps and publishes inside CUDA graphs on a side stream. |
 | your own update rule (not a gradient step) | `@pllm.write(state=, fields=)` | in-place writes to parameters | Writes publish a new version atomically. |
 | to train weights while the prompt streams through | `@pllm.train_in_forward(chunk=, ...)` | `@pllm.train` | Only it updates within the forward, so later chunks of the same prompt see the update. |
@@ -179,9 +168,8 @@ silently; pLLM will faithfully run the changed version.
 
 ### 2. Write the workload
 
-Put it in an importable `.py` module (needed for `ModelConfig(multiprocessing=True)` and tensor
-parallelism). Start from the nearest example in [examples.md](examples.md) and the matching section of
-[reference.md](reference.md). Make strengths and switches fields of a frozen dataclass, read through methods,
+Put it in an importable `.py` module (needed when `multiprocessing` is enabled for `make_async_llm`, `pllm serve`, or `tensor_parallel_size > 1`; `ModelConfig.multiprocessing="auto"` selects the right mode automatically). Start from the nearest example in [examples.md](examples.md) and the matching section of
+[reference.md](reference.md). Make strengths and switches fields of a frozen dataclass, read through `pllm.cfg(...)` or methods,
 so a neutral setting (strength 0) exists for step 4. Write the plain correct version first; optimize
 (custom kernels, host placement, lag) only after it checks out and only with the user's agreement.
 

@@ -112,12 +112,7 @@ def example(
     """Construct metadata and borrowed operands; execution itself constructs all task scratch.
 
     `tokens` gives every scheduled token its own row, as readers of tokens="all" see them."""
-    # Hidden taps keep one row per request (its prompt end or decode token), as do request states.
-    count = (
-        facts.max_admitted_lineages
-        if (binding.graph.states or facts.probe.hidden_resources) and not tokens
-        else facts.probe.max_packed_rows
-    )
+    count = facts.probe.max_packed_rows if tokens else facts.max_admitted_lineages
     # One decode token per request; sampler rows run in reverse packed order.
     labeled = label_rows(
         tuple(RequestIdentity(str(i), i, 0, str(i)) for i in range(count)), [1] * count, [0] * count, [0] * count, 0
@@ -316,7 +311,7 @@ def shape_site_results(binding: TensorDeclaration, facts: BackendCompileFacts) -
     """Trace pre-forward result metadata before backends allocate captured hook buffers."""
     if not binding.model_site_tasks:
         return
-    data, batch = example(binding, facts, ExecutionOptions())
+    data, batch = example(binding, facts, ExecutionOptions(), tokens=True)
     operations = binding.executables(facts, ())
     for symbol in producers_first(binding.graph, tuple(binding.model_site_tasks)):
         with fixed_shapes():
@@ -353,7 +348,7 @@ def derive_resources(
     requests = example(binding, facts, options)
     tokens = (
         example(binding, facts, options, tokens=True)
-        if any(task.phase is HiddenPhase.ALL for task in binding.tensor_tasks.values())
+        if binding.model_site_tasks or any(task.phase is HiddenPhase.ALL for task in binding.tensor_tasks.values())
         else requests
     )
     tasks: list[TaskResourceFact] = []
@@ -367,7 +362,11 @@ def derive_resources(
         operation = operations[symbol]
         task = binding.tensor_tasks.get(symbol)
         phase = None if task is None else task.phase
-        data, batch = tokens if phase is HiddenPhase.ALL else (task_example(requests[0], phase), requests[1])
+        data, batch = (
+            tokens
+            if symbol in binding.model_site_tasks or phase is HiddenPhase.ALL
+            else (task_example(requests[0], phase), requests[1])
+        )
         tables = tuple(
             (str(address.resource), tensor, state.placement == "host")
             for address, root in zip(batch.selection.addresses, batch.roots, strict=True)

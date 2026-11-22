@@ -23,7 +23,9 @@ from pllm.workloads.reward_head import RewardHeadConfig, RewardHeadWorkload, maj
 from pllm.workloads.tlm import TLMConfig, TLMWorkload
 from pllm.workloads.video import VideoWorkload
 
-pytestmark = pytest.mark.skipif(torch.cuda.device_count() < 2 or compat.VLLM_027, reason="needs two GPUs and vLLM 0.32")
+pytestmark = pytest.mark.skipif(
+    torch.cuda.device_count() < 2 or not compat.VLLM_TP_CAPABLE, reason="needs two GPUs and vLLM >= 0.32"
+)
 PROMPTS = [
     "The sky is",
     "Water freezes at",
@@ -153,9 +155,9 @@ def test_j1_admission():
     for name in ("pipeline_parallel_size", "data_parallel_size"):
         with pytest.raises(ValueError, match=name + "=1"):
             pllm.make_llm(replace(config(), **{name: 2}), workload=DummyWorkload())
-    for workload, message in ((TLMWorkload(TLMConfig()), "causal_model"), (VideoWorkload(), "state feeds")):
-        with pytest.raises(ValueError, match=message + ".*tensor_parallel_size=1"):
-            pllm.make_llm(config(), workload=workload)
+    with pytest.raises(ValueError, match="causal_model.*tensor_parallel_size=1"):
+        pllm.make_llm(config(), workload=TLMWorkload(TLMConfig()))
+    assert pllm.explain(VideoWorkload(), config()).model.hidden_size > 0
     with pytest.raises(ValueError, match="not shard-local.*other ranks"):
         pllm.explain(PrefillAdaptersWorkload(), config())
 

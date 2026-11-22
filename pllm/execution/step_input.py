@@ -39,6 +39,8 @@ class StepInput:
         default_factory=lambda: _NO_UPDATES
     )
 
+    force_import: bool = False
+
     def __post_init__(self) -> None:
         assert self.sampler_rows.row_batch is self.rows
         if self.hidden is None:
@@ -50,10 +52,20 @@ class StepInput:
             assert readiness == (device if device.type == "cuda" else None)
 
     @classmethod
-    def of_batch(cls, batch: HostBatch[torch.Tensor]) -> StepInput:
-        """A host step without request rows, carrying one host batch ready on the stream the step runs on."""
-        sampler = label_rows((), [], [], [], 0)
-        return cls(sampler.row_batch, sampler, batch=batch)
+    def of_batch(
+        cls,
+        batch: HostBatch[torch.Tensor],
+        *,
+        identities: tuple[RequestIdentity, ...] = (),
+        import_rows: Mapping[str, int] | None = None,
+        force_import: bool = False,
+    ) -> StepInput:
+        """Build one host invocation, with a selectable prompt row for each request import."""
+        n = len(identities)
+        sampler = label_rows(identities, [1] * n, [1] * n, [0] * n, 0)
+        return cls(
+            sampler.row_batch, sampler, batch=batch, import_rows=dict(import_rows or {}), force_import=force_import
+        )
 
     def hidden_batch(self, stream: torch.cuda.Stream | None) -> HiddenRowBatch:
         if self.hidden is None or (self.hidden_readiness is None) != (stream is None):

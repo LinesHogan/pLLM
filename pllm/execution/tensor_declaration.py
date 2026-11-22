@@ -584,6 +584,18 @@ class TensorDeclaration:
             )
         )
 
+    def _import_values(
+        self, resource: str, values: tuple[torch.Tensor, ...], root: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        views = self.imports[resource]
+        shards = self.field_shards[resource]
+        local = tuple(
+            shards[view.field].read(value, view.shape, self.tensor_parallel_rank) if view.field in shards else value
+            for view, value in zip(views, values, strict=True)
+        )
+        targets = tuple(view.read(root[view.field]) for view in views)
+        return field_values(local, targets, resource=resource, validate=False)
+
     def prepare_import(self, update: StateImport[torch.Tensor], batch: TensorBatch, data: TensorFrame) -> None:
         """Convert validated fields to storage precision and select their private roots."""
         (resource,) = self.imports
@@ -594,7 +606,7 @@ class TensorDeclaration:
         else:
             selected: dict[int, int] = {}
             for row, index in zip(selection.rows, group.state_indices, strict=True):
-                if selection.refs[int(index)].version_id != 0:
+                if not data.step.force_import and selection.refs[int(index)].version_id != 0:
                     continue
                 source = data.step.import_rows[row.identity.request_id]
                 if index in selected and selected[index] != source:
@@ -603,11 +615,9 @@ class TensorDeclaration:
             data.replacements = tuple(
                 (index, tuple(tensor[row] for tensor in update.values)) for index, row in selected.items()
             )
-        replacements: list[tuple[int, tuple[torch.Tensor, ...]]] = []
-        for index, values in data.replacements:
-            root = tuple(view.read(batch.roots[index][view.field]) for view in self.imports[resource])
-            replacements.append((index, field_values(values, root, resource=resource, validate=False)))
-        data.replacements = tuple(replacements)
+        data.replacements = tuple(
+            (index, self._import_values(resource, values, batch.roots[index])) for index, values in data.replacements
+        )
 
     @property
     def model_site_tasks(self) -> frozenset[TaskSymbol]:
@@ -1032,5 +1042,28 @@ class TensorDeclaration:
                 "the workload has no effect on the model: add @pllm.train, @pllm.add_logits, @pllm.guide_sampling, "
                 "@pllm.export, @pllm.train_in_forward, @pllm.custom_residual, @pllm.custom_attention, a custom_forward or a "
                 "pllm.model.ActivationPatch/Adapter"
+            )
+        if self.graph.training_mode in ("batch", "weighted_batch"):
+            from pllm.contracts.host_batch import CausalTrainBatch, WeightedCEBatch, WeightedRowBatch
+            from pllm.execution.state_execution import batch_task_closure
+
+            schemas = (CausalTrainBatch.schema, WeightedCEBatch.schema, WeightedRowBatch.schema)
+            trained = {
+                str(effect.resource)
+                for task in batch_task_closure(self.graph, schemas)
+                for effect in task.effects
+                if effect.kind
+                in (
+                    StateEffectKind.TRANSITION,
+                    StateEffectKind.TRANSITION_MAYBE,
+                    StateEffectKind.UPDATE,
+                    StateEffectKind.UPDATE_MAYBE,
+                )
+            }
+            self.effects = replace(
+                self.effects,
+                batch_fields=tuple(
+                    (resource, name, view) for (resource, name), view in self.field_views.items() if resource in trained
+                ),
             )
         return self.graph, self.layouts, self.effects

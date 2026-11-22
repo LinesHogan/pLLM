@@ -21,6 +21,22 @@ from pllm.contracts.codec import decode_boundary, encode_boundary
 from pllm.contracts.kv_layout import KVLayout
 
 POLICY_KEY = "pllm.prefix_cache"
+IDENTITY_KEY = "pllm.online_identity"
+
+
+@dataclass(frozen=True)
+class OnlineRequest:
+    """Per-request identity carried across async/OpenAI submission to the worker session."""
+
+    route: str = ""
+    sample_index: int = 0
+    prompt_index: int = 0
+
+
+def read_online(params: SamplingParams | None) -> OnlineRequest | None:
+    """Read an online request's identity metadata when present."""
+    value = None if params is None else (params.extra_args or {}).get(IDENTITY_KEY)
+    return decode_boundary(value, OnlineRequest) if isinstance(value, str) else None
 
 
 @dataclass(frozen=True)
@@ -49,6 +65,16 @@ class CachePolicy:
         """Copy caller options and carry this identity through EngineCore serialization."""
         result = params.clone()
         result.extra_args = {**(params.extra_args or {}), POLICY_KEY: encode_boundary(self)}
+        return result
+
+    def online_sampling(self, params: SamplingParams | None, request: OnlineRequest) -> SamplingParams:
+        """Copy caller options and stamp cache policy plus online request identity."""
+        result = SamplingParams() if params is None else params.clone()
+        extras = dict(result.extra_args or {})
+        extras.pop("pllm_route", None)
+        extras[POLICY_KEY] = encode_boundary(self)
+        extras[IDENTITY_KEY] = encode_boundary(request)
+        result.extra_args = extras
         return result
 
     @classmethod

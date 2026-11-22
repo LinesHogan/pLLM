@@ -362,9 +362,9 @@ print(pllm.explain(PromptLoRA(), CONFIG).states[0].name)
      **不要使用全零初始化（`pllm.Zeros()`）！**
      **为什么？**
      低秩增量为 $B A$。若 $A$ 和 $B$ 初值同时为 0，反向传播时 $A$ 的梯度正比于 $B^\top = 0$，$B$ 的梯度正比于 $A^\top = 0$。双方梯度全部恒等于 0，优化器永远无法迈出第一步！pLLM 会在构建期直接拦截并抛出错误。在线训练必须使用 `init=pllm.Computed(...)` 将一个因子（如 $A$）初始化为随机小值、另一个因子（$B$）初始化为 0。
-3. **RequestState vs InstanceState 的执行代价**：
+3. **RequestState vs InstanceState 的执行特性**：
    - 挂载在 `RequestState` 上的 `Adapter`：不同请求在同一个批次中各自读取自己请求副本的因子，**完全保留在 CUDA Graph 内部运行**，没有任何 CPU 调度额外开销。
-   - 挂载在 `InstanceState` 上的 `Adapter`：修改的是跨请求全局共享的投影权重，会导致模型前向**退回 eager 模式**运行（详见 [改模型](../guides/model-edits.md)）。
+   - 挂载在 `InstanceState` 上的 `Adapter`：通过版本槽页表在 CUDA Graph 内部直接寻址并计算增量，同样**留在 CUDA Graph 内**；若同时存在请求期间动态写或并发导入，会按并发请求容量预留版本快照页（详见 [改模型](../guides/model-edits.md)）。
 
 **自测**：
 如果一个 LoRA 适配层包含了 4 个目标投影（`q_proj`, `k_proj`, `v_proj`, `down_proj`），且声明了 `operator="low_rank", factors=("a", "b")`，那么 safetensors 文件中应该存入哪些键？

@@ -55,19 +55,21 @@ def test_oracle_rejects_plausible_wrong_math() -> None:
 @pytest.mark.parametrize("agent_name", run.AGENTS)
 def test_author_cannot_read_host_sources(tmp_path: Path, agent_name: str) -> None:
     """A real mount namespace must hide a sentinel, runtime, oracle, tests and agent history."""
+    agent = run.AGENTS[agent_name]
+    if not agent.binary.exists():
+        pytest.skip(f"{agent_name} CLI is not installed on this host")
     destination = tmp_path / "caa"
     destination.mkdir()
     workspace, _ = run.prepare(destination, "HEAD")
     sentinel = tmp_path / "hidden-oracle-secret"
     sentinel.write_text("must not be visible")
-    command = run.sandbox(destination, run.AGENTS[agent_name], run.AGENTS[agent_name].model, authenticate=False)
+    command = run.sandbox(destination, agent, agent.model, authenticate=False)
     command = command[: command.index("/author", command.index("--clearenv"))]
     # A non-agent shell probes the exact namespace the production author command would receive.
     script = (
         "test -f /workspace/TASK.md && test -f /workspace/README.md "
         "&& test ! -e /workspace/pllm && test ! -e /workspace/test "
-        "&& test ! -e /workspace/pllm && test ! -e /home/agent/.codex/auth.json "
-        "&& test ! -e /home/agent/.gemini/codex-cli/conversation_summaries.db "
+        f"&& test ! -e {run.ROOT} && test ! -e /home/agent/.codex/sessions "
         f"&& test ! -e {sentinel}"
     )
     subprocess.run([*command, "/bin/sh", "-c", script], cwd=workspace, check=True)
@@ -76,13 +78,18 @@ def test_author_cannot_read_host_sources(tmp_path: Path, agent_name: str) -> Non
 @pytest.mark.parametrize(
     ("agent", "transcript", "count", "failure"),
     [
-        ("codex", '{"event":"step_update","step_update":{"state":"DONE","step_type":"agent_response"}}', 1, ""),
-        ("codex", '{"event":"step_update","step_update":{"text_delta":"HTTP 429"}}', 0, ""),
-        ("kimi", '{"role":"assistant","content":"quota exhausted"}', 1, ""),
-        ("codex", '{"event":"error","error":{"message":"HTTP 429 quota exhausted"}}', 0, "HTTP 429"),
-        ("kimi", "authentication failed: invalid token", 0, "authentication failed"),
+        ("codex", '{"type":"turn.completed"}', 1, ""),
+        ("codex", '{"type":"item.updated","text":"HTTP 429"}', 0, ""),
+        (
+            "codex",
+            '{"type":"item.completed","item":{"type":"agent_message","text":"quota exhausted"}}\n{"type":"turn.completed"}',
+            1,
+            "",
+        ),
+        ("codex", '{"type":"error","message":"HTTP 429 quota exhausted"}', 0, "HTTP 429"),
+        ("codex", "authentication failed: invalid token", 0, "authentication failed"),
         ("codex", "dial tcp: connection refused", 0, "dial tcp"),
-        ("codex", 'HTTP 429\n{"event":"result","result":{"status":"SUCCESS","num_turns":2}}', 0, ""),
+        ("codex", 'HTTP 429\n{"type":"turn.completed"}', 1, ""),
     ],
 )
 def test_transcript_evidence(agent: str, transcript: str, count: int, failure: str, tmp_path: Path) -> None:
@@ -104,7 +111,7 @@ def test_provider_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     def unavailable(command: list[str], cwd: Path, output: Path, timeout: int) -> tuple[int, float]:
         assert not (cwd / "submission.py").exists()
         (cwd / "submission.py").write_text("# partial output must not reach the retry")
-        output.write_text('{"event":"error","error":{"message":"HTTP 429"}}\n')
+        output.write_text('{"type":"error","message":"HTTP 429"}\n')
         attempts.append(output)
         return 1, 2.0
 

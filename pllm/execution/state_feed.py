@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
+import io
 import os
+import pickle
 from collections import deque
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from multiprocessing import get_context
 from multiprocessing.connection import Connection, wait
+from multiprocessing.reduction import ForkingPickler
 from multiprocessing.resource_sharer import DupFd
+from types import TracebackType
+from typing import Self, overload
 
 import torch
 
@@ -108,7 +114,54 @@ class ConsumerClosed(RuntimeError):
     """The consumer has proved that no further GPU reads can occur."""
 
 
-class Feed:
+class _FeedWriter:
+    """Publication and lifetime operations shared by single-rank and tensor-parallel producers."""
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        try:
+            if exc is None:
+                self.end()
+        finally:
+            self.close()
+
+    def zero_(self) -> None:
+        """Publish zeroes in every declared field."""
+        with self.publish() as fields:
+            for tensor in fields.values():
+                tensor.zero_()
+
+    @overload
+    def publish(self) -> AbstractContextManager[dict[str, torch.Tensor]]: ...
+
+    @overload
+    def publish(self, **fields: torch.Tensor) -> AbstractContextManager[dict[str, torch.Tensor]] | None: ...
+
+    def publish(self, **fields: torch.Tensor) -> AbstractContextManager[dict[str, torch.Tensor]] | None:
+        """Publish supplied fields, or fill a writable set of fields in a context manager."""
+        if fields:
+            self._publish(fields)
+            return None
+        return self._writable()
+
+    def _publish(self, fields: dict[str, torch.Tensor]) -> None:
+        raise NotImplementedError
+
+    def _writable(self) -> AbstractContextManager[dict[str, torch.Tensor]]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def end(self) -> None:
+        raise NotImplementedError
+
+
+class Feed(_FeedWriter):
     """Publish complete tensor fields into a declared state, with bounded backpressure."""
 
     def __init__(
@@ -213,7 +266,16 @@ class Feed:
             (self.current_ref,) = publication.after_refs
         return self.arena
 
-    def publish(self, **fields: torch.Tensor) -> None:
+    @contextmanager
+    def _writable(self) -> Generator[dict[str, torch.Tensor]]:
+        fields = {
+            name: torch.empty(field.shape, dtype=field.dtype.torch, device=self._device)
+            for name, field in self._fields.items()
+        }
+        yield fields
+        self._publish(fields)
+
+    def _publish(self, fields: dict[str, torch.Tensor]) -> None:
         """Copy all declared fields, then publish one immutable version; block on capacity."""
         # A mismatched call is rejected before _live, so it does not fail-stop the feed.
         if fields.keys() != self._fields.keys() or any(
@@ -302,6 +364,63 @@ class Feed:
             self.arena = None
             self.closed = True
             self._disconnect()
+
+
+def encode_feed(feed: Feed) -> str:
+    """Transfer the writer's file descriptors through the multiprocessing resource sharer."""
+    buffer = io.BytesIO()
+    ForkingPickler(buffer).dump(feed)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def decode_feed(payload: str) -> Feed:
+    """Claim the writer exported by one worker."""
+    feed = pickle.loads(base64.b64decode(payload))
+    assert isinstance(feed, Feed)
+    return feed
+
+
+class FanoutFeed(_FeedWriter):
+    """One producer that publishes identical fields to every worker rank."""
+
+    def __init__(self, feeds: tuple[Feed, ...]) -> None:
+        if not feeds:
+            raise ValueError("provide a feed from each worker rank")
+        self.feeds = feeds
+
+    @contextmanager
+    def _writable(self) -> Generator[dict[str, torch.Tensor]]:
+        with ExitStack() as stack:
+            first, *others = [stack.enter_context(feed.publish()) for feed in self.feeds]
+            yield first
+            for fields in others:
+                for name, tensor in fields.items():
+                    tensor.copy_(first[name])
+
+    def _publish(self, fields: dict[str, torch.Tensor]) -> None:
+        with self.publish() as destination:
+            if fields.keys() != destination.keys():
+                raise ValueError("publish one tensor for every declared feed field")
+            for name, tensor in destination.items():
+                if tensor.shape != fields[name].shape or tensor.dtype != fields[name].dtype:
+                    raise ValueError(f"feed field {name} needs shape {tuple(tensor.shape)} and dtype {tensor.dtype}")
+                tensor.copy_(fields[name])
+
+    def missing(self) -> None:
+        """Submit an absent step on every rank."""
+        for feed in self.feeds:
+            feed.missing()
+
+    def end(self) -> None:
+        """End every rank's input stream."""
+        for feed in self.feeds:
+            feed.end()
+
+    def close(self) -> None:
+        """Release the writer on each rank."""
+        with ExitStack() as stack:
+            for feed in self.feeds:
+                stack.callback(feed.close)
 
 
 class FeedReceiver:

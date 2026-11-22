@@ -12,8 +12,7 @@ pLLM 的文档按用途分成五类，每一页只做一件事：**教程**带�
 查字段、配置、报错原文 → 参考
 ```
 
-改 pLLM 框架本身的贡献者文档在 [dev/](dev/README.md)；让编码 agent 写负载，把 [agent skill](agent/SKILL.md) 和
-[agent 参考](agent/reference.md)（英文，含全部公开 API 的签名）交给它。
+让编码 agent 写负载或把已有项目迁到 pLLM，先安装 skill（`pllm skill --install claude` / `codex` / `cursor`），或直接交出 [agent skill](agent/SKILL.md)、[迁移指南](agent/migration.md) 和 [agent 参考](agent/reference.md)。
 
 ## 教程
 
@@ -49,6 +48,7 @@ pLLM 的文档按用途分成五类，每一页只做一件事：**教程**带�
 ## 操作指南
 
 - [排查报错](howto/troubleshooting.md)
+- [在线服务：AsyncVllmLlm 与 pllm serve](howto/online-serving.md)
 - [加载训练好的权重](howto/load-trained-weights.md)
 - [让一组请求共享训练成果](howto/share-training-across-requests.md)
 - [上生产：多进程、张量并行与量化底座](howto/production.md)
@@ -75,7 +75,7 @@ pLLM 的文档按用途分成五类，每一页只做一件事：**教程**带�
 
 ## 延伸阅读
 
-[技术杂谈](explain/highlights/00-guide.md)：一篇导读加十篇独立长文，每篇讲一个在 vLLM 里跑推理期算法时会撞上的系统问题、pLLM 怎么解、代价在哪里。它们是有日期的工程文章，开头写明日期、对应的 pLLM 提交和测量环境，不随代码更新；用法以上面的指南为准。
+- [独立技术随笔 (中/英)](../blog/README.md)：围绕推理期算法趋势、调度器复盘、带宽配额、尾声位变换、编译图快权重训练、静态图指针寻址、显存 MVCC/RCU、注意力布局、`attn_metadata` 解包及多租户核验的十篇独立文章
 
 ## 示例库
 

@@ -9,17 +9,17 @@ From the repository root, using its venv (bubblewrap and the selected authentica
 agent CLI must already be installed):
 
 ```bash
-/workspace/pllm/.venv/bin/python examples/algorithm_search/search.py \
+.venv/bin/python examples/algorithm_search/search.py \
   --rounds 5 --output outputs/search-1
-/workspace/pllm/.venv/bin/python examples/algorithm_search/search.py \
+.venv/bin/python examples/algorithm_search/search.py \
   --replay outputs/search-1/ledger.jsonl --output outputs/replay-1
-/workspace/pllm/.venv/bin/python examples/algorithm_search/search.py \
+.venv/bin/python examples/algorithm_search/search.py \
   --replay outputs/search-1/ledger.jsonl --output outputs/replay-2
 ```
 
-Each output directory must be new. The default author is ai_eval's codex runner
-with `gpt-6.1-sol`; `--agent kimi` remains selectable. `--model` overrides
-the selected runner's default author model. Each author gets 900 seconds, as in
+Each output directory must be new. The default author is ai_eval's `codex` runner
+with `gpt-6.1-sol`; `--model` overrides
+the default author model. Each author gets 900 seconds, as in
 ai_eval; `--timeout` overrides that limit. The three initial seeds
 are vanilla (an ordinary residual sum), the built-in DoLa, and a bounded
 `active=` early-exit loop. Each round sees the committed README/doc snapshot,
@@ -31,15 +31,15 @@ written. Provider failures are recorded as `INFRA`, rather than failed algorithm
 To score a standalone, self-contained candidate defining `WORKLOAD` and `NEUTRAL`:
 
 ```bash
-/workspace/pllm/.venv/bin/python examples/algorithm_search/score.py \
+.venv/bin/python examples/algorithm_search/score.py \
   examples/algorithm_search/dola.py --output outputs/dola-score.json
 ```
 
 The output parent must exist. CPU explain and `pllm.testing.check` gate GPU work.
-GPU scoring takes `/tmp/pllm-gpu.lock` and CPU affinity 0-15, runs
+GPU scoring serializes on `PLLM_GPU_LOCK` (default `/tmp/pllm-gpu.lock`, with optional
+`PLLM_CPU_AFFINITY` for `taskset`), runs
 `check_on_gpu`, measures greedy accuracy, then calls `pllm.benchmark.compare`.
-Every engine is scoped to its context manager. Use the local RTX 4090; the
-standing pool remains available for the repository's full verifier.
+Every engine is scoped to its context manager.
 
 Throughput uses bfloat16, batch 8, 256 tokens, 16 completions, warmup 1, three
 rounds, seed 7, ignore-EOS, temperature 0.8, top-p 0.95, top-k -1 and prefix

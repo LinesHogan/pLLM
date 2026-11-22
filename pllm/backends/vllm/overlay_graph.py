@@ -14,12 +14,12 @@ The upstream manager owns all capture/replay loops; PTTS owns every request vers
 
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
+from functools import cached_property
 from typing import Any, Protocol, TypedDict
 
 import numpy as np
 import torch
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode, VllmConfig
-from vllm.config.utils import SupportsHash
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from pllm.backends.vllm import compat
 from pllm.backends.vllm.admission import model_hooks
-from pllm.backends.vllm.architecture import DecoderBody, bind_model
+from pllm.backends.vllm.architecture import Decoder, DecoderBody, bind_model
 from pllm.backends.vllm.parameter_overlay import capacities, uniform_decode
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
@@ -43,7 +43,7 @@ _OVERLAY_GRAPHS = CUDAGraphMode.FULL_AND_PIECEWISE
 
 class _GraphConfiguration(Protocol):
     @property
-    def additional_config(self) -> Mapping[str, int | str] | SupportsHash: ...
+    def additional_config(self) -> Mapping[str, int | str] | compat.AdditionalConfigFactor: ...
 
 
 def _additional_config(config: _GraphConfiguration) -> dict[str, int]:
@@ -112,15 +112,7 @@ def graph_options(config: ModelConfig, requirements: BackendRequirements) -> Gra
 class _HybridGraphManager(compat.CudaGraphManager):
     """Keep upstream decode replay ownership; prefill uses the unpadded source model."""
 
-    def __init__(
-        self,
-        config: VllmConfig,
-        device: torch.device,
-        mode: CUDAGraphMode,
-        decode_query_len: int,
-    ) -> None:
-        super().__init__(config, device, mode, decode_query_len)
-        self.eager = False
+    eager: bool = False
 
     def dispatch(
         self,
@@ -150,9 +142,13 @@ class OverlayGraphRunner(compat.ModelRunner):
         self.overlay_graph_budget_bytes = _graph_budget(vllm_config)
         self._compile_cleanups: tuple[int, ...] = ()
 
+    @cached_property
+    def decoder(self) -> Decoder:
+        """Bind the decoder when a workload or completion request first needs it."""
+        return bind_model(self.model)
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights)  # pyright: ignore[reportUnknownMemberType]
-        self.decoder = bind_model(self.model)
         if (
             _BUDGET in _additional_config(self.vllm_config)
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -173,16 +169,17 @@ class OverlayGraphRunner(compat.ModelRunner):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager[Any, bool | None] | None = None,
+        extensible: bool = False,
     ) -> None:
         """vLLM picks the graph mode here; it must see the compiled body that finish_overlay_graphs captures.
 
-        vLLM 0.32 silently resolves FULL_AND_PIECEWISE to decode-only graphs for a body that is not compiled,
+        vLLM 0.32+ silently resolves FULL_AND_PIECEWISE to decode-only graphs for a body that is not compiled,
         so the deferred compilation is lifted while it resolves.
         """
         deferred = self.projection_model
         if deferred is not None:
             deferred.do_not_compile = False
-        super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context)  # pyright: ignore[reportUnknownMemberType]
+        super().initialize_kv_cache(kv_cache_config, is_profiling, kv_cache_allocation_context, extensible)  # pyright: ignore[reportUnknownMemberType]
         if deferred is not None:
             deferred.do_not_compile = True
 
@@ -226,8 +223,8 @@ class OverlayGraphRunner(compat.ModelRunner):
                 "use FlashAttention2 or set ModelConfig(cuda_graphs=False)"
             )
         if attachment.plan.semantic_graph.updates_in_forward:
-            self.cudagraph_manager = _HybridGraphManager(
-                self.vllm_config, self.device, manager.cudagraph_mode, manager.decode_query_len
+            self.cudagraph_manager = compat.clone_graph_manager(
+                _HybridGraphManager, self.vllm_config, self.device, manager
             )
         self.projection_model.do_not_compile = False
         pool = current_platform.get_global_graph_pool()

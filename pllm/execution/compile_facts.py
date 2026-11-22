@@ -8,13 +8,35 @@ from dataclasses import dataclass, field
 
 import torch
 
-from pllm.contracts.backend_attachment import ModelProbe
+from pllm.contracts.backend_attachment import BackendAttachmentSpec, ModelProbe
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.kv_layout import KVLayout
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.sampler import SamplerStage
-from pllm.contracts.semantic_graph import HiddenInputSource, SchedulerTimeline
+from pllm.contracts.semantic_graph import (
+    HiddenInputSource,
+    SchedulerTimeline,
+    SemanticGraph,
+    StateEffectKind,
+    StateScope,
+)
 from pllm.execution.ptts.page_bundle_planning import PageBundleProviderFacts
+
+
+def prefix_cache_reason(
+    reads: Iterable[tuple[str, StateScope, bool]], *, custom_attention: bool, in_forward: bool, last_tokens: bool
+) -> str | None:
+    """Identify a model dependency missing from the prefix cache key."""
+    if custom_attention:
+        return "@pllm.custom_attention needs full causal attention metadata"
+    if in_forward:
+        return "@pllm.train_in_forward changes model state during the forward"
+    if last_tokens:
+        return "ActivationPatch(last_tokens > 0) depends on the prompt length"
+    for name, scope, mutable in reads:
+        if scope is StateScope.REQUEST or mutable:
+            return f"the model reads {scope.value} state {name!r} whose value can differ between requests"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,12 +63,53 @@ class BackendRequirements:
     stateful_residual: bool = False
     custom_attention: bool = False
     kv_layouts: tuple[KVLayout, ...] = ()
-    # Whether a pllm.model.Adapter reads an InstanceState; CUDA-graph overlays bind request state only.
-    instance_adapter: bool = False
+    custom_value_site: bool = False
+    custom_attention_facts: bool = False
+    prefix_cache_unsafe_reason: str | None = None
+    trains_on_batch: bool = False
+    imports: bool = False
     causal_training: bool = False
     feeds: bool = False
     # The smallest pllm.sample_index(limit=); requests must use a lower sample index.
     sample_limit: int | None = None
+
+    @property
+    def custom_attention_tp_unsafe(self) -> bool:
+        """Cross-head facts and altered KV storage need coordination across TP ranks."""
+        return self.custom_attention_facts or any(layout.keep != "all" for layout in self.kv_layouts)
+
+    def check_prefix_cache(self) -> None:
+        """Reject a token-keyed cache for a workload with a state- or position-dependent prefix."""
+        if self.prefix_cache_unsafe_reason:
+            raise ValueError(f"disable prefix caching (enable_prefix_caching=False): {self.prefix_cache_unsafe_reason}")
+
+    @classmethod
+    def from_model_reads(
+        cls,
+        graph: SemanticGraph,
+        attachment: BackendAttachmentSpec,
+        *,
+        external_states: set[str],
+        custom_attention: bool,
+    ) -> BackendRequirements:
+        """Classify cache reuse using the lowered model reads, task writes and activation windows."""
+        written = {
+            effect.resource
+            for task in graph.tasks
+            for effect in task.effects
+            if effect.kind is not StateEffectKind.READ
+        }
+        reason = prefix_cache_reason(
+            (
+                (state.resource, state.scope, state.resource in written or state.resource in external_states)
+                for state in graph.states
+                if state.resource in graph.model_reads
+            ),
+            custom_attention=custom_attention,
+            in_forward=attachment.in_forward is not None,
+            last_tokens=any(patch.last_tokens > 0 for patch in attachment.activation_bindings),
+        )
+        return cls(prefix_cache_unsafe_reason=reason)
 
     @staticmethod
     def combine(parts: Iterable[BackendRequirements]) -> BackendRequirements:
@@ -69,7 +132,13 @@ class BackendRequirements:
             stateful_residual=any(part.stateful_residual for part in parts),
             custom_attention=any(part.custom_attention for part in parts),
             kv_layouts=tuple(layout for part in parts for layout in part.kv_layouts),
-            instance_adapter=any(part.instance_adapter for part in parts),
+            custom_value_site=any(part.custom_value_site for part in parts),
+            custom_attention_facts=any(part.custom_attention_facts for part in parts),
+            prefix_cache_unsafe_reason=next(
+                (part.prefix_cache_unsafe_reason for part in parts if part.prefix_cache_unsafe_reason), None
+            ),
+            trains_on_batch=any(part.trains_on_batch for part in parts),
+            imports=any(part.imports for part in parts),
             causal_training=any(part.causal_training for part in parts),
             feeds=any(part.feeds for part in parts),
             sample_limit=min((part.sample_limit for part in parts if part.sample_limit is not None), default=None),

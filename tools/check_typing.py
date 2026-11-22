@@ -18,10 +18,18 @@ UNTYPED_BOUNDARIES = {
     ROOT / "pllm/workload.py",
     ROOT / "pllm/execution/method_dependencies.py",
     ROOT / "pllm/workload_transport.py",
+    ROOT / "pllm/cli.py",
 }
 KERNELS = ROOT / "pllm/kernels"
-# Pyright follows the compat module's VLLM_027 branch per release, so each vLLM release has its own config.
-PROJECT = "pyrightconfig.json" if version("vllm").startswith("0.27.1") else "pyrightconfig.vllm032.json"
+# Pyright follows the compat module's release constants per release, so each major seam gets a config.
+_VLLM_VERSION = version("vllm")
+PROJECT = (
+    "pyrightconfig.json"
+    if _VLLM_VERSION.startswith("0.27.")
+    else "pyrightconfig.vllm034.json"
+    if _VLLM_VERSION.startswith(("0.33.", "0.34."))
+    else "pyrightconfig.vllm032.json"
+)
 FORBIDDEN = {"Any", "object", "cast", "getattr", "setattr", "hasattr"}
 
 

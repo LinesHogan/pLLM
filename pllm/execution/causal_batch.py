@@ -8,6 +8,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
 import torch
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint  # pyright: ignore[reportUnknownVariableType]
 
 from pllm.contracts.host_batch import CausalTrainBatch, WeightedRowBatch
 from pllm.contracts.parameter_overlay import FieldView, ParameterOverlayFieldBinding
@@ -23,18 +25,34 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class LMHead:
-    """The decoder's frozen output projection: logits = (hidden @ weight.T)[..., :vocab_size] * scale."""
+    """Frozen vocabulary projection with the decoder's optional logit soft cap and scale."""
 
     weight: torch.Tensor
     vocab_size: int
     scale: float
+    soft_cap: float | None = None
 
     def __call__(self, hidden: torch.Tensor) -> torch.Tensor:
-        return head_logits(hidden, self.weight, self.vocab_size, self.scale)
+        if self.soft_cap is None:
+            return head_logits(hidden, self.weight, self.vocab_size, self.scale)
+        logits = F.linear(hidden, self.weight)[..., : self.vocab_size]
+        return (torch.tanh(logits / self.soft_cap) * self.soft_cap) * self.scale
 
     def label_logprobs(self, hidden: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
         """[rows] log-probabilities of each row's label, without materializing all rows' logits at once."""
-        return label_logprobs(hidden, self.weight, labels, self.vocab_size, self.scale, ignore_index)
+        if self.soft_cap is None:
+            return label_logprobs(hidden, self.weight, labels, self.vocab_size, self.scale, ignore_index)
+        # Recompute each capped block in backward, keeping only its hidden inputs between passes.
+        return torch.cat(
+            [
+                checkpoint(self._label_block, rows, targets, ignore_index, use_reentrant=False)
+                for rows, targets in zip(torch.split(hidden, 256), torch.split(labels, 256), strict=True)
+            ]
+        )
+
+    def _label_block(self, rows: torch.Tensor, targets: torch.Tensor, ignore_index: int) -> torch.Tensor:
+        logits = self(rows).to(torch.promote_types(rows.dtype, torch.float32))
+        return -F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction="none")
 
 
 class CausalForward(Protocol):

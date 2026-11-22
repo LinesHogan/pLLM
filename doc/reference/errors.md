@@ -28,6 +28,7 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `pllm.input_tokens(history=) needs a nonnegative integer` | `history` 是当前 token 之前的 token 数 | 传大于等于 0 的整数 |
 | `pllm.attention needs a nonnegative layer and fact='aux' or 'lse'` | attention 的量按层存在，只有辅助输出和 log-sum-exp 两种 | 层号大于等于 0，`fact="aux"` 或 `fact="lse"` |
 | `... reads tokens="all" rows; only @pllm.export methods read them, and without pllm.result inputs. Export the rows, or read tokens="prefill" or "decode"` | `tokens="all"` 每个算出的 token 一行，别的效果无法按请求对齐 | 只在 `@pllm.export` 里读它，其他方法读 `tokens="decode"` 或 `tokens="prefill"` |
+| `pllm.cfg(...): expected a dotted Python attribute path such as 'layer' or 'config.layer'` | `pllm.cfg` 按点号路径读取绑定后负载实例上的属性 | 传合法的 Python 属性路径，如 `pllm.cfg("beta")` 或 `pllm.cfg("config.rank")` |
 
 ## 阶段：值什么时候存在
 
@@ -114,7 +115,8 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward` | 带状态的子层每个 token 必须恰好经过一次 | 分成两个负载，或在 custom forward 里用 `pllm.PositionState` 保存记忆 |
 | `...: take the site tensors ... first, without defaults, then markers` | 位置张量由 pLLM 按顺序传入 | 先写 `x, y`（或 `v`），再写带默认值的输入 |
 | `...: take q and kv first, without defaults, then markers` | query 和分页 KV 由 pLLM 按顺序传入 | 先写 `q, kv` |
-| `...: return attention with q's shape and model dtype` | 输出要接回原生的输出投影 | 返回与 `q` 同形同 dtype 的张量 |
+| `...: return attention shaped [rows, heads, v_head_dim] with model dtype` | 输出要接回原生的输出投影（稠密注意力下 `v_head_dim` 等于 `head_dim`，MLA 下等于值头维度） | 返回形状为 `[rows, heads, v_head_dim]`、精度与 `q` 相同的张量 |
+| `MLA @pllm.custom_attention supports keep='all' with window=/topk= read selection; remove sliding-window or shared KV layout declarations` | MLA 页存放压缩潜变量，底层块分配器保持全历史布局 | 在 MLA 模型上保持默认的 `keep="all"`，改在 `kv.attend(...)` 里传 `window=` 或 `topk=` |
 | `keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources` | 更深的层在当前 token 还没算到 | 源选更早的层，或用 custom forward |
 | `kv.attend topk needs integer positions [rows, k] or [rows, heads, k], padded with -1` | top-K 是逻辑位置 | 按形状给整数位置，不足的用 -1 补 |
 | `static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)` | KV 布局把 KV cache 分成几组，这些功能需要一组 | 去掉布局（`keep=` / `window=` / `source=`）或 custom forward |
@@ -123,7 +125,7 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet combine with a pllm.model.Adapter; ...` | 前向内训练方法占用了 Adapter 也要用的投影钩子 | 在 `@pllm.train_in_forward` 方法里训练这个状态，或分成两个负载 |
 | `... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...` | 没有优化器的 `@pllm.train_in_forward` 返回加到投影输出上的修正，pLLM 在声明时按最大形状检查一次 | 返回 `[rows, out_features]`、输入 dtype 或 float32 的修正 |
 | `... must return changed (bool) and update_count and trained_rows (int64) as 0-d tensors on the input's device` | 计数留在设备上，每步才不和宿主同步 | 用 0 维设备张量（`x.new_ones((), dtype=torch.bool)`），或返回 `pllm.UpdateOutput.unchanged(output)` |
-| `layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead` | MoE 层没有统一的稠密 MLP 投影 | 改 attention 的 query 或 value 投影 |
+| `layer ... uses ...; MLP overlays need a dense MLP. Choose q_proj, k_proj or v_proj` | MoE 层把 token 路由给不同专家，没有单一的稠密 MLP 投影 | 改写该层的 `q_proj`、`k_proj` 或 `v_proj` |
 | `layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)` | Qwen3.5 的线性 attention 层没有标准的 q/k/v 投影 | 改写全注意力层（见模型配置的 `layer_types`） |
 | `gated attention interleaves each head's query rows with its output-gate rows; overlay the value projection instead` | Qwen3.5 的门控 attention 把每个头的 query 行和门控行交错存放，切不出单独的 query 投影 | 改写 `v_proj` |
 | `per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP` | 按头的增量没有按张量并行切分 | 多卡时用 `"dense"` 或 `"low_rank"`，或单卡 |
@@ -144,21 +146,20 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 
 | 报错（原文） | 为什么 | 改法 |
 | --- | --- | --- |
-| `pLLM runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...` | pLLM 只对这两个版本做过对齐 | 安装 0.27.1 或 0.32.0 |
-| `choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads` | pLLM 只接受它认识层结构的 vLLM 模型类 | 换成列出的模型家族，见[支持矩阵](support-matrix.md) |
+| `pLLM runs on vLLM 0.27 through 0.34; install a supported 0.27..0.34 release instead of vLLM ...` | pLLM 接入 vLLM V1 版本的 worker、runner 和调度器内部，只支持对齐范围内的版本 | 安装 0.27.0 到 0.34.0 之间的 vLLM 版本（及匹配的 PyTorch / CUDA 驱动） |
+| `...: choose one of the supported vLLM decoders: ...` | pLLM 只接受已核对过归一化、残差、KV 与投影结构的 vLLM 解码器类 | 换成列出的解码器家族，见[支持矩阵](support-matrix.md) |
 | `pLLM runs vLLM's own model classes, not subclasses of them` | 子类可能改变投影布局或 logits | 用列出的模型类本身 |
-| `... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model` | DeepSeek V2/V3 和 gpt-oss 的 MLA、MoE 投影 pLLM 不能改写 | 在这些模型上只用读取、ESamp、采样引导和激活补丁，或换稠密模型 |
-| `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model` | Qwen3.5 的线性 attention 状态不在 KV 页里，无法从 KV 重建 | custom forward 和定制 attention 用 Qwen2、Llama、Qwen3 或 Qwen3-MoE |
-| `projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks` | CPU 上 pLLM 只能推出稠密 Qwen2、Qwen3、Llama 配置的投影形状 | CPU 检查用同尺寸的稠密配置，目标模型在 `make_llm` 时检查 |
-| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | vLLM 按 token 而不是按状态缓存 K/V，缓存的前缀可能是在别的请求的状态下算出的 | 保持 `enable_prefix_caching=False`（默认） |
+| `... needs separate KV projections (...); hidden taps, sampler stages, activation patches and sublayer residuals still run on this model` | DeepSeek V2/V3（MLA + MoE）和 gpt-oss 没有可按常规方式切片的独立 KV 或稠密 MLP 投影 | 在这些模型上使用读取、采样引导、激活补丁、子层 `@pllm.custom_residual` 或 MLA `@pllm.custom_attention`（DeepSeek V2/V3），或换稠密 / KV-MoE 模型 |
+| `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; choose a decoder with KV attention in every layer` | Qwen3.5 的线性注意力状态不在分页 KV 里，无法仅靠 KV 页重放层状态 | 换用每层均为 KV 注意力的稠密或 KV-MoE 模型 |
+| `projection shapes for this architecture are decided at make_llm; use a dense or KV MoE config for CPU checks` | 仅凭 `config.json` 的投影形状推导覆盖稠密、KV-MoE 与 Qwen3.5 混合配置 | CPU 检查用同尺寸的稠密或 KV-MoE 配置，目标模型在 `make_llm` 时检查 |
+| `disable prefix caching (enable_prefix_caching=False): ...` | 前缀缓存只在模型钩子无状态或仅读不可变 `InstanceState`（且 `last_tokens == 0`）时安全；按请求或可变状态、`last_tokens > 0`、`@pllm.train_in_forward` 与 `@pllm.custom_attention` 会算出随请求变化的 K/V | 保持 `enable_prefix_caching=False`（默认），或让模型只读不可变的 `InstanceState`（且 `last_tokens=0`） |
 | `...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | `cuda_graphs=True` 要求整模型进图，而报错点名的写法需要 eager | 去掉那个写法，或用 `cuda_graphs="auto"`（默认），原因会写进 `diagnostics().eager_reason` |
-| `CUDA-graph overlays do not support adapters backed by shared InstanceState` | 这是 `eager_reason` 而不是异常：读共享实例状态的 Adapter 让 forward 退回 eager | 要留在 CUDA graph 里，把状态改成每请求一份（`RequestState`） |
 | `@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2` | 定制 attention 建立在 vLLM 的 FlashAttention 2 后端上 | 按报错设置两个环境变量 |
 | `@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto` | 你的读法按模型精度读 K/V | 保持 `kv_cache_dtype="auto"` |
-| `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | 定制读法要看到完整的头 | 单卡 |
-| `multi-GPU needs vLLM 0.32.0; otherwise use tensor_parallel_size=1` | pLLM 只在 vLLM 0.32.0 上支持张量并行 | 换到 0.32.0，或单卡 |
-| `... runs on one GPU only; set tensor_parallel_size=1` | `causal_model` 训练、状态投喂和 `@pllm.custom_residual` 只支持单卡 | 单卡 |
-| `TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local @pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1` | 多卡时增量按分片存放，只有分片内的更新能保持各卡一致 | 多卡时 Adapter 状态从 `Zeros` / `Computed` 开始、只在 `@pllm.train_in_forward` 里更新；否则单卡 |
+| `multi-GPU needs vLLM 0.32.0 or newer; otherwise use tensor_parallel_size=1` | pLLM 从 vLLM 0.32.0 起支持张量并行 | 升级到 vLLM 0.32.0 及以上，或设 `tensor_parallel_size=1` |
+| `... runs on one GPU only; set tensor_parallel_size=1` | `causal_model` 训练、`@pllm.custom_residual(site="value")` 以及带跨头 `pllm.attention(...)` 事实或非默认 KV 布局的 `@pllm.custom_attention` 需要单卡 | 设为 `tensor_parallel_size=1`（默认 `keep="all"` 且不读跨头事实的 `@pllm.custom_attention`、子层 `@pllm.custom_residual` 与 `Fed` 支持多卡） |
+| `TP Adapter updates need shard-local @pllm.train_in_forward; side-lane updates need tensor_parallel_size=1` | 多卡时每张卡持有自己的增量分片（支持 `Zeros`、`Computed`、`Pretrained` 或 `Imported`）；旁路流上的 `@pllm.train` / `@pllm.write` 不会跨卡同步分片 | 多卡下用分片内 `@pllm.train_in_forward` 或 `import_state` / `StateImport` 更新，或用单卡跑旁路训练 |
+| `...: TP sharded fields are projection-local; other readers need tensor_parallel_size=1` | 分片后的 Adapter 字段在每张卡上只存本卡切片，普通张量方法无法读到完整权重 | 只通过 `pllm.model.Adapter` 或 `@pllm.train_in_forward` 使用该状态，或设 `tensor_parallel_size=1` |
 | `TP projection update is not shard-local at ...; ...` | 更新的数学要用到别的卡上的分片 | 改成只用本卡分片的更新，或单卡 |
 | `other processes receive the workload by pickling (...); hold plain values, tensors and functions instead of locks, open files or live handles, or use tensor_parallel_size=1 with multiprocessing=False` | 负载字段（或其中函数捕获的变量）持有锁、打开的文件或活动句柄，无法 pickle | 字段只放普通值、张量和函数；句柄在方法内打开 |
 | `check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script` | GPU 检查跑一段固定的多请求脚本 | 检查时调大这两个设置 |
@@ -185,8 +186,10 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `a route-keyed request state requires per-prompt routes` | 没有路由值的请求不知道该用哪份状态 | `generate` 时传 `routes=` |
 | `RequestIdentity ... is missing a field required by ...` | 请求缺少声明的键字段值（空路由、负的 prompt 编号） | 给每个请求的每个键字段一个合法值 |
 | `batch, sample_index, prompt_indices and routes need workload= in make_llm` | 没装负载的引擎没有东西可喂 | `make_llm` 时传 `workload=` |
-| `state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer` | `llm.feed(...)` 给出的是进程内的句柄 | 用单进程引擎，生产者放在 spawn 出的进程里 |
-| `completions carry each sample's final hidden row, which only a workload collects; ...` | `generate_completions` 和 `generate_feedback` 要把每个样本最终位置的 hidden 交给宿主，只有装了负载的引擎才会采集 | 只做重试或打分、不训练时，给 `make_llm` 传 `workload=pllm.workloads.DummyWorkload()` |
+| `online serving runs vLLM's async multiprocess engine; omit multiprocessing=False or set True` | `make_async_llm` 和 `pllm serve` 运行异步多进程引擎（默认的 `multiprocessing="auto"` 会自动开启） | 保持默认的 `multiprocessing="auto"` 或设为 `True` |
+| `import_state needs a nonempty route and RequestState keyed only by route` | `llm.import_state(..., route=...)` 只面向 `InstanceState`（不传 route）或仅按 `"route"` 分组的 `RequestState` | 声明 `key_fields=("route",)` 并传入非空 `route`，或按请求传 `stream(..., state_import=...)` / `generate(..., batch=...)` |
+| `train_batch needs a workload with a host batch training method` | `llm.train_batch(batch)` 需要负载声明了读取 `pllm.batch(...)` 的宿主批训练方法 | 在负载里声明读取 `pllm.batch(...)` 的 `@pllm.train` 方法 |
+| `online request lacks pLLM identity metadata; submit through AsyncVllmLlm or pllm serve` | 在线请求缺少 pLLM 身份元数据，worker 无法绑定或追踪请求状态 | 通过 `pllm.make_async_llm` 或 `pllm serve` 提交请求 |
 
 ## testing.check 的 ContractError
 

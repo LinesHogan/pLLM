@@ -22,7 +22,11 @@
   "reportUnnecessaryComparison": "error",
   "reportUnnecessaryCast": "error",
   "defineConstant": {
-    "VLLM_027": true
+    "VLLM_027": true,
+    "VLLM_028_030": false,
+    "VLLM_031": false,
+    "VLLM_033_PLUS": false,
+    "VLLM_034": false
   },
   "venvPath": ".",
   "venv": ".venv",

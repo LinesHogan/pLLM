@@ -174,12 +174,13 @@ def main() -> None:
             environment["CUDA_VISIBLE_DEVICES"] = CUDA_DEVICES
         environment.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "1")
         environment.setdefault("OMP_NUM_THREADS", "1")
+        gpu_lock = os.environ.get("PLLM_GPU_LOCK", "/tmp/pllm-gpu.lock")
+        affinity = os.environ.get("PLLM_CPU_AFFINITY", "")
+        prefix: list[str] = ["flock", gpu_lock] if gpu_lock else []
+        if affinity:
+            prefix += ["taskset", "-c", affinity]
         command = [
-            "flock",
-            "/tmp/pllm-gpu.lock",
-            "taskset",
-            "-c",
-            "0-15",
+            *prefix,
             sys.executable,
             str(Path(__file__).resolve()),
             str(args.candidate.resolve()),

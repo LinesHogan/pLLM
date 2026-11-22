@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from pllm.contracts.backend_attachment import ModelProbe
 from pllm.contracts.kv_layout import KVLayout, storage_layout
 from pllm.contracts.semantic_graph import PackedSamplerRowsInputSource, TaskResultInputSource, TaskSymbol
 from pllm.contracts.state_representation import StateDeviceKind
@@ -62,7 +63,8 @@ class AttentionCost:
 class TraceRead:
     """Shape-only native reads for planning and explain's per-layer cost rows."""
 
-    def __init__(self, context: int) -> None:
+    def __init__(self, context: int, out_head_dim: int = 0) -> None:
+        self.out_head_dim = out_head_dim
         self.context = context
         self.reads: list[str] = []
         self.tokens = 0
@@ -99,7 +101,18 @@ class TraceRead:
             if self.sink
             else "all positions natively"
         )
-        return torch.empty_like(q), torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        output = q.new_empty((*q.shape[:2], self.out_head_dim)) if self.out_head_dim > 0 else torch.empty_like(q)
+        return output, torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+
+    def cost(self, layer: int, method: str, q: torch.Tensor, probe: ModelProbe) -> AttentionCost:
+        """Count stored features transferred and score/value products for all reads."""
+        if probe.kv_lora_rank:
+            features = (probe.kv_lora_rank + probe.qk_rope_head_dim) * self.tokens
+            flops = 2 * probe.attention_heads * (2 * probe.kv_lora_rank + probe.qk_rope_head_dim) * self.tokens
+        else:
+            features = 2 * probe.head_dim * (probe.kv_heads * self.shared_tokens + self.head_tokens)
+            flops = 4 * probe.attention_heads * probe.head_dim * self.tokens
+        return AttentionCost(layer, method, tuple(self.reads), flops, features * q.element_size())
 
 
 def identity(value: torch.Tensor) -> torch.Tensor:
@@ -156,12 +169,19 @@ class AttentionProgram:
         """Gather the fact for each sampled row into the task's owned result."""
         indices = data.table.index.sampler
         value = self.facts[source]
-        if indices.is_meta:
+        if indices.is_meta and (not value.is_meta or not len(value)):
             return torch.empty((len(indices), *value.shape[1:]), dtype=value.dtype, device="meta")
         return value.index_select(0, self.sample_rows.index_select(0, indices.clamp_min(0)))
 
-    def plan(self, binding: TensorDeclaration, facts: BackendCompileFacts) -> None:
-        """Trace methods in forward order to infer fact shapes and attention work."""
+    def validate_mla_layouts(self) -> None:
+        """MLA selection reads borrow the complete compressed history."""
+        if any(layout.keep != "all" or layout.sink for layout in self.layouts):
+            raise ValueError(
+                "MLA @pllm.custom_attention supports keep='all' with window=/topk= read selection; "
+                "remove sliding-window or shared KV layout declarations"
+            )
+
+    def _declare_fact_reads(self) -> None:
         for method in tuple(self.methods.values()):
             for _, source in method.inputs:
                 if isinstance(source, AttentionFact):
@@ -173,12 +193,19 @@ class AttentionProgram:
                         f"pllm.attention({source.layer}, 'aux') needs custom attention returning (output, aux)"
                     )
                 self.methods[source.layer] = AttentionMethod("native", (source.layer,), native, ())
+
+    def plan(self, binding: TensorDeclaration, facts: BackendCompileFacts) -> None:
+        """Trace methods in forward order to infer fact shapes and attention work."""
+        self._declare_fact_reads()
         probe = facts.probe
         rows, heads, dim = probe.max_packed_rows, probe.attention_heads, probe.head_dim
         if not self.methods:
             return
-        if not heads or not dim:
-            raise ValueError("@pllm.custom_attention needs dense GQA/MHA model geometry")
+        mla_dims = (probe.kv_lora_rank, probe.qk_nope_head_dim, probe.qk_rope_head_dim, probe.v_head_dim)
+        if not heads or not dim or (probe.kv_lora_rank and min(mla_dims) <= 0):
+            raise ValueError("@pllm.custom_attention needs dense GQA/MHA or complete MLA model geometry")
+        if probe.kv_lora_rank:
+            self.validate_mla_layouts()
         context = probe.causal_domain.positions if probe.causal_domain is not None else 1
         costs: list[AttentionCost] = []
         for layer, method in sorted(self.methods.items()):
@@ -188,8 +215,8 @@ class AttentionProgram:
             q, kv, kwargs = attention_example(binding, facts, self, layer, rows, trace)
             result = method.function(q, kv, **kwargs)
             output, aux = result if isinstance(result, tuple) else (result, None)
-            if output.shape != q.shape or output.dtype != q.dtype:
-                raise ValueError(f"{method.name}: return attention with q's shape and model dtype")
+            if output.shape != (rows, heads, probe.v_head_dim or dim) or output.dtype != q.dtype:
+                raise ValueError(f"{method.name}: return attention shaped [rows, heads, v_head_dim] with model dtype")
             for source in tuple(self.facts):
                 if source.layer != layer:
                     continue
@@ -202,15 +229,7 @@ class AttentionProgram:
                         raise ValueError(f"{method.name}: return (attention, aux) with aux shaped [rows, ...]")
                     value = aux
                 self.facts[source] = value
-            costs.append(
-                AttentionCost(
-                    layer,
-                    method.name,
-                    tuple(trace.reads),
-                    4 * heads * dim * trace.tokens,
-                    2 * dim * q.element_size() * (probe.kv_heads * trace.shared_tokens + trace.head_tokens),
-                )
-            )
+            costs.append(trace.cost(layer, method.name, q, probe))
         self.costs = tuple(costs)
         self.sample_rows = torch.empty(rows if self.facts else 0, dtype=torch.long, device="meta")
         self.prompt_lens = torch.empty(
@@ -248,21 +267,27 @@ def attention_example(
     q = torch.empty((rows, probe.attention_heads, probe.head_dim), dtype=probe.tensor_dtype.torch, device="meta")
     size = CHECK_PAGE_SIZE if probe.device_kind is StateDeviceKind.CPU else PAGE_SIZE
     pages = (trace.context + size - 1) // size
-    cache = q.new_empty((rows * pages, size, probe.kv_heads, probe.head_dim))
     integer = torch.empty(rows, dtype=torch.int32, device="meta")
+    table, starts = integer.new_empty((rows, pages)), integer.new_empty(rows + 1)
     layout = storage_layout(program.layouts, layer)
     trace.sink = layout.sink
-    kv = PagedKV(
-        cache,
-        cache,
-        integer.new_empty((rows, pages)),
-        integer,
-        integer.new_empty(rows + 1),
-        rows,
-        trace,
-        layout.window,
-        integer if layout.sink else None,
-    )
+    trace.out_head_dim = probe.v_head_dim
+    if probe.kv_lora_rank:
+        rank, heads = probe.kv_lora_rank, probe.attention_heads
+        kv = PagedKV.from_latent(
+            q.new_empty((rows * pages, size, rank)),
+            q.new_empty((rows * pages, size, probe.qk_rope_head_dim)),
+            q.new_empty((heads, probe.qk_nope_head_dim, rank)),
+            q.new_empty((heads, rank, probe.v_head_dim)),
+            table,
+            integer,
+            starts,
+            rows,
+            trace,
+        )
+    else:
+        cache = q.new_empty((rows * pages, size, probe.kv_heads, probe.head_dim))
+        kv = PagedKV(cache, cache, table, integer, starts, rows, trace, layout.window, integer if layout.sink else None)
     arguments = {
         name: meta_site_state(binding, source, None)
         if isinstance(source, StateInput)

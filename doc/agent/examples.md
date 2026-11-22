@@ -54,6 +54,8 @@ Where each kind of example lives:
 | Unit-test your math without a model | [reference.md: Step a workload by hand](reference.md#step-a-workload-by-hand-in-tests) (`Centered`) | `pllm.testing.compile_execution`, `step_input`, `run_step` |
 | Compare throughput with plain vLLM | [reference.md: Measure throughput](reference.md#measure-throughput); `tools/benchmark_esamp.py` | `pllm.benchmark.throughput`, `pllm.benchmark.compare` |
 | Let an agent search over workload variants | `examples/algorithm_search/`; example 13 | `pllm.explain`, `pllm.testing.check`, `pllm.benchmark` |
+| Migrate existing HF / PyTorch / vLLM hooks | [migration.md](migration.md) | Pre-flight audit table + CPU-verified translations |
+| Online streaming or OpenAI HTTP serving | [SKILL.md](SKILL.md); [migration.md: Runtime entry points](migration.md#3-wire-into-the-right-runtime-entry-point); [doc/howto/online-serving.md](../howto/online-serving.md) | `pllm.make_async_llm`, `pllm serve`, `extra_body={"vllm_xargs": {"pllm_route": ...}}` |
 
 ## Built-in workloads
 

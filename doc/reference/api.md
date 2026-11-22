@@ -15,6 +15,14 @@ pllm.make_llm(config: 'ModelConfig', *, workload: 'Workload | None' = None) -> '
 
 A context-managed vLLM engine; execution options apply when a workload is installed.
 
+### `pllm.make_async_llm`
+
+```text
+pllm.make_async_llm(config: 'ModelConfig', *, workload: 'Workload | None' = None) -> 'AsyncVllmLlm'
+```
+
+An async continuous-batching vLLM engine handle (`async with make_async_llm(...) as llm:`).
+
 ### `pllm.explain`
 
 ```text
@@ -43,7 +51,7 @@ value; every component must agree with the engine's ExecutionOptions.publish_lag
 ### `pllm.ModelConfig`
 
 ```text
-pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, kv_cache_memory_bytes: int | None = None, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: bool = False, execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
+pllm.ModelConfig(model: str, dtype: Literal['bfloat16', 'float16', 'float32'] = 'bfloat16', max_model_len: int = 512, max_num_seqs: int = 8, max_num_batched_tokens: int = 512, gpu_memory_utilization: float = 0.5, kv_cache_memory_bytes: int | None = None, seed: int = 0, trust_remote_code: bool = False, enable_prefix_caching: bool = False, enable_chunked_prefill: bool = False, generated_kv: Literal['reuse', 'isolate'] = 'isolate', revision: str | None = None, multiprocessing: Union[Literal['auto'], bool] = 'auto', execution: pllm.config.ExecutionOptions = ..., cuda_graphs: Union[Literal['auto'], bool] = 'auto', kv_offload: pllm.config.KVOffload | None = None, tensor_parallel_size: int = 1, pipeline_parallel_size: int = 1, data_parallel_size: int = 1)
 ```
 
 ### `pllm.ExecutionOptions`
@@ -502,6 +510,14 @@ pllm.Phase: BEFORE_FORWARD | AFTER_FORWARD | BEFORE_SAMPLE | AFTER_SAMPLE | IN_F
 
 The windows of one engine step a method can run in (@pllm.on); each effect has a default window.
 
+### `pllm.cfg`
+
+```text
+pllm.cfg(path: 'str') -> 'Any'
+```
+
+Refer to a workload attribute or dotted path in a decorator or marker setting.
+
 ## 改模型与 forward
 
 ### `pllm.model.ActivationPatch`
@@ -619,12 +635,15 @@ are owned by vLLM's RSWAManager. Score-based memory eviction is unsupported.
 ### `pllm.model.PagedKV`
 
 ```text
-pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', query_count: 'int', read_attention: 'AttentionRead', storage_window: 'int' = 0, prompt_lens: 'torch.Tensor | None' = None)
+pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', query_count: 'int', read_attention: 'AttentionRead', storage_window: 'int' = 0, prompt_lens: 'torch.Tensor | None' = None, storage_kind: "Literal['kv', 'mla_latent']" = 'kv', latent_cache: 'torch.Tensor | None' = None, rope_cache: 'torch.Tensor | None' = None, w_uk_t: 'torch.Tensor | None' = None, w_uv: 'torch.Tensor | None' = None)
 ```
 
 Borrowed paged K/V, already including the current tokens; never changes cache storage.
 
-Caches have shape [blocks, block_size, kv_heads, head_dim]. ``topk`` contains
+Dense pages have shape [blocks, block_size, kv_heads, head_dim]. MLA stores
+[blocks, block_size, latent_rank] and [blocks, block_size, rope_dim] views,
+with per-head [nope_dim, latent_rank] and [latent_rank, v_dim] projections.
+``topk`` contains
 logical token positions [rows, k] or [rows, query_heads, k], padded with -1.
 Different heads and layers may select different budgets. Selection saves reads,
 not allocated KV memory. ``window`` counts tokens including the current token.
@@ -780,8 +799,7 @@ Each `train(batch)` runs on the caller's current CUDA stream, so the batch only 
 pllm.host.TrainStep(loss: 'torch.Tensor | None', parameters: 'Mapping[str, torch.Tensor]')
 ```
 
-One host training step: its loss (None when the train method skipped the update) and the trained state's
-fields after the step, by name, as owned copies ready on the caller's current stream.
+Loss and owned parameter snapshots from a host batch update on an attached engine.
 
 ### `pllm.host.WeightedRowBatch`
 

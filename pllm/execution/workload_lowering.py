@@ -18,13 +18,14 @@ import torch
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import ActivationPatchOperator, DecodeRefresh, DecodeWindow, MissingPolicy
 from pllm.contracts.hidden_locator import HiddenSite
-from pllm.contracts.host_batch import validate_host_batch
+from pllm.contracts.host_batch import StateImport, validate_host_batch
 from pllm.contracts.member import MemberDeclaration
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator, ProjectionDelta
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
     HiddenInputSource,
+    HostServiceInputSource,
     MathContract,
     SamplerFeedbackInputSource,
     SchedulerTimeline,
@@ -249,8 +250,10 @@ class WorkloadContext:
                 self.binding.initial_values[resource](self.binding.dimensions, 0)
             else:
                 layout = next(item.layout for item in self.binding.layouts.layouts if item.resource == resource)
+                shards = self.binding.field_shards[resource]
                 tensors = tuple(
-                    torch.empty(field.shape, dtype=field.dtype.torch, device="meta") for field in layout.fields
+                    torch.empty(shards[i].shape if i in shards else field.shape, dtype=field.dtype.torch, device="meta")
+                    for i, field in enumerate(layout.fields)
                 )
                 self.binding.initializers[resource](tensors, torch.Generator())
 
@@ -592,9 +595,9 @@ def declare_state(context: WorkloadContext, name: str, definition: InstanceState
     fields = _layout_fields(context, name, definition)
     if context.binding.dimensions.tensor_parallel_size > 1 and any(field.shard is not None for field in fields):
         # Initialization runs on the whole field before each rank takes its slice.
-        if definition.optimizer is not None or not isinstance(definition.init, (Zeros, Computed)):
+        if definition.optimizer is not None or not isinstance(definition.init, (Zeros, Computed, Pretrained, Imported)):
             raise ValueError(
-                "TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local "
+                "TP Adapter fields support Zeros, Computed, Pretrained and Imported initialization and shard-local "
                 "@pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1"
             )
     context.states[name], ports = declare_parameters(
@@ -698,15 +701,21 @@ def lower_workload(context: WorkloadContext, b: TensorDeclaration, capabilities:
     context.attach_imports()
     context.attach_effects()
     context.attach_training()
-    if b.dimensions.tensor_parallel_size > 1:
+    if b.dimensions.tensor_parallel_size > 1 and b.effects.in_forward is None:
         for task in b.graph.tasks:
-            for effect in task.effects:
-                if b.field_shards.get(str(effect.resource)) and effect.kind is not StateEffectKind.READ:
-                    if b.effects.in_forward is None:
-                        raise ValueError(
-                            "TP Adapter updates need shard-local @pllm.train_in_forward; "
-                            "side-lane updates need tensor_parallel_size=1"
-                        )
+            if any(
+                isinstance(port.source, HostServiceInputSource) and port.source.schema == StateImport.schema
+                for port in task.inputs
+            ):
+                continue
+            if any(
+                b.field_shards.get(effect.resource)
+                and effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
+                for effect in task.effects
+            ):
+                raise ValueError(
+                    "TP Adapter updates need shard-local @pllm.train_in_forward; side-lane updates need tensor_parallel_size=1"
+                )
     if all(
         capability in capabilities
         for capability in ("compute/cuda@1", "transition/full_root@1", "backend/tensor_parallel@1")

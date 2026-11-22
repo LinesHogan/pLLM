@@ -1,8 +1,10 @@
-"""Causal training for the dense vLLM decoders (Qwen2, Llama, Qwen3) over borrowed weights and RoPE caches.
+"""Causal training for the dense vLLM decoders over borrowed weights and RoPE caches.
 
 Quantized checkpoints train like QLoRA: each frozen projection runs its own inference kernel forward, and its
 input gradient uses the dense weight vLLM dequantizes for that one backward step.
 """
+
+from __future__ import annotations
 
 from collections.abc import Callable
 from functools import partial
@@ -10,14 +12,26 @@ from typing import Protocol
 
 import torch
 from torch.nn import functional as F
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.phi3_long_rope_scaled_rope import Phi3LongRoPEScaledRotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+from vllm.model_executor.models.gemma2 import Gemma2Attention, Gemma2DecoderLayer
+from vllm.model_executor.models.gemma3 import Gemma3Attention, Gemma3DecoderLayer
+from vllm.model_executor.models.glm4 import Glm4DecoderLayer
+from vllm.model_executor.models.mistral import MistralAttention, MistralDecoderLayer
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 
-from pllm.backends.vllm.architecture import DENSE_ARCHITECTURES, Decoder, DenseLayer, frozen_weight
+from pllm.backends.vllm.architecture import (
+    DENSE_ARCHITECTURES,
+    Decoder,
+    DenseLayer,
+    Norm,
+    frozen_weight,
+    lm_head_module,
+)
 from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding
 from pllm.execution.causal_batch import LMHead
 from pllm.execution.parameter_projection import parameter_correction
@@ -52,24 +66,32 @@ def frozen_projection(hidden: torch.Tensor, projection: LinearBase) -> torch.Ten
     return FrozenProjection.apply(hidden, projection)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
 
 
-def norm(module: RMSNorm, hidden: torch.Tensor) -> torch.Tensor:
+def norm(module: Norm, hidden: torch.Tensor) -> torch.Tensor:
     """Normalize the dense families' full hidden width in FP32, rounding once to the model dtype."""
-    assert module.variance_size_override is None
-    return F.rms_norm(hidden.float(), (hidden.shape[-1],), module.weight.float(), module.variance_epsilon).to(
-        hidden.dtype
-    )
+    weight = module.weight.float()
+    if isinstance(module, GemmaRMSNorm):
+        weight = weight + 1.0
+    else:
+        assert module.variance_size_override is None
+    return F.rms_norm(hidden.float(), (hidden.shape[-1],), weight, module.variance_epsilon).to(hidden.dtype)
 
 
-def add_norm(module: RMSNorm, hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def add_norm(module: Norm, hidden: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """The fused kernel stores the model-dtype sum as the residual and normalizes that rounded sum."""
     residual = hidden + residual
     return norm(module, residual), residual
 
 
 def rotary(
-    module: RotaryEmbedding, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    module: RotaryEmbedding | Phi3LongRoPEScaledRotaryEmbedding,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Use FP32 rotary arithmetic without replacing or modifying the borrowed cache."""
+    if isinstance(module, Phi3LongRoPEScaledRotaryEmbedding):
+        q, k = module(positions.flatten(), query.flatten(0, 1), key.flatten(0, 1))
+        return q.reshape_as(query), k.reshape_as(key)
     rotated_query, rotated_key = RotaryEmbedding.forward_static(
         positions,
         query.float(),
@@ -88,7 +110,7 @@ def attention_forward(
     positions: torch.Tensor,
     mask: torch.Tensor | None,
     project: Project,
-    qk_norms: tuple[RMSNorm, RMSNorm] | None,
+    qk_norms: tuple[Norm, Norm] | None,
 ) -> torch.Tensor:
     """Apply projection overlays before per-head normalization, RoPE and causal attention."""
     attention = layer.self_attn
@@ -99,16 +121,47 @@ def attention_forward(
         query = norm(qk_norms[0], query.reshape(batch_size, length, -1, attention.head_dim)).reshape_as(query)
         key = norm(qk_norms[1], key.reshape(batch_size, length, -1, attention.head_dim)).reshape_as(key)
     query, key = rotary(attention.rotary_emb, positions, query, key)
+    if isinstance(attention, MistralAttention) and attention.do_llama_4_scaling:
+        query = (query * attention._get_llama_4_attn_scale(positions)).to(query.dtype)
     query = query.view(batch_size, length, attention.num_heads, attention.head_dim).transpose(1, 2)
     key = key.view(batch_size, length, attention.num_kv_heads, attention.head_dim).transpose(1, 2)
     value = value.view(batch_size, length, attention.num_kv_heads, attention.head_dim).transpose(1, 2)
-    if mask is not None:
-        # Native GQA with an explicit mask falls back to the slower math backend.
-        groups = attention.num_heads // attention.num_kv_heads
-        key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
-    hidden = F.scaled_dot_product_attention(query, key, value, attn_mask=mask, is_causal=mask is None, enable_gqa=True)
+    cap = attention.config.attn_logit_softcapping if isinstance(attention, Gemma2Attention) else None
+    scale = attention.scaling if isinstance(attention, (Gemma2Attention, Gemma3Attention)) else attention.head_dim**-0.5
+    hidden = causal_attention(query, key, value, mask, attention.attn.sliding_window, cap, scale)
     hidden = hidden.transpose(1, 2).reshape(batch_size, length, attention.q_size)
     return project(attention.o_proj, hidden)
+
+
+def causal_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor | None,
+    window: int | None,
+    soft_cap: float | None,
+    scale: float,
+) -> torch.Tensor:
+    """Apply the layer's score transform before masking and softmax, including fully masked padding rows."""
+    if window is not None or soft_cap is not None:
+        length = query.shape[2]
+        visible = torch.ones((length, length), dtype=torch.bool, device=query.device).tril()
+        if window is not None:
+            visible = visible.triu(1 - window)
+        mask = visible if mask is None else mask & visible
+    if mask is not None:
+        groups = query.shape[1] // key.shape[1]
+        key, value = key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
+    if soft_cap is None:
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, is_causal=mask is None, enable_gqa=True, scale=scale
+        )
+    assert mask is not None
+    scores = (query.float() @ key.float().transpose(-1, -2)) * scale
+    capped = torch.tanh(scores / soft_cap) * soft_cap
+    # A fully masked row must have zero output and zero gradient.
+    scores = capped.masked_fill(~mask, torch.finfo(capped.dtype).min)
+    return scores.softmax(-1).masked_fill(~mask, 0).to(value.dtype) @ value
 
 
 def mlp_forward(layer: DenseLayer, hidden: torch.Tensor, project: Project) -> torch.Tensor:
@@ -118,10 +171,32 @@ def mlp_forward(layer: DenseLayer, hidden: torch.Tensor, project: Project) -> to
     return project(layer.mlp.down_proj, hidden)
 
 
-def bind_qk_norms(layer: DenseLayer) -> tuple[RMSNorm, RMSNorm] | None:
+def feedforward(
+    layer: DenseLayer, branch: torch.Tensor, residual: torch.Tensor, project: Project
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the branch norms around each family's MLP and retain its residual stream."""
+    if isinstance(layer, (Gemma2DecoderLayer, Gemma3DecoderLayer)):
+        hidden, residual = add_norm(
+            layer.pre_feedforward_layernorm, norm(layer.post_attention_layernorm, branch), residual
+        )
+        return norm(layer.post_feedforward_layernorm, mlp_forward(layer, hidden, project)), residual
+    if isinstance(layer, Glm4DecoderLayer):
+        branch = norm(layer.post_self_attn_layernorm, branch)
+    hidden, residual = add_norm(layer.post_attention_layernorm, branch, residual)
+    if isinstance(layer, MistralDecoderLayer) and layer.ada_rms_norm_t_cond is not None:
+        raise ValueError("causal training needs a Mistral checkpoint without a conditioning tensor")
+    hidden = mlp_forward(layer, hidden, project)
+    return (norm(layer.post_mlp_layernorm, hidden) if isinstance(layer, Glm4DecoderLayer) else hidden), residual
+
+
+def bind_qk_norms(layer: DenseLayer) -> tuple[Norm, Norm] | None:
     """Resolve the sole attention family difference once when borrowing the model."""
     attention = layer.self_attn
-    if isinstance(attention, Qwen3Attention) or isinstance(attention, Qwen2Attention) and attention.qk_norm:
+    if (
+        isinstance(attention, (Qwen3Attention, Gemma3Attention))
+        or isinstance(attention, Qwen2Attention)
+        and attention.qk_norm
+    ):
         return attention.q_norm, attention.k_norm
     return None
 
@@ -132,12 +207,10 @@ class CausalTraining:
     def __init__(self, decoder: Decoder, bindings: tuple[ParameterOverlayFieldBinding, ...]) -> None:
         model = decoder.writable("causal training")
         if not isinstance(model, DENSE_ARCHITECTURES):
-            raise ValueError(
-                f"causal training implements dense Qwen2, Llama and Qwen3 decoders; choose one of those "
-                f"instead of {type(model).__name__}"
-            )
+            raise ValueError(f"causal training needs a dense decoder; {type(model).__name__} uses another layer layout")
         self.model = model
-        embeddings = (model.model.embed_tokens, model.lm_head)
+        head = lm_head_module(model)
+        embeddings = (model.model.embed_tokens, head)
         if (
             not all(isinstance(module.quant_method, UnquantizedEmbeddingMethod) for module in embeddings)
             or model.model.embed_tokens.weight.dtype is not torch.bfloat16
@@ -151,7 +224,9 @@ class CausalTraining:
             self.projections.setdefault(projection, []).append((offset, size, binding, slice(start, end)))
             start = end
         self.qk_norms = tuple(bind_qk_norms(layer) for layer in self.model.model.layers)
-        self.head = LMHead(model.lm_head.weight, model.config.vocab_size, model.logits_processor.scale)
+        self.head = LMHead(
+            head.weight, model.config.vocab_size, model.logits_processor.scale, model.logits_processor.soft_cap
+        )
 
     def project(
         self, projection: LinearBase, hidden: torch.Tensor, *, factors: tuple[torch.Tensor, ...] | None
@@ -177,7 +252,7 @@ class CausalTraining:
         if attention_mask is not None:
             causal = torch.ones(length, length, device=tokens.device, dtype=torch.bool).tril()
             mask = causal[None, None] & attention_mask[:, None, None, :].bool()
-        hidden = F.embedding(tokens, self.model.model.embed_tokens.weight)
+        hidden = self.model.model.embed_input_ids(tokens)
         project = partial(self.project, factors=factors)
         residual = None
         for index, layer in enumerate(self.model.model.layers):
@@ -194,8 +269,7 @@ class CausalTraining:
                 project,
                 self.qk_norms[index],
             )
-            hidden, residual = add_norm(layer.post_attention_layernorm, hidden, residual)
-            hidden = mlp_forward(layer, hidden, project)
+            hidden, residual = feedforward(layer, hidden, residual, project)
         assert residual is not None
         hidden, _ = add_norm(self.model.model.norm, hidden, residual)
         return hidden

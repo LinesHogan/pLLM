@@ -12,7 +12,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import partial
 from graphlib import CycleError, TopologicalSorter
 from inspect import Parameter as SignatureParameter, signature
-from itertools import pairwise
+from itertools import chain, pairwise
 from types import FunctionType
 from typing import Any, ClassVar, TypeVar
 
@@ -21,7 +21,7 @@ import torch
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
 from pllm.contracts.compilation import PlanBundle
-from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline, SemanticGraph, StateScope, TaskId
+from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline, SemanticGraph, TaskId
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.backend_attachment import (
@@ -30,26 +30,33 @@ from pllm.execution.backend_attachment import (
     derive_attachment_resources,
 )
 from pllm.execution.causal_batch import CausalBinder
-from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements
+from pllm.execution.compile_facts import BackendCompileFacts, BackendRequirements, prefix_cache_reason
 from pllm.execution.declaration import When
 from pllm.execution.host_runtime import HostConfig
 from pllm.execution.method_dependencies import check_dependencies
 from pllm.execution.method_effects import (
+    CustomAttention,
     CustomResidual,
     Effect,
     Gradient,
     TrainInForward,
+    Write,
 )
 from pllm.execution.method_inputs import (
+    Attention,
     InputMarker,
     InputTokens,
     Parameter,
     Result,
+    StateIndex,
+    StateVersion,
+    Value,
 )
 from pllm.execution.position_state import PositionState
 from pllm.execution.ptts.page_bundle import PageBundleArena
 from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
 from pllm.execution.state_execution import MathBinding, StateExecution
+from pllm.execution.state_init import Fed, Imported
 from pllm.execution.task_memory import custom_forward_capture_bytes
 from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.trace import TraceEvent
@@ -103,7 +110,12 @@ class Workload:
                 )
 
     def specialize(
-        self, facts: BackendCompileFacts, options: ExecutionOptions, *, causal: CausalBinder | None = None
+        self,
+        facts: BackendCompileFacts,
+        options: ExecutionOptions,
+        *,
+        causal: CausalBinder | None = None,
+        prefix_caching: bool = False,
     ) -> tuple[BackendCompileFacts, TensorDeclaration]:
         """Measure and fund the declaration on this backend, then declare against the funded facts as workers do;
         planning and binding reuse both."""
@@ -115,6 +127,13 @@ class Workload:
                 )
         facts = _apply_options(facts, options)
         measured = self.build(facts, causal=causal)
+        if prefix_caching:
+            BackendRequirements.from_model_reads(
+                measured.graph,
+                measured.effects,
+                external_states={*measured.imports, *(feed.resource for feed in measured.feeds)},
+                custom_attention=bool(measured.attention.methods),
+            ).check_prefix_cache()
         timeline = _fund_attachment(measured, facts.probe, reserve_resources(measured, facts, options), options)
         facts = replace(facts, timeline=timeline)
         declaration = self.funded_declaration(facts, causal=causal)
@@ -170,27 +189,30 @@ class Workload:
 
     def backend_requirements(self) -> BackendRequirements:
         """Read model dependencies from declarations and markers before dimensions or tensor readers exist."""
+        from pllm.execution.method_inputs import Batch
+
         context = read_workload(self)
         definitions = context.state_definitions
         inputs: dict[str, tuple[InputMarker, ...]] = {}
+        trains_on_batch = False
         for operation in context.operations:
             if operation.effect.reads_taps:
                 with operation.context.declaring(operation.name):
-                    inputs.update((name, tuple(arguments.values())) for name, arguments in operation.sources().items())
+                    sources = operation.sources()
+                if any(isinstance(marker, Batch) for markers in sources.values() for marker in markers.values()):
+                    trains_on_batch = True
+                inputs.update((name, tuple(arguments.values())) for name, arguments in sources.items())
         declared = BackendRequirements(
             parameter_targets=tuple(target for delta in context.adapters.values() for target in delta.targets),
             activation_layers=tuple(layer for patch in context.activations.values() for layer in patch.layers),
             position_states=context.position_states(),
             custom_forward=bool(context.custom_forwards),
-            instance_adapter=any(
-                definitions[delta.state].scope is StateScope.INSTANCE
-                for delta in context.adapters.values()
-                if delta.state in definitions
-            ),
+            trains_on_batch=trains_on_batch,
         )
         return BackendRequirements.combine(
             (
                 declared,
+                _model_site_requirements(context, inputs),
                 *(state.init.requirements(state) for state in definitions.values()),
                 *(operation.effect.requirements() for operation in context.operations),
                 *(source.requirements() for name in sorted(inputs) for source in inputs[name]),
@@ -268,6 +290,67 @@ class Workload:
         declaration = host_declaration(type(self).__qualname__, config)
         lower_workload(read_workload(self), declaration)
         return bind_host_declaration(declaration, config, self._export_handler(declaration, declaration.graph))
+
+
+def _model_site_requirements(
+    context: WorkloadContext, inputs: Mapping[str, tuple[InputMarker, ...]]
+) -> BackendRequirements:
+    """Read the model-site signatures before layer counts and storage layouts are available."""
+    reads = {item.state for item in (*context.adapters.values(), *context.activations.values())}
+    methods = [name for name, _, _ in context.custom_forwards]
+    writers = {op.effect.state for op in context.operations if op.effect.training or isinstance(op.effect, Write)}
+    value_site = False
+    custom_attention = False
+    for op in context.operations:
+        effect = op.effect
+        if isinstance(effect, CustomResidual):
+            methods.append(op.name)
+            if effect.read:
+                methods.append(effect.read)
+            value_site |= effect.site == "value"
+            if effect.state:
+                reads.add(effect.state)
+        elif isinstance(effect, CustomAttention):
+            custom_attention = True
+            methods.append(op.name)
+    markers = tuple(
+        arg.default.bind(context.component(name))
+        for name in methods
+        for arg in signature(context.method(name)).parameters.values()
+        if isinstance(arg.default, InputMarker)
+    )
+    reads.update(_states_read_by_sites(markers, inputs))
+    attention_facts = any(isinstance(marker, Attention) for marker in chain(markers, *inputs.values()))
+    reason = prefix_cache_reason(
+        (
+            (name, state.scope, isinstance(state.init, (Fed, Imported)) or name in writers)
+            for name, state in context.state_definitions.items()
+            if name in reads
+        ),
+        custom_attention=custom_attention or attention_facts,
+        in_forward=any(isinstance(op.effect, TrainInForward) for op in context.operations),
+        last_tokens=any(patch.last_tokens > 0 for patch in context.activations.values()),
+    )
+    return BackendRequirements(
+        custom_value_site=value_site or any(isinstance(marker, Value) for marker in markers),
+        custom_attention_facts=attention_facts,
+        prefix_cache_unsafe_reason=reason,
+    )
+
+
+def _states_read_by_sites(markers: tuple[InputMarker, ...], inputs: Mapping[str, tuple[InputMarker, ...]]) -> set[str]:
+    """Follow pre-forward result dependencies to their state inputs."""
+    reads: set[str] = set()
+    pending = list(markers)
+    visited: set[str] = set()
+    while pending:
+        source = pending.pop()
+        if isinstance(source, (Parameter, StateVersion, StateIndex)):
+            reads.add(source.state)
+        elif isinstance(source, Result) and source.operation not in visited:
+            visited.add(source.operation)
+            pending.extend(inputs.get(source.operation, ()))
+    return reads
 
 
 def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> BackendCompileFacts:

@@ -177,6 +177,10 @@ class RequestStateDirectory:
     def has_inference_pin(self, identity: RequestIdentity) -> bool:
         return identity in self._inference_pins
 
+    def has_address(self, identities: tuple[RequestIdentity, ...]) -> bool:
+        """Whether all projected keys already have live or dormant lineages."""
+        return all(address in self._lineages for address in self._addresses(identities))
+
     def _addresses(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateAddress, ...]:
         return tuple(
             StateAddress(state.resource, key)

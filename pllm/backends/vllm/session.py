@@ -14,7 +14,8 @@ import torch
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.architecture import Decoder
+from pllm.backends.vllm.architecture import Decoder, lm_head_module
+from pllm.backends.vllm.control import control_key
 from pllm.backends.vllm.custom_attention import CustomAttention
 from pllm.backends.vllm.custom_forward import VllmCustomForward
 from pllm.backends.vllm.hidden_taps import HiddenTaps
@@ -22,7 +23,7 @@ from pllm.backends.vllm.layer_logits import LayerLogits
 from pllm.backends.vllm.model_sites import ModelSites
 from pllm.backends.vllm.parameter_overlay import ParameterOverlay
 from pllm.backends.vllm.position_state import PositionCacheLayer
-from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy
+from pllm.backends.vllm.prefix_cache import POLICY_KEY, CachePolicy, read_online
 from pllm.backends.vllm.sampler import (
     BoundedSamplerGuidance,
     GuidedSampler,
@@ -71,7 +72,7 @@ class VllmSession:
             stage.stage is SamplerStage.PACKED_POST_FILTER_EXACT for stage in deployment.attachment.spec.sampler
         ):
             assert sampler is not None
-            self._guidance_weight = decoder.model.lm_head.weight
+            self._guidance_weight = lm_head_module(decoder.model).weight
         self.cache_envelope = encode_boundary(cache_policy)
         attachment = deployment.attachment
         plan = attachment.plan
@@ -126,7 +127,7 @@ class VllmSession:
             torch.empty(
                 (probe.max_packed_rows, history + 1),
                 dtype=torch.long,
-                device=decoder.model.lm_head.weight.device,
+                device=lm_head_module(decoder.model).weight.device,
             )
             if history >= 0
             else None
@@ -217,6 +218,16 @@ class VllmSession:
             params = request.sampling_params
             if params is None or (params.extra_args or {}).get(POLICY_KEY) != self.cache_envelope:
                 raise ValueError("request cache policy differs from installed workload; submit through its handle")
+            if not self.driver.is_staged(request.req_id):
+                online = read_online(params)
+                if online is None:
+                    raise ValueError(
+                        "online request lacks pLLM identity metadata; submit through AsyncVllmLlm or pllm serve"
+                    )
+                self.driver.stage_online(
+                    RequestIdentity(request.req_id, online.prompt_index, online.sample_index, online.route),
+                    import_key=control_key(params),
+                )
             new.append(request.req_id)
         self.driver.schedule(scheduler_output.finished_req_ids, scheduler_output.preempted_req_ids or set(), new)
 

@@ -225,6 +225,9 @@ class Imported(StateInit):
     """Supplied by generate(batch=pllm.io.StateImport(...)) and applied before the request's first forward: one row
     per prompt for a RequestState, the field tensors for an InstanceState."""
 
+    def requirements(self, state: InstanceState) -> BackendRequirements:
+        return BackendRequirements(imports=True)
+
     def describe(self, scope: StateScope) -> str:
         rows = "one row per prompt" if scope is StateScope.REQUEST else "field tensors"
         return (
@@ -234,7 +237,12 @@ class Imported(StateInit):
     def declare(self, context: WorkloadContext, name: str, state: InstanceState) -> None:
         b, allocated = context.binding, context.states[name]
         views = tuple((field, view) for (resource, field), view in b.field_views.items() if resource == name)
-        b.effects = replace(b.effects, import_fields=views)
+        shards = b.field_shards[name]
+        full_views = tuple(
+            (key, replace(view, shape=shards[view.field].shape) if view.field in shards else view)
+            for key, view in views
+        )
+        b.effects = replace(b.effects, import_fields=full_views)
         b.imports[name] = tuple(view for _, view in views)
         update = import_update(b, allocated, f"{name}:import@1")
         context.writes[name] = (update, b.publish(update, allocated, when=When.BEFORE_FORWARD, name=f"{name}.publish"))

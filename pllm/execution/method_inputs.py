@@ -153,6 +153,9 @@ class SampleIndex(InputMarker):
 class Batch(InputMarker):
     field: str
 
+    def requirements(self) -> BackendRequirements:
+        return BackendRequirements(trains_on_batch=True)
+
     def training_port(self, context: WorkloadContext, schema: str) -> CausalPort:
         return CausalPort(
             context.binding.input("training", self.field, schema),

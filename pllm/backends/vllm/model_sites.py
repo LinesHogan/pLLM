@@ -21,7 +21,14 @@ from torch import Tensor
 from vllm.model_executor.layers.linear import LinearBase
 
 from pllm.backends.vllm.activation import VllmActivationPatch
-from pllm.backends.vllm.architecture import Decoder, LinearOutput, NormForward, hidden_binding, sublayer_norms
+from pllm.backends.vllm.architecture import (
+    Decoder,
+    LinearOutput,
+    NormForward,
+    hidden_binding,
+    post_attention_norm_name,
+    sublayer_norms,
+)
 from pllm.backends.vllm.hidden_taps import HiddenTaps, Tap
 from pllm.backends.vllm.site_body import SiteBody, compile_site_method
 from pllm.contracts.hidden_locator import HiddenSite
@@ -112,6 +119,7 @@ class ModelSites:
         owners = {place: rewrite for rewrite in rewrites for place in rewrite.places}
         earlier = {source for rewrite in rewrites for source in rewrite.earlier}
         self.streams, self.hidden = max((rewrite.streams for rewrite in rewrites), default=1), weight.shape[0]
+        self.post_attn_norm = post_attention_norm_name(type(decoder.model).__name__)
         self.taps = taps
         self.active: Tensor | None = None
         # The packed rows of the layer call a custom forward is running (on the device and the host); None while
@@ -195,7 +203,7 @@ class ModelSites:
             path = (
                 "model.norm"
                 if layer == count
-                else f"model.layers.{layer}.{'post_attention_layernorm' if attention else 'input_layernorm'}"
+                else f"model.layers.{layer}.{self.post_attn_norm if attention else 'input_layernorm'}"
             )
             boundary = SublayerBoundary(
                 self,
@@ -361,7 +369,7 @@ class ModelSites:
         if self.taps is not None:
             for layer in range(start, stop):
                 for site in (HiddenSite.RESIDUAL, HiddenSite.ATTENTION_RESIDUAL):
-                    tap = self.taps.taps.get(hidden_binding(layer, site, len(self._ends)).tap)
+                    tap = self.taps.taps.get(hidden_binding(layer, site, len(self._ends), self.post_attn_norm).tap)
                     if tap is not None:
                         tap.copy(hidden)
 

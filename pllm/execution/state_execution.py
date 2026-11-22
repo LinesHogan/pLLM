@@ -7,7 +7,7 @@ while generate is running is unsupported.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -17,15 +17,20 @@ import numpy as np
 import torch
 
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.host_batch import HOST_BATCH_SCHEMAS
 from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.sampler import PackedSamplerGuidanceBatch, SamplerFeedback
 from pllm.contracts.semantic_graph import (
     AnchorId,
+    HostServiceInputSource,
     ImplementationId,
     PhysicalTask,
     ScheduleDecision,
+    SemanticGraph,
+    SemanticTask,
+    StateEffectKind,
     StateResource,
     TaskId,
     TaskResultInputSource,
@@ -55,7 +60,7 @@ from pllm.execution.trace import ExecutionTrace, TraceEvent, TraceEventKind
 if TYPE_CHECKING:
     from pllm.execution.post_sample import PostSampleOverlap
     from pllm.execution.step_input import StepInput
-    from pllm.execution.tensor_declaration import TensorOutput
+    from pllm.execution.tensor_declaration import StepResult, TensorOutput
     from pllm.execution.tensor_frame import TensorFrame
     from pllm.execution.tensor_program import FunctionMath, TensorBatch
 
@@ -452,6 +457,35 @@ class PartialCommitError(RuntimeError):
         self.receipt = receipt
 
 
+def batch_task_closure(graph: SemanticGraph, schemas: Collection[str]) -> tuple[SemanticTask, ...]:
+    """Find host batch consumers, their downstream tasks, and publishers of their writes."""
+    symbols = {
+        task.symbol
+        for task in graph.tasks
+        if any(isinstance(p.source, HostServiceInputSource) and p.source.schema in schemas for p in task.inputs)
+    }
+    while downstream := {
+        task.symbol
+        for task in graph.tasks
+        if task.symbol not in symbols
+        and any(isinstance(p.source, TaskResultInputSource) and p.source.task in symbols for p in task.inputs)
+    }:
+        symbols.update(downstream)
+    written = {
+        effect.resource
+        for task in graph.tasks
+        if task.symbol in symbols
+        for effect in task.effects
+        if effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
+    }
+    return tuple(
+        task
+        for task in graph.tasks
+        if task.symbol in symbols
+        or any(effect.kind is StateEffectKind.PUBLISH and effect.resource in written for effect in task.effects)
+    )
+
+
 class StateExecution:
     def __init__(
         self,
@@ -478,6 +512,11 @@ class StateExecution:
         self._implementations = tuple(
             bindings[task.implementation_id] for task in sorted(self.plan.tasks, key=lambda task: task.task_id)
         )
+        graph = arena.plan.semantic_graph
+        self._batch_tasks: dict[str, tuple[PhysicalTask, ...]] = {}
+        for schema in HOST_BATCH_SCHEMAS:
+            symbols = {task.symbol for task in batch_task_closure(graph, (schema,))}
+            self._batch_tasks[schema] = tuple(t for t in self.plan.tasks if graph.tasks[t.task_id].symbol in symbols)
         self._active: dict[int, StateTaskContext] = {}
         self._next_invocation = 1
         self._loss_count = self._update_count = self._trained_rows = self._sampler_count = 0
@@ -643,24 +682,33 @@ class StateExecution:
         retain_gradients: bool = True,
     ) -> StateTaskContext:
         """Open a state invocation; token-only consumers can omit returned gradient snapshots."""
-        self._require_borrow_live()
-        self.arena.collect_completed()
-        selection = self.directory.select(rows, history)
-        pin = self.arena.pin_exact(selection.refs, stream)
-        context = StateTaskContext(selection, self.arena, pin, self.trace, self._next_invocation)
+        context = self._open_context(rows, stream, history)
         context.held_input = held_input
         context.retain_gradients = retain_gradients
-        self._next_invocation += 1
-        self._active[context.invocation_id] = context
         if self.feeds and context.held_input is None:
             assert self._pending_borrows is not None
             context.borrowed_roots = self._pending_borrows
             self._pending_borrows = None
             try:
                 for root in context.borrowed_roots:
-                    root.bind(pin)
+                    root.bind(context.pin)
             except Exception as exc:
                 self._failed(context, exc)
+        return context
+
+    def _open_context(
+        self,
+        rows: PackedRows,
+        stream: torch.cuda.Stream | None,
+        history: tuple[StateRefs, ...] = (),
+    ) -> StateTaskContext:
+        self._require_borrow_live()
+        self.arena.collect_completed()
+        selection = self.directory.select(rows, history)
+        pin = self.arena.pin_exact(selection.refs, stream)
+        context = StateTaskContext(selection, self.arena, pin, self.trace, self._next_invocation)
+        self._next_invocation += 1
+        self._active[context.invocation_id] = context
         self.trace.record(
             TraceEventKind.BEGIN,
             context.invocation_id,
@@ -669,6 +717,30 @@ class StateExecution:
             identities=selection.rows.identities,
         )
         return context
+
+    def run_batch(self, value: StepInput, stream: torch.cuda.Stream | None = None) -> StepResult:
+        """Execute only the tasks consuming this host batch, between model steps."""
+        from pllm.execution.tensor_declaration import StepResult
+
+        if value.batch is None or not (tasks := self._batch_tasks.get(value.batch.schema)):
+            raise ValueError("pass a host batch consumed by this workload")
+        if stream is None and self.device.type == "cuda":
+            stream = torch.cuda.current_stream(self.device)
+        context = self._open_context(value.rows.request_rows, stream)
+        self.submit_input(context, value)
+        try:
+            for task in tasks:
+                context.last_anchor_id = int(task.anchor_id)
+                self.execute_task(context, task)
+            if stream is not None and context.prefetch_stream is not None:
+                stream.wait_stream(context.prefetch_stream)
+            context.finished = True
+            result = self.math.output(context)
+            assert isinstance(result, StepResult)
+            self._release(context)
+            return result
+        except Exception as exc:
+            self._failed(context, exc)
 
     def start_step(
         self,

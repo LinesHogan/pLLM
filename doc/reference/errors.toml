@@ -127,6 +127,13 @@ fix = '''Export those rows, or read `tokens="decode"` / `tokens="prefill"`.'''
 why_zh = '''`tokens="all"` 每个算出的 token 一行，别的效果无法按请求对齐'''
 fix_zh = '''只在 `@pllm.export` 里读它，其他方法读 `tokens="decode"` 或 `tokens="prefill"`'''
 
+[[section.error]]
+message = '''pllm.cfg(...): expected a dotted Python attribute path such as 'layer' or 'config.layer''''
+why = '''`pllm.cfg` resolves a dotted attribute path on the bound workload instance.'''
+fix = '''Pass one or more Python identifiers joined by dots, e.g. `pllm.cfg("beta")` or `pllm.cfg("config.rank")`.'''
+why_zh = '''`pllm.cfg` 按点号路径读取绑定后负载实例上的属性'''
+fix_zh = '''传合法的 Python 属性路径，如 `pllm.cfg("beta")` 或 `pllm.cfg("config.rank")`'''
+
 [[section]]
 en = "Phases: when a value exists"
 zh = "阶段：值什么时候存在"
@@ -544,11 +551,18 @@ why_zh = '''query 和分页 KV 由 pLLM 按顺序传入'''
 fix_zh = '''先写 `q, kv`'''
 
 [[section.error]]
-message = '''...: return attention with q's shape and model dtype'''
-why = '''The output feeds the model's own output projection.'''
-fix = '''Return a tensor with `q`'s shape and dtype.'''
-why_zh = '''输出要接回原生的输出投影'''
-fix_zh = '''返回与 `q` 同形同 dtype 的张量'''
+message = '''...: return attention shaped [rows, heads, v_head_dim] with model dtype'''
+why = '''The output feeds the model's own output projection (`v_head_dim` equals `head_dim` on dense GQA/MHA and the value head width on MLA).'''
+fix = '''Return a tensor shaped `[rows, heads, v_head_dim]` in `q.dtype`.'''
+why_zh = '''输出要接回原生的输出投影（稠密注意力下 `v_head_dim` 等于 `head_dim`，MLA 下等于值头维度）'''
+fix_zh = '''返回形状为 `[rows, heads, v_head_dim]`、精度与 `q` 相同的张量'''
+
+[[section.error]]
+message = '''MLA @pllm.custom_attention supports keep='all' with window=/topk= read selection; remove sliding-window or shared KV layout declarations'''
+why = '''MLA pages store compressed latent vectors whose block allocator uses full-history retention.'''
+fix = '''Keep `keep="all"` (the default) on MLA models and pass `window=` or `topk=` to `kv.attend(...)`.'''
+why_zh = '''MLA 页存放压缩潜变量，底层块分配器保持全历史布局'''
+fix_zh = '''在 MLA 模型上保持默认的 `keep="all"`，改在 `kv.attend(...)` 里传 `window=` 或 `topk=`'''
 
 [[section.error]]
 message = '''keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources'''
@@ -607,11 +621,11 @@ why_zh = '''计数留在设备上，每步才不和宿主同步'''
 fix_zh = '''用 0 维设备张量（`x.new_ones((), dtype=torch.bool)`），或返回 `pllm.UpdateOutput.unchanged(output)`'''
 
 [[section.error]]
-message = '''layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead'''
-why = '''An MoE layer has no single dense MLP projection.'''
-fix = '''Rewrite the attention query or value projection.'''
-why_zh = '''MoE 层没有统一的稠密 MLP 投影'''
-fix_zh = '''改 attention 的 query 或 value 投影'''
+message = '''layer ... uses ...; MLP overlays need a dense MLP. Choose q_proj, k_proj or v_proj'''
+why = '''An MoE layer routes tokens across expert weights and has no single dense MLP projection.'''
+fix = '''Target `q_proj`, `k_proj`, or `v_proj` on that layer instead.'''
+why_zh = '''MoE 层把 token 路由给不同专家，没有单一的稠密 MLP 投影'''
+fix_zh = '''改写该层的 `q_proj`、`k_proj` 或 `v_proj`'''
 
 [[section.error]]
 message = '''layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)'''
@@ -692,18 +706,18 @@ en = "Engine settings, models and parallelism"
 zh = "引擎设置、模型与并行"
 
 [[section.error]]
-message = '''pLLM runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...'''
-why = '''pLLM is aligned with these two vLLM versions only.'''
-fix = '''Install vLLM 0.27.1 or 0.32.0.'''
-why_zh = '''pLLM 只对这两个版本做过对齐'''
-fix_zh = '''安装 0.27.1 或 0.32.0'''
+message = '''pLLM runs on vLLM 0.27 through 0.34; install a supported 0.27..0.34 release instead of vLLM ...'''
+why = '''pLLM integrates directly with vLLM's V1 worker, runner and scheduler internals within this tested range.'''
+fix = '''Install a vLLM release between 0.27.0 and 0.34.0 (with matching PyTorch / CUDA driver).'''
+why_zh = '''pLLM 接入 vLLM V1 版本的 worker、runner 和调度器内部，只支持对齐范围内的版本'''
+fix_zh = '''安装 0.27.0 到 0.34.0 之间的 vLLM 版本（及匹配的 PyTorch / CUDA 驱动）'''
 
 [[section.error]]
-message = '''choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads'''
-why = '''pLLM admits exact vLLM model classes whose layer structure it knows.'''
-fix = '''Use a listed family (see [rules.md, Support matrix](rules.md#support-matrix)).'''
-why_zh = '''pLLM 只接受它认识层结构的 vLLM 模型类'''
-fix_zh = '''换成列出的模型家族，见[支持矩阵](support-matrix.md)'''
+message = '''...: choose one of the supported vLLM decoders: ...'''
+why = '''pLLM admits exact vLLM decoder classes whose norm, residual, KV, and projection structure it has verified.'''
+fix = '''Use a listed decoder family (see [rules.md, Support matrix](rules.md#support-matrix)).'''
+why_zh = '''pLLM 只接受已核对过归一化、残差、KV 与投影结构的 vLLM 解码器类'''
+fix_zh = '''换成列出的解码器家族，见[支持矩阵](support-matrix.md)'''
 
 [[section.error]]
 message = '''pLLM runs vLLM's own model classes, not subclasses of them'''
@@ -713,32 +727,32 @@ why_zh = '''子类可能改变投影布局或 logits'''
 fix_zh = '''用列出的模型类本身'''
 
 [[section.error]]
-message = '''... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model'''
-why = '''DeepSeek V2/V3 and gpt-oss have MLA or MoE projections pLLM cannot rewrite.'''
-fix = '''Use read-only features on these models, or a dense family.'''
-why_zh = '''DeepSeek V2/V3 和 gpt-oss 的 MLA、MoE 投影 pLLM 不能改写'''
-fix_zh = '''在这些模型上只用读取、ESamp、采样引导和激活补丁，或换稠密模型'''
+message = '''... needs separate KV projections (...); hidden taps, sampler stages, activation patches and sublayer residuals still run on this model'''
+why = '''DeepSeek V2/V3 (MLA + MoE) and gpt-oss (sink attention + MXFP4 MoE) have no standard sliceable q/k/v or dense MLP projections.'''
+fix = '''Use hidden reads, sampler stages, activation patches, sublayer `@pllm.custom_residual`, or MLA `@pllm.custom_attention` (on DeepSeek V2/V3), or switch to a dense / KV-MoE model.'''
+why_zh = '''DeepSeek V2/V3（MLA + MoE）和 gpt-oss 没有可按常规方式切片的独立 KV 或稠密 MLP 投影'''
+fix_zh = '''在这些模型上使用读取、采样引导、激活补丁、子层 `@pllm.custom_residual` 或 MLA `@pllm.custom_attention`（DeepSeek V2/V3），或换稠密 / KV-MoE 模型'''
 
 [[section.error]]
-message = '''... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model'''
-why = '''Qwen3.5 keeps linear-attention state outside the KV pages, so it cannot be rebuilt from them.'''
-fix = '''Use a Qwen2, Llama, Qwen3 or Qwen3-MoE model for custom forwards and custom attention.'''
-why_zh = '''Qwen3.5 的线性 attention 状态不在 KV 页里，无法从 KV 重建'''
-fix_zh = '''custom forward 和定制 attention 用 Qwen2、Llama、Qwen3 或 Qwen3-MoE'''
+message = '''... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; choose a decoder with KV attention in every layer'''
+why = '''Qwen3.5 keeps linear-attention recurrent state outside paged KV, so layers cannot be replayed from KV pages alone.'''
+fix = '''Use a dense or KV-MoE decoder (such as Qwen2, Llama, Mistral, Phi3, Glm4, Gemma2/3, Mixtral, Qwen2-MoE, Qwen3, or Qwen3-MoE).'''
+why_zh = '''Qwen3.5 的线性注意力状态不在分页 KV 里，无法仅靠 KV 页重放层状态'''
+fix_zh = '''换用每层均为 KV 注意力的稠密或 KV-MoE 模型'''
 
 [[section.error]]
-message = '''projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks'''
-why = '''On CPU, pLLM derives projection shapes only for dense Qwen2, Qwen3 and Llama configs.'''
-fix = '''Run `pllm.explain` on a dense config of the same sizes, and check the target model with `make_llm`.'''
-why_zh = '''CPU 上 pLLM 只能推出稠密 Qwen2、Qwen3、Llama 配置的投影形状'''
-fix_zh = '''CPU 检查用同尺寸的稠密配置，目标模型在 `make_llm` 时检查'''
+message = '''projection shapes for this architecture are decided at make_llm; use a dense or KV MoE config for CPU checks'''
+why = '''CPU config-only shape derivation covers dense, KV-MoE, and Qwen3.5 hybrid configs.'''
+fix = '''Use a dense or KV-MoE config of matching dimensions for CPU checks, and verify the target checkpoint with `make_llm`.'''
+why_zh = '''仅凭 `config.json` 的投影形状推导覆盖稠密、KV-MoE 与 Qwen3.5 混合配置'''
+fix_zh = '''CPU 检查用同尺寸的稠密或 KV-MoE 配置，目标模型在 `make_llm` 时检查'''
 
 [[section.error]]
-message = '''disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...'''
-why = '''vLLM keys cached K/V by tokens, not by state, so a cached prefix would hold K/V computed under another request's state.'''
-fix = '''Keep `enable_prefix_caching=False` (the default).'''
-why_zh = '''vLLM 按 token 而不是按状态缓存 K/V，缓存的前缀可能是在别的请求的状态下算出的'''
-fix_zh = '''保持 `enable_prefix_caching=False`（默认）'''
+message = '''disable prefix caching (enable_prefix_caching=False): ...'''
+why = '''Prefix caching is safe only when model hooks are stateless or read immutable `InstanceState`s with `last_tokens == 0`; per-request or mutable state, `last_tokens > 0`, `@pllm.train_in_forward`, and `@pllm.custom_attention` produce request-dependent K/V.'''
+fix = '''Keep `enable_prefix_caching=False` (the default), or make the model-read state an immutable `InstanceState` (`Pretrained`, `Zeros`, `Computed`, `FromModule`, `ModelCheckpoint`) with `last_tokens=0`.'''
+why_zh = '''前缀缓存只在模型钩子无状态或仅读不可变 `InstanceState`（且 `last_tokens == 0`）时安全；按请求或可变状态、`last_tokens > 0`、`@pllm.train_in_forward` 与 `@pllm.custom_attention` 会算出随请求变化的 K/V'''
+fix_zh = '''保持 `enable_prefix_caching=False`（默认），或让模型只读不可变的 `InstanceState`（且 `last_tokens=0`）'''
 
 [[section.error]]
 message = '''...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False'''
@@ -746,13 +760,6 @@ why = '''`cuda_graphs=True` demands vLLM's whole-model graphs, and the named fea
 fix = '''Remove that feature, or use `cuda_graphs="auto"` (the default); `diagnostics().eager_reason` then names the cause.'''
 why_zh = '''`cuda_graphs=True` 要求整模型进图，而报错点名的写法需要 eager'''
 fix_zh = '''去掉那个写法，或用 `cuda_graphs="auto"`（默认），原因会写进 `diagnostics().eager_reason`'''
-
-[[section.error]]
-message = '''CUDA-graph overlays do not support adapters backed by shared InstanceState'''
-why = '''This is an `eager_reason`, not an exception: an Adapter reading shared instance state runs the forward eagerly.'''
-fix = '''Keep the state per request (`RequestState`) to stay in CUDA graphs.'''
-why_zh = '''这是 `eager_reason` 而不是异常：读共享实例状态的 Adapter 让 forward 退回 eager'''
-fix_zh = '''要留在 CUDA graph 里，把状态改成每请求一份（`RequestState`）'''
 
 [[section.error]]
 message = '''@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2'''
@@ -769,32 +776,32 @@ why_zh = '''你的读法按模型精度读 K/V'''
 fix_zh = '''保持 `kv_cache_dtype="auto"`'''
 
 [[section.error]]
-message = '''@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads'''
-why = '''Your read function sees all heads at once.'''
-fix = '''Use `tensor_parallel_size=1`.'''
-why_zh = '''定制读法要看到完整的头'''
-fix_zh = '''单卡'''
-
-[[section.error]]
-message = '''multi-GPU needs vLLM 0.32.0; otherwise use tensor_parallel_size=1'''
-why = '''pLLM supports tensor parallelism only on vLLM 0.32.0.'''
-fix = '''Use the 0.32.0 environment, or one GPU.'''
-why_zh = '''pLLM 只在 vLLM 0.32.0 上支持张量并行'''
-fix_zh = '''换到 0.32.0，或单卡'''
+message = '''multi-GPU needs vLLM 0.32.0 or newer; otherwise use tensor_parallel_size=1'''
+why = '''pLLM supports tensor parallelism starting in vLLM 0.32.0.'''
+fix = '''Upgrade to vLLM 0.32.0 or newer, or set `tensor_parallel_size=1`.'''
+why_zh = '''pLLM 从 vLLM 0.32.0 起支持张量并行'''
+fix_zh = '''升级到 vLLM 0.32.0 及以上，或设 `tensor_parallel_size=1`'''
 
 [[section.error]]
 message = '''... runs on one GPU only; set tensor_parallel_size=1'''
-why = '''`causal_model` training, state feeds and `@pllm.custom_residual` run on one GPU only.'''
-fix = '''Use `tensor_parallel_size=1`.'''
-why_zh = '''`causal_model` 训练、状态投喂和 `@pllm.custom_residual` 只支持单卡'''
-fix_zh = '''单卡'''
+why = '''`causal_model` training, `@pllm.custom_residual(site="value")`, and `@pllm.custom_attention` with cross-head `pllm.attention(...)` facts or non-default KV layouts require a single GPU.'''
+fix = '''Use `tensor_parallel_size=1` (plain `keep="all"` `@pllm.custom_attention`, sublayer `@pllm.custom_residual`, and `Fed` states work with TP > 1).'''
+why_zh = '''`causal_model` 训练、`@pllm.custom_residual(site="value")` 以及带跨头 `pllm.attention(...)` 事实或非默认 KV 布局的 `@pllm.custom_attention` 需要单卡'''
+fix_zh = '''设为 `tensor_parallel_size=1`（默认 `keep="all"` 且不读跨头事实的 `@pllm.custom_attention`、子层 `@pllm.custom_residual` 与 `Fed` 支持多卡）'''
 
 [[section.error]]
-message = '''TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local @pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1'''
-why = '''Under TP each rank holds its shard of the delta; only shard-local updates keep shards consistent.'''
-fix = '''With TP, start adapter state from `Zeros` / `Computed` and update it only in `@pllm.train_in_forward`; otherwise use one GPU.'''
-why_zh = '''多卡时增量按分片存放，只有分片内的更新能保持各卡一致'''
-fix_zh = '''多卡时 Adapter 状态从 `Zeros` / `Computed` 开始、只在 `@pllm.train_in_forward` 里更新；否则单卡'''
+message = '''TP Adapter updates need shard-local @pllm.train_in_forward; side-lane updates need tensor_parallel_size=1'''
+why = '''Under TP each rank holds its shard of the delta (`Zeros`, `Computed`, `Pretrained`, or `Imported`); online gradient/write updates on side streams do not synchronize shards across GPUs.'''
+fix = '''Update TP adapters via shard-local `@pllm.train_in_forward` or `import_state` / `StateImport`, or use `tensor_parallel_size=1` for `@pllm.train` / `@pllm.write` updates.'''
+why_zh = '''多卡时每张卡持有自己的增量分片（支持 `Zeros`、`Computed`、`Pretrained` 或 `Imported`）；旁路流上的 `@pllm.train` / `@pllm.write` 不会跨卡同步分片'''
+fix_zh = '''多卡下用分片内 `@pllm.train_in_forward` 或 `import_state` / `StateImport` 更新，或用单卡跑旁路训练'''
+
+[[section.error]]
+message = '''...: TP sharded fields are projection-local; other readers need tensor_parallel_size=1'''
+why = '''A sharded adapter field holds only the current GPU's slice, so ordinary tensor methods cannot read the full tensor.'''
+fix = '''Read the state only through `pllm.model.Adapter` / `@pllm.train_in_forward`, or set `tensor_parallel_size=1`.'''
+why_zh = '''分片后的 Adapter 字段在每张卡上只存本卡切片，普通张量方法无法读到完整权重'''
+fix_zh = '''只通过 `pllm.model.Adapter` 或 `@pllm.train_in_forward` 使用该状态，或设 `tensor_parallel_size=1`'''
 
 [[section.error]]
 message = '''TP projection update is not shard-local at ...; ...'''
@@ -917,18 +924,32 @@ why_zh = '''没装负载的引擎没有东西可喂'''
 fix_zh = '''`make_llm` 时传 `workload=`'''
 
 [[section.error]]
-message = '''state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer'''
-why = '''`llm.feed(...)` hands out an in-process handle.'''
-fix = '''Use one in-process engine; run the producer in a spawned process.'''
-why_zh = '''`llm.feed(...)` 给出的是进程内的句柄'''
-fix_zh = '''用单进程引擎，生产者放在 spawn 出的进程里'''
+message = '''online serving runs vLLM's async multiprocess engine; omit multiprocessing=False or set True'''
+why = '''`make_async_llm` and `pllm serve` use vLLM's async worker process (`ModelConfig.multiprocessing="auto"` enables this automatically).'''
+fix = '''Leave `multiprocessing="auto"` (the default) or set `multiprocessing=True`.'''
+why_zh = '''`make_async_llm` 和 `pllm serve` 运行异步多进程引擎（默认的 `multiprocessing="auto"` 会自动开启）'''
+fix_zh = '''保持默认的 `multiprocessing="auto"` 或设为 `True`'''
 
 [[section.error]]
-message = '''completions carry each sample's final hidden row, which only a workload collects; ...'''
-why = '''`generate_completions` and `generate_feedback` hand each sample's final hidden row to the host, and only an installed workload captures it.'''
-fix = '''Pass `workload=pllm.workloads.DummyWorkload()` to `make_llm` when nothing should train.'''
-why_zh = '''`generate_completions` 和 `generate_feedback` 要把每个样本最终位置的 hidden 交给宿主，只有装了负载的引擎才会采集'''
-fix_zh = '''只做重试或打分、不训练时，给 `make_llm` 传 `workload=pllm.workloads.DummyWorkload()`'''
+message = '''import_state needs a nonempty route and RequestState keyed only by route'''
+why = '''Out-of-band `llm.import_state(..., route=...)` targets either an `InstanceState` (no route) or a `RequestState` keyed solely by `"route"`.'''
+fix = '''Declare `RequestState(..., key_fields=("route",))` and pass `route="..."`, or pass per-request imports via `stream(..., state_import=...)` / `generate(..., batch=...)`.'''
+why_zh = '''`llm.import_state(..., route=...)` 只面向 `InstanceState`（不传 route）或仅按 `"route"` 分组的 `RequestState`'''
+fix_zh = '''声明 `key_fields=("route",)` 并传入非空 `route`，或按请求传 `stream(..., state_import=...)` / `generate(..., batch=...)`'''
+
+[[section.error]]
+message = '''train_batch needs a workload with a host batch training method'''
+why = '''`llm.train_batch(batch)` runs a `@pllm.train` method declared with `pllm.batch(...)` inputs.'''
+fix = '''Declare a `@pllm.train` method reading `pllm.batch(...)` fields (for `CausalTrainBatch`, `WeightedRowBatch`, or unkeyed `WeightedCEBatch`).'''
+why_zh = '''`llm.train_batch(batch)` 需要负载声明了读取 `pllm.batch(...)` 的宿主批训练方法'''
+fix_zh = '''在负载里声明读取 `pllm.batch(...)` 的 `@pllm.train` 方法'''
+
+[[section.error]]
+message = '''online request lacks pLLM identity metadata; submit through AsyncVllmLlm or pllm serve'''
+why = '''Worker execution requires the online identity metadata stamped by `make_async_llm` or `pllm serve`.'''
+fix = '''Submit requests through `pllm.make_async_llm` or `pllm serve` (passing session keys via `extra_body={"vllm_xargs": {"pllm_route": ...}}`).'''
+why_zh = '''在线请求缺少 pLLM 身份元数据，worker 无法绑定或追踪请求状态'''
+fix_zh = '''通过 `pllm.make_async_llm` 或 `pllm serve` 提交请求'''
 
 [[section]]
 en = "Contract check errors"

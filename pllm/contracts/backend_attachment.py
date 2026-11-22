@@ -59,6 +59,10 @@ class ModelProbe:
     attention_heads: int = 0
     kv_heads: int = 0
     head_dim: int = 0
+    v_head_dim: int = 0
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
     intermediate_size: int = 0
     blas_workspace_bytes: int = 0
     # Shape-only planning selects an ordinal without querying CUDA; workers use their current device.
@@ -124,6 +128,7 @@ class BackendAttachmentSpec:
     """
 
     import_fields: tuple[tuple[str, FieldView], ...] = ()
+    batch_fields: tuple[tuple[str, str, FieldView], ...] = ()
     sampler: tuple[SamplerBinding, ...] = ()
     guidance_capacity: int | None = None
     # The @pllm.train methods (request rows or a host batch).

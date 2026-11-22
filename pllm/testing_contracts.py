@@ -197,7 +197,7 @@ SIMULATED_CAPABILITIES = (
     "state/fenced_reclaim@1",
     "transition/full_root@1",
 )
-_IDS = tuple(RequestIdentity(name, index, index) for index, name in enumerate(("r2", "r0", "r1")))
+_IDS = tuple(RequestIdentity(name, index, index, f"route-{index}") for index, name in enumerate(("r2", "r0", "r1")))
 _PROMPTS = (5, 1, 9)
 _LOGITS_CHANNEL = 90
 

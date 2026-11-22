@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import KW_ONLY, dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, get_args
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, get_args, overload
 
 import torch
 
@@ -443,6 +443,11 @@ def write(*, state: str, fields: tuple[str, ...]) -> Callable[[F], F]:
     return _mark(effect=lambda owner: Write(state=state, fields=fields))
 
 
+@overload
+def export(fn: F, /) -> F: ...
+
+
+@overload
 def export(
     *,
     name: str | Callable[[Any], str] = "value",
@@ -451,7 +456,20 @@ def export(
     max_cols: int | Callable[[Any], int] = 16,
     enabled: bool | Callable[[Any], bool] = True,
     overflow: Literal["drop", "block"] = "drop",
-) -> Callable[[F], F]:
+) -> Callable[[F], F]: ...
+
+
+def export(
+    fn: F | None = None,
+    /,
+    *,
+    name: str | Callable[[Any], str] = "value",
+    every: int | Callable[[Any], int] = 1,
+    max_rows: int | Callable[[Any], int] = 1,
+    max_cols: int | Callable[[Any], int] = 16,
+    enabled: bool | Callable[[Any], bool] = True,
+    overflow: Literal["drop", "block"] = "drop",
+) -> F | Callable[[F], F]:
     """Deliver bounded observations of executed forward rows to on_export.
 
     A step delivers at most max_rows rows, split into events of whole rows of at most 32 KiB; each event lists
@@ -461,7 +479,7 @@ def export(
     """
     if overflow not in ("drop", "block"):
         raise ValueError("export overflow must be 'drop' or 'block'")
-    return _mark(
+    decorator = _mark(
         effect=lambda owner: Export(
             _setting(name, owner, str),
             _setting(every, owner, int),
@@ -471,14 +489,24 @@ def export(
             overflow,
         )
     )
+    return decorator(fn) if fn is not None else decorator
 
 
-def add_logits(*, rows: str = "") -> Callable[[F], F]:
+@overload
+def add_logits(fn: F, /) -> F: ...
+
+
+@overload
+def add_logits(*, rows: str = "") -> Callable[[F], F]: ...
+
+
+def add_logits(fn: F | None = None, /, *, rows: str = "") -> F | Callable[[F], F]:
     """Add the returned tensor to the logits before sampling.
 
     `rows` (here and on the other effects) names a method returning a boolean mask: only those rows run.
     """
-    return _mark(effect=lambda owner: Sampler(SamplerStage.PACKED_PRE_FILTER_ADD), rows=rows)
+    decorator = _mark(effect=lambda owner: Sampler(SamplerStage.PACKED_PRE_FILTER_ADD), rows=rows)
+    return decorator(fn) if fn is not None else decorator
 
 
 def guide_sampling(*, beta: float | Callable[[Any], float], rows: str = "") -> Callable[[F], F]:
@@ -537,11 +565,28 @@ def train(
     )
 
 
+@overload
+def differentiate(fn: F, /) -> F: ...
+
+
+@overload
 def differentiate(
     *, inputs: tuple[str, ...] = (), parameters: bool = False, input_rows: str = "", parameter_rows: str = ""
-) -> Callable[[F], F]:
+) -> Callable[[F], F]: ...
+
+
+def differentiate(
+    fn: F | None = None,
+    /,
+    *,
+    inputs: tuple[str, ...] = (),
+    parameters: bool = False,
+    input_rows: str = "",
+    parameter_rows: str = "",
+) -> F | Callable[[F], F]:
     """Keep derivative edges; parameters may stay frozen while inputs differentiate."""
-    return _mark(gradient=Gradient(inputs, parameters, input_rows, parameter_rows))
+    decorator = _mark(gradient=Gradient(inputs, parameters, input_rows, parameter_rows))
+    return decorator(fn) if fn is not None else decorator
 
 
 def train_in_forward(
@@ -662,7 +707,15 @@ def custom_residual(
     )
 
 
-def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]:
+@overload
+def custom_forward(fn: F, /) -> F: ...
+
+
+@overload
+def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[[F], F]: ...
+
+
+def custom_forward(fn: F | None = None, /, *, tokens: Tokens = "all", over: Over = "token") -> F | Callable[[F], F]:
     """Replace the forward of the selected tokens with this method's program over model layer slices and tensor math.
 
     ``tokens`` follows the token's prompt/generated role, including after preemption.
@@ -676,7 +729,8 @@ def custom_forward(*, tokens: Tokens = "all", over: Over = "token") -> Callable[
         raise ValueError('set @pllm.custom_forward(tokens=) to "prefill", "decode" or "all"')
     if over not in ("token", "span"):
         raise ValueError('set @pllm.custom_forward(over=) to "token" or "span"')
-    return _mark(tokens=tokens, over=over)
+    decorator = _mark(tokens=tokens, over=over)
+    return decorator(fn) if fn is not None else decorator
 
 
 # Settings and markers read from the bound workload, and the attributes the decorators leave on a method.
@@ -690,6 +744,31 @@ class _Deferred(InputMarker):
 
     def bind(self, context: WorkloadContext) -> InputMarker:
         return self.build(context.owner).bind(context)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigAttr:
+    """Deferred dotted attribute read on the bound workload, built by `pllm.cfg(...)`."""
+
+    path: str
+
+    def __post_init__(self) -> None:
+        parts = self.path.split(".")
+        if not self.path or any(not part.isidentifier() for part in parts):
+            raise ValueError(
+                f"pllm.cfg({self.path!r}): expected a dotted Python attribute path such as 'layer' or 'config.layer'"
+            )
+
+    def __call__(self, owner: object) -> Any:
+        current: Any = owner
+        for part in self.path.split("."):
+            current = getattr(current, part)
+        return current
+
+
+def cfg(path: str) -> Any:
+    """Refer to a workload attribute or dotted path in a decorator or marker setting."""
+    return _ConfigAttr(path)
 
 
 def _setting(value: C | Callable[[Any], C], owner: object, expected: type[C]) -> C:
@@ -754,6 +833,7 @@ def _mark(
 
 __all__ = [
     "custom_forward",
+    "cfg",
     "Phase",
     "on",
     "write",

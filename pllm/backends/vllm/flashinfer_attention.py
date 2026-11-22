@@ -32,7 +32,7 @@ from vllm.v1.attention.backends.flashinfer import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from pllm.backends.vllm.compat import VLLM_027
+from pllm.backends.vllm.compat import VLLM_027, VLLM_028_030, VLLM_MINOR
 
 if VLLM_027:
     from vllm.v1.attention.backends.utils import get_kv_cache_layout
@@ -42,7 +42,7 @@ if VLLM_027:
         return get_kv_cache_layout() == "HND"
 
     class FlashInferMetadataBuilder(VllmFlashInferMetadataBuilder):
-        """Give 0.27's planner the exact host lengths that 0.32 already uses without a CUDA copy."""
+        """Give 0.27's planner the exact host lengths that >=0.31 already uses without a CUDA copy."""
 
         def build(
             self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
@@ -54,21 +54,61 @@ if VLLM_027:
                 )
             return super().build(common_prefix_len, common_attn_metadata, fast_build)
 
+    @dataclass
+    class WindowMetadata(FlashInferMetadata):
+        """Native FlashInfer execution plus FA2 metadata for authored alternative reads."""
+
+        flash: FlashAttentionMetadata
+
+elif VLLM_028_030:
+    if VLLM_MINOR < (0, 29):
+        from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
+        def _builder_head_first(builder: VllmFlashInferMetadataBuilder) -> bool:
+            return get_kv_cache_layout() == "HND"
+    else:
+        from vllm.v1.attention.backends.utils import get_flashinfer_layout_string
+
+        def _builder_head_first(builder: VllmFlashInferMetadataBuilder) -> bool:
+            return get_flashinfer_layout_string(builder.kv_cache_layout) == "HND"
+
+    class FlashInferMetadataBuilder(VllmFlashInferMetadataBuilder):
+        """Give 0.28..0.30's planner the exact host lengths without a CUDA copy."""
+
+        def build(
+            self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
+        ) -> FlashInferMetadata:
+            if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+                common_attn_metadata = replace(
+                    common_attn_metadata, _seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound
+                )
+            return super().build(common_prefix_len, common_attn_metadata, fast_build)
+
+    @dataclass
+    class WindowMetadata(FlashInferMetadata):
+        """Native FlashInfer execution plus FA2 metadata for authored alternative reads."""
+
+        flash: FlashAttentionMetadata
+        head_first: bool = False
+
+    def flashinfer_head_first(metadata: WindowMetadata) -> bool:
+        """Match 0.28..0.30 FlashInfer wrappers to the resolved cache layout."""
+        return metadata.head_first
+
 else:
     from vllm.v1.attention.backends.utils import get_flashinfer_layout_string
 
     def flashinfer_head_first(metadata: FlashInferMetadata) -> bool:
-        """Match 0.32's FlashInfer wrappers to the layout carried in their metadata."""
+        """Match >=0.31's FlashInfer wrappers to the layout carried in their metadata."""
         return get_flashinfer_layout_string(metadata.kv_cache_layout) == "HND"
 
     FlashInferMetadataBuilder = VllmFlashInferMetadataBuilder
 
+    @dataclass
+    class WindowMetadata(FlashInferMetadata):
+        """Native FlashInfer execution plus FA2 metadata for authored alternative reads."""
 
-@dataclass
-class WindowMetadata(FlashInferMetadata):
-    """Native FlashInfer execution plus FA2 metadata for authored alternative reads."""
-
-    flash: FlashAttentionMetadata
+        flash: FlashAttentionMetadata
 
 
 class WindowMetadataBuilder(FlashInferMetadataBuilder):
@@ -86,6 +126,8 @@ class WindowMetadataBuilder(FlashInferMetadataBuilder):
     ) -> WindowMetadata:
         infer = super().build(common_prefix_len, common_attn_metadata, fast_build)
         flash = self.flash.build(common_prefix_len, common_attn_metadata, fast_build)
+        if VLLM_028_030:
+            return WindowMetadata(**vars(infer), flash=flash, head_first=_builder_head_first(self))
         return WindowMetadata(**vars(infer), flash=flash)
 
 

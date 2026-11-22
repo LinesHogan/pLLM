@@ -215,14 +215,22 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-## Costom
+## Local & internal non-published directories
 
-outputs
+/outputs/
+/docs/
+/doc/dev/
+/tools/verification/
 .worktrees/
+.venv*/
+.verify/
+.claude/
 .codex
 .codex/
+.gemini/
+.agent/
+.agents/
 AGENTS.md
-docs
 
 # accidental npm artifacts
 package.json

@@ -112,9 +112,9 @@
 
 在使用上述功能时，还有几条共同的边界与设计原则：
 
-- `@pllm.custom_residual`、`@pllm.custom_attention` 目前需要 `tensor_parallel_size=1`，并且要关闭前缀缓存。
-- `@pllm.custom_attention` 需要 FlashAttention 2 后端、未量化的 KV，只用于 KV 全部在分页缓存里的模型（稠密 Qwen2/2.5、Llama、Qwen3 和 Qwen3-MoE）。
+- 只有读取 `RequestState`、可变/外部输入 `InstanceState`、`@pllm.train_in_forward`、`last_tokens > 0` 的 `ActivationPatch` 或 `@pllm.custom_attention` 时必须关闭前缀缓存（`enable_prefix_caching=False`）；无状态 `@pllm.custom_residual` 与只读不可变 `InstanceState` 的静态改写可保留开启。
+- `@pllm.custom_attention` 需要未量化 KV（在稠密与 KV-MoE 上使用 FlashAttention 2，在 DeepSeek V2/V3 MLA 上直接吸收 `W_UK_T` / `W_UV` 读取 `kv_lora_rank` + `qk_rope_head_dim` 潜变量缓存且仅支持 `keep="all"`）；若读取 `pllm.attention(...)` 事实则需 `tensor_parallel_size=1`。
 - 静态 KV 布局不能和 `PositionState` 或 `@pllm.custom_forward` 一起用。
-- 张量并行只在 vLLM 0.32.0 上，哪些功能可以多卡见[支持矩阵](../reference/support-matrix.md)。
+- 张量并行在 vLLM 0.32.0 及以上可用，哪些功能可以多卡见[支持矩阵](../reference/support-matrix.md)。
 - 一个原则：贵的选择由你显式写出来，pLLM 不替你做——大表放显存还是主机内存、KV 怎么存、训练结果几步后可见（`publish_lag`），都写在你的声明里，`pllm.explain` 把代价列出来。默认值只替你省掉小的决定。
 - 这些能力各自省的是哪种资源（显存容量、显存带宽、PCIe、卡间通信、时间线气泡、SM、host CPU）、实测效果和边界，见[性能与显存](../explain/performance.md)。

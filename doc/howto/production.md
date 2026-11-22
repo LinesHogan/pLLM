@@ -1,6 +1,6 @@
 # 上生产：多进程、张量并行与量化底座
 
-在 Notebook 或本地脚本中验证完算法之后，将负载（`pllm.Workload`）推向生产服务通常面临三类工程需求：将推理引擎隔离进独立子进程（`multiprocessing=True`）以服务在线流量、在多张 GPU 上开启张量并行（Tensor Parallelism）以承载更大模型，以及在量化底座（FP8、AWQ、GPTQ）上保持高效运行。
+在 Notebook 或本地脚本中验证完算法之后，将负载（`pllm.Workload`）推向生产服务通常面临三类工程需求：将推理引擎隔离进独立子进程（`multiprocessing="auto"` 或 `True`）以服务在线流量、在多张 GPU 上开启张量并行（Tensor Parallelism）以承载更大模型，以及在量化底座（FP8、AWQ、GPTQ）上保持高效运行。
 
 本文介绍这三项能力的配置方法、约束条件及其背后的运行机制。
 
@@ -8,7 +8,7 @@
 
 ## 开启多进程：EngineCore 隔离与序列化要求
 
-在本地开发调试时，负载与引擎默认运行在同一个 Python 进程中（`multiprocessing=False`）。在生产部署时，为了将请求接入与模型执行解耦、避免 Python 全局解释器锁（GIL）干扰并发处理，应通过 `ModelConfig(multiprocessing=True)` 将执行引擎放入独立的 EngineCore worker 进程中。
+`ModelConfig` 默认设置 `multiprocessing="auto"`：在本地用 `pllm.make_llm` 做单卡调试时，负载与引擎默认运行在同一个 Python 进程中；当使用 `pllm.make_async_llm`、`pllm serve` 或开启 `tensor_parallel_size > 1` 时，`pLLM` 会自动将执行引擎隔离进独立的 EngineCore 子进程中（也可显式传 `multiprocessing=True` / `False` 覆盖默认策略）。启用多进程时需满足以下序列化条件：
 
 驱动端（driver）通过 `pickle` 将负载对象序列化传递给 EngineCore worker。
 
@@ -78,7 +78,9 @@ with pllm.make_llm(mp_config, workload=StreamMonitor()) as llm:
 
 当单张卡显存不足以容纳整个模型权重，或者需要更高显存带宽时，可以通过 `ModelConfig(tensor_parallel_size=2, ...)` 开启多卡张量并行（Tensor Parallelism）。
 
-在张量并行下，必须使用 vLLM 0.32.0：
+在张量并行下，需要 vLLM 0.32.0 及以上：
+
+如果需要长期运行并发请求、逐 token 流式返回或暴露 OpenAI 兼容 HTTP 接口，请参阅 [在线服务指南](online-serving.md)。
 
 ```python
 # check-docs: skip: starts a multi-GPU engine with tensor parallelism
@@ -107,11 +109,12 @@ with pllm.make_llm(tp_config, workload=StreamMonitor()) as llm:
 | 特性分类 | 在 TP > 1 下的表现 | 说明与原因 |
 | :--- | :--- | :--- |
 | **隐藏状态与采样** | 完全支持 | `pllm.hidden`、`pllm.residual`、`pllm.final_hidden`、`@pllm.guide_sampling`、`@pllm.add_logits` 在各卡本地副本上确定性计算。 |
-| **请求状态在线训练** | 完全支持 | 例如 ESamp 等请求状态训练，各卡独立更新本地副本，无跨卡通信开销。 |
-| **自定义前向** | 完全支持 | `@pllm.custom_forward` 在各卡本地分片上推进层执行。 |
-| **适配器权重分片** | 支持 dense / low-rank | `pllm.model.Adapter` 的 dense 与 low-rank 增量与投影分片对齐：q/k/v 和 gate/up 投影按输出行切分权重与因子 B；down 投影按输入列切分权重与因子 A；另一因子各卡复制。由 `@pllm.train_in_forward` 在本地分片上更新。 |
+| **请求状态与并发激活补丁** | 完全支持 | 例如 ESamp 等请求状态训练，以及 `ActivationPatch`，在各卡本地副本与版本槽表上独立运行，无跨卡通信开销。 |
+| **自定义前向与残差** | 支持 | `@pllm.custom_forward` 与无 `pllm.value(...)` / `pllm.input_tokens` 依赖的 `@pllm.custom_residual` 在各卡本地分片上推进执行。 |
+| **自定义注意力（本地头）** | 支持 | 直接在各卡本地 KV 分片头（含 DeepSeek V2/V3 潜变量头）上重算的 `@pllm.custom_attention`；若读取 `pllm.attention(...)` 事实表或静态 `window` 缓冲则需 `tensor_parallel_size=1`。 |
+| **适配器权重分片** | 支持 dense / low-rank | `pllm.model.Adapter` 的 dense 与 low-rank 增量（支持 `Zeros`、`Computed`、`Pretrained`、`Imported` 初始化）与投影分片对齐：q/k/v 和 gate/up 投影按输出行切分权重与因子 B；down 投影按输入列切分权重与因子 A；另一因子各卡复制，可由 `@pllm.train_in_forward` 在本地分片上更新。 |
 | **导出（`@pllm.export`）** | 仅由 rank 0 交付 | 所有 rank 上的计算结果完全一致，因此导出事件只由 rank 0 送回 CPU，避免重复传输。 |
-| **必须设为 TP=1 的特性** | 直接拒绝报错 | `operator="per_head"` 的适配器增量、带优化器或非 `Zeros` / `Computed` 初始化的适配器状态、经 `pllm.causal_model` 的整模型训练、外部状态投喂（`pllm.Fed`）、`@pllm.custom_residual`、`@pllm.custom_attention`（单卡只能看到本地分配的头，无法做全局注意力重写），以及 `pllm.testing.check_on_gpu`（须先在 TP=1 下验证）。 |
+| **必须设为 TP=1 的特性** | 直接拒绝报错 | `operator="per_head"` 的适配器增量、带优化器 / 侧链读写或 `FromModule` / `ModelCheckpoint` / `Fed` 初始化的适配器状态、经 `pllm.causal_model` 的整模型训练、外部状态投喂（`pllm.Fed`）、依赖 `pllm.value(...)` / `pllm.input_tokens` 的 `@pllm.custom_residual`、使用 `pllm.attention(...)` 或 `window` 缓冲的 `@pllm.custom_attention`，以及 `pllm.testing.check_on_gpu`（须先在 TP=1 下验证）。 |
 
 > [!IMPORTANT]
 > **TP 不会减少单卡上请求状态的显存占用**：`pllm.explain` 在报告显存时会提示 `reservations are per rank`。张量并行平摊的是底座模型的权重显存，但 pLLM 的请求状态在每张卡上均保留完整副本，因此请求状态占用的显存不会随卡数增加而减少。
@@ -223,17 +226,16 @@ service_plan = pllm.explain(StreamMonitor(), service_config)
 
 ---
 
-## 前向改写与 Prefix Caching 的互斥
+## 前向改写与 Prefix Caching 的精细边界
 
 vLLM 提供了前缀缓存功能（Prefix Caching，`enable_prefix_caching=True`），能够对相同前缀的 prompt 复用已有 KV Cache 块，从而显著降低长上下文 prefill 的计算耗时。
 
-在 `ModelConfig` 中，`enable_prefix_caching` 默认为 `False`。**凡是改写模型前向计算的负载，必须保持该选项关闭，若显式开启会在准入时报错拒绝。**
+在 `ModelConfig` 中，`enable_prefix_caching` 默认为 `False`。当算法改写模型计算时，`pLLM` 按状态是否随请求或步数变化来判断是否允许开启前缀缓存：
 
-### 互斥原因
+### 允许与互斥边界
 
-前缀缓存的工作原理是对 prompt token 序列计算哈希值，当发现匹配时直接复用缓存中的 KV 块。
-
-当负载改写了模型内部计算时（使用了 `ActivationPatch`、`Adapter`、`@pllm.custom_residual` 或 `@pllm.custom_attention`），生成的 KV 张量不再单纯由 prompt 文本决定，还会受到当前请求独有的适配器权重、激活补丁或动态算子影响。如果复用前缀缓存，后续请求就会读到未经本请求修改的旧 KV 数据，导致计算结果与算法语义不一致。因此，改写模型站点的负载严格互斥前缀缓存。
+- **可以安全开启**：纯只读或采样引导负载、无状态的 `@pllm.custom_residual`，以及仅读取静态不可变 `InstanceState`（使用 `Zeros` / `Computed` / `Pretrained`，非 `Imported`/`Fed`、无写入任务）的 `Adapter` 或 `ActivationPatch(..., last_tokens=0)`。因为相同 prompt 在所有请求上算出的 KV 张量完全一致。
+- **必须关闭（启动准入拒绝）**：使用 `@pllm.custom_attention`（包含读取 `pllm.attention(...)` 事实）、`@pllm.train_in_forward`、`ActivationPatch(..., last_tokens > 0)`，或读取 `RequestState` / 可变与外部写入 `InstanceState` 的模型改写。这些写法会使相同前缀在不同请求或不同版本下得到不同的 KV 张量，复用缓存会导致数值语义错误。
 
 ---
 

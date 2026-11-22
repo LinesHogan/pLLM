@@ -1,16 +1,4 @@
-"""Shared decoder structure and native logits bound once by the vLLM runners.
-
-All admitted families expose the same hidden sites. Block taps keep the fresh
-layer output, without its separately returned residual. Dense Qwen2, Llama and
-Qwen3 models support every feature, quantized or not: layer reruns call vLLM's own
-quantized modules, overlays correct projection outputs, and training differentiates
-through dequantized weights (see `frozen_weight`). Qwen3-MoE keeps Qwen3 attention and
-KV but routes its MLP through experts; the Qwen3.5 hybrids interleave Gated
-DeltaNet layers, whose recurrent state is not KV, with gated full attention.
-`Decoder.projection` and `Decoder.kv_writable` decide which projections and layer
-reruns those two admit. Other admitted models run read-only workloads (hidden
-taps, sampler stages, activation patches).
-"""
+"""Decoder structure, projection slices and residual boundaries shared by the vLLM runners."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,9 +32,21 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2Model,
     DeepseekV3ForCausalLM,
 )
+from vllm.model_executor.models.gemma2 import Gemma2DecoderLayer, Gemma2ForCausalLM, Gemma2Model
+from vllm.model_executor.models.gemma3 import Gemma3DecoderLayer, Gemma3ForCausalLM, Gemma3Model
+from vllm.model_executor.models.glm4 import Glm4DecoderLayer, Glm4ForCausalLM, Glm4Model
 from vllm.model_executor.models.gpt_oss import GptOssForCausalLM, GptOssModel, TransformerBlock
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaModel
+from vllm.model_executor.models.mistral import MistralDecoderLayer, MistralForCausalLM, MistralModel
+from vllm.model_executor.models.mixtral import MixtralDecoderLayer, MixtralForCausalLM, MixtralModel
+from vllm.model_executor.models.phi3 import Phi3ForCausalLM
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2Model
+from vllm.model_executor.models.qwen2_moe import (
+    Qwen2MoeDecoderLayer,
+    Qwen2MoeForCausalLM,
+    Qwen2MoeModel,
+    Qwen2MoeSparseMoeBlock,
+)
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3Model
 from vllm.model_executor.models.qwen3_moe import (
     Qwen3MoeDecoderLayer,
@@ -56,7 +56,7 @@ from vllm.model_executor.models.qwen3_moe import (
 )
 from vllm.scalar_type import scalar_types
 
-from pllm.backends.vllm.compat import VLLM_027
+from pllm.backends.vllm import compat
 from pllm.backends.vllm.marlin import dequantize
 from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenSite
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
@@ -72,18 +72,24 @@ if TYPE_CHECKING:
         Qwen3_5MoeForCausalLM,
     )
 
-DenseLM = Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM
+DenseLM = (
+    Qwen2ForCausalLM | LlamaForCausalLM | Qwen3ForCausalLM | Glm4ForCausalLM | Gemma2ForCausalLM | Gemma3ForCausalLM
+)
 # Families whose layer state lives only in KV pages, so custom forwards and PositionState can recompute it.
-KvLM = DenseLM | Qwen3MoeForCausalLM
+KvLM = DenseLM | MixtralForCausalLM | Qwen2MoeForCausalLM | Qwen3MoeForCausalLM
 WritableLM: TypeAlias = "KvLM | Qwen3_5ForCausalLM | Qwen3_5MoeForCausalLM"
 CausalLM: TypeAlias = "WritableLM | DeepseekV2ForCausalLM | GptOssForCausalLM"
-DecoderBody: TypeAlias = (
-    "Qwen2Model | LlamaModel | Qwen3Model | Qwen3MoeModel | Qwen3_5Model | DeepseekV2Model | GptOssModel"
+DecoderBody: TypeAlias = "Qwen2Model | LlamaModel | MistralModel | Glm4Model | Gemma2Model | Gemma3Model | MixtralModel | Qwen2MoeModel | Qwen3Model | Qwen3MoeModel | Qwen3_5Model | DeepseekV2Model | GptOssModel"
+DenseLayer = (
+    Qwen2DecoderLayer
+    | LlamaDecoderLayer
+    | MistralDecoderLayer
+    | Qwen3DecoderLayer
+    | Glm4DecoderLayer
+    | Gemma2DecoderLayer
+    | Gemma3DecoderLayer
 )
-DenseLayer = Qwen2DecoderLayer | LlamaDecoderLayer | Qwen3DecoderLayer
-DecoderLayer: TypeAlias = (
-    "DenseLayer | Qwen3MoeDecoderLayer | Qwen3_5DecoderLayer | DeepseekV2DecoderLayer | TransformerBlock"
-)
+DecoderLayer: TypeAlias = "DenseLayer | MixtralDecoderLayer | Qwen2MoeDecoderLayer | Qwen3MoeDecoderLayer | Qwen3_5DecoderLayer | DeepseekV2DecoderLayer | TransformerBlock"
 Logits = Callable[[Tensor], Tensor | None]
 Norm: TypeAlias = "RMSNorm | GemmaRMSNorm"
 
@@ -131,8 +137,8 @@ def frozen_weight(projection: LinearBase) -> Tensor:
     shape = (projection.input_size_per_partition, projection.output_size_per_partition)
     if projection.params_dtype == torch.bfloat16:
         if isinstance(kernel, MarlinLinearKernel) and kernel.config.act_type == torch.bfloat16:
-            # 0.27 also admits activation-order GPTQ; its permuted K axis uses vLLM's inverse.
-            if not VLLM_027 or not kernel.config.has_g_idx:
+            # Older vLLM releases also admit activation-order GPTQ; their permuted K axis uses vLLM's inverse.
+            if not compat.marlin_has_g_idx(kernel):
                 assert kernel.w_zp_name is not None
                 return dequantize(
                     projection.get_parameter(kernel.w_q_name),
@@ -159,20 +165,22 @@ def frozen_weight(projection: LinearBase) -> Tensor:
 _GUIDANCE_TRANSFORM_REJECTION = "scaled or transformed LM head needs exact dense projection"
 
 
-def guidance_head_rejection(head: VocabParallelEmbedding, scale: float, dtype: torch.dtype | None) -> str | None:
+def guidance_head_rejection(
+    head: VocabParallelEmbedding, scale: float, dtype: torch.dtype | None, soft_cap: float | None = None
+) -> str | None:
     """Classify head arithmetic identically for meta-device and loaded-model probes."""
     if not isinstance(head.quant_method, UnquantizedEmbeddingMethod):
         return f"LM-head method {type(head.quant_method).__name__} needs exact dense projection"
-    if scale != 1.0 or dtype not in (None, head.weight.dtype):
+    if soft_cap is not None or scale != 1.0 or dtype not in (None, head.weight.dtype):
         return _GUIDANCE_TRANSFORM_REJECTION
     return None
 
 
 def guidance_rejection(head: VocabParallelEmbedding, processor: torch.nn.Module) -> str | None:
     """Why the loaded head and its processor need dense guidance."""
-    if not isinstance(processor, LogitsProcessor) or processor.soft_cap is not None or processor.logits_as_input:
+    if not isinstance(processor, LogitsProcessor) or processor.logits_as_input:
         return _GUIDANCE_TRANSFORM_REJECTION
-    return guidance_head_rejection(head, processor.scale, processor.head_dtype)
+    return guidance_head_rejection(head, processor.scale, processor.head_dtype, processor.soft_cap)
 
 
 class Mlp(Protocol):
@@ -187,7 +195,7 @@ class Decoder:
 
     model: CausalLM
     compute_logits: Logits
-    # Why only read-only workloads run on this model; None when every workload does.
+    # Why projection overlays and KV-only replay are unavailable on this decoder.
     read_only: str | None
     # The norms between sublayers (see `sublayer_norms`), as their own forwards saved before any tap wraps them.
     norms: tuple[NormForward, ...]
@@ -201,12 +209,10 @@ class Decoder:
 
     def kv_writable(self, feature: str) -> KvLM:
         """The model for `feature`, which recomputes layer state from KV pages alone."""
-        from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
-
         model = self.writable(feature)
         if reason := kv_rejection(type(model).__name__):
             raise ValueError(f"{feature} {reason}")
-        assert not isinstance(model, (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM))
+        assert isinstance(model, KvLM)
         return model
 
     @property
@@ -223,12 +229,11 @@ class Decoder:
         assert target.layer is not None
         layer = self.writable("a parameter overlay").model.layers[target.layer]
         if target.name in ("gate_proj", "up_proj", "down_proj"):
+            if isinstance(layer, MixtralDecoderLayer):
+                raise moe_projection_error(target.layer, "MixtralDecoderLayer.block_sparse_moe")
             mlp = layer.mlp
-            if isinstance(mlp, (Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
-                raise ValueError(
-                    f"layer {target.layer} routes tokens to experts; MLP overlays need a dense MLP, "
-                    "so overlay the attention query or value projection instead"
-                )
+            if isinstance(mlp, (Qwen2MoeSparseMoeBlock, Qwen3MoeSparseMoeBlock, Qwen3NextSparseMoeBlock)):
+                raise moe_projection_error(target.layer, type(mlp).__name__)
             if target.name == "down_proj":
                 return mlp.down_proj, 0, mlp.down_proj.output_size_per_partition, mlp
             width = mlp.gate_up_proj.output_size_per_partition // 2
@@ -266,7 +271,17 @@ class Decoder:
 # slice flows only through per-head q_norm (Qwen3 and Qwen3-MoE, or Qwen2 when enabled), RoPE and the
 # attention query; it cannot write same-layer K/V. Overlay corrections enter before that split.
 # These families share the decoder structure; logits dispatch remains native to each model.
-DENSE_ARCHITECTURES = (Qwen2ForCausalLM, LlamaForCausalLM, Qwen3ForCausalLM)
+DENSE_ARCHITECTURES = (
+    Qwen2ForCausalLM,
+    LlamaForCausalLM,
+    Qwen3ForCausalLM,
+    MistralForCausalLM,
+    Phi3ForCausalLM,
+    Glm4ForCausalLM,
+    Gemma2ForCausalLM,
+    Gemma3ForCausalLM,
+)
+KV_MOE_ARCHITECTURES = (MixtralForCausalLM, Qwen2MoeForCausalLM, Qwen3MoeForCausalLM)
 _MLA_MOE = "has MLA attention (no separate V projection, a latent KV cache) and per-expert MoE projections"
 # Their decoder layers return (fresh block output, residual) and end in model.norm like the dense
 # families, so hidden sites and activation patches mean the same; their projections and KV do not.
@@ -277,8 +292,8 @@ READ_ONLY_ARCHITECTURES: dict[type[CausalLM], str] = {
 }
 
 
-_BASE_ARCHITECTURES = (*DENSE_ARCHITECTURES, Qwen3MoeForCausalLM, *READ_ONLY_ARCHITECTURES)
-_HYBRID_NAMES = ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM")
+_BASE_ARCHITECTURES = (*DENSE_ARCHITECTURES, *KV_MOE_ARCHITECTURES, *READ_ONLY_ARCHITECTURES)
+HYBRID_NAMES = ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM")
 
 
 def _architectures() -> tuple[type[CausalLM], ...]:
@@ -290,17 +305,15 @@ def _architectures() -> tuple[type[CausalLM], ...]:
 
 def admit_architecture(name: str) -> str | None:
     """Admit a registry-inspected class name without importing CUDA-initializing hybrid modules."""
-    if name not in (*_HYBRID_NAMES, *(cls.__name__ for cls in _BASE_ARCHITECTURES)):
-        raise ValueError(
-            "choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss "
-            "ForCausalLM model for vLLM workloads"
-        )
+    names = (*HYBRID_NAMES, *(cls.__name__ for cls in _BASE_ARCHITECTURES))
+    if name not in names:
+        raise ValueError(f"{name}: choose one of the supported vLLM decoders: {', '.join(names)}")
     family = next((reason for cls, reason in READ_ONLY_ARCHITECTURES.items() if cls.__name__ == name), None)
     return (
         None
         if family is None
-        else f"needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model ({name} {family}); "
-        "hidden taps, ESamp, sampler stages and activation patches still run on this model"
+        else f"needs separate KV projections ({name} {family}); "
+        "hidden taps, sampler stages, activation patches and sublayer residuals still run on this model"
     )
 
 
@@ -308,8 +321,8 @@ def kv_rejection(name: str) -> str | None:
     """Why a model cannot replay its layer state from KV pages alone."""
     return (
         f"recomputes layer state from KV pages, but {name} keeps "
-        "Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model"
-        if name in _HYBRID_NAMES
+        "Gated DeltaNet recurrent state outside them; choose a decoder with KV attention in every layer"
+        if name in HYBRID_NAMES
         else None
     )
 
@@ -317,7 +330,7 @@ def kv_rejection(name: str) -> str | None:
 def bind_model(model: nn.Module) -> Decoder:
     """Admit a concrete vLLM architecture at model load, before any instance wrapping."""
     read_only = admit_architecture(type(model).__name__)
-    architectures = _architectures()
+    architectures = _architectures() if type(model).__name__ in HYBRID_NAMES else _BASE_ARCHITECTURES
     if type(model) not in architectures:
         raise ValueError(
             f"pLLM runs vLLM's own model classes, not subclasses of them; got {type(model).__name__}. "
@@ -327,26 +340,45 @@ def bind_model(model: nn.Module) -> Decoder:
     return Decoder(model, model.compute_logits, read_only, tuple(norm.forward for norm in sublayer_norms(model)))
 
 
+def moe_projection_error(layer: int, module: str) -> ValueError:
+    """Explain which routed MLP prevents a dense projection overlay."""
+    return ValueError(f"layer {layer} uses {module}; MLP overlays need a dense MLP. Choose q_proj, k_proj or v_proj")
+
+
+def lm_head_module(model: CausalLM) -> VocabParallelEmbedding:
+    """Return the vocabulary projection borrowed by inference and training."""
+    return model.model.embed_tokens if isinstance(model, Gemma2ForCausalLM) else model.lm_head
+
+
+def post_attention_norm_name(architecture: str) -> str:
+    """Name of the residual-add norm at the input to the MLP."""
+    if architecture in ("Gemma2ForCausalLM", "Gemma3ForCausalLM"):
+        return "pre_feedforward_layernorm"
+    return "post_attention_layernorm"
+
+
 def sublayer_norms(model: CausalLM) -> tuple[Norm, ...]:
-    """The 2L + 1 norms between sublayers, in forward order: each layer's input and post-attention norm, then the
-    final norm. Every admitted family calls them with (branch output, residual) and returns (normalized, sum), so
-    they are where each sublayer's residual add happens; the attribute names are shared, so this is no table."""
+    """Residual-add norms in forward order, including the final model norm."""
     body = model.model
     return (
-        *(norm for layer in body.layers for norm in (layer.input_layernorm, layer.post_attention_layernorm)),
+        *(
+            norm
+            for layer in body.layers
+            for norm in (
+                layer.input_layernorm,
+                layer.pre_feedforward_layernorm
+                if isinstance(layer, (Gemma2DecoderLayer, Gemma3DecoderLayer))
+                else layer.post_attention_layernorm,
+            )
+        ),
         body.norm,
     )
 
 
-def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHiddenResourceBinding:
-    """Resolve the shared decoder sites to the module a tap wraps.
-
-    Every admitted family computes `h, r = input_layernorm(h, r)`, attention, `h, r = post_attention_layernorm(h,
-    r)`, MLP, and ends with `model.norm(h, r)`; each norm adds the previous sublayer's output into the residual
-    stream and returns the sum second. So the stream after layer l is the second output of layer l+1's input norm
-    (of model.norm after the last layer), and the stream between attention and MLP that of the post-attention norm.
-    Layer logits are computed from residual taps by the session, at the LM head.
-    """
+def hidden_binding(
+    layer: int, site: HiddenSite, layer_count: int, post_attn_norm: str = "post_attention_layernorm"
+) -> PackedHiddenResourceBinding:
+    """Resolve a hidden site to its module and output index. Residual-add norms return the sum second."""
     if layer == -1 and site in (HiddenSite.MODEL_OUTPUT, HiddenSite.LAYER_LOGITS):
         return PackedHiddenResourceBinding(
             str(layer), HiddenLayerKind.INDEX, site, "model.norm" if site is HiddenSite.MODEL_OUTPUT else "lm_head"
@@ -360,7 +392,7 @@ def hidden_binding(layer: int, site: HiddenSite, layer_count: int) -> PackedHidd
         case HiddenSite.RESIDUAL:
             path, output = "model.norm" if index == layer_count - 1 else f"model.layers.{index + 1}.input_layernorm", 1
         case HiddenSite.ATTENTION_RESIDUAL:
-            path, output = f"model.layers.{index}.post_attention_layernorm", 1
+            path, output = f"model.layers.{index}.{post_attn_norm}", 1
         case _:
             raise ValueError(f"hidden site {site.value} reads layer -1 only")
     return PackedHiddenResourceBinding(str(layer), HiddenLayerKind.INDEX, site, path, output)

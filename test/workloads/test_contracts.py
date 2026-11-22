@@ -452,7 +452,7 @@ class MoR(pllm.Workload):
 @pytest.mark.parametrize("tp", (1, 2))
 def test_custom_forward_state_check_and_explain(workload, state, model_config, tp):
     model_config = replace(model_config, tensor_parallel_size=tp)
-    if tp > 1 and compat.VLLM_027:
+    if tp > 1 and not compat.VLLM_TP_CAPABLE:
         with pytest.raises(testing.ContractError, match="vLLM 0.32.0"):
             testing.check(workload, model_config)
         return

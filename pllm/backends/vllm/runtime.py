@@ -8,14 +8,11 @@ from __future__ import annotations
 import gc
 import logging
 import os
-import pickle
-from base64 import b64decode, b64encode
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack
+from collections.abc import Callable, Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from hashlib import sha256
-from traceback import format_exception
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -26,6 +23,16 @@ from vllm.entrypoints.llm import LLM
 from pllm.backends.vllm.admission import admit_workload
 from pllm.backends.vllm.checkpoint import load_options
 from pllm.backends.vllm.compile_facts import compile_facts
+from pllm.backends.vllm.control import (
+    BackendCompletions,
+    BackendImport,
+    BackendTrain,
+    completion_hidden,
+    import_versions,
+    reported_result,
+    train_result,
+    unwrap_feeds,
+)
 from pllm.backends.vllm.hidden_taps import TAPS_ENV, HiddenTapAnnouncement
 from pllm.backends.vllm.kv_layout import LAYOUT_ENV
 from pllm.backends.vllm.model_shape import ModelShape
@@ -59,7 +66,8 @@ from pllm.execution.host_runtime import CompletionInput
 from pllm.execution.position_state import PositionAnnouncement
 from pllm.execution.shared_tensor import SharedTensor
 from pllm.execution.state_execution import StateDiagnostics
-from pllm.execution.state_feed import Feed
+from pllm.execution.state_feed import FanoutFeed, Feed
+from pllm.execution.step_driver import TrainStep
 from pllm.execution.torch_private import (
     blas_workspace_bytes,
     bytecode_hooks,
@@ -80,7 +88,7 @@ _MP_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 _V2_RUNNER_ENV = "VLLM_USE_V2_MODEL_RUNNER"
 
 
-_WORKER_CLASS = "pllm.worker.GPUWorker"
+WORKER_CLASS = "pllm.worker.GPUWorker"
 
 
 class BackendCommand(StrEnum):
@@ -94,6 +102,12 @@ class BackendCommand(StrEnum):
     PROFILE = "profile_tasks"
     SELECT_TRACE = "select_trace"
     DETACH = "detach"
+    IMPORT_STATE = "import_state"
+    STAGE_ONLINE_IMPORT = "stage_online_import"
+    TRAIN_BATCH = "train_batch"
+    FEED = "feed"
+    STAGE_COMPLETIONS = "stage_completions"
+    FINISH_COMPLETIONS = "finish_completions"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,30 +120,6 @@ class BackendStage:
 
 
 FeedbackT = TypeVar("FeedbackT", bound=CompletionFeedback)
-ReplyT = TypeVar("ReplyT")
-
-
-def reported_call(call: Callable[[], ReplyT]) -> str:
-    """Run a worker command and return its result, or the exception it raised, pickled for the driver.
-
-    vLLM turns a worker exception into a bare message; the pickled exception keeps its type, and its note keeps
-    the worker's traceback."""
-    result: ReplyT | Exception
-    try:
-        result = call()
-    except Exception as error:
-        error.add_note("EngineCore worker traceback:\n" + "".join(format_exception(error)))
-        result = error
-    return b64encode(pickle.dumps(result)).decode("ascii")
-
-
-def reported_result(reply: str, expected: type[ReplyT]) -> ReplyT:
-    """Return a worker's result, or raise the exception the worker raised."""
-    result = pickle.loads(b64decode(reply))
-    if isinstance(result, Exception):
-        raise result
-    assert isinstance(result, expected)
-    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,14 +217,24 @@ class VllmLlm:
                 raise
             exc.add_note(f"model cleanup also failed: {cleanup}")
 
-    def feed(self, name: str) -> Feed:
-        """Return the producer handle for a declared externally fed state."""
-        self.require_llm()
-        if self._runner is None:
-            raise ValueError(
-                "state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer"
-            )
-        return self.runner.require_session().driver.feed(name)
+    def feed(self, name: str) -> Feed | FanoutFeed:
+        """Claim the producer endpoint for a declared fed state on every rank."""
+        self.attachment
+        if self._runner is not None:
+            return self.runner.require_session().driver.feed(name)
+        return unwrap_feeds(self.command(BackendCommand.FEED, encode_boundary(name)))
+
+    def import_state(self, state_import: StateImport[torch.Tensor], *, route: str = "") -> None:
+        """Publish instance or route state between generation steps."""
+        self.attachment
+        import_versions(
+            self.command(BackendCommand.IMPORT_STATE, encode_boundary(BackendImport.of(state_import, route)))
+        )
+
+    def train_batch(self, batch: HostBatch[torch.Tensor]) -> TrainStep:
+        """Run a host batch update and return its loss and parameter snapshots."""
+        self.attachment
+        return train_result(self.command(BackendCommand.TRAIN_BATCH, encode_boundary(BackendTrain.of(batch))))
 
     def diagnostics(self) -> StateDiagnostics:
         """Read exact workload health and vLLM's allocated KV blocks/max-length concurrency."""
@@ -250,7 +250,8 @@ class VllmLlm:
 
     def command(self, command: BackendCommand, payload: str = "", *, timeout: float = 30.0) -> list[str]:
         """Send a workload command to every engine worker and collect their replies."""
-        self.attachment
+        if command not in (BackendCommand.STAGE_COMPLETIONS, BackendCommand.FINISH_COMPLETIONS):
+            self.attachment
         replies = self.require_llm().collective_rpc("workload_command", timeout=timeout, args=(command.value, payload))
         return replies
 
@@ -442,11 +443,6 @@ class VllmLlm:
 
     def _completion_device(self, requested: torch.device | None) -> torch.device:
         """Where completion hidden rows land: `requested`, else the model's device (CPU for an EngineCore engine)."""
-        if self.backend_attachment is None:
-            raise ValueError(
-                "completions carry each sample's final hidden row, which only a workload collects; pass "
-                "workload=pllm.workloads.DummyWorkload() to make_llm when nothing should train"
-            )
         return requested or (torch.device("cpu") if self._runner is None else self.device)
 
     def _generate(
@@ -475,28 +471,12 @@ class VllmLlm:
                 "raise the workload's limit"
             )
         indices = self.resolve_prompt_indices(texts, prompt_indices)
-        # A route value is user-computed (regex, discriminator, tenant); the signed
-        # graph only declares whether any request state keys on it.
-        signed_route = any(
-            RequestKeyField.ROUTE in state.key_fields for state in self.attachment.plan.semantic_graph.states
-        )
-        if routes is not None and (not signed_route or len(routes) != len(texts) or any(not route for route in routes)):
-            raise ValueError('routes= needs a request state keyed by "route" and one value per prompt')
-        if signed_route and routes is None:
-            raise ValueError("a route-keyed request state requires per-prompt routes")
-        validate_host_batch(
-            batch,
-            self.attachment.plan.semantic_graph,
-            self.attachment.plan.tensor_layout_request,
-            self.attachment.plan.timeline,
-            SharedTensor.describe,
-            hidden_size=self.hidden_size,
-            vocab_size=self.vocab_size,
-            prompt_count=len(texts),
-            import_fields=self.attachment.spec.import_fields,
-        )
+        if self.backend_attachment is not None:
+            self._validate_inputs(batch, texts, routes)
+        elif batch is not None or routes is not None:
+            raise ValueError("pass workload= to supply batch or routes")
         llm = self.require_llm()
-        assert self.cache_policy is not None
+        capture: BackendCompletions | None = None
         llm.sleep(level=0, mode="keep")
         request_ids: list[str] = []
         lifetime = ExitStack()
@@ -505,7 +485,7 @@ class VllmLlm:
             request_ids = llm.enqueue(
                 [prompt for prompt in texts for _ in range(n)],
                 [
-                    self.cache_policy.sampling(sample)
+                    self.cache_policy.sampling(sample) if self.cache_policy is not None else sample
                     for first in first_samples
                     for sample in _one_per_sample(sampling_params, first)
                 ],
@@ -517,17 +497,34 @@ class VllmLlm:
                 llm.llm_engine.output_processor.request_states[identity.request_id].external_req_id: identity
                 for identity in identities
             }
-            destination = self._stage(identities, batch, completion_device, lifetime, n)
+            if self.backend_attachment is None:
+                capture = BackendCompletions(
+                    tuple((key, llm.llm_engine.output_processor.request_states[key].prompt_len) for key in request_ids)
+                )
+                for reply in self.command(BackendCommand.STAGE_COMPLETIONS, encode_boundary(capture)):
+                    reported_result(reply, type(None))
+                destination = None
+            else:
+                destination = self._stage(identities, batch, completion_device, lifetime, n)
             self.next_prompt_index = max(self.next_prompt_index, max(indices) + 1)
             llm.wake_up(tags=["scheduling"])
             outputs = llm.wait_for_completion(RequestOutput, use_tqdm=use_tqdm)
             # FINISH validates and synchronizes the staged rows before releasing requests.
-            self.command(BackendCommand.FINISH)
+            if capture is None:
+                self.command(BackendCommand.FINISH)
+            else:
+                assert completion_device is not None
+                destination = completion_hidden(
+                    self.command(BackendCommand.FINISH_COMPLETIONS, encode_boundary(capture))
+                ).to(completion_device)
             return _Generation(outputs, identities, external, destination, n)
         except Exception as original:
             try:
                 llm.llm_engine.abort_request(request_ids, internal=True)
-                self.command(BackendCommand.ABORT)
+                if capture is not None:
+                    self.command(BackendCommand.FINISH_COMPLETIONS, encode_boundary(replace(capture, discard=True)))
+                if self.backend_attachment is not None:
+                    self.command(BackendCommand.ABORT)
                 llm.wake_up(tags=["scheduling"])
             except Exception as cleanup:
                 # Borrowed input storage cannot outlive an unacknowledged worker.
@@ -542,6 +539,28 @@ class VllmLlm:
                 self._pending_input = lifetime
             else:
                 lifetime.close()
+
+    def _validate_inputs(
+        self, batch: HostBatch[torch.Tensor] | None, texts: list[str], routes: tuple[str, ...] | None
+    ) -> None:
+        has_route = any(
+            RequestKeyField.ROUTE in state.key_fields for state in self.attachment.plan.semantic_graph.states
+        )
+        if routes is not None and (not has_route or len(routes) != len(texts) or any(not route for route in routes)):
+            raise ValueError('routes= needs a request state keyed by "route" and one value per prompt')
+        if has_route and routes is None:
+            raise ValueError("a route-keyed request state requires per-prompt routes")
+        validate_host_batch(
+            batch,
+            self.attachment.plan.semantic_graph,
+            self.attachment.plan.tensor_layout_request,
+            self.attachment.plan.timeline,
+            SharedTensor.describe,
+            hidden_size=self.hidden_size,
+            vocab_size=self.vocab_size,
+            prompt_count=len(texts),
+            import_fields=self.attachment.spec.import_fields,
+        )
 
     def resolve_prompt_indices(self, texts: list[str], prompt_indices: tuple[int, ...] | None) -> tuple[int, ...]:
         """Assign prompt indices when omitted and validate explicitly supplied indices."""
@@ -651,6 +670,72 @@ def free_cuda_garbage() -> None:
         torch.cuda.empty_cache()
 
 
+@contextmanager
+def engine_environment(
+    config: ModelConfig, environment: dict[str, str], *, async_engine: bool = False
+) -> Generator[None]:
+    """Validate and apply transient process variables around vLLM engine creation."""
+    multiprocessing = config.uses_multiprocessing(async_engine=async_engine)
+    full_env = {
+        _MP_ENV: "1" if multiprocessing else "0",
+        _V2_RUNNER_ENV: "1",
+        **environment,
+    }
+    if multiprocessing:
+        full_env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    previous = {name: os.environ.get(name) for name in full_env}
+    conflicts = tuple(name for name, value in full_env.items() if previous[name] not in (None, value))
+    if conflicts:
+        raise RuntimeError(
+            f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose a matching multiprocessing setting"
+        )
+    os.environ.update(full_env)
+    # vLLM's startup profile asserts free memory does not grow during measurement: release dead CUDA cycles first.
+    free_cuda_garbage()
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name)
+            else:
+                os.environ[name] = value
+
+
+def workload_engine_setup(
+    config: ModelConfig, requirements: BackendRequirements
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """Build vLLM engine kwargs and worker environment for an admitted workload."""
+    eager_reason = admit_workload(config, requirements)
+    if config.cuda_graphs == "auto" and eager_reason:
+        _logger.warning("running the model without CUDA graphs: %s", eager_reason)
+    environment = {
+        TAPS_ENV: encode_boundary(HiddenTapAnnouncement.declared(requirements, config)),
+        POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
+        LAYOUT_ENV: encode_boundary(requirements.kv_layouts),
+    }
+    options: GraphOptions = {} if eager_reason else graph_options(config, requirements)
+    # vLLM keys its compiled-model cache by config; hidden taps, position states and layouts enter the digest.
+    forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV]).encode()).hexdigest()
+    options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
+    engine_options: dict[str, Any] = {
+        **options,
+        **load_options(requirements.checkpoint_names),
+        "worker_cls": WORKER_CLASS,
+        # The supported uni-process, non-speculative decoder enables async by default.
+        "async_scheduling": True,
+        "scheduler_cls": "pllm.backends.vllm.prefix_cache.WorkloadScheduler",
+    }
+    return eager_reason, engine_options, environment
+
+
+def local_runner(llm: LLM, config: ModelConfig) -> WorkloadModelRunner | None:
+    """The model runner when vLLM executes on the calling thread."""
+    if config.uses_multiprocessing():
+        return None
+    return llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+
+
 def vllm_engine(
     config: ModelConfig, workload_options: dict[str, Any], environment: dict[str, str], *, cuda_graphs: bool
 ) -> tuple[LLM, tuple[int, ...]]:
@@ -659,27 +744,10 @@ def vllm_engine(
     Also returns the Dynamo bytecode hooks an in-process model registered while loading (Qwen3 registers two);
     vLLM never removes them, so the handle's close() does.
     """
-    environment = {
-        _MP_ENV: "1" if config.multiprocessing else "0",
-        _V2_RUNNER_ENV: "1",
-        **environment,
-    }
-    if config.tensor_parallel_size > 1:
-        if cuda_graphs:
-            workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
-        environment.update(VLLM_WORKER_MULTIPROC_METHOD="spawn")
-    previous = {name: os.environ.get(name) for name in environment}
-    conflicts = tuple(name for name, value in environment.items() if previous[name] not in (None, value))
-    if conflicts:
-        raise RuntimeError(
-            f"ModelConfig conflicts with {', '.join(conflicts)}; unset these variables or choose a matching multiprocessing setting"
-        )
-    os.environ.update(environment)
-    # vLLM's startup profile asserts that free memory does not grow while it measures, and it collects garbage
-    # mid-profile: CUDA tensors kept alive only by cycles (say, a caught exception's traceback) must go first.
-    free_cuda_garbage()
+    if config.tensor_parallel_size > 1 and cuda_graphs:
+        workload_options = {**graph_options(config, BackendRequirements()), **workload_options}
     hooks = bytecode_hooks()
-    try:
+    with engine_environment(config, environment):
         llm = LLM(
             model=config.model,
             revision=config.revision,
@@ -701,12 +769,6 @@ def vllm_engine(
             kv_transfer_config=None if config.kv_offload is None else config.kv_offload.options(),
             **workload_options,
         )
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name)
-            else:
-                os.environ[name] = value
     return llm, tuple(bytecode_hooks() - hooks)
 
 
@@ -717,40 +779,14 @@ def create_vllm_llm(
     definition: str | None = None,
 ) -> VllmLlm:
     requirements = workload.backend_requirements()
-    eager_reason = admit_workload(config, requirements)
-    if config.cuda_graphs == "auto" and eager_reason:
-        _logger.warning("running the model without CUDA graphs: %s", eager_reason)
-    environment = {
-        TAPS_ENV: encode_boundary(HiddenTapAnnouncement.declared(requirements, config)),
-        POSITION_ENV: encode_boundary(PositionAnnouncement(requirements.position_states)),
-        LAYOUT_ENV: encode_boundary(requirements.kv_layouts),
-    }
-    if config.multiprocessing or config.tensor_parallel_size > 1:
-        environment["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    options: GraphOptions = {} if eager_reason else graph_options(config, requirements)
-    # vLLM keys its compiled-model cache by its own config; the hidden taps and position states pLLM adds to the
-    # forward must enter that key, or an engine loads a model compiled for another workload. pLLM's entries are
-    # integers (overlay_graph decodes them as dict[str, int]), so the digest enters as one.
-    forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV]).encode()).hexdigest()
-    options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
-    llm, hooks = vllm_engine(
-        config,
-        {
-            **options,
-            **load_options(requirements.checkpoint_names),
-            "worker_cls": _WORKER_CLASS,
-            # The supported uni-process, non-speculative decoder enables async by default.
-            "async_scheduling": True,
-            "scheduler_cls": "pllm.backends.vllm.prefix_cache.WorkloadScheduler",
-        },
-        environment,
-        cuda_graphs=not eager_reason,
-    )
+    eager_reason, engine_options, environment = workload_engine_setup(config, requirements)
+    llm, hooks = vllm_engine(config, engine_options, environment, cuda_graphs=not eager_reason)
 
     with ExitStack() as construction:
         # Until the workload handle exists, a plain handle owns the engine and releases it on failure.
         construction.callback(VllmLlm(llm, compile_hooks=hooks).close)
-        if config.multiprocessing or config.tensor_parallel_size > 1:
+        runner = local_runner(llm, config)
+        if runner is None:
             replies = llm.collective_rpc(
                 "workload_command",
                 timeout=30.0,
@@ -771,9 +807,7 @@ def create_vllm_llm(
             )
             (installed, *others) = (reported_result(reply, BackendInstalled) for reply in replies)
             assert all(other == installed for other in others), "TP workers planned different workloads"
-            runner = None
         else:
-            runner = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
             installed = runner.install_workload(
                 workload, probe_backend(requirements, runner), config.execution, config.generated_kv
             )

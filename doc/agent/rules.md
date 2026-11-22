@@ -16,7 +16,7 @@ change satisfies it. The messages pLLM raises when a rule is broken, and their f
 | Inputs and parameters are read-only. | They are views shared with other methods and with pLLM's state versions; an in-place write corrupts what others read. |
 | State changes only through effects: `@pllm.write`, `@pllm.train`, `@pllm.train_in_forward`, `init=` sources, imports and feeds. | pLLM versions every state, publishes new versions atomically and may replay them; a write it does not know about breaks versions and replay. |
 | A workload holds declarations and settings only: plain values, enums, dataclasses, other workloads. No tensors, modules, open files or mutable globals. | The workload is deep-copied at make_llm and rebuilt in worker processes; tensors belong in state that pLLM places and pages. |
-| A setting that depends on the instance is a function of the workload (`beta=strength` with `def strength(self) -> float`). | Decorators run when the class is defined; a field name in the class body is its class default (see [pitfalls.md](pitfalls.md#a-dataclass-field-named-in-the-class-body-passes-the-class-default)). |
+| A setting that depends on the instance is read with `pllm.cfg("field")` or a function of the workload (`beta=strength` with `def strength(self) -> float`). | Decorators run when the class is defined; a bare field name in the class body passes its class default (see [pitfalls.md](pitfalls.md#a-dataclass-field-named-in-the-class-body-passes-the-class-default)). |
 | A method has at most one decorator of each kind, and one effect. | One method has one destination; the plan gives each a single anchor. |
 | At most one `@pllm.guide_sampling` per workload, components included; any number of `@pllm.add_logits`. | The sampler applies one guidance per step; logit additions are summed before it. |
 | One training mode per workload: request rows, or host batches. | The two reserve different memory and run at different times of the step. |
@@ -52,24 +52,25 @@ change satisfies it. The messages pLLM raises when a rule is broken, and their f
 
 ### Models
 
-pLLM admits exact vLLM model classes (not subclasses: relatives such as Phi3 or Mistral may change
-projection layouts or logits).
+pLLM admits exact verified vLLM decoder classes (not arbitrary subclasses) across 15 architectures:
 
 | Family | Supported | Not supported, and why |
 | --- | --- | --- |
-| Qwen2 / Qwen2.5, Llama, Qwen3 (dense) | Everything. | — |
-| Qwen3-MoE | Reads, exports, sampler effects, training on request rows, `ActivationPatch`, `@pllm.custom_forward`, `PositionState`, `@pllm.custom_attention`; Adapter / `train_in_forward` on attention q/k/v. | Adapters on MLP projections (tokens route to experts); `causal_model` training (implemented for dense decoders only). |
-| Qwen3.5 / Qwen3.5-MoE (Gated DeltaNet hybrids) | Reads, exports, sampler effects, request training, `ActivationPatch`; Adapters on full-attention k/v projections and dense (non-MoE) MLP projections. | `@pllm.custom_forward`, `PositionState`, static KV layouts and `@pllm.custom_attention` (DeltaNet state lives outside KV pages, so layers cannot be recomputed from KV); q overlays (gated attention interleaves query and gate rows); Gated DeltaNet layers have no q/k/v. |
-| DeepSeek V2 / V3, gpt-oss | Hidden taps, ESamp-style training with guidance, sampler stages, activation patches. | Everything that rewrites weights or reruns layers (MLA attention, per-expert MoE or MXFP4 projections). |
+| Dense decoders (`Qwen2`, `Llama`, `Qwen3`, `Mistral`, `Phi3`, `Glm4`, `Gemma2`, `Gemma3`) | Everything (including `CausalTrainBatch` on dense `Qwen2`, `Llama`, `Qwen3`, `Mistral`, `Phi3`, `Glm4`, `Gemma3`). | Tied `Gemma2ForCausalLM` lacks a separate `lm_head` and `final_logit_softcapping` requires exact dense guidance instead of bounded top-K guidance. |
+| KV-MoE (`Mixtral`, `Qwen2Moe`, `Qwen3Moe`) | Reads, exports, sampler effects, request training, `ActivationPatch`, sublayer `@pllm.custom_residual`, `@pllm.custom_forward`, `PositionState`, `@pllm.custom_attention`; `Adapter` / `@pllm.train_in_forward` on `q/k/v_proj`. | Adapters on MLP projections (tokens route across experts); `causal_model` training (implemented for dense decoders only). |
+| Hybrids (`Qwen3_5`, `Qwen3_5Moe`: Gated DeltaNet + full attention) | Reads, exports, sampler effects, request training, `ActivationPatch`, `@pllm.custom_residual` (sublayer + `site="value"` on full-attention layers); `Adapter` / `@pllm.train_in_forward` on full-attention `k/v_proj` and dense MLP projections. | `@pllm.custom_forward`, `PositionState`, static KV layouts, and `@pllm.custom_attention` (DeltaNet state lives outside KV pages); `q_proj` overlays (interleaved output gate); DeltaNet linear-attention layers have no `q/k/v_proj`. |
+| `DeepseekV2`, `DeepseekV3` (MLA + MoE) | Hidden taps, exports, sampler stages, request training (ESamp), `ActivationPatch`, non-`"value"` `@pllm.custom_residual`, and `@pllm.custom_attention` (`keep="all"`, absorbed reads in compressed latent space). | `Adapter`, `@pllm.train_in_forward`, `causal_model`, `site="value"`, `@pllm.custom_forward`, and sliding-window/shared KV layouts (MLA uses compressed latent KV pages and per-expert MoE projections). |
+| `GptOss` (sink attention + MXFP4 MoE) | Hidden taps, exports, sampler stages, request training (ESamp), `ActivationPatch`, and non-`"value"` `@pllm.custom_residual`. | `Adapter`, `@pllm.train_in_forward`, `causal_model`, `@pllm.custom_attention`, and `@pllm.custom_forward`. |
 
 Quantized checkpoints (GPTQ, AWQ, FP8) follow their family's rules: adapters correct the quantized
-projection's output, and reruns call vLLM's quantized modules. `causal_model` training needs a dense
-Qwen2/Llama/Qwen3 model in bfloat16 whose embedding and LM head are not quantized.
+projection's output, and reruns call vLLM's quantized modules. `causal_model` training needs an unquantized
+BF16 dense model whose embedding and LM head are not quantized.
 
 ### Engine versions
 
-- vLLM 0.27.1 and 0.32.0 (`.venv` and `.venv-vllm032` in this repository); other versions refuse to start.
+- vLLM 0.27 through 0.34 (with `.venv` on 0.27.1 and `.venv-vllm032` on 0.32.0 as live GPU baselines; 0.33–0.34 require CUDA 13 driver >= 580 for PyTorch 2.14+cu130); other releases refuse to start.
 - pLLM always runs vLLM's MRv2 model runner (it sets `VLLM_USE_V2_MODEL_RUNNER=1` itself); MRv1 is unsupported.
+- `pllm.make_llm`, `pllm.make_async_llm`, and `pllm serve` share one unified control plane: live `import_state(..., route=...)`, per-request `stream(..., state_import=...)`, `train_batch(HostBatch)` (including `CausalTrainBatch`), cross-process/TP `feed(name)`, `generate_completions` / `generate_feedback` (also with `workload=None`), and route-keyed persistence all work across sync and async handles. `ModelConfig.multiprocessing="auto"` selects `False` for sync `TP=1` and `True` for `make_async_llm`, `pllm serve`, or `TP > 1`.
 
 ### CUDA graphs
 
@@ -81,20 +82,20 @@ Qwen2/Llama/Qwen3 model in bfloat16 whose embedding and LM head are not quantize
 | --- | --- |
 | Hidden reads, `pllm.layer_logits`, exports, `@pllm.write`, `@pllm.train`, sampler effects | CUDA graphs |
 | `pllm.model.ActivationPatch`, `@pllm.custom_residual`, `@pllm.custom_attention`, token-history lookups | CUDA graphs (vLLM captures source operators instead of inductor-fused ones) |
-| `pllm.model.Adapter` on a `RequestState` | CUDA graphs |
-| `pllm.model.Adapter` on an `InstanceState` | eager: `CUDA-graph overlays do not support adapters backed by shared InstanceState` |
+| `pllm.model.Adapter` on a `RequestState` or an `InstanceState` | CUDA graphs |
 | `@pllm.custom_forward` | pLLM captures its own graphs per layer slice: `@pllm.custom_forward schedules model slices and owns their wave graphs` |
 | `cuda_graphs=False` | eager |
 
 ### Tensor parallelism (`tensor_parallel_size > 1`)
 
-Needs vLLM 0.32.0; single node; `pipeline_parallel_size` and `data_parallel_size`
+Needs vLLM 0.32.0 or newer; single node; `pipeline_parallel_size` and `data_parallel_size`
 stay 1.
 
 | Works with TP | Needs `tensor_parallel_size=1` |
 | --- | --- |
-| Hidden reads, exports, sampler effects, request-state training (ESamp, output LoRA), `@pllm.custom_forward` | `@pllm.custom_residual` (also when fed by `pllm.input_tokens`), `@pllm.custom_attention`, state feeds, `causal_model` training |
-| Adapter `"dense"` / `"low_rank"` deltas on q/k/v, gate/up, down, starting from `pllm.Zeros` / `pllm.Computed` and updated only by shard-local `@pllm.train_in_forward` | `"per_head"` deltas; adapter states with an optimizer or another `init=` source; reading a sharded adapter field anywhere but its projection |
+| Hidden reads, exports (delivered from rank 0), sampler effects, request-state training, `@pllm.custom_forward` | `causal_model` training |
+| `Adapter` `"dense"` / `"low_rank"` deltas on `q/k/v`, `gate/up`, `down` (`Zeros`, `Computed`, `Pretrained`, or `Imported`) updated via shard-local `@pllm.train_in_forward` or `StateImport` / `import_state` | `"per_head"` deltas; adapters updated by `@pllm.train` / `@pllm.write` side tasks; reading a sharded adapter field anywhere outside its projection |
+| Non-`"value"` `@pllm.custom_residual` (including `pllm.input_tokens` helpers), `keep="all"` `@pllm.custom_attention` (without cross-head `pllm.attention(...)` facts), and `pllm.Fed` streams (`FanoutFeed`) | `@pllm.custom_residual(site="value")`, `@pllm.custom_attention` reading cross-head `pllm.attention(...)` facts, and sliding-window/shared KV layouts |
 
 q/k/v and gate/up shard dense weights and B by output rows; down shards dense weights and A by input
 columns; the other factor is replicated. An update that needs other ranks' shards is rejected.
@@ -113,7 +114,6 @@ these to make something pass without telling the user.
 | `@pllm.train_in_forward(visibility="exact")` | `"forward_pinned"` | Later chunks wait for earlier chunks' updates | `timing` line |
 | `tokens="all"` on hidden reads | `"decode"` | Sizes the tap by `max_num_batched_tokens` and exports many rows | `tap` and `export` lines |
 | `@pllm.custom_forward` | none | vLLM's whole-model graph is replaced by per-slice graphs; may need a larger `cuda_graph_pool_budget_bytes`, which explain does not estimate | `forward eager because ...` |
-| `pllm.model.Adapter` on an `InstanceState` | — | The model forward runs eagerly | `forward` line |
 | `ExecutionOptions(guidance_capacity=None)` | `4096` | Exact dense guidance over the full vocabulary instead of the top 4096 survivors | `timing guidance_capacity` |
 | `ExecutionOptions(max_host_training_rows=n)` | `1` | Host-fed training rows per state per step; more memory | `state` and `memory` lines |
 | Memory budgets: `state_page_budget_bytes`, `execution_peak_budget_bytes`, `cuda_graph_pool_budget_bytes` | observed free capacity / unlimited / traced | Caps pLLM's own reservations (not weights or KV); planning fails with a message when they do not fit | `state`, `memory`, `budget` lines |
@@ -124,9 +124,9 @@ these to make something pass without telling the user.
 
 | Setting | Default | Rule | Reason |
 | --- | --- | --- | --- |
-| `enable_prefix_caching` | `False` | Keep it off for workloads that change K/V. It is rejected with `pllm.model.Adapter`, `pllm.model.ActivationPatch`, `@pllm.train_in_forward`, `@pllm.custom_residual` and `@pllm.custom_attention`. | Cached prompt K/V were computed under another request's state; the cache key covers the workload's identity, not its state values. |
+| `enable_prefix_caching` | `False` | Safe for stateless model hooks and immutable `InstanceState` hooks with `ActivationPatch(last_tokens=0)`. Rejected for `RequestState`, mutable/`Imported`/`Fed` `InstanceState`s, `last_tokens > 0`, `@pllm.train_in_forward`, and `@pllm.custom_attention`. | Cached prompt K/V are keyed by tokens (plus workload namespace and generated-boundary isolation), not per-request or mutable state values. |
 | `enable_chunked_prefill` | `False` | Results must not depend on how prompts are split into steps (`testing.check` verifies it), so either value is safe. | vLLM decides the split from its token budget. |
 | `max_num_seqs`, `max_model_len`, `gpu_memory_utilization` | `8`, `512`, `0.5` | Size so vLLM does not preempt workloads whose replay is rejected. | See [Preemption and recompute](pitfalls.md#preemption-and-recompute). |
-| `multiprocessing` | `False` | With `True` (or TP), workload fields must be picklable (no locks, open files or live handles). | Workers rebuild the workload from cloudpickle bytes (classes from `__main__` or a notebook travel by value, importable ones by import path) and plan it themselves; editing imported modules between make_llm and the worker's start is your responsibility. |
+| `multiprocessing` | `"auto"` | `"auto"` uses `False` for sync `TP=1` and `True` for `make_async_llm`, `pllm serve`, or `TP > 1`. With worker processes, workload fields must be picklable (no locks, open files or live handles). | Workers rebuild the workload from cloudpickle bytes (classes from `__main__` or a notebook travel by value, importable ones by import path) and plan it themselves; editing imported modules between make_llm and the worker's start is your responsibility. |
 | `dtype` | `"bfloat16"` | Hidden rows and model-dtype state follow it. | Inference precision; compute sensitive math in float32 inside the method. |
 | `seed` | `0` | Seeds `pllm.Computed` initializers and sampling. | Reproducible runs and checks. |

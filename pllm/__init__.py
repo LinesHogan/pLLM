@@ -42,6 +42,7 @@ from pllm.usage import (
     batch as batch,
     carry as carry,
     causal_model as causal_model,
+    cfg as cfg,
     custom_attention as custom_attention,
     custom_forward as custom_forward,
     custom_residual as custom_residual,
@@ -72,32 +73,47 @@ from pllm.workload import Workload as Workload
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.runtime import VllmLlm
+    from pllm.backends.vllm.serving import AsyncVllmLlm
 
 
 def make_llm(config: ModelConfig, *, workload: Workload | None = None) -> VllmLlm:
     """A context-managed vLLM engine; execution options apply when a workload is installed."""
     if workload is None:
         from pllm.backends.vllm.compat import admit_parallel
-        from pllm.backends.vllm.runtime import VllmLlm, vllm_engine
+        from pllm.backends.vllm.runtime import WORKER_CLASS, VllmLlm, local_runner, vllm_engine
 
         admit_parallel(config)
-        llm, hooks = vllm_engine(config, {"worker_cls": "auto"}, {}, cuda_graphs=config.cuda_graphs is not False)
-        return VllmLlm(llm, compile_hooks=hooks)
+        llm, hooks = vllm_engine(config, {"worker_cls": WORKER_CLASS}, {}, cuda_graphs=config.cuda_graphs is not False)
+        return VllmLlm(llm, local_runner(llm, config), compile_hooks=hooks)
     from pllm.backends.vllm.runtime import create_vllm_llm
 
     definition = None
-    if config.multiprocessing or config.tensor_parallel_size > 1:
+    if config.uses_multiprocessing():
         from pllm.workload_transport import encode_workload
 
         definition = encode_workload(workload)
     return create_vllm_llm(workload, config, definition=definition)
 
 
+def make_async_llm(config: ModelConfig, *, workload: Workload | None = None) -> AsyncVllmLlm:
+    """An async continuous-batching vLLM engine handle (`async with make_async_llm(...) as llm:`)."""
+    from pllm.backends.vllm.serving import create_async_llm
+
+    definition = ""
+    if workload is not None:
+        from pllm.workload_transport import encode_workload
+
+        definition = encode_workload(workload)
+    return create_async_llm(workload, config, definition=definition)
+
+
 __all__ = [
     "make_llm",
+    "make_async_llm",
     "explain",
     "scan",
     "custom_forward",
+    "cfg",
     "custom_residual",
     "custom_attention",
     "attention",

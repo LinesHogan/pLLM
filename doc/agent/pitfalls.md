@@ -58,6 +58,7 @@ weights, so run it first. The tables are generated from [errors.toml](../referen
 | `pllm.input_tokens(history=) needs a nonnegative integer` | `history` counts tokens before the current one. | Pass `history=0` or more. |
 | `pllm.attention needs a nonnegative layer and fact='aux' or 'lse'` | Attention facts exist per layer and are either the auxiliary output or the log-sum-exp. | Pass a layer index `>= 0` and `fact="aux"` or `fact="lse"`. |
 | `... reads tokens="all" rows; only @pllm.export methods read them, and without pllm.result inputs. Export the rows, or read tokens="prefill" or "decode"` | `tokens="all"` gives one row per computed token, which no other effect can align with requests. | Export those rows, or read `tokens="decode"` / `tokens="prefill"`. |
+| `pllm.cfg(...): expected a dotted Python attribute path such as 'layer' or 'config.layer'` | `pllm.cfg` resolves a dotted attribute path on the bound workload instance. | Pass one or more Python identifiers joined by dots, e.g. `pllm.cfg("beta")` or `pllm.cfg("config.rank")`. |
 
 ### Phases: when a value exists
 
@@ -144,7 +145,8 @@ weights, so run it first. The tables are generated from [errors.toml](../referen
 | `... advances its memory once per token, but a @pllm.custom_forward may run its layer several times or not at all per token; drop state= or the custom forward` | A stateful sublayer needs exactly one visit per token. | Use two workloads, or carry the memory in `pllm.PositionState` inside the custom forward. |
 | `...: take the site tensors ... first, without defaults, then markers` | pLLM passes the site tensors positionally, in order. | Write `x, y` (or `v`) first, then inputs with marker defaults. |
 | `...: take q and kv first, without defaults, then markers` | pLLM passes the query and the paged KV positionally. | Write `q, kv` first, then inputs with marker defaults. |
-| `...: return attention with q's shape and model dtype` | The output feeds the model's own output projection. | Return a tensor with `q`'s shape and dtype. |
+| `...: return attention shaped [rows, heads, v_head_dim] with model dtype` | The output feeds the model's own output projection (`v_head_dim` equals `head_dim` on dense GQA/MHA and the value head width on MLA). | Return a tensor shaped `[rows, heads, v_head_dim]` in `q.dtype`. |
+| `MLA @pllm.custom_attention supports keep='all' with window=/topk= read selection; remove sliding-window or shared KV layout declarations` | MLA pages store compressed latent vectors whose block allocator uses full-history retention. | Keep `keep="all"` (the default) on MLA models and pass `window=` or `topk=` to `kv.attend(...)`. |
 | `keep="none" needs explicit layers and source >= 1 pointing to an earlier layer; use @pllm.custom_forward with kv="peek" for top-layer sources` | Deeper layers have not run yet for the current token. | Point `source` at an earlier layer, or use a custom forward. |
 | `kv.attend topk needs integer positions [rows, k] or [rows, heads, k], padded with -1` | Top-K entries are logical token positions. | Pass integer positions of that shape; pad missing ones with -1. |
 | `static KV layouts cannot accompany PositionState or @pllm.custom_forward (including kv_copy)` | A layout splits the KV cache into several groups; these features need one group. | Drop the layout (`keep=` / `window=` / `source=`) or the custom forward. |
@@ -153,7 +155,7 @@ weights, so run it first. The tables are generated from [errors.toml](../referen
 | `a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet combine with a pllm.model.Adapter; ...` | The training method owns the projection hooks the adapter would also use. | Train the adapter's state in the `@pllm.train_in_forward` method itself, or use two workloads. |
 | `... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...` | A `@pllm.train_in_forward` method without an optimizer returns the correction added to the projection's output; pLLM checks it once at declaration on maximum-shape operands. | Return `output` shaped `[rows, out_features]` of the target, in the input dtype or float32. |
 | `... must return changed (bool) and update_count and trained_rows (int64) as 0-d tensors on the input's device` | The counters stay on the device so no step synchronizes with the host. | Build them as 0-d device tensors (`x.new_ones((), dtype=torch.bool)`), or return `pllm.UpdateOutput.unchanged(output)`. |
-| `layer ... routes tokens to experts; MLP overlays need a dense MLP, so overlay the attention query or value projection instead` | An MoE layer has no single dense MLP projection. | Rewrite the attention query or value projection. |
+| `layer ... uses ...; MLP overlays need a dense MLP. Choose q_proj, k_proj or v_proj` | An MoE layer routes tokens across expert weights and has no single dense MLP projection. | Target `q_proj`, `k_proj`, or `v_proj` on that layer instead. |
 | `layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)` | Qwen3.5 linear-attention layers have no standard q/k/v projections. | Target a full-attention layer (`layer_types` in the model config). |
 | `gated attention interleaves each head's query rows with its output-gate rows; overlay the value projection instead` | Qwen3.5 gated attention packs each head's query rows with its gate rows, so there is no separate query projection. | Rewrite `v_proj`. |
 | `per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP` | Per-head deltas are not split along the tensor-parallel shards. | Use `"dense"` or `"low_rank"` under TP, or `tensor_parallel_size=1`. |
@@ -174,21 +176,20 @@ weights, so run it first. The tables are generated from [errors.toml](../referen
 
 | Message | Why | Fix |
 | --- | --- | --- |
-| `pLLM runs on vLLM 0.27.1 or 0.32.0; install one of them instead of vLLM ...` | pLLM is aligned with these two vLLM versions only. | Install vLLM 0.27.1 or 0.32.0. |
-| `choose a Qwen2, Llama, Qwen3, Qwen3Moe, Qwen3_5, Qwen3_5Moe, DeepseekV2, DeepseekV3 or GptOss ForCausalLM model for vLLM workloads` | pLLM admits exact vLLM model classes whose layer structure it knows. | Use a listed family (see [rules.md, Support matrix](rules.md#support-matrix)). |
+| `pLLM runs on vLLM 0.27 through 0.34; install a supported 0.27..0.34 release instead of vLLM ...` | pLLM integrates directly with vLLM's V1 worker, runner and scheduler internals within this tested range. | Install a vLLM release between 0.27.0 and 0.34.0 (with matching PyTorch / CUDA driver). |
+| `...: choose one of the supported vLLM decoders: ...` | pLLM admits exact vLLM decoder classes whose norm, residual, KV, and projection structure it has verified. | Use a listed decoder family (see [rules.md, Support matrix](rules.md#support-matrix)). |
 | `pLLM runs vLLM's own model classes, not subclasses of them` | A subclass may change the projection layout or the logits. | Use the listed model class itself. |
-| `... needs a Qwen2, Llama, Qwen3, Qwen3-MoE or Qwen3.5 model (...); hidden taps, ESamp, sampler stages and activation patches still run on this model` | DeepSeek V2/V3 and gpt-oss have MLA or MoE projections pLLM cannot rewrite. | Use read-only features on these models, or a dense family. |
-| `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; use a Qwen2, Llama, Qwen3 or Qwen3-MoE model` | Qwen3.5 keeps linear-attention state outside the KV pages, so it cannot be rebuilt from them. | Use a Qwen2, Llama, Qwen3 or Qwen3-MoE model for custom forwards and custom attention. |
-| `projection shapes for this architecture are decided at make_llm; use a dense Qwen2, Qwen3 or Llama config for CPU checks` | On CPU, pLLM derives projection shapes only for dense Qwen2, Qwen3 and Llama configs. | Run `pllm.explain` on a dense config of the same sizes, and check the target model with `make_llm`. |
-| `disable prefix caching (enable_prefix_caching=False) with pllm.model.Adapter, pllm.model.ActivationPatch, @pllm.train_in_forward, @pllm.custom_residual or @pllm.custom_attention: ...` | vLLM keys cached K/V by tokens, not by state, so a cached prefix would hold K/V computed under another request's state. | Keep `enable_prefix_caching=False` (the default). |
+| `... needs separate KV projections (...); hidden taps, sampler stages, activation patches and sublayer residuals still run on this model` | DeepSeek V2/V3 (MLA + MoE) and gpt-oss (sink attention + MXFP4 MoE) have no standard sliceable q/k/v or dense MLP projections. | Use hidden reads, sampler stages, activation patches, sublayer `@pllm.custom_residual`, or MLA `@pllm.custom_attention` (on DeepSeek V2/V3), or switch to a dense / KV-MoE model. |
+| `... recomputes layer state from KV pages, but ... keeps Gated DeltaNet recurrent state outside them; choose a decoder with KV attention in every layer` | Qwen3.5 keeps linear-attention recurrent state outside paged KV, so layers cannot be replayed from KV pages alone. | Use a dense or KV-MoE decoder (such as Qwen2, Llama, Mistral, Phi3, Glm4, Gemma2/3, Mixtral, Qwen2-MoE, Qwen3, or Qwen3-MoE). |
+| `projection shapes for this architecture are decided at make_llm; use a dense or KV MoE config for CPU checks` | CPU config-only shape derivation covers dense, KV-MoE, and Qwen3.5 hybrid configs. | Use a dense or KV-MoE config of matching dimensions for CPU checks, and verify the target checkpoint with `make_llm`. |
+| `disable prefix caching (enable_prefix_caching=False): ...` | Prefix caching is safe only when model hooks are stateless or read immutable `InstanceState`s with `last_tokens == 0`; per-request or mutable state, `last_tokens > 0`, `@pllm.train_in_forward`, and `@pllm.custom_attention` produce request-dependent K/V. | Keep `enable_prefix_caching=False` (the default), or make the model-read state an immutable `InstanceState` (`Pretrained`, `Zeros`, `Computed`, `FromModule`, `ModelCheckpoint`) with `last_tokens=0`. |
 | `...; set ModelConfig(cuda_graphs="auto") or cuda_graphs=False` | `cuda_graphs=True` demands vLLM's whole-model graphs, and the named feature runs the forward without them. | Remove that feature, or use `cuda_graphs="auto"` (the default); `diagnostics().eager_reason` then names the cause. |
-| `CUDA-graph overlays do not support adapters backed by shared InstanceState` | This is an `eager_reason`, not an exception: an Adapter reading shared instance state runs the forward eagerly. | Keep the state per request (`RequestState`) to stay in CUDA graphs. |
 | `@pllm.custom_attention needs vLLM's FlashAttention 2 backend; set VLLM_ATTENTION_BACKEND=FLASH_ATTN and VLLM_FLASH_ATTN_VERSION=2` | Custom attention is built on vLLM's FlashAttention 2 backend. | Set the two environment variables the message names. |
 | `@pllm.custom_attention needs unquantized KV; set kv_cache_dtype=auto` | Your read function reads K/V in the model dtype. | Keep `kv_cache_dtype="auto"`. |
-| `@pllm.custom_attention needs tensor_parallel_size=1: each rank sees only its heads` | Your read function sees all heads at once. | Use `tensor_parallel_size=1`. |
-| `multi-GPU needs vLLM 0.32.0; otherwise use tensor_parallel_size=1` | pLLM supports tensor parallelism only on vLLM 0.32.0. | Use the 0.32.0 environment, or one GPU. |
-| `... runs on one GPU only; set tensor_parallel_size=1` | `causal_model` training, state feeds and `@pllm.custom_residual` run on one GPU only. | Use `tensor_parallel_size=1`. |
-| `TP Adapter fields start from pllm.Zeros or pllm.Computed and take shard-local @pllm.train_in_forward updates; optimizers and other init= sources need tensor_parallel_size=1` | Under TP each rank holds its shard of the delta; only shard-local updates keep shards consistent. | With TP, start adapter state from `Zeros` / `Computed` and update it only in `@pllm.train_in_forward`; otherwise use one GPU. |
+| `multi-GPU needs vLLM 0.32.0 or newer; otherwise use tensor_parallel_size=1` | pLLM supports tensor parallelism starting in vLLM 0.32.0. | Upgrade to vLLM 0.32.0 or newer, or set `tensor_parallel_size=1`. |
+| `... runs on one GPU only; set tensor_parallel_size=1` | `causal_model` training, `@pllm.custom_residual(site="value")`, and `@pllm.custom_attention` with cross-head `pllm.attention(...)` facts or non-default KV layouts require a single GPU. | Use `tensor_parallel_size=1` (plain `keep="all"` `@pllm.custom_attention`, sublayer `@pllm.custom_residual`, and `Fed` states work with TP > 1). |
+| `TP Adapter updates need shard-local @pllm.train_in_forward; side-lane updates need tensor_parallel_size=1` | Under TP each rank holds its shard of the delta (`Zeros`, `Computed`, `Pretrained`, or `Imported`); online gradient/write updates on side streams do not synchronize shards across GPUs. | Update TP adapters via shard-local `@pllm.train_in_forward` or `import_state` / `StateImport`, or use `tensor_parallel_size=1` for `@pllm.train` / `@pllm.write` updates. |
+| `...: TP sharded fields are projection-local; other readers need tensor_parallel_size=1` | A sharded adapter field holds only the current GPU's slice, so ordinary tensor methods cannot read the full tensor. | Read the state only through `pllm.model.Adapter` / `@pllm.train_in_forward`, or set `tensor_parallel_size=1`. |
 | `TP projection update is not shard-local at ...; ...` | The update math needs other ranks' shards (for example training replicated A from column-sharded outputs). | Rewrite the update to use only the local shard, or use `tensor_parallel_size=1`. |
 | `other processes receive the workload by pickling (...); hold plain values, tensors and functions instead of locks, open files or live handles, or use tensor_parallel_size=1 with multiprocessing=False` | A workload field (or something a function in it captures) holds a lock, open file or live handle, which cannot be pickled. | Hold plain values, tensors and functions; open handles inside the method instead. |
 | `check_on_gpu needs max_num_seqs >= 2 and max_model_len >= 32 for its fixed script` | The GPU check runs a fixed multi-request script. | Raise those settings for the check. |
@@ -215,8 +216,10 @@ weights, so run it first. The tables are generated from [errors.toml](../referen
 | `a route-keyed request state requires per-prompt routes` | A request without a route does not know which state copy to use. | Pass `routes=` to `generate`. |
 | `RequestIdentity ... is missing a field required by ...` | A request lacks a value for a declared key field (an empty route, a negative prompt index). | Give every request a valid value for each key field. |
 | `batch, sample_index, prompt_indices and routes need workload= in make_llm` | A plain engine has nothing to feed. | Pass `workload=` to `make_llm`. |
-| `state feeds need tensor_parallel_size=1 and multiprocessing=False; pass the writer to a spawned producer` | `llm.feed(...)` hands out an in-process handle. | Use one in-process engine; run the producer in a spawned process. |
-| `completions carry each sample's final hidden row, which only a workload collects; ...` | `generate_completions` and `generate_feedback` hand each sample's final hidden row to the host, and only an installed workload captures it. | Pass `workload=pllm.workloads.DummyWorkload()` to `make_llm` when nothing should train. |
+| `online serving runs vLLM's async multiprocess engine; omit multiprocessing=False or set True` | `make_async_llm` and `pllm serve` use vLLM's async worker process (`ModelConfig.multiprocessing="auto"` enables this automatically). | Leave `multiprocessing="auto"` (the default) or set `multiprocessing=True`. |
+| `import_state needs a nonempty route and RequestState keyed only by route` | Out-of-band `llm.import_state(..., route=...)` targets either an `InstanceState` (no route) or a `RequestState` keyed solely by `"route"`. | Declare `RequestState(..., key_fields=("route",))` and pass `route="..."`, or pass per-request imports via `stream(..., state_import=...)` / `generate(..., batch=...)`. |
+| `train_batch needs a workload with a host batch training method` | `llm.train_batch(batch)` runs a `@pllm.train` method declared with `pllm.batch(...)` inputs. | Declare a `@pllm.train` method reading `pllm.batch(...)` fields (for `CausalTrainBatch`, `WeightedRowBatch`, or unkeyed `WeightedCEBatch`). |
+| `online request lacks pLLM identity metadata; submit through AsyncVllmLlm or pllm serve` | Worker execution requires the online identity metadata stamped by `make_async_llm` or `pllm serve`. | Submit requests through `pllm.make_async_llm` or `pllm serve` (passing session keys via `extra_body={"vllm_xargs": {"pllm_route": ...}}`). |
 
 ### Contract check errors
 
@@ -334,9 +337,25 @@ inside a method body reads `self.beta` normally.
 - **`pllm.ModelCheckpoint` takes its tensors away from the model.** vLLM skips every listed tensor when it
   loads the weights, so the model runs without them and nothing reports it. List only tensors the model
   does not use itself; never list one it needs, such as `model.embed_tokens.weight` or a layer's weights.
-- **Instance state read by an Adapter makes the forward eager.** `diagnostics().eager_reason` reports
-  `CUDA-graph overlays do not support adapters backed by shared InstanceState`; per-request adapter state
-  stays in CUDA graphs.
+- **`torch.library.wrap_triton` leaks tensor tuples across steps.** `wrap_triton` caches `tuple[Tensor, ...]`
+  arguments as compile-time constants in a global side table, retaining step tensors in GPU memory across
+  decode steps. Register custom Triton kernels with `@torch.library.custom_op("ns::op", mutates_args=())`
+  taking `list[torch.Tensor]` (plus `@op.register_fake`, and `register_vmap` / `register_autograd` where
+  used).
+- **Accumulating small fast-weight updates directly in BF16 rounds them away.** Adding a small step update
+  (such as `1e-5` norm) directly onto a BF16 weight matrix loses most elements below the 7-bit BF16 mantissa
+  step. Keep base weights frozen and accumulate fast-weight deltas in `float32` (`dtype="auto"` or
+  `dtype=torch.float32`).
+- **`placement="host"` tables only overlap the forward when gathered in a token-only helper.** Mixing
+  `pllm.hidden(...)` into the same method delays the PCIe gather until after the model forward starts,
+  exposing bus latency on the critical path. Gather rows inside an undecorated helper reading only
+  `pllm.input_tokens` and the table, then consume `pllm.result("helper")` downstream so the bounded gather
+  overlaps the forward pass.
+- **Early exit (`active=`) or dropped KV (`keep="window"` / `"none"`) on unadapted models shifts distributions
+  quietly.** Generated text often stays grammatical even when skipping layers or dropping remote KV alters
+  next-token probabilities, and partial decode skipping saves wall-clock time only when every row in the
+  batch skips together or long-context KV reads dominate layer weights. Always verify quality with
+  `pllm.testing.check_distribution`.
 
 ## Preemption and recompute
 

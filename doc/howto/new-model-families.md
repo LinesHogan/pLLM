@@ -10,18 +10,19 @@
 
 当你在 Qwen2.5 上验证完一个算法负载并准备迁移到其他开源模型时，遇到的第一个问题通常是：**pLLM 怎么判定一个模型能不能跑？**
 
-pLLM 的底层运行时直接按 vLLM 的**具体模型类**进行准入判断，**不支持模型子类**。
+pLLM 的底层运行时直接按 vLLM 的**具体模型类**进行准入判断，**不支持未核对的任意子类**。
 
-- **为什么不支持子类（动机）**：像 Phi-3、Mistral 等近亲变体或第三方派生子类，可能会改变注意力投影的物理布局（例如 QKV 的打包与切片划分规则、交错顺序）或 LM Head / logits 计算与归一化逻辑。pLLM 需要精确绑定每一层内部残差流与子层归一化（LayerNorm / RMSNorm）的挂载点、投影输出分片和 logits 计算位置；如果允许任意子类准入，一旦底层张量切片假设失效，就会引发静默的数值错误或未定义行为。因此，必须使用原生 vLLM 模型类。
+- **为什么按具体模型类准入**：不同变体或第三方派生子类可能改变注意力投影的物理布局（例如 QKV 的打包、切片划分、交错门控顺序）、子层归一化位置（如 GLM-4 与 Gemma 2 / 3 的四处归一化）或 LM Head 绑定与 logits 缩放逻辑（如 Gemma 2 的共享 embedding 与 `final_logit_softcapping`）。pLLM 会核对每一类原生模型内部的残差挂载点、投影输出分片与权重布局；因此仅准入以下已核对的原生 vLLM 模型类。
 
-目前已准入的原生模型类分为四类：
+目前已准入 15 类架构（16 个原生模型类），按能力分为五组：
 
 | 架构类别 | 准入的具体模型类 | 适用模型示例 |
 | --- | --- | --- |
-| **全功能稠密** | `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM` | Qwen2 / Qwen2.5、Llama 2 / 3、Qwen3（稠密版） |
-| **稀疏 MoE** | `Qwen3MoeForCausalLM` | Qwen3-MoE |
+| **全功能稠密** | `Qwen2ForCausalLM`、`LlamaForCausalLM`、`Qwen3ForCausalLM`、`MistralForCausalLM`、`Phi3ForCausalLM`、`Glm4ForCausalLM`、`Gemma2ForCausalLM`、`Gemma3ForCausalLM` | Qwen2 / Qwen2.5、Llama 2 / 3、Qwen3（稠密版）、Mistral、Phi-3、GLM-4、Gemma 2 / 3 |
+| **稀疏 KV-MoE** | `MixtralForCausalLM`、`Qwen2MoeForCausalLM`、`Qwen3MoeForCausalLM` | Mixtral、Qwen2-MoE、Qwen3-MoE |
 | **混合架构** | `Qwen3_5ForCausalLM`、`Qwen3_5MoeForCausalLM` | Qwen3.5 稠密版与 MoE 版（Gated DeltaNet + 全注意力） |
-| **只读与引导** | `DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM`、`GptOssForCausalLM` | DeepSeek V2 / V3、gpt-oss |
+| **潜变量 MLA** | `DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM` | DeepSeek V2 / V3（支持潜变量 `@pllm.custom_attention` 与非 `value` 子层残差） |
+| **滑动窗融合** | `GptOssForCausalLM` | gpt-oss（支持只读、`ActivationPatch` 与非 `value` 子层残差） |
 
 如果传入未准入的架构或派生子类，引擎初始化时会直接拒绝并明确提示。
 
@@ -56,8 +57,8 @@ assert testing.check(ObserveResidual(), config).passed
 
 使用 `pllm.explain` 预检新模型时，需要注意以下边界：
 
-1. **投影形状推导范围**：`pllm.explain` 在 CPU 上的配置解析目前覆盖**稠密 Qwen2、Qwen3 和 Llama** 的投影形状计算。
-2. **非稠密模型的投影准入时机**：对于其他模型家族（例如 MoE 专家层或混合架构下的非标准层），由于各层投影排布需要在加载真实模块时解析，其具体的投影级准入（projection admission）是在调用 `pllm.make_llm` 创建引擎时判定的。若在 `explain` 中对这些模型推导参数改写（overlay）的投影形状，会提示使用稠密配置进行 CPU 检查。
+1. **投影与结构解析范围**：`pllm.explain` 在 CPU 上即可根据模型配置（`config.json`）解析全部 8 类稠密解码器、3 类稀疏 KV-MoE 解码器（`Mixtral` / `Qwen2-MoE` / `Qwen3-MoE`）、`Qwen3.5` 混合架构以及 `DeepSeek V2/V3`（含 MLA 潜变量尺寸）的投影与注意力布局。
+2. **模型类准入时机**：只要配置里声明了已核对的 `architectures` 模型类，`pllm.explain` 就会立即校验对应的功能支持矩阵；真正的模型权重布局、量化算子（如 gpt-oss 的 MXFP4 专家或自定义量化配置）与可用 KV Cache 容量会在调用 `pllm.make_llm` / `pllm.make_async_llm` 时由引擎核实。
 3. **真实显存占用**：`pllm.explain` 给出的是负载自身状态与工作区的显存需求，不包含模型权重、KV 缓存以及 vLLM 自身的显存占用。模型能否装进显卡仍需在启动引擎时确定。
 
 更多关于成本解析的细节，见[看成本：pllm.explain](../guides/explain.md)。
@@ -68,32 +69,32 @@ assert testing.check(ObserveResidual(), config).passed
 
 不同模型家族在注意力机制、KV 存储和前馈网络结构上的差异，决定了它们在 pLLM 中的能力边界。各模型的详细特性对照见[支持矩阵](../reference/support-matrix.md)；本节总结各家族的能力边界及背后的设计原因。
 
-### 稠密模型（Qwen2 / Qwen2.5、Llama、Qwen3 稠密版）
+### 稠密模型（Qwen2 / Qwen2.5、Llama、Qwen3、Mistral、Phi-3、GLM-4、Gemma 2 / 3）
 
-- **可用功能**：全部功能。包括 hidden/残差流读取与导出、探针、激活补丁（`pllm.model.ActivationPatch`）、DoLa / logit lens、采样引导（`@pllm.guide_sampling`）、logits 修正（`@pllm.add_logits`）、每请求 LoRA / 权重改写（`pllm.model.Adapter`）、decode 时在线训练（`@pllm.train`）、整模型因果训练、循环深度与 forward 重放（`@pllm.custom_forward`）、`@pllm.custom_residual` 以及 `@pllm.custom_attention`。
-- **原因**：这类模型采用标准的多头注意力（MHA）或分组查询注意力（GQA），KV 全部保存在分页缓存中，且 MLP 均为规整的稠密 SwiGLU 结构。子层归一化与残差连接位置统一，投影切片明确。
+- **可用功能**：全部核心功能。包括 hidden/残差流读取与导出、探针、激活补丁（`pllm.model.ActivationPatch`）、DoLa / logit lens、采样引导（`@pllm.guide_sampling`）、logits 修正（`@pllm.add_logits`）、全部投影的 LoRA / 权重改写（`pllm.model.Adapter`）、decode 时在线训练（`@pllm.train`）、循环深度与 forward 重放（`@pllm.custom_forward`）、`@pllm.custom_residual`、`@pllm.custom_attention`，以及除 Gemma 2 之外的整模型因果训练（`pllm.causal_model`）。
+- **原因与差异细节**：这类模型采用标准多头或分组查询注意力，KV 全部保存在分页缓存中，MLP 均为稠密门控/前馈结构，投影切片明确；GLM-4 与 Gemma 2/3 使用四层归一化分支布局（已在残差位点与因果训练前馈分支中对齐）。Gemma 2 因词表嵌入与输出权重共享且带有 `final_logit_softcapping`，不开放 `pllm.causal_model` 整模型反向并需使用全词表精确采样引导。
 
-### Qwen3-MoE
+### 稀疏 KV-MoE（Mixtral、Qwen2-MoE、Qwen3-MoE）
 
-- **可用功能**：只读功能全部可用；`@pllm.custom_forward` 可用；`@pllm.custom_attention` 可用；LoRA 类参数改写可用于注意力的 `q_proj` 和 `v_proj`。
+- **可用功能**：只读与采样引导功能全部可用；`@pllm.custom_forward`、`@pllm.custom_attention`、除 `site="value"` 外的 `@pllm.custom_residual` 均可用；`pllm.model.Adapter` 可挂载到全部层的注意力 `q_proj`、`k_proj`、`v_proj`，以及 `Qwen2-MoE` / `Qwen3-MoE` 中非路由稠密层的 MLP 投影。
 - **受限功能与原因**：
-  - **MoE 专家层不支持 LoRA 类改写**：MoE 路由将 token 动态分发给不同的专家，每个专家是一个独立的权重子集，不存在单一的稠密投影矩阵。因此无法直接对 `gate_proj` / `up_proj` / `down_proj` 挂载统一的低秩修正。若尝试改写会报错并建议改写 attention 的 query 或 value 投影。
-  - **不支持整模型因果训练**：因果反向传播目前不支持跨路由专家的梯度更新。
+  - **MoE 专家层不支持 MLP `Adapter`**：路由层将 token 动态分发给不同专家，不存在单一稠密 MLP 投影矩阵，因此无法挂载统一的专家层增量（会报错并提示改用注意力的 query/key/value 投影）。
+  - **不开放 `site="value"` 残差与整模型因果训练**：`site="value"` 依赖独立稠密 V 投影切片约定，而因果反向传播暂不覆盖跨路由专家的梯度更新。
 
 ### Qwen3.5（Gated DeltaNet 混合注意力，含 MoE 版）
 
-- **可用功能**：只读功能全部可用；在全注意力（full-attention）层上，LoRA 类改写可用于 `v_proj`，以及稠密 MLP 的 `gate_proj` / `up_proj` / `down_proj`。
+- **可用功能**：只读与采样引导全部可用；全注意力层的 `@pllm.custom_residual`（全部 site）以及所有层上的非 `site="value"` `@pllm.custom_residual` 可用；`Adapter` 可用于全注意力层的 `v_proj` 与稠密 MLP 投影。
 - **受限功能与原因**：
-  - **不支持 `@pllm.custom_forward` 与 `@pllm.custom_attention`**：Gated DeltaNet 层维护的是按 token 递推更新的循环隐藏状态（recurrent state），该状态独立于 vLLM 的分页 KV 缓存。`custom_forward` 和 `custom_attention` 依赖从分页 KV 缓存中读取历史上下文并重放计算，无法重新生成或回溯 DeltaNet 的循环状态。
-  - **DeltaNet 层没有 Q/K/V 投影**：DeltaNet 层属于线性循环注意力，没有常规自注意力的 `q_proj` / `k_proj` / `v_proj` 线性层，不能挂载注意力参数改写。
-  - **全注意力层的输出门控交错**：Qwen3.5 的全注意力层带有输出门（`attn_output_gate`），其 QKV 权重矩阵中将每个头的 query 向量与 output gate 向量交织打包，无法简单切出纯 query 的线性投影；因此 `q_proj` 改写被拒绝，应改写 `v_proj`。
+  - **不支持 `@pllm.custom_forward` 与 `@pllm.custom_attention`**：Gated DeltaNet 层维护按 token 递推更新的循环隐藏状态，独立于分页 KV 缓存，无法仅靠 KV 页重放或替代读出。
+  - **DeltaNet 层没有标准 Q/K/V 投影**，全注意力层则将 query 与输出门（`attn_output_gate`）交错打包，因此仅开放 `v_proj` 与稠密 MLP。
   - **不支持整模型因果训练**：混合循环状态的反向传播暂未纳入支持。
 
 ### DeepSeek V2 / V3（MLA + MoE）与 gpt-oss
 
-- **可用功能**：只读与采样阶段功能。包括 hidden taps（`pllm.hidden`、残差流读取与导出）、线性探针、ESamp（在 decode 阶段基于 hidden 训练请求私有状态）、采样引导（`@pllm.guide_sampling`）、logits 修正（`@pllm.add_logits`）以及激活补丁（`pllm.model.ActivationPatch`）。
-- **受限功能与原因**：
-  - **不支持参数改写、整模型因果训练与 forward 重放**：DeepSeek 采用多头潜在注意力（MLA），将键值压缩为低维潜在向量存储在潜在 KV 缓存中（没有单独的 V 投影，且 KV 是压缩表示），无法切出独立的 V 投影或重放标准 KV；同时 MLP 采用细粒度路由专家，缺乏单一稠密投影矩阵。gpt-oss 则采用带滑动窗口的 sink attention 与每专家 MXFP4 量化投影。因此这类模型被归入只读与引导架构。
+- **可用功能**：只读、`@pllm.add_logits` / `@pllm.guide_sampling`、ESamp、`ActivationPatch`、不依赖 `site="value"` 的子层 `@pllm.custom_residual`（如 `stream` / `mlp` / `attention`）；此外，**DeepSeek V2 / V3 开放压缩潜空间 `@pllm.custom_attention`**。
+- **技术说明与受限原因**：
+  - **DeepSeek V2 / V3 的潜变量 `@pllm.custom_attention`**：MLA 将 KV 压缩为潜变量 `c_kv` 与解耦旋转位置编码部分存储于分页缓存，无独立 `v_proj`。pLLM 在执行自定义注意力时直接以压缩潜变量为存储单元，并通过吸收矩阵 `W_UK_T` / `W_UV` 在不显式还原全量 KV 缓存的情况下完成分数与加权和计算（要求 `keep="all"` 且不支持静态 `window` 缓冲）。
+  - **不支持 `Adapter`、整模型因果训练与 `@pllm.custom_forward`**：DeepSeek 的专家层按路由拆分、gpt-oss 使用带 sink 的滑动窗口 attention 与 MXFP4 专家投影，均未开放参数覆盖与整模型训练。
 
 各算法与模型能力的系统梳理，见[能力地图](../guides/capability-map.md)。
 
@@ -177,7 +178,7 @@ with pllm.make_llm(slice_config, workload=ObserveResidual()) as llm:
     outputs = llm.generate(["测试 Kimi 切片"], SamplingParams(max_tokens=8))
 ```
 
-切片沿用 DeepSeek V3 的只读能力边界：可以使用 hidden taps、ESamp 以及采样引导；参数 overlay、整模型因果训练和 PositionState 等写入特性会被拒绝。
+切片沿用 DeepSeek V3 的能力边界：支持 hidden taps、ESamp、采样引导、`ActivationPatch`、非 `value` 的 `@pllm.custom_residual` 以及潜变量 `@pllm.custom_attention`；参数 overlay、整模型因果训练和 `PositionState` 仍会被拒绝。
 
 ---
 

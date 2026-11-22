@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax
 
-from pllm.backends.vllm.compat import VLLM_027
+from pllm.backends.vllm.compat import GUMBEL_MODE
 
 
 @triton.jit
@@ -40,10 +40,10 @@ def _draw(
     Positions: torch.Tensor,
     VOCAB: tl.constexpr,
     FP64: tl.constexpr,
-    V027: tl.constexpr,
+    MODE: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor]:
     logits = tl.where(mask, logits, float("-inf"))
-    if V027:
+    if MODE == 0:
         value, index = gumbel_block_argmax(
             logits,
             tokens,
@@ -57,6 +57,46 @@ def _draw(
             0,
             None,
             VOCAB,
+            APPLY_TEMPERATURE=False,
+            USE_FP64=FP64,
+        )
+    elif MODE == 1:
+        value, index = gumbel_block_argmax(
+            logits,
+            tokens,
+            mask,
+            row,
+            Mapping,
+            Temperature,
+            Seeds,
+            Positions,
+            None,
+            0,
+            0,
+            None,
+            VOCAB,
+            IS_DRAFTING=False,
+            APPLY_TEMPERATURE=False,
+            USE_FP64=FP64,
+        )
+    elif MODE == 2:
+        value, index = gumbel_block_argmax(
+            logits,
+            tokens,
+            mask,
+            row,
+            Mapping,
+            Temperature,
+            Seeds,
+            Positions,
+            None,
+            0,
+            0,
+            None,
+            None,
+            0,
+            VOCAB,
+            IS_DRAFTING=False,
             APPLY_TEMPERATURE=False,
             USE_FP64=FP64,
         )
@@ -76,6 +116,7 @@ def _draw(
             None,
             None,
             0,
+            None,
             VOCAB,
             IS_DRAFTING=False,
             APPLY_TEMPERATURE=False,
@@ -101,7 +142,7 @@ def _scan_survivors(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
     FP64: tl.constexpr,
-    V027: tl.constexpr,
+    MODE: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor, tl.tensor, tl.tensor]:
     offsets = tl.arange(0, BLOCK)
     count = tl.full((), 0, tl.int32)
@@ -130,7 +171,7 @@ def _scan_survivors(
             tl.store(Scratch + row * K + count + ranks, keys, finite)
         if not guided:
             value, token = _draw(
-                logits, tokens, tokens < VOCAB, row, Mapping, Temperature, Seeds, Positions, VOCAB, FP64, V027
+                logits, tokens, tokens < VOCAB, row, Mapping, Temperature, Seeds, Positions, VOCAB, FP64, MODE
             )
             replace = (value > best) | ((value == best) & (token < winner))
             best, winner = tl.maximum(best, value), tl.where(replace, token, winner)
@@ -179,7 +220,7 @@ def _draw_tail(
     VOCAB: tl.constexpr,
     BLOCK: tl.constexpr,
     FP64: tl.constexpr,
-    V027: tl.constexpr,
+    MODE: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor]:
     best = tl.full((), float("-inf"), tl.float64 if FP64 else tl.float32)
     winner = tl.full((), 0, tl.int32)
@@ -199,7 +240,7 @@ def _draw_tail(
             Positions,
             VOCAB,
             FP64,
-            V027,
+            MODE,
         )
         replace = (value > best) | ((value == best) & (token < winner))
         best, winner = tl.maximum(best, value), tl.where(replace, token, winner)
@@ -231,7 +272,7 @@ def _sample(
     DOT_ROWS: tl.constexpr,
     DOT_WIDTH: tl.constexpr,
     FP64: tl.constexpr,
-    V027: tl.constexpr,
+    MODE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0).to(tl.int64)
     prediction_row = tl.load(RowMap + row)
@@ -254,13 +295,13 @@ def _sample(
         K,
         BLOCK,
         FP64,
-        V027,
+        MODE,
     )
     if guided:
         if count > K and peak_key == 0:
             threshold = _select_top_survivors(Logits, Scratch, row, LS, VOCAB, K, max(K, 512))
             best, winner = _draw_tail(
-                Logits, row, threshold, Mapping, Temperature, Seeds, Positions, LS, VOCAB, BLOCK, FP64, V027
+                Logits, row, threshold, Mapping, Temperature, Seeds, Positions, LS, VOCAB, BLOCK, FP64, MODE
             )
             count = tl.full((), K, tl.int32)
         if peak_key != 0:
@@ -293,7 +334,7 @@ def _sample(
             selected_logits = tl.where(valid, (1 + beta) * selected_logits - beta * prediction, float("-inf"))
             tl.store(Logits + row * LS + selected_tokens, selected_logits, valid)
             value, token = _draw(
-                selected_logits, selected_tokens, valid, row, Mapping, Temperature, Seeds, Positions, VOCAB, FP64, V027
+                selected_logits, selected_tokens, valid, row, Mapping, Temperature, Seeds, Positions, VOCAB, FP64, MODE
             )
             replace = (value > best) | ((value == best) & (token < winner))
             best, winner = tl.maximum(best, value), tl.where(replace, token, winner)
@@ -350,7 +391,7 @@ def guided_sample(
         DOT_ROWS=16,
         DOT_WIDTH=triton.next_power_of_2(hidden.shape[1]),
         FP64=fp64,
-        V027=VLLM_027,
+        MODE=GUMBEL_MODE,
         num_warps=8,  # pyright: ignore[reportCallIssue]
         enable_fp_fusion=False,  # pyright: ignore[reportCallIssue]
     )

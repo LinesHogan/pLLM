@@ -1,35 +1,33 @@
 # Agent authoring regression suite
 
-This suite measures whether users developing with agents can write a workload from
-pLLM's published documentation. The default author is codex with `gpt-6.1-sol`.
+This suite measures whether users developing with coding agents can write a workload from
+pLLM's published documentation. The author runner uses OpenAI `codex` (default model `gpt-6.1-sol`).
 This is an **easy to write** regression, not a model quality or throughput benchmark.
 
 Run from a checkout whose framework/docs match the baseline revision:
 
 ```sh
-/workspace/pllm/.venv/bin/python tools/ai_eval/run.py \
+.venv/bin/python tools/ai_eval/run.py \
   --revision main --output tools/ai_eval/results/codex-main-new
 ```
 
-Requirements: Linux user namespaces, `bwrap`, the authenticated codex CLI at
-`/home/user/.local/bin/codex`, and the repo virtualenv. `--agent codex|kimi` selects
-the author; `--model` overrides its default (`gpt-6.1-sol` for codex,
-`gpt-6.1-sol` for Kimi). Kimi uses `/home/user/.codex/auth.json`.
-Inspect each CLI's `--help` when updating versions. codex 1.4.12 uses
-`-p ... --model ... --output-format stream-json --dangerously-skip-permissions
---add-dir /workspace`; permissions are skipped only inside bubblewrap. Kimi uses
-`--prompt ... --output-format stream-json`, without `--auto`.
-Both run non-interactively. Two tasks run concurrently by default (`--jobs 2`).
+Requirements: Linux user namespaces, `bwrap`, an authenticated `codex` CLI (`CODEX_BIN` or `PATH`),
+and the repo virtualenv. `--agent codex` selects the runner; `--model` overrides its default (`gpt-6.1-sol`).
+Inspect the CLI's `--help` when updating versions:
+`codex` runs `codex exec --json --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /workspace`
+(permissions are bypassed only inside the outer `bubblewrap` sandbox).
+Sessions run non-interactively. Two tasks run concurrently by default (`--jobs 2`).
 Each task gets a fresh session, no evaluator feedback, and a
 900-second default authoring limit. A timeout is exit 124; any saved submission
 is still scored. Infrastructure failures remain explicit, not documentation
-failures. `--tasks` selects a subset; `--gpu` adds CUDA tensor comparisons under
-`flock /tmp/pllm-gpu.lock taskset -c 0-15`. No engine is started.
+failures. `--tasks` selects a subset; `--gpu` adds CUDA tensor comparisons serialized
+via `PLLM_GPU_LOCK` (default `/tmp/pllm-gpu.lock`, with optional `PLLM_CPU_AFFINITY` for `taskset`).
+No engine is started.
 
 ## What the author sees
 
-`git archive REV README.md doc/ ':(exclude)doc/dev'` makes a clean documentation snapshot without the
-contributor docs, which describe pLLM's internals rather than how to write a workload. The runner
+`git archive REV README.md doc/ ':(exclude)doc/dev'` makes a clean documentation snapshot without
+contributor-only internal notes. The runner
 adds exactly one spec as `TASK.md`. A bubblewrap mount allowlist exposes that
 workspace, fresh CLI home, operating-system binaries/libraries and the selected CLI
 executable. It hides the entire host checkout, `.git`, venv, `test/`, `examples/`,
@@ -39,12 +37,10 @@ Python introspection can reveal an algorithm. The sandbox has no importable `pll
 or Torch runtime. Doc tutorial code/output remains available because it is part
 of the documented authoring surface. Broken links to hidden examples stay broken.
 
-Only the selected CLI's authentication files are bound read-only into a fresh home,
-without prior sessions, user/project skills, history or logs. codex reads
-`~/.codex/auth.json`; no other host codex configuration
-is exposed. Kimi receives its config.toml, device_id, region, credentials and oauth
-paths when present. No credential contents are printed or copied into results.
-Temporary home and workspace are removed in `finally`;
+Only the CLI's authentication state (`.codex/auth.json`,
+plus `OPENAI_API_KEY` / `OPENAI_BASE_URL` if set) is bound into a fresh home,
+without prior sessions, user/project skills, history or logs. No credential contents
+are printed or copied into results. Temporary home and workspace are removed in `finally`;
 only submission, notes and transcript are retained. The CLI needs network for its
 model service; network is not a security boundary, and the spec forbids external
 sources. This evaluates cooperative authors, not adversarial agents. Python
@@ -87,10 +83,8 @@ mode also compares tensor math only. Full-model GPU integration belongs to the
 repo's established verification groups. No new GPU tests are introduced here.
 
 `results.json` and the generated `README.md` contain the table, author wall time,
-author turn count and per-task JSONL transcript links. Kimi turns are complete
-assistant messages including tool calls; codex turns count completed
-`step_update` events with `state=DONE` and `step_type=agent_response`, including
-tool calls. Streamed deltas, tool replies and the terminal summary do not count.
+author turn count and per-task JSONL transcript links. `codex` turns count completed `turn.completed`
+events. Streamed deltas, tool replies and the terminal summary do not count.
 Completed turns remain countable when a session times out before its summary. The transcript is the raw
 combined CLI stream; incidental non-JSON diagnostics are preserved, and the turn
 counter skips those lines. HTTP 429, quota, authentication and network errors are
@@ -120,10 +114,10 @@ the recorded commit; preserve transcripts when comparing later revisions.
 ## Validate the harness
 
 ```sh
-CUDA_VISIBLE_DEVICES= /workspace/pllm/.venv/bin/python -m pytest \
+CUDA_VISIBLE_DEVICES= .venv/bin/python -m pytest \
   tools/ai_eval/test_harness.py -q
-/workspace/pllm/.venv/bin/python -m pyright \
-  --pythonpath /workspace/pllm/.venv/bin/python tools/ai_eval/*.py
+.venv/bin/python -m pyright \
+  --pythonpath .venv/bin/python tools/ai_eval/*.py
 ```
 
 Tests verify all eight references, reject plausible incorrect math, and probe the
