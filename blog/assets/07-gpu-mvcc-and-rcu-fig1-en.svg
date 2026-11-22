@@ -63,8 +63,8 @@
   <!-- weight slot #03 -->
   <rect x="316" y="214" width="288" height="38" rx="6" fill="#fefce8" stroke="#0047ab" stroke-width="1.75"/>
   <text x="328" y="238" class="mono">weight · slot #03</text>
-  <rect x="466" y="222" width="126" height="22" rx="4" fill="#0047ab"/>
-  <text x="529" y="237" text-anchor="middle" class="pill-text" fill="#ffffff">FRESH PRIVATE SLOT</text>
+  <rect x="456" y="222" width="138" height="22" rx="4" fill="#0047ab"/>
+  <text x="525" y="237" text-anchor="middle" class="pill-text" fill="#ffffff">FRESH PRIVATE SLOT</text>
 
   <!-- Right Card: Root v8 -->
   <rect x="679" y="83" width="216" height="168" rx="6" fill="#111111"/>

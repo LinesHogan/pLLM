@@ -32,7 +32,7 @@
   <rect x="38" y="114" width="66" height="20" rx="4" fill="#0047ab"/>
   <text x="71" y="128" text-anchor="middle" class="badge" fill="#ffffff">TRAINING</text>
   <text x="38" y="156" class="label">Training Track</text>
-  <text x="38" y="177" class="sub">Uniform scale pays</text>
+  <text x="38" y="177" class="sub">Scale still pays</text>
 
   <line x1="156" y1="150" x2="174" y2="150" stroke="#0047ab" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
 

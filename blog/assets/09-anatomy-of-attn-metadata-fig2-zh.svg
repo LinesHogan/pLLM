@@ -13,9 +13,9 @@
   <rect x="4" y="4" width="912" height="482" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
 
   <!-- Header -->
-  <rect x="28" y="22" width="150" height="22" rx="4" fill="#111111"/>
-  <text x="103" y="37" text-anchor="middle" class="badge" fill="#ffffff">FIG 02 · 5-STEP PROBE</text>
-  <text x="190" y="39" class="title">五步探针实测快照：attn_metadata 运行期字段演化全貌</text>
+  <rect x="28" y="22" width="160" height="22" rx="4" fill="#111111"/>
+  <text x="108" y="37" text-anchor="middle" class="badge" fill="#ffffff">FIG 02 · 5-STEP PROBE</text>
+  <text x="200" y="39" class="title">五步探针实测快照：attn_metadata 运行期字段演化全貌</text>
   <text x="28" y="64" class="sub">实验配置：max_num_batched_tokens = 64 · Req 0 (5词, n=2→0_0/1_0) · Req 1 (2词) · Req 2 (150词长提示)</text>
 
   <!-- Table Shadow & Frame -->

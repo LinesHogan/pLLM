@@ -16,9 +16,9 @@
   <rect x="4" y="4" width="912" height="332" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
 
   <!-- Header -->
-  <rect x="28" y="22" width="160" height="22" rx="4" fill="#111111"/>
-  <text x="108" y="37" text-anchor="middle" class="badge" fill="#ffffff">FIG 01 · TENSOR PACKING</text>
-  <text x="200" y="39" class="title">连续批处理下的张量降维：从三维切片到二维扁平拼接</text>
+  <rect x="28" y="22" width="174" height="22" rx="4" fill="#111111"/>
+  <text x="115" y="37" text-anchor="middle" class="badge" fill="#ffffff">FIG 01 · TENSOR PACKING</text>
+  <text x="214" y="39" class="title">连续批处理下的张量降维：从三维切片到二维扁平拼接</text>
   <text x="28" y="64" class="sub">调度器按步分配词预算并首尾相接拼入 [num_tokens, H]；开启静态 CUDA Graph 时尾部可能补入空行</text>
 
   <!-- Left Box: 3D Tensor -->

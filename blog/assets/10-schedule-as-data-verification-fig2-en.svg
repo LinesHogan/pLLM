@@ -63,7 +63,7 @@
 
   <!-- Flow Connector to Hook Entry -->
   <path d="M 760 278 L 760 297 L 154 297 L 154 316" fill="none" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
-  <rect x="256" y="285" width="408" height="22" rx="4" fill="#ffffff" stroke="#111111" stroke-width="1.2"/>
+  <rect x="236" y="285" width="448" height="22" rx="4" fill="#ffffff" stroke="#111111" stroke-width="1.2"/>
   <text x="460" y="300" text-anchor="middle" class="sub">Identical [51, Hidden] dimensions: compare req_a slices at every hook</text>
 
   <!-- 3-Box Hook Pipeline -->

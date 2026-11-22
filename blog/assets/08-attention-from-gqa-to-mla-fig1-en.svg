@@ -55,9 +55,9 @@
 
   <!-- Panel 2: Window decode -->
   <rect x="28" y="222" width="864" height="192" rx="8" fill="#fff1f2" stroke="#111111" stroke-width="1.5"/>
-  <rect x="44" y="236" width="146" height="22" rx="4" fill="#e62b2b"/>
-  <text x="117" y="251" text-anchor="middle" class="badge" fill="#ffffff">91.5 µs · 5.5x SLOWER</text>
-  <text x="202" y="252" class="label">2. Raw FA2 window decode (falls back to 14-Query-head grid — packing lost)</text>
+  <rect x="44" y="236" width="160" height="22" rx="4" fill="#e62b2b"/>
+  <text x="124" y="251" text-anchor="middle" class="badge" fill="#ffffff">91.5 µs · 5.5x SLOWER</text>
+  <text x="214" y="252" class="label">2. Raw FA2 window decode (falls back to 14-Query-head grid — packing lost)</text>
 
   <rect x="47" y="299" width="214" height="64" rx="6" fill="#111111"/>
   <rect x="44" y="296" width="214" height="64" rx="6" fill="#eef4ff" stroke="#111111" stroke-width="1.75"/>

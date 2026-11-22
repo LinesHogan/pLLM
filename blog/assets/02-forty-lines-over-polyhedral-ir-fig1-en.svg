@@ -115,7 +115,7 @@
   <text x="344" y="470" text-anchor="middle" class="mono">@ a_v</text>
 
   <!-- Intra-step caption -->
-  <rect x="176" y="492" width="180" height="22" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.2"/>
+  <rect x="164" y="492" width="204" height="22" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.2"/>
   <text x="266" y="507" text-anchor="middle" class="badge" fill="#0047ab">intra-step (k = 0, sep ≥ d)</text>
 
   <!-- Middle Fold Arrow -->
@@ -147,5 +147,5 @@
   <rect x="610" y="468" width="148" height="22" rx="4" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.2"/>
   <text x="684" y="483" text-anchor="middle" class="mono" fill="#e62b2b">weight: d - 8k</text>
 
-  <text x="684" y="514" text-anchor="middle" class="sub">Solved in microseconds via 40 lines of Bellman-Ford window relaxation</text>
+  <text x="684" y="514" text-anchor="middle" class="sub" font-size="11.5">Solved in µs via 40 lines of Bellman-Ford window relaxation</text>
 </svg>
