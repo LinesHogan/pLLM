@@ -11,7 +11,9 @@
 
 在单序列 PyTorch 脚本里验证一个推理期算法（激活引导、探针监控、每请求动态 LoRA、decode 期在线训练），通常只需几十行代码；但一旦进入生产级 vLLM，连续批处理会把并发请求拼进同一张动态重排的二维张量，CUDA graph 重放会绕开运行期 Python hook，每请求分页状态的分配、抢占回滚与多流同步也都必须重新处理。
 
-pLLM 与 vLLM 的关系类似 eBPF 之于 Linux 内核：无需 fork 或改动 vLLM 源码，只需继承 `pllm.Workload` 声明**读取模型的哪个内部表示、持有何种请求级或实例级状态、计算与参数更新作用于何处**，并编写标准 PyTorch 张量数学。pLLM 在接触 GPU 前先于 CPU 上完成形状追踪与多租户隔离契约检查，再将张量计算、反向传播与多版本状态管理编译进连续批处理与静态 CUDA graph。
+pLLM 与 vLLM 的关系类似 eBPF 之于 Linux 内核：无需 fork 或改动 vLLM 源码，只需继承 `pllm.Workload` 声明**读取模型的哪个内部表示、持有何种请求级或实例级状态、计算与参数更新作用于何处**，并编写标准 PyTorch 张量数学。pLLM 在接触 GPU 前先于 CPU 上完成形状追踪与多租户隔离契约检查，再将前向干预、自定义层/KV 调度、分页多版本状态与按需的在线训练直接编译进连续批处理与静态 CUDA graph。
+
+![pLLM 架构总览](doc/assets/pllm-architecture-zh.svg)
 
 ---
 
@@ -21,7 +23,7 @@ pLLM 与 vLLM 的关系类似 eBPF 之于 Linux 内核：无需 fork 或改动 v
 | --- | --- | --- |
 | **读取隐藏状态或逐层 logits**（探针、SAE、Logit Lens、DoLa） | 多请求交错排布，CUDA graph 重放时不触发 Python hook | `pllm.hidden(layer)`、`pllm.residual(layer)`、`pllm.layer_logits(...)`、`@pllm.export`、`@pllm.add_logits` |
 | **按请求或会话叠加激活 / 权重**（CAA、ReFT、超网络动态 LoRA） | 手工管理槽位分配、回收与量化投影叠加极易泄漏显存或跨租户串味 | `pllm.RequestState` + `pllm.model.ActivationPatch` / `pllm.model.Adapter` |
-| **解码过程中在线训练快权重**（ESamp、In-Place TTT、测试时学习、TTRL） | 同步反向传播阻塞解码流，多流并发又会导致原地权重读写撕裂 | `@pllm.train` / `@pllm.train_in_forward`（捕获进 CUDA graph，在旁路 stream 与前向重叠） |
+| **解码过程中在线训练快权重**（ESamp、In-Place TTT、测试时学习、TTRL） | 同步反向传播阻塞解码流，多流并发又会导致原地权重读写撕裂 | `@pllm.train` / `@pllm.train_in_forward`（捕获进静态 CUDA graph，按依赖内联融合或异步重叠） |
 | **改写 forward 循环、注意力读法或 KV 布局**（早退跳层、循环深度、滑窗/Sink、大表记忆） | 手改层调度与块表极易破坏只追加分页 KV 的底层内存不变量 | `@pllm.custom_forward`、`@pllm.custom_attention`、`@pllm.custom_residual`、`pllm.input_tokens` |
 
 ---

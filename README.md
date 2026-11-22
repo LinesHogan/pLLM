@@ -11,7 +11,9 @@
 
 Prototyping an inference-time algorithm—activation steering, linear probes, per-request dynamic LoRA, or decode-time online training—takes a few dozen lines of PyTorch on a single sequence (`batch_size = 1`). Moving that same logic into production vLLM collides with packed continuous batching, frozen CUDA graphs (where Python hooks do not execute during replay), per-request paged state management, KV preemption rollback, and multi-stream memory hazards.
 
-pLLM acts like an eBPF layer for vLLM: instead of maintaining a private fork of `GPUModelRunner` or the scheduler, you subclass `pllm.Workload` to declare **which internal representations to read, what per-request or engine-wide state to own, and where outputs or parameter updates take effect**, writing standard PyTorch tensor math. Before initializing CUDA or loading weights, pLLM statically verifies multi-tenant isolation and scheduling contracts on CPU, then compiles your tensor programs, autograd backward passes, and versioned state transitions directly into vLLM's execution pipeline.
+pLLM acts like an eBPF layer for vLLM: instead of maintaining a private fork of `GPUModelRunner` or the scheduler, you subclass `pllm.Workload` to declare **which internal representations to read, what per-request or engine-wide state to own, and where outputs or parameter updates take effect**, writing standard PyTorch tensor math. Before initializing CUDA or loading weights, pLLM statically verifies multi-tenant isolation and scheduling contracts on CPU, then compiles your forward interventions, custom KV/layer schedules, paged state transitions, and optional online training steps directly into vLLM's execution pipeline.
+
+![pLLM Architecture Overview](doc/assets/pllm-architecture-en.svg)
 
 ---
 
@@ -21,7 +23,7 @@ pLLM acts like an eBPF layer for vLLM: instead of maintaining a private fork of 
 | --- | --- | --- |
 | **Inspect hidden states & per-layer logits** (probes, SAEs, Logit Lens, DoLa) | Concurrent requests interleave across dynamic token rows; Python hooks never fire during CUDA graph replay | `pllm.hidden(layer)`, `pllm.residual(layer)`, `pllm.layer_logits(...)`, `@pllm.export`, `@pllm.add_logits` |
 | **Apply per-request or session overlays** (CAA, ReFT, hypernetwork LoRA) | Manual slot allocation, eviction, and quantized projection overlays leak VRAM or corrupt state across tenants | `pllm.RequestState` + `pllm.model.ActivationPatch` / `pllm.model.Adapter` |
-| **Train fast weights online during decode** (ESamp, In-Place TTT, TLM, TTRL) | Synchronous autograd stalls decoding; uncoordinated streams tear in-place parameters and break KV preemption | `@pllm.train` / `@pllm.train_in_forward` (CUDA-graph captured and overlapped on a side stream) |
+| **Train fast weights online during decode** (ESamp, In-Place TTT, TLM, TTRL) | Synchronous autograd stalls decoding; uncoordinated streams tear in-place parameters and break KV preemption | `@pllm.train` / `@pllm.train_in_forward` (CUDA-graph captured; fused inline or overlapped when independent) |
 | **Customize forward schedules, attention & KV layouts** (early exit, looped depth, sliding/sink KV, lookup tables) | Ad-hoc layer loops and KV reads violate append-only block-table invariants | `@pllm.custom_forward`, `@pllm.custom_attention`, `@pllm.custom_residual`, `pllm.input_tokens` |
 
 ---
