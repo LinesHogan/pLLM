@@ -1,5 +1,6 @@
 # pLLM: Programmable LLM（可编程大语言模型推理层）
 
+[![Release: v0.5.0](https://img.shields.io/badge/Release-v0.5.0-e62b2b.svg)](https://github.com/LinesHogan/pLLM/releases/tag/v0.5.0)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](pyproject.toml)
 [![vLLM 0.27–0.34](https://img.shields.io/badge/vLLM-0.27--0.34-111111.svg)](doc/reference/support-matrix.md)
