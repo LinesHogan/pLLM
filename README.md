@@ -127,7 +127,7 @@ with pllm.make_llm(esamp_cfg, workload=ESampLite()) as llm:
 
 **Measured Throughput Overhead:**
 - **ESamp on Qwen2.5-7B-Instruct** (single RTX 4090, 8 prompts × 16 samples, 256 tokens each): reaches **97.4%** of native vLLM throughput when training per-request distillers online without guidance, and **96.3%** with both online training and survivor-filtered sampling guidance enabled ([measurements.toml](doc/reference/measurements.toml), reproducible in [Tutorial 03](doc/tutorials/03_decode_training.ipynb)).
-- **4B In-Place TTT** ([Example 08](doc/examples/08_inplace_ttt.ipynb), vLLM 0.32.0, CUDA graphs enabled, 256 greedy tokens at 4096 / 16384 prompt tokens): runs at **59.64 / 42.27 token/s** for a single request vs. **54.79 / 34.89 token/s** for the official single-stream Hugging Face implementation, and scales to **111.38 token/s** across 4 concurrent requests.
+- **4B In-Place TTT** ([Example 08](doc_en/examples/08_inplace_ttt.ipynb), vLLM 0.32.0, CUDA graphs enabled, 256 greedy tokens at 4096 / 16384 prompt tokens): ~25 lines of tensor math automatically compile into per-request paged fast weights, FP32 delta retention, chunked-prefill tail buffering, CUDA-graph conditional chunk updates, and zero-copy paged streaming reads—running at **73.02 / 47.97 token/s** for a single request vs. **54.79 / 34.89 token/s** for the official `bs=1`-only Hugging Face implementation, and scaling to **171.56 token/s** across 4 concurrent requests (3.13× official single-request throughput).
 
 ---
 

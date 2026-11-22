@@ -120,7 +120,7 @@ rounds = "预热 1 轮，3 轮中位数"
 
 [[run]]
 what = "示例 08：In-Place TTT（社区 4B 检查点）与官方 Hugging Face 实现，贪心生成"
-date = "2026-11-09"
+date = "2026-11-22"
 model = "In-Place TTT 4B 检查点"
 gpu = "RTX 4090 24 GiB"
 vllm = "0.32.0"
@@ -128,11 +128,11 @@ rows = "1 个请求（另测 4 个请求）"
 tokens = 256
 rounds = "预热 1 轮，3 轮中位数"
 [run.results]
-"pLLM float32，prompt 4096" = "59.64 tok/s"
-"pLLM float32，prompt 16384" = "42.27 tok/s"
-"pLLM bfloat16，prompt 4096" = "57.12 tok/s"
-"pLLM bfloat16，prompt 16384" = "40.64 tok/s"
-"pLLM float32，4 个请求，prompt 4096" = "111.38 tok/s"
+"pLLM float32，prompt 4096" = "73.02 tok/s"
+"pLLM float32，prompt 16384" = "47.97 tok/s"
+"pLLM bfloat16，prompt 4096" = "61.02 tok/s"
+"pLLM bfloat16，prompt 16384" = "42.32 tok/s"
+"pLLM float32，4 个请求，prompt 4096" = "171.56 tok/s"
 "官方实现，prompt 4096" = "54.79 tok/s"
 "官方实现，prompt 16384" = "34.89 tok/s"
 

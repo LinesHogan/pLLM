@@ -127,7 +127,7 @@ with pllm.make_llm(esamp_cfg, workload=ESampLite()) as llm:
 
 **实测吞吐开销**：
 - **Qwen2.5-7B-Instruct 上的 ESamp**（单张 RTX 4090，8 条 prompt × 16 个样本，各生成 256 token）：仅开启每请求在线训练时，吞吐达原生 vLLM 的 **97.4%**；同时开启在线训练与采样引导时，达原生 vLLM 的 **96.3%**（详见 [实测记录](doc/reference/measurements.toml) 与 [教程 03](doc/tutorials/03_decode_training.ipynb)）。
-- **4B In-Place TTT 社区检查点**（[示例 08](doc/examples/08_inplace_ttt.ipynb)，vLLM 0.32.0，CUDA graph 开启，贪心生成 256 token）：单请求、prompt 4096 / 16384 token 时，pLLM 为 **59.64 / 42.27 token/s**，官方单流 Hugging Face 实现为 **54.79 / 34.89 token/s**；4 请求并发时 pLLM 合计达 **111.38 token/s**。
+- **4B In-Place TTT 社区检查点**（[示例 08](doc/examples/08_inplace_ttt.ipynb)，vLLM 0.32.0，CUDA graph 开启，贪心生成 256 token）：仅用约 25 行数学公式声明更新规则，pLLM 自动编译出多请求分页隔离、FP32 残差增量、跨步攒块、CUDA graph 条件块更新与非边界步零拷贝流式读取——单请求、prompt 4096 / 16384 token 时达 **73.02 / 47.97 token/s**，官方硬编码 `bs=1` 的 Hugging Face 实现为 **54.79 / 34.89 token/s**；4 请求并发时 pLLM 合计达 **171.56 token/s**（官方单请求吞吐的 3.13 倍）。
 
 ---
 

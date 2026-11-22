@@ -200,6 +200,22 @@ print(testing.check(RecentMass(), CONFIG).passed)
   - `topk`：逻辑 token 位置张量，形状为 `[rows, k]` 或 `[rows, heads, k]`（不足处用 -1 补齐）。
 - **可选返回值 `aux`**：方法可返回 `(out, aux)`。后续层或导出方法可通过 `pllm.attention(layer, "aux")` 读取该张量；`"lse"` 则读取第一次调用 `kv.attend` 返回的 float32 log-sum-exp。
 
+### 为什么极简的 `kv.attend` 签名能表达丰富的自定义注意力？
+
+初看之下，`@pllm.custom_attention` 既不暴露形状为 `[rows, heads, seq_len]` 的注意力权重矩阵，也不接收任意二维 `attn_mask`，更不允许原地改写缓存里的 K/V——核心原语只有 `kv.attend(q, *, window=0, topk=None) -> (out, lse)`。这并非功能缺失，而是为了同时守住三条硬件与系统红线：
+1. **保住在线 Softmax 片上融合**：FlashAttention 之所以快，正是因为它在片上 SRAM 内分块完成 $Q K^\top$、Softmax 与乘 $V$，从不把随序列长度增长的 `[rows, heads, seq_len]` 矩阵写回显存；一旦暴露整行权重或稠密掩码，长上下文的显存带宽和容量就会退回二次方。
+2. **保住连续批处理与静态形状 CUDA graph**：同一批请求的 `seq_len` 各不相同，任何带 `seq_len` 维度的中间张量都会引入动态形状或主机同步，直接打碎整模型图捕获。
+3. **跨物理缓存架构通用（GQA 与 DeepSeek MLA）**：在 DeepSeek V2/V3 的多头潜在注意力（MLA）中，分页缓存里存放的是压缩潜变量 `kv_lora_rank` 与共享旋转位置向量，根本没有展开的多头 K/V。把读取抽象为 `kv.attend` 后，同一份负载代码既能在普通 GQA 模型上运行 FlashAttention，也能在 MLA 模型上自动通过矩阵吸收直接在压缩潜变量上完成注意力计算，无需解压缓存。
+
+在这个约束下，四项正交设计组合起来覆盖了绝大多数对硬件友好的自定义注意力变体：
+- **`(out, lse)` 构成在线 Softmax 的完备统计量（精确合并与子集归约）**：返回的 `float32` `lse` 形状恒为 `[rows, heads]`（即 $\log \sum_{j \in S} e^{s_j}$），与序列长度无关，却保留了完整的归一化分母信息：
+  - **注意力分布统计**（如局部窗口占比、Lookback Lens、开头位置占比）：对子集 $S$ 调一次 `kv.attend` 拿到 `lse_s`，用 `(lse_s - lse_full).exp()` 两行即可算出精确概率质量，零 `[seq_len]` 张量分配。
+  - **不相交区域的精确拼接**（如“固定锚点位置 `topk` $\sqcup$ 最近局部窗口 `window`”，或多级稀疏窗口）：只要两个位置集合 $A$ 与 $B$ 互不重叠，分别调用 `kv.attend` 得到 `(out_a, lse_a)` 与 `(out_b, lse_b)` 后，可按在线 Softmax 结合律精确合并为 $A \sqcup B$ 上的注意力：`m = torch.logaddexp(lse_a, lse_b)`，`out = (lse_a - m).exp()[..., None] * out_a + (lse_b - m).exp()[..., None] * out_b`（注意两段集合不能有交集，否则重叠位置会被重复计入分母）。
+  - **查询侧变换与头间组合**（如 Differential Attention 的双路查询差分 $\text{Attn}(q_1) - \lambda \text{Attn}(q_2)$、检索头与局部流式头按头掩码 `torch.where` 混合、逐头门控缩放）：在调用 `kv.attend` 前后对固定形状的 `q` 和 `out` 直接做张量运算即可。
+- **定宽 `-1` 填充的 `topk` 在静态图内表达逐头可变预算**：当不同层、不同头需要根据打分保留不同数量的位置时，只需按最大预算 `K_max` 分配 `[rows, heads, K_max]`，在 GPU 上将超出各头预算的槽位用 `masked_fill(..., -1)` 填为 `-1`。内核会自动把 `-1` 屏蔽为 $-\infty$（某头全为 `-1` 时安全返回零输出与 `-inf` LSE），无需动态张量形状即可实现自适应稀疏度。
+- **`aux` 与 `pllm.attention(...)` 实现跨层索引复用**：像跨层共享稀疏选择器（IndexCache 一类）只需在浅层打分选出一次 `chosen` 索引并返回 `(out, chosen)`，深层通过参数默认值 `chosen: torch.Tensor = pllm.attention(earlier_layer, "aux")` 接收后直接调用 `kv.attend(q, topk=chosen)`，省去逐层重复扫页打分。
+- **把“写前改值”、“物理块回收”与“注意力读取”拆成三个正交原语**：需要在写入缓存前修改 value（如 Value Residual 或 LoRA）交给 `@pllm.custom_residual(site="value")` 或 `pllm.model.Adapter`；需要真正释放滑出窗口的物理块交给装饰器上的 `keep=` / `window=` / `sink=` / `source=`；`@pllm.custom_attention` 方法体只专注在已写入的缓存上组织读取，从而完整保留原生缓存写入路径与物理块回收机制。
+
 ### 静态 KV 布局声明
 `@pllm.custom_attention` 允许在装饰器中直接声明底层 KV 缓存的物理留存策略：
 - `keep="window", window=N`：仅保留最近 $N$ 个 token 的 KV，更早的物理块由 vLLM 的 `SlidingWindowSpec` 自动回收至显存池。
