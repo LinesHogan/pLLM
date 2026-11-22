@@ -29,18 +29,18 @@ pLLM acts like an eBPF layer for vLLM: instead of maintaining a private fork of 
 
 pLLM requires **Python 3.11+**, a Rust toolchain when building from source, and **vLLM 0.27 through 0.34** (`torch>=2.13,<2.16`, `triton>=3.7,<4`). pLLM registers no global vLLM plugins and leaves upstream vLLM untouched.
 
+- **Create a fresh virtual environment with [`uv`](https://docs.astral.sh/uv/) (recommended):**
+  ```bash
+  uv venv --python 3.12 .venv && source .venv/bin/activate
+  uv pip install -e ".[vllm032,test]"   # alternatives: ".[vllm034,test]", ".[vllm027,test]", ".[vllm,test]"
+  ```
 - **Install into an existing vLLM 0.27–0.34 environment:**
   ```bash
-  python -m pip install -e . --no-deps   # or `python -m pip install -e .` to pull pure-Python dependencies
-  ```
-- **Create a fresh virtual environment:**
-  ```bash
-  python -m venv .venv && source .venv/bin/activate
-  python -m pip install -e ".[vllm032,test]"   # alternatives: "[vllm034,test]", "[vllm027,test]", "[vllm,test]"
+  uv pip install -e . --no-deps   # or `uv pip install -e .` (also works with `python -m pip install -e .`)
   ```
 - **CPU-only workload authoring & contract verification (`pllm.explain`, `pllm.testing.check`):**
   ```bash
-  python -m pip install -e ".[test]"
+  uv pip install -e ".[test]"
   ```
 
 **Model & Hardware Matrix:** Supports 15 decoder families—`Qwen2 / Qwen2.5`, `Llama`, `Mistral`, `Phi-3`, `GLM-4`, `Gemma 2 / 3`, `Mixtral`, `Qwen2-MoE`, `Qwen3 / Qwen3-MoE`, `Qwen3.5` (including MoE), `DeepSeek V2 / V3` (including compressed latent MLA `@pllm.custom_attention` and sublayer residuals), and `gpt-oss`—alongside GPTQ / AWQ / FP8 quantized checkpoints and single-node tensor parallelism (`tensor_parallel_size > 1` requires `vllm >= 0.32.0`). `vLLM 0.27.1` and `0.32.0` serve as full GPU regression baselines (`0.33`–`0.34` pull PyTorch `2.14+cu130` and require a CUDA 13 driver). See the [Support Matrix](doc/reference/support-matrix.md) for exact per-feature coverage.

@@ -29,18 +29,18 @@ pLLM 与 vLLM 的关系类似 eBPF 之于 Linux 内核：无需 fork 或改动 v
 
 需要 **Python 3.11+**、Rust 工具链（从源码构建时），支持 **vLLM 0.27 至 0.34**（`torch>=2.13,<2.16`、`triton>=3.7,<4`）。pLLM 不注册全局 vLLM 插件，不改动上游 vLLM 代码。
 
+- **使用 [`uv`](https://docs.astral.sh/uv/) 从零创建虚拟环境（推荐）**：
+  ```bash
+  uv venv --python 3.12 .venv && source .venv/bin/activate
+  uv pip install -e ".[vllm032,test]"   # 亦可选 ".[vllm034,test]"、".[vllm027,test]" 或 ".[vllm,test]"
+  ```
 - **装入已有的 vLLM 0.27–0.34 环境**：
   ```bash
-  python -m pip install -e . --no-deps   # 若需补齐纯 Python 依赖可执行 python -m pip install -e .
-  ```
-- **从零创建虚拟环境**：
-  ```bash
-  python -m venv .venv && source .venv/bin/activate
-  python -m pip install -e ".[vllm032,test]"   # 亦可选 "[vllm034,test]"、"[vllm027,test]" 或 "[vllm,test]"
+  uv pip install -e . --no-deps   # 若需补齐纯 Python 依赖可执行 uv pip install -e .（亦兼容 python -m pip）
   ```
 - **仅在 CPU 上编写与检查负载**：
   ```bash
-  python -m pip install -e ".[test]"   # 无需 GPU 即可运行 pllm.explain 与 pllm.testing.check
+  uv pip install -e ".[test]"   # 无需 GPU 即可运行 pllm.explain 与 pllm.testing.check
   ```
 
 **模型与硬件支持范围**：准入覆盖 15 类解码器架构——`Qwen2 / Qwen2.5`、`Llama`、`Mistral`、`Phi-3`、`GLM-4`、`Gemma 2 / 3`、`Mixtral`、`Qwen2-MoE`、`Qwen3 / Qwen3-MoE`、`Qwen3.5`（含混合 MoE）、`DeepSeek V2 / V3`（含 MLA 压缩潜空间 `@pllm.custom_attention` 与子层残差）与 `gpt-oss`，支持 GPTQ / AWQ / FP8 量化底座与单节点张量并行（`tensor_parallel_size > 1` 需 `vllm >= 0.32.0`）。其中 `0.27.1` 与 `0.32.0` 为仓库完整 GPU 回归基线；`0.33`–`0.34` 依赖的 PyTorch `2.14+cu130` 需要支持 CUDA 13 的 NVIDIA 驱动。各模型与特性的精确边界见 [支持矩阵](doc/reference/support-matrix.md)。

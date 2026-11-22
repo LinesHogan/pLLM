@@ -9,7 +9,7 @@
 - [rules.md](doc/agent/rules.md): Invariants, refused combinations, engine/model/CUDA-graph support matrix, explicit cost choices
 - [pitfalls.md](doc/agent/pitfalls.md): Error catalog (`errors.toml` generated), anti-patterns, silent traps, shapes & dtypes
 
-Or via CLI after `pip install pllm`: `pllm skill --print` or `pllm skill --install claude|codex|cursor`.
+Or via CLI after `uv pip install -e .`: `pllm skill --print` or `pllm skill --install claude|codex|cursor`.
 
 ## User Guides & Howtos
 - [README (English)](README.md) | [README (中文)](README.zh.md)
