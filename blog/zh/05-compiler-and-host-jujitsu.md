@@ -18,16 +18,7 @@ assert len(input_ids) == 1, "only support bs=1 for inference"
 
 在教科书里，Transformer 子层结尾是 `x = x + sublayer(norm(x))`；但打印出 vLLM 的真实计算图，从头找到尾也找不到那个独立的 `+` 号。为了省掉一次全隐藏层宽度的显存读写往返，vLLM 把“上一子层的残差相加”直接融进了**下一子层开头**的 `fused_add_rms_norm` C++ 内核里：
 
-```text
-教科书里的层间结构：                    vLLM 真实的层间结构（全模型 2L + 1 个边界）：
-  分支输出 branch                         分支输出 branch    主干残差 residual
-        │                                       │                   │
-        ▼                                       └─────────┬─────────┘
-   (+) 残差相加                                            ▼
-        │                                    fused_add_rms_norm(branch, residual)
-        ▼                                    (单次显存往返，同时吐出 归一化输入 与 新残差!)
-   RMSNorm 归一化
-```
+![教科书层间结构与 vLLM 真实 2L + 1 处 fused_add_rms_norm 接缝对比](../assets/05-compiler-and-host-jujitsu-fig1-zh.svg)
 
 起初这像是一扇锁死的门，换个角度看却替我们标出了全模型最规整的挂载接缝：正因为上一子层没自己做加法，走到下一个 Norm 门口时，**分支输出 `branch` 与主干残差 `residual` 恰好完好无损地同时交到了这里**。只要没有被声明改写的层，原厂 Norm 连碰都不碰，零额外开销。
 
@@ -35,12 +26,7 @@ assert len(input_ids) == 1, "only support bs=1 for inference"
 
 如果建一个全局字典 `_SITES[session_id]`、传整数 `session_id: int` 进去查表，单实例跑着好好的，一旦同一进程关掉旧引擎再起第二个同结构引擎，激活值就会串台——因为 Dynamo 会把一切非 `Tensor` 的 `int` 参数当成**编译期常量烘焙进 AOT 代码缓存**，第二个引擎命中缓存后依然在硬读 `_SITES[1]`！
 
-```text
-@torch.library.custom_op("pllm::model_site", ...) 参数在 Dynamo 眼里的区别：
-
-  传整数 session_id: int       ──► 被当成编译期常量烘焙进 AOT 缓存，跨实例复用时读回旧会话!
-  读张量 reads[0].data_ptr()   ──► Tensor 视为运行期动态输入；常驻路由表存活期内 64 位物理地址全局唯一!
-```
+![Dynamo 对 custom_op 整数常量与张量物理地址参数的两种编译处理](../assets/05-compiler-and-host-jujitsu-fig2-zh.svg)
 
 顺着编译器的规矩借力：每个引擎会话启动时本来就持有一张常驻显存的路由索引张量 `reads[0]`，会话存活期间显存分配器绝不会把这块物理地址分给别人。直接拿 `reads[0].data_ptr()` 当 `_SITES` 字典的键，动态会话身份就合法穿过了静态编译图；反倒是标记“模型里第几个钩子”的拓扑序号 `hook: int` 真是静态常量，正好让 Dynamo 烘焙进去省掉传参开销。（顺带一提，单进程反复启停引擎时，vLLM 注册进 `torch._dynamo.convert_frame._bytecode_hooks` 的闭包从不清理，会把整座编译模型死死钉在显存里；在会话关闭时对钩子集合与 `CleanupManager` 做一次快照差集清理，几十 GB 显存才能干净退回。）
 
@@ -70,10 +56,7 @@ if isinstance(tail, fx.Node) and tail.target == torch.ops.aten.add.Tensor and no
     body.recompile()
 ```
 
-```text
-手术前： x, y ──► [ 门控/投影子树 ] ──► [ 独立 BF16 add 写回显存 ] ──► [ rms_norm 重读显存 ]
-手术后： x, y ──► [ 门控/投影子树 ] ──► 剪除末尾 add，吐出 (left, right) ──► [ 原厂 fused_add_rms_norm ]
-```
+![make_fx 剪除末尾加法前后的执行流与内核开销对比](../assets/05-compiler-and-host-jujitsu-fig3-zh.svg)
 
 这套十行图手术的边界由原厂 C++ 算子物理写死的入口决定：只要表达式树的**根节点**是加法——不管左右子树里包着多复杂的门控乘法、低秩投影或激活函数（如 `x + gate * silu(y @ W)`，覆盖了绝大多数残差干预写法）——末尾那次全隐藏层加法就会被剪掉，`(left, right)` 原样对接 `fused_add_rms_norm`，`61,440` 个多余内核归零，吞吐回到 **99.5%**（若整张图只剩纯 `x + y`，则直接卸载该层钩子）。只有当根节点本身是非线性变换（如 `tanh(x + y)`）时，才交由独立的 `torch.compile` 把用户数学与端口写出融成单个内核，只多付一趟显存读写。
 
@@ -115,17 +98,7 @@ compiled = torch.compile(eager, fullgraph=True, dynamic=False, options={"triton.
 
 怎么在不写几万行分布式分片推导器的前提下，自动拦截所有需要跨卡通信的更新函数？依然用两张假张量 `make_fx` 图做“找不同”：
 
-```text
-用 FakeTensor 把更新函数追踪两遍（全局完整特征宽 H  vs  单卡分片宽 H / 2）：
-
-  情况 A（外积 values.T @ inputs —— 放行）：
-    全局图: inputs [C, H]   ──► update [Out, H]
-    分片图: inputs [C, H/2] ──► update [Out, H/2]  (第 1 维照常缩半，分片轴完好保留!)
-
-  情况 B（重构误差 inputs @ base.T —— 启动期报错拦截）：
-    全局图: inputs [C, H]   ──► pred [C, Out]
-    分片图: inputs [C, H/2] ──► pred [C, Out]      (吃了分片输入，输出形状却不再缩半 ══► 分片轴收缩消失!)
-```
+![两张 FakeTensor 计算图对比验证 TP > 1 分片安全性](../assets/05-compiler-and-host-jujitsu-fig4-zh.svg)
 
 剪除无关死代码后，把两张图的节点逐一对齐：只要发现任何一个算子吃进了带分片轴（两图形状成比例）的输入，吐出来的输出在两张图里形状却变得一模一样，就证明那个被切开的维度在算子内部被求和收缩了！不到百行代码，不需要为上千个算子手写分片规则表，两张假图自己就把分片守恒律证得明明白白。
 

@@ -28,16 +28,7 @@ So each field owns one contiguous fixed-base tensor `pool[capacity, *field_shape
 
 Whole-field slots unlock two immediate wins. First is **zero-copy untouched sharing plus Redirect-on-Write**:
 
-```text
-Root v7 (read lock-free on main stream)    Root v8 (published by side stream)
-┌──────────────────────┐                   ┌──────────────────────┐
-│ bias   ──► slot #00 ─┼───────────────────┼──► slot #00 (untouched: refcount +1, zero-copy!)
-│ weight ──► slot #00  │                   │    weight ──► slot #03 (fresh private slot)
-└──────────────────────┘                   └──────────────────────┘
-
-Naive Copy-on-Write:       Copy slot #00 -> slot #03 first ──► run in-place AdamW on slot #03 (extra HBM pass!)
-Fused Redirect-on-Write:   Paged AdamW loads old values from sources[slot #00] into registers & stores straight to destinations[slot #03]!
-```
+![Zero-copy field sharing and fused Redirect-on-Write](../assets/07-gpu-mvcc-and-rcu-fig1-en.svg)
 
 Standard COW copies the old page before mutating (`fill_versions`). For full-tensor writers like `AdamW`, our paged optimizer kernel reads `sources[0]` into registers, computes the step, and writes straight out to `destinations[3]`—**skipping the pre-copy HBM round-trip altogether** (only partial-row writers opt into `copy_fields`).
 
@@ -74,17 +65,7 @@ In a CPU database, `holders == 0` means memory is immediately reusable. On an as
 
 Calling `event.synchronize()` on the CPU before reusing a slot would stall the host launch pipeline. Look at how `Pool::allocate` avoids CPU stalls completely via **two-tier non-blocking allocation (`ready` vs. `reuse`)**:
 
-```text
-Writer requests a free physical slot; allocator scans all slots with `holders == 0`:
-
-  Tier 1 — `ready` slots (`holders == 0` AND absent from every active Event bitmap in `fences`)
-           ──► Hand out immediately! Zero CPU wait, zero GPU stream wait.
-
-  Tier 2 — `reuse` slots (`holders == 0`, but still guarded by uncompleted Event #42 in `fences`)
-           ──► Still hand out immediately without blocking the CPU!
-           ──► Ledger returns `waits = [Event #42]`; Python enqueues a device-side fence on the writer stream:
-               writer_stream.wait_event(event_42)  (GPU hardware queues order themselves; host keeps running!)
-```
+![Two-tier non-blocking slot reclamation (ready vs. reuse)](../assets/07-gpu-mvcc-and-rcu-fig2-en.svg)
 
 This two-tier handoff yields a remarkable capacity property: **our memory budget reserves zero extra slack pages for in-flight GPU kernels!** Once logical ownership ends, slots are immediately reallocatable behind GPU-side `wait_event` ordering.
 

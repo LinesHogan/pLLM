@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 350" width="100%" role="img" aria-label="How Dynamo treats custom_op arguments: scalar constant baking vs. tensor pointer addressing">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; fill: #111111; }
+    .red { fill: #e62b2b; }
+    .blue { fill: #0047ab; }
+    .green { fill: #059669; }
+    .white { fill: #ffffff; }
+  </style>
+  <defs>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect x="4" y="4" width="912" height="342" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <rect x="28" y="22" width="66" height="22" rx="4" fill="#111111"/>
+  <text x="61" y="37" text-anchor="middle" class="badge white">FIG 02</text>
+  <text x="108" y="39" class="title">Dynamo &amp; <tspan class="mono">custom_op("pllm::model_site", ...)</tspan>: Scalar Baking vs. Pointer Addressing</text>
+  <line x1="28" y1="56" x2="892" y2="56" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Row 1: Trap -->
+  <rect x="28" y="72" width="864" height="118" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.75"/>
+  <rect x="44" y="84" width="206" height="24" rx="4" fill="#e62b2b"/>
+  <text x="147" y="100" text-anchor="middle" class="badge white">TRAP · PASS session_id: int</text>
+  <text x="876" y="100" text-anchor="end" class="sub red">Cross-talks across in-process engine restarts</text>
+
+  <rect x="44" y="120" width="224" height="54" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="156" y="142" text-anchor="middle" class="mono">session_id = 1</text>
+  <text x="156" y="162" text-anchor="middle" class="sub">Non-Tensor scalar arg</text>
+
+  <line x1="268" y1="147" x2="294" y2="147" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arr-red)"/>
+
+  <rect x="298" y="120" width="276" height="54" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="436" y="142" text-anchor="middle" class="label">Baked as compile-time constant</text>
+  <text x="436" y="162" text-anchor="middle" class="sub">Hardcodes <tspan class="mono red">_SITES[1]</tspan> in AOT cache</text>
+
+  <line x1="574" y1="147" x2="600" y2="147" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arr-red)"/>
+
+  <rect x="604" y="120" width="272" height="54" rx="6" fill="#ffffff" stroke="#e62b2b" stroke-width="1.75"/>
+  <text x="740" y="142" text-anchor="middle" class="label red">Engine #2 cross-talks on reuse!</text>
+  <text x="740" y="162" text-anchor="middle" class="sub">Keeps reading closed Engine #1</text>
+
+  <!-- Row 2: Fix -->
+  <rect x="28" y="206" width="864" height="122" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <rect x="44" y="218" width="256" height="24" rx="4" fill="#059669"/>
+  <text x="172" y="234" text-anchor="middle" class="badge white">FIX · READ reads[0].data_ptr()</text>
+  <text x="876" y="234" text-anchor="end" class="sub">Static site index <tspan class="mono">hook: int</tspan> stays baked</text>
+
+  <rect x="44" y="254" width="224" height="54" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="156" y="276" text-anchor="middle" class="mono">reads[0]: Tensor</text>
+  <text x="156" y="296" text-anchor="middle" class="sub">Persistent GPU routing tensor</text>
+
+  <line x1="268" y1="281" x2="294" y2="281" stroke="#059669" stroke-width="1.8" marker-end="url(#arr-green)"/>
+
+  <rect x="298" y="254" width="276" height="54" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="436" y="276" text-anchor="middle" class="label">Stays dynamic runtime input</text>
+  <text x="436" y="296" text-anchor="middle" class="mono blue">key = reads[0].data_ptr()</text>
+
+  <line x1="574" y1="281" x2="600" y2="281" stroke="#059669" stroke-width="1.8" marker-end="url(#arr-green)"/>
+
+  <rect x="607" y="257" width="272" height="54" rx="6" fill="#111111"/>
+  <rect x="604" y="254" width="272" height="54" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.75"/>
+  <text x="740" y="276" text-anchor="middle" class="label green">Unique 64-bit addr per session</text>
+  <text x="740" y="296" text-anchor="middle" class="sub">Zero collisions while session lives</text>
+</svg>

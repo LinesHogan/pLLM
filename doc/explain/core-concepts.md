@@ -165,14 +165,7 @@ pLLM 把引擎的每一步划分为有序的时间轴**锚点（anchors）**。�
 
 以第 1 节的 `Distill` 负载（再加一个只读 token 查表辅助方法）为例，连续两个 decode 步在两条流上的时间线如下：
 
-```text
-时间轴锚点:  request.prepare   model.execute    state.publish   sampler.pre_draw  token.commit     next.prepare
-                 |                 |                 |                |               |                |
-第 n 步   main:  |-- [元数据准备] --|-- [模型前向 n] --|-- [predict] ---|-- [采样器抽样] -|                |
-          side:  |-- [token 查表] -|                 |                |               |-- [loss 反向与 AdamW (第 n 步)] -->
-                                                                                              (与第 n+1 步前向重叠)
-第 n+1 步 main:                                                                       |-- [准备] --|-- [模型前向 n+1] --|
-```
+![双流时间线：主流前向与旁路流训练及查表重叠](../assets/step-timeline-zh.svg)
 
 ### 对你写代码的直接影响
 

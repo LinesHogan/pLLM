@@ -10,16 +10,7 @@ Although one surprise happens over PCIe and the other inside Transformer blocks,
 
 Sketching the hardware quotas of a single concurrent decode step puts both bottlenecks on one map:
 
-```text
-Pinned Host RAM (594 MiB static lookup table)
-     │
-     │ Channel A: PCIe 4.0 x16 slow straw (~24 GB/s)
-     ▼
-┌───────────────────────────────────────────────┐      Channel B: Local VRAM bus (~1,000 GB/s)
-│           GPU Array (128 SMs total)           │ ◄─── Every active layer streams ~466 MB of weights
-│ (Non-preemptive block scheduler assigns slots)│
-└───────────────────────────────────────────────┘
-```
+![Hardware quota map of one concurrent decode step showing Channel A slow PCIe link and Channel B local VRAM weight bus](../assets/03-bandwidth-and-sm-quotas-fig1-en.svg)
 
 Tracing Channel A and Channel B in turn derives both reversals from elementary arithmetic.
 
@@ -54,19 +45,7 @@ Timed alongside four `4096³` BF16 matmuls on the main stream (`3.88 ms` solo):
 
 Distinguishing the GPU's two schedulers explains why 300x more blocks ruined concurrency. Inside one SM, warp schedulers switch warps every cycle—provided another kernel already holds a residency slot on that SM. Above them, **CUDA's global block scheduler is non-preemptive**:
 
-```text
-Launching 9,600 gather blocks (side stream fills every residency slot across all 128 SMs):
-  ┌──────────┬──────────┬─────┬──────────┐
-  │   SM 0   │   SM 1   │ ... │  SM 127  │ ◄── Stalled waiting on 24 GB/s PCIe; Tensor Cores sit idle!
-  └──────────┴──────────┴─────┴──────────┘
-       ▲ Main-stream GEMMs request SMs ──► Block Scheduler: "All slots occupied; wait outside."
-
-Capping at 32 persistent blocks (touches at most 1/4 of SMs):
-  ┌──────────┬─────┬──────────╦──────────┬──────────┬─────┬──────────┐
-  │   SM 0   │ ... │  SM 31   ║  SM 32   │  SM 33   │ ... │  SM 127  │
-  │ (Saturates 24 GB/s PCIe)  ║  (96 SMs run main-stream GEMMs full speed) │
-  └──────────┴─────┴──────────╩──────────┴──────────┴─────┴──────────┘
-```
+![Non-preemptive block scheduler comparison: 9,600 CTAs fill all 128 SMs and block main-stream GEMMs, whereas 32 persistent CTAs leave 96 SMs free](../assets/03-bandwidth-and-sm-quotas-fig2-en.svg)
 
 That gives a general rule for any multi-stream server: **when a background kernel is bottlenecked on slow external I/O, maximizing SM occupancy is self-sabotage.** Launching just enough persistent CTAs to saturate the external link leaves the remaining SMs free so complementary resources actually overlap. It also states the exact boundary where host placement stops hiding: once $\text{bytes\_per\_step} / 24\text{ GB/s} > T_{\text{forward}}$ (on tiny 3 ms models or massive batches, or if the lookup accidentally depends on `hidden` states and cannot launch at step start), PCIe latency surfaces directly on the critical path.
 
@@ -85,14 +64,7 @@ Why did compacting nearly a quarter of the rows away lose a percent, while skipp
 
 Count the bytes on Channel B. Across 28 layers, a BF16 7B model averages ~**466 MB of weights per layer**. In skinny decode GEMMs (dozens of rows), runtime is dominated by streaming those 466 MB from VRAM into registers rather than Tensor Core math:
 
-```text
-Case A: 8 of 32 rows skip; 24 active rows still enter Layer 16
-  [ 24 Active | 8 Skipped ] ──► Even 1 active row forces SMs to stream 100% of 466 MB layer weights!
-                                Plus ~7% KV propagation + argsort gather/scatter ──► 98% throughput
-
-Case B: All 32 rows skip (active count == 0)
-  [    All 32 Skipped     ] ──► Conditional IF node short-circuits all 4 layers, saving ~1.86 GB reads ──► 112%!
-```
+![Channel B byte accounting: partial early exit still streams 466 MB of weights per layer for 98% throughput, while full-batch skip saves 1.86 GB for 112% throughput](../assets/03-bandwidth-and-sm-quotas-fig3-en.svg)
 
 On a shared weight-streaming conveyor belt, one active row keeps the entire station running. Partial per-token skipping only starts saving wall-clock time in two regimes: when **batch concurrency grows large enough to enter compute-bound GEMMs**, or when **context lengths reach tens of thousands of tokens** so per-row KV cache scans outweigh the 466 MB layer weights.
 

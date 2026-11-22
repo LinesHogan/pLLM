@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 486" width="100%" role="img" aria-label="解码尾声的显存带宽漏斗示意图">
+  <defs>
+    <style>
+      .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+      .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+      .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+    </style>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arrow-mustard" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#d99b26"/>
+    </marker>
+  </defs>
+
+  <!-- Outer card -->
+  <rect x="4" y="4" width="912" height="478" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <rect x="28" y="22" width="146" height="22" rx="4" fill="#111111"/>
+  <text x="101" y="37" text-anchor="middle" class="badge" fill="#ffffff">BANDWIDTH FUNNEL</text>
+  <text x="188" y="39" class="title">解码尾声的显存带宽漏斗（7B 模型，B = 128，V = 152,064）</text>
+  <line x1="28" y1="56" x2="892" y2="56" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Stage 1: Hidden state h -->
+  <rect x="35" y="77" width="436" height="58" rx="6" fill="#111111"/>
+  <rect x="32" y="74" width="436" height="58" rx="6" fill="#eef4ff" stroke="#111111" stroke-width="1.75"/>
+  <text x="250" y="98" text-anchor="middle" class="label">隐藏状态 h <tspan class="mono">[128, 3584]</tspan></text>
+  <text x="250" y="119" text-anchor="middle" class="sub">进入词表投影前体积不足 1 MB</text>
+
+  <!-- Arrow 1 -> 2 -->
+  <line x1="250" y1="132" x2="250" y2="186" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Bottleneck 1 callout -->
+  <path d="M 250 158 L 496 158" stroke="#e62b2b" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#arrow-red)"/>
+  <rect x="503" y="123" width="388" height="68" rx="6" fill="#111111"/>
+  <rect x="500" y="120" width="388" height="68" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.75"/>
+  <rect x="516" y="130" width="142" height="18" rx="3" fill="#e62b2b"/>
+  <text x="587" y="143" text-anchor="middle" class="badge" fill="#ffffff">HBM BOTTLENECK #1</text>
+  <text x="670" y="143" class="mono" fill="#e62b2b">~1.1 GB 权重读取</text>
+  <text x="516" y="164" class="label">乘 <tspan class="mono">lm_head</tspan> 权重 <tspan class="mono">[3584, 152064]</tspan> (BF16)</text>
+  <text x="516" y="180" class="sub">128 行算力远未吃满，耗时全卡在搬运权重</text>
+
+  <!-- Stage 2: Raw logits -->
+  <rect x="35" y="193" width="436" height="58" rx="6" fill="#111111"/>
+  <rect x="32" y="190" width="436" height="58" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+  <text x="250" y="214" text-anchor="middle" class="label">原始词表得分 <tspan class="mono">[128, 152064]</tspan></text>
+  <text x="250" y="235" text-anchor="middle" class="sub">未过滤的全词表二维打分张量</text>
+
+  <!-- Arrow 2 -> 3 -->
+  <line x1="250" y1="248" x2="250" y2="302" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Bottleneck 2 callout -->
+  <path d="M 250 274 L 496 274" stroke="#d99b26" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#arrow-mustard)"/>
+  <rect x="503" y="229" width="388" height="72" rx="6" fill="#111111"/>
+  <rect x="500" y="226" width="388" height="72" rx="6" fill="#fefce8" stroke="#d99b26" stroke-width="1.75"/>
+  <rect x="516" y="236" width="142" height="18" rx="3" fill="#d99b26"/>
+  <text x="587" y="249" text-anchor="middle" class="badge" fill="#ffffff">HBM BOTTLENECK #2</text>
+  <text x="670" y="249" class="mono" fill="#b45309">~78 MB 工作区</text>
+  <text x="516" y="270" class="label">转为 FP32 采样工作区张量</text>
+  <text x="516" y="288" class="sub">朴素 <tspan class="mono">torch.where</tspan> 拆成 7 个小内核往返扫 7 遍</text>
+
+  <!-- Stage 3: Filtering -->
+  <rect x="35" y="309" width="436" height="58" rx="6" fill="#111111"/>
+  <rect x="32" y="306" width="436" height="58" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.75"/>
+  <text x="250" y="330" text-anchor="middle" class="label">温度缩放 + <tspan class="mono">top-k / top-p</tspan> 过滤</text>
+  <text x="250" y="351" text-anchor="middle" class="sub">淘汰词置为 <tspan class="mono">-inf</tspan>（超过 99.99% 的列被屏蔽）</text>
+
+  <!-- Arrow 3 -> 4 -->
+  <line x1="250" y1="364" x2="250" y2="398" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Stage 4: Gumbel-Max -->
+  <rect x="35" y="405" width="436" height="52" rx="6" fill="#111111"/>
+  <rect x="32" y="402" width="436" height="52" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <text x="250" y="433" text-anchor="middle" class="label"><tspan class="mono">Gumbel-Max</tspan> 随机抽样  ──►  128 个新 <tspan class="mono">token_id</tspan></text>
+
+  <!-- Bottom-right takeaway card -->
+  <rect x="500" y="320" width="388" height="134" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.75"/>
+  <text x="516" y="346" class="label">为什么朴素重打分比 <tspan class="mono">lm_head</tspan> 还慢？</text>
+  <line x1="516" y1="356" x2="872" y2="356" stroke="#d4d4d8" stroke-width="1"/>
+  <text x="516" y="378" class="sub">• 为引导向量 g 再读一遍 1.1 GB <tspan class="mono">lm_head</tspan> 权重</text>
+  <text x="516" y="400" class="sub">• 在约 80 MB 词表张量上拆出 7 趟额外显存读写</text>
+  <rect x="516" y="414" width="356" height="28" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.25"/>
+  <text x="694" y="432" text-anchor="middle" class="label" fill="#0047ab">目标：把新增全词表显存往返次数压成零</text>
+</svg>

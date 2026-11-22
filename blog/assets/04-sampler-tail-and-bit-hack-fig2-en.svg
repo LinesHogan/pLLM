@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 314" width="100%" role="img" aria-label="Surviving candidates distribution after top-p = 0.95 filtering">
+  <defs>
+    <style>
+      .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+      .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+      .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+      .stat { font: 700 30px "JetBrains Mono", "SF Mono", Menlo, monospace; fill: #111111; }
+    </style>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-mustard" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#d99b26"/>
+    </marker>
+  </defs>
+
+  <!-- Outer card -->
+  <rect x="4" y="4" width="912" height="306" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <rect x="28" y="22" width="142" height="22" rx="4" fill="#111111"/>
+  <text x="99" y="37" text-anchor="middle" class="badge" fill="#ffffff">SURVIVOR PROFILE</text>
+  <text x="184" y="39" class="title">Surviving Candidates out of 152,064 After top-p = 0.95 Filtering</text>
+  <line x1="28" y1="56" x2="892" y2="56" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Proportional vocabulary bar -->
+  <text x="32" y="77" class="sub">Total vocabulary: <tspan class="mono">152,064</tspan> columns (drawn to scale)</text>
+  <text x="888" y="77" text-anchor="end" class="sub">Masked columns: <tspan class="mono">-inf</tspan></text>
+
+  <rect x="32" y="86" width="856" height="36" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.75"/>
+  <!-- 2,785 / 152,064 * 856 = 15.7 px -->
+  <rect x="33" y="87" width="16" height="34" rx="4" fill="#d99b26"/>
+  <!-- 4.83 / 152,064 * 856 < 1 px, draw 3px emerald hairline on left edge -->
+  <rect x="33" y="87" width="3" height="34" rx="1" fill="#059669"/>
+  <line x1="49" y1="87" x2="49" y2="121" stroke="#111111" stroke-width="1.2"/>
+  <text x="476" y="109" text-anchor="middle" class="label" fill="#52525b">&gt; 99.99% of columns are already masked to -inf and need zero dot products</text>
+
+  <!-- Callout connectors from proportional bar to cards -->
+  <path d="M 34 122 L 34 142 L 238 142 L 238 158" fill="none" stroke="#059669" stroke-width="1.6" marker-end="url(#arrow-emerald)"/>
+  <path d="M 43 122 L 43 135 L 682 135 L 682 158" fill="none" stroke="#d99b26" stroke-width="1.6" marker-end="url(#arrow-mustard)"/>
+
+  <!-- Left metric card: Mean -->
+  <rect x="35" y="165" width="414" height="118" rx="6" fill="#111111"/>
+  <rect x="32" y="162" width="414" height="118" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <rect x="48" y="174" width="124" height="18" rx="3" fill="#059669"/>
+  <text x="110" y="187" text-anchor="middle" class="badge" fill="#ffffff">MEAN SURVIVORS</text>
+  <text x="184" y="187" class="label" fill="#059669">Typical decode row</text>
+  <text x="48" y="226" class="stat">4.83 <tspan class="label">tokens</tspan></text>
+  <text x="48" y="248" class="sub">&gt; 99.99% of columns are already <tspan class="mono">-inf</tspan></text>
+  <text x="48" y="267" class="label" fill="#0047ab">5 sparse rows of lm_head = ~35 KB (vs 1.1 GB)</text>
+
+  <!-- Right metric card: Peak Max -->
+  <rect x="477" y="165" width="414" height="118" rx="6" fill="#111111"/>
+  <rect x="474" y="162" width="414" height="118" rx="6" fill="#fefce8" stroke="#d99b26" stroke-width="1.75"/>
+  <rect x="490" y="174" width="156" height="18" rx="3" fill="#d99b26"/>
+  <text x="568" y="187" text-anchor="middle" class="badge" fill="#ffffff">MAX OVER 652K ROWS</text>
+  <text x="656" y="187" class="label" fill="#b45309">Empirical ceiling</text>
+  <text x="490" y="226" class="stat">2,785 <tspan class="label">tokens</tspan></text>
+  <text x="490" y="248" class="sub">&lt; 2% of the vocabulary even at peak entropy</text>
+  <text x="490" y="267" class="sub">Bounded tail fits cleanly inside a fixed scratchpad</text>
+</svg>

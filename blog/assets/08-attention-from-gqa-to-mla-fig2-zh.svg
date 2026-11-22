@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 404" width="100%" role="img" aria-label="vLLM 缓存分组继承陷阱与 sink_first 修复">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+  </style>
+  <defs>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect x="4" y="4" width="912" height="396" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <text x="28" y="34" class="title">vLLM 缓存分组陷阱：父类 isinstance 吞并窗口子类</text>
+  <text x="28" y="54" class="sub">为何把部分层设为 RSWASpec 后，运行期一页物理显存都没有回收</text>
+
+  <!-- Stage 1: Class Hierarchy -->
+  <rect x="28" y="70" width="864" height="98" rx="8" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <text x="44" y="92" class="label">类继承关系</text>
+
+  <rect x="44" y="104" width="206" height="48" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.75"/>
+  <text x="147" y="125" text-anchor="middle" class="mono">AttentionSpec</text>
+  <text x="147" y="143" text-anchor="middle" class="sub">基类</text>
+
+  <line x1="250" y1="128" x2="314" y2="128" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+  <text x="282" y="119" text-anchor="middle" class="sub">派生</text>
+
+  <rect x="325" y="107" width="244" height="48" rx="6" fill="#111111"/>
+  <rect x="322" y="104" width="244" height="48" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+  <text x="444" y="125" text-anchor="middle" class="mono">FullAttentionSpec</text>
+  <text x="444" y="143" text-anchor="middle" class="sub">宽容的全量父类</text>
+
+  <line x1="566" y1="128" x2="630" y2="128" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+  <text x="598" y="119" text-anchor="middle" class="sub">派生</text>
+
+  <rect x="641" y="107" width="235" height="48" rx="6" fill="#111111"/>
+  <rect x="638" y="104" width="235" height="48" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.75"/>
+  <text x="755" y="125" text-anchor="middle" class="mono">RSWASpec</text>
+  <text x="755" y="143" text-anchor="middle" class="sub">挑剔的滑窗子类！</text>
+
+  <!-- Stage 2: Bug -->
+  <rect x="28" y="182" width="864" height="104" rx="8" fill="#fff1f2" stroke="#111111" stroke-width="1.5"/>
+  <rect x="44" y="194" width="90" height="22" rx="4" fill="#e62b2b"/>
+  <text x="89" y="209" text-anchor="middle" class="badge" fill="#ffffff">TRAP</text>
+  <text x="146" y="210" class="label">vLLM 分组检查（第 0 项 FullAttentionSpec 先发言）</text>
+
+  <rect x="44" y="226" width="200" height="48" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.5"/>
+  <text x="144" y="247" text-anchor="middle" class="sub">字典第 0 项</text>
+  <text x="144" y="264" text-anchor="middle" class="mono">FullAttentionSpec</text>
+
+  <line x1="244" y1="250" x2="278" y2="250" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <rect x="286" y="226" width="320" height="48" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="446" y="246" text-anchor="middle" class="mono">isinstance(rswa, FullAttentionSpec)</text>
+  <text x="446" y="264" text-anchor="middle" class="sub">逐层询问是否属于第 0 项父类</text>
+
+  <line x1="606" y1="250" x2="652" y2="250" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arrow-red)"/>
+  <text x="629" y="240" text-anchor="middle" class="mono" fill="#e62b2b">True</text>
+
+  <rect x="660" y="226" width="216" height="48" rx="6" fill="#ffffff" stroke="#e62b2b" stroke-width="1.75"/>
+  <text x="768" y="247" text-anchor="middle" class="label" fill="#e62b2b">被吞并进全量保留组</text>
+  <text x="768" y="265" text-anchor="middle" class="sub">回收 0 页物理显存</text>
+
+  <!-- Stage 3: Fix -->
+  <rect x="28" y="298" width="864" height="86" rx="8" fill="#ecfdf5" stroke="#111111" stroke-width="1.5"/>
+  <rect x="44" y="309" width="90" height="22" rx="4" fill="#059669"/>
+  <text x="89" y="324" text-anchor="middle" class="badge" fill="#ffffff">FIX</text>
+  <text x="146" y="325" class="label">sink_first 排序 + 收紧相等判断：让 RSWASpec 排在第 0 项先发言</text>
+
+  <rect x="44" y="338" width="222" height="36" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <text x="155" y="361" text-anchor="middle" class="mono">Entry #0: RSWASpec</text>
+
+  <line x1="266" y1="356" x2="306" y2="356" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <rect x="314" y="338" width="292" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="460" y="361" text-anchor="middle" class="mono">isinstance(full, RSWASpec)</text>
+
+  <line x1="606" y1="356" x2="652" y2="356" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="629" y="346" text-anchor="middle" class="mono" fill="#059669">False</text>
+
+  <rect x="660" y="338" width="216" height="36" rx="6" fill="#ffffff" stroke="#059669" stroke-width="1.75"/>
+  <text x="768" y="361" text-anchor="middle" class="label" fill="#059669">独立分组 · 物理页正常回收</text>
+</svg>

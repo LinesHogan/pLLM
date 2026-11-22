@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 494" width="100%" role="img" aria-label="IEEE 754 float32 比特布局与保序位变换">
+  <defs>
+    <style>
+      .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+      .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+      .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+    </style>
+    <clipPath id="float32-clip">
+      <rect x="36" y="86" width="848" height="40" rx="6"/>
+    </clipPath>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <!-- Outer card -->
+  <rect x="4" y="4" width="912" height="486" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <rect x="28" y="22" width="142" height="22" rx="4" fill="#111111"/>
+  <text x="99" y="37" text-anchor="middle" class="badge" fill="#ffffff">IEEE 754 FLOAT32</text>
+  <text x="184" y="39" class="title">IEEE 754 float32 比特布局（共 32 位）与保序位变换</text>
+  <line x1="28" y1="56" x2="892" y2="56" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Band 1: 32-bit Register Layout -->
+  <text x="64" y="78" text-anchor="middle" class="mono">31</text>
+  <text x="104" y="78" class="mono">30</text>
+  <text x="314" y="78" text-anchor="end" class="mono">23</text>
+  <text x="336" y="78" class="mono">22</text>
+  <text x="874" y="78" text-anchor="end" class="mono">0</text>
+
+  <rect x="39" y="89" width="848" height="40" rx="6" fill="#111111"/>
+  <g clip-path="url(#float32-clip)">
+    <rect x="36" y="86" width="56" height="40" fill="#fff1f2"/>
+    <rect x="92" y="86" width="232" height="40" fill="#eef4ff"/>
+    <rect x="324" y="86" width="560" height="40" fill="#f5f5f4"/>
+    <line x1="92" y1="86" x2="92" y2="126" stroke="#111111" stroke-width="1.75"/>
+    <line x1="324" y1="86" x2="324" y2="126" stroke="#111111" stroke-width="1.75"/>
+  </g>
+  <rect x="36" y="86" width="848" height="40" rx="6" fill="none" stroke="#111111" stroke-width="1.75"/>
+
+  <text x="64" y="111" text-anchor="middle" class="mono" fill="#e62b2b">S</text>
+  <text x="208" y="111" text-anchor="middle" class="label">指数位 Exponent (8b)</text>
+  <text x="604" y="111" text-anchor="middle" class="label">尾数位 Mantissa (23b)</text>
+
+  <!-- Sign bit annotation -->
+  <path d="M 64 126 L 64 146 L 82 146" fill="none" stroke="#e62b2b" stroke-width="1.6"/>
+  <text x="90" y="150" class="sub"><tspan class="label" fill="#e62b2b">符号位 S</tspan>：0 代表正数，1 代表负数（注意：不是补码，而是“符号 + 绝对值”！）</text>
+
+  <!-- Band 2: Raw uint32 view -->
+  <text x="36" y="177" class="label">① 把原始比特直接当成 <tspan class="mono">uint32</tspan> 看时，实数轴在零点处是拧着的：</text>
+
+  <!-- Negative raw box -->
+  <rect x="39" y="191" width="408" height="82" rx="6" fill="#111111"/>
+  <rect x="36" y="188" width="408" height="82" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.75"/>
+  <text x="56" y="210" class="mono">-inf</text>
+  <line x1="108" y1="206" x2="366" y2="206" stroke="#e62b2b" stroke-width="1.6" marker-end="url(#arrow-red)"/>
+  <text x="424" y="210" text-anchor="end" class="mono">-0.0</text>
+  <text x="56" y="233" class="mono" fill="#e62b2b">0xFF800000</text>
+  <text x="240" y="233" text-anchor="middle" class="mono" fill="#e62b2b">&gt; 递减反序 &gt;</text>
+  <text x="424" y="233" text-anchor="end" class="mono" fill="#e62b2b">0x80000000</text>
+  <text x="240" y="256" text-anchor="middle" class="sub" fill="#b91c1c">S=1：越负比特反而越大（反序！）</text>
+
+  <!-- Positive raw box -->
+  <rect x="479" y="191" width="408" height="82" rx="6" fill="#111111"/>
+  <rect x="476" y="188" width="408" height="82" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.75"/>
+  <text x="496" y="210" class="mono">+0.0</text>
+  <line x1="548" y1="206" x2="806" y2="206" stroke="#0047ab" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <text x="864" y="210" text-anchor="end" class="mono">+inf</text>
+  <text x="496" y="233" class="mono" fill="#0047ab">0x00000000</text>
+  <text x="680" y="233" text-anchor="middle" class="mono" fill="#0047ab">&lt; 递增正序 &lt;</text>
+  <text x="864" y="233" text-anchor="end" class="mono" fill="#0047ab">0x7F800000</text>
+  <text x="680" y="256" text-anchor="middle" class="sub" fill="#0047ab">S=0：越正比特越大（本来就保序！）</text>
+
+  <!-- Band 3: Transform boxes -->
+  <line x1="240" y1="270" x2="240" y2="288" stroke="#111111" stroke-width="1.75" marker-end="url(#arrow-ink)"/>
+  <line x1="680" y1="270" x2="680" y2="288" stroke="#111111" stroke-width="1.75" marker-end="url(#arrow-ink)"/>
+
+  <rect x="55" y="295" width="376" height="52" rx="6" fill="#111111"/>
+  <rect x="52" y="292" width="376" height="52" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+  <text x="240" y="314" text-anchor="middle" class="label">负数 (S=1) → <tspan class="mono">~bits</tspan>（32 位全部取反）</text>
+  <text x="240" y="334" text-anchor="middle" class="sub">最高位变 0 落入下半区，且反序变正序</text>
+
+  <rect x="495" y="295" width="376" height="52" rx="6" fill="#111111"/>
+  <rect x="492" y="292" width="376" height="52" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+  <text x="680" y="314" text-anchor="middle" class="label">正数 (S=0) → <tspan class="mono">bits ^ 0x80000000</tspan></text>
+  <text x="680" y="334" text-anchor="middle" class="sub">仅最高位异或翻成 1 升入上半区，保持正序</text>
+
+  <line x1="240" y1="344" x2="240" y2="390" stroke="#059669" stroke-width="1.75" marker-end="url(#arrow-emerald)"/>
+  <line x1="680" y1="344" x2="680" y2="390" stroke="#059669" stroke-width="1.75" marker-end="url(#arrow-emerald)"/>
+
+  <!-- Band 4: Unfolded monotonic uint32 -->
+  <text x="36" y="381" class="label">② 变换后，整根实数轴严格映射到单调递增的 <tspan class="mono">uint32</tspan>：</text>
+
+  <rect x="39" y="397" width="848" height="68" rx="6" fill="#111111"/>
+  <rect x="36" y="394" width="848" height="68" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <line x1="460" y1="402" x2="460" y2="454" stroke="#059669" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+  <text x="108" y="423" text-anchor="middle" class="mono">0x007FFFFF</text>
+  <text x="108" y="446" text-anchor="middle" class="sub">(-inf)</text>
+  <line x1="162" y1="419" x2="334" y2="419" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+  <text x="390" y="423" text-anchor="middle" class="mono">0x7FFFFFFF</text>
+  <text x="390" y="446" text-anchor="middle" class="sub">(-0.0)</text>
+
+  <line x1="436" y1="419" x2="482" y2="419" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+
+  <text x="530" y="423" text-anchor="middle" class="mono">0x80000000</text>
+  <text x="530" y="446" text-anchor="middle" class="sub">(+0.0)</text>
+  <line x1="584" y1="419" x2="756" y2="419" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+  <text x="812" y="423" text-anchor="middle" class="mono">0xFF800000</text>
+  <text x="812" y="446" text-anchor="middle" class="sub">(+inf)</text>
+</svg>

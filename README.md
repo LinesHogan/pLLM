@@ -4,7 +4,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](pyproject.toml)
 [![vLLM 0.27–0.34](https://img.shields.io/badge/vLLM-0.27--0.34-111111.svg)](doc/reference/support-matrix.md)
 
-> **[Project & Documentation Site](https://lineshogan.github.io/pllm/)** · **[Engineering Blog (EN/ZH)](blog/README.md)** · **[Agent Skill & API Reference](doc/agent/SKILL.md)** · **[Migration Guide](doc/agent/migration.md)** · **[中文文档](README.zh.md)**
+> **[Project & Documentation Site](https://lineshogan.github.io/pllm/)** · **[Documentation (EN)](doc_en/README.md)** · **[Engineering Blog (EN/ZH)](blog/README.md)** · **[Agent Skill](doc/agent/SKILL.md)** · **[Migration Guide](doc/agent/migration.md)** · **[中文文档](README.zh.md)**
 
 **pLLM** (**Programmable LLM**) is a declarative programmability layer for running stateful and adaptive inference-time algorithms inside unmodified [vLLM](https://github.com/vllm-project/vllm) with continuous batching and CUDA graphs.
 
@@ -196,7 +196,7 @@ Recommended prompt for porting existing research code or authoring new workloads
 
 - **Project & Documentation Portal:** [lineshogan.github.io/pllm](https://lineshogan.github.io/pllm/)
 - **English Agent & API Reference:** [SKILL.md](doc/agent/SKILL.md) · [migration.md](doc/agent/migration.md) · [reference.md](doc/agent/reference.md) · [examples.md](doc/agent/examples.md) · [rules.md](doc/agent/rules.md) · [pitfalls.md](doc/agent/pitfalls.md) · [llms.txt](llms.txt)
-- **Guides, How-Tos & Reference Manuals (中文):** [Documentation Index](doc/README.md) · [Capability Map](doc/guides/capability-map.md) · [Online Serving](doc/howto/online-serving.md) · [Production Deployment](doc/howto/production.md) · [API Reference](doc/reference/api.md)
+- **Guides, How-Tos & Reference Manuals (EN & 中文):** [English Docs Index](doc_en/README.md) · [Chinese Docs Index](doc/README.md) · [Capability Map](doc_en/guides/capability-map.md) · [Online Serving](doc_en/howto/online-serving.md) · [Production Deployment](doc_en/howto/production.md) · [API Reference](doc_en/reference/api.md)
 - **Engineering Essays & Systems Deep Dives (EN & ZH):** [blog/README.md](blog/README.md) (also published on [LinesHogan's Blog](https://lineshogan.github.io/blog/)) — ten standalone articles covering post-*Bitter Lesson* inference economics, 40-line longest-path scheduling vs. polyhedral IRs, PCIe/weight bandwidth quotas, IEEE 754 order-preserving bit tricks, compiled fast-weight training, frozen CUDA Graph pointer tables, lock-free GPU MVCC/RCU, GQA/MLA attention memory layouts, sync-free `attn_metadata` unpacking, and schedule-as-data multi-tenant verification.
 
 ---

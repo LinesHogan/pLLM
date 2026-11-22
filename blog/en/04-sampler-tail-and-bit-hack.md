@@ -18,18 +18,7 @@ To diagnose why, draw the dataflow and byte volumes at the end of a decode step 
 
 Take a 7B model serving 128 concurrent decode requests with a vocabulary of `152,064` and hidden dimension `3,584`. Every step pushes data through this bandwidth funnel:
 
-```text
-  Hidden state h [128, 3584] (< 1 MB)
-        │
-        ▼  Multiply by lm_head weights [3584, 152064] (BF16, ~1.1 GB HBM read!)
-  Raw vocabulary logits [128, 152064]
-        │
-        ▼  Materialize FP32 sampler workspace (~78 MB HBM read/write)
-  Temperature scaling + top-k / top-p mask (rejected columns set to -inf)
-        │
-        ▼
-  Gumbel-Max stochastic draw ──► 128 next token_ids
-```
+![Decode-tail HBM bandwidth funnel](../assets/04-sampler-tail-and-bit-hack-fig1-en.svg)
 
 Staring at the byte counts makes the bottleneck obvious. At 128 rows per step, the arithmetic in `[128, 3584] × [3584, 152064]` barely warms up modern Tensor Cores; runtime is dominated by streaming **1.1 GB** of weights out of HBM. Once past `lm_head`, the FP32 `[128, 152064]` sampler workspace spans nearly **80 MB**.
 
@@ -43,11 +32,7 @@ How do you avoid reading that 1.1 GB `lm_head` matrix a second time? Flip the qu
 
 Instead of guessing, instrument a live decode stream and count finite entries per row. Across `652,000` real decode rows, the survivor count is heavily skewed:
 
-```text
-Surviving candidates out of 152,064 after top-p = 0.95 filtering:
-  • Mean:               4.83 tokens  (> 99.99% of columns are already -inf)
-  • Max over 652k rows: 2,785 tokens (< 2% of the vocabulary even at peak entropy)
-```
+![Surviving candidates distribution after top-p = 0.95 filtering](../assets/04-sampler-tail-and-bit-hack-fig2-en.svg)
 
 Seeing `4.83` turns the algorithm upside down: when four or five candidates survive on a typical step, multiplying $g$ against all `152,064` columns only to throw away `99.997%` of the dot products is pure waste.
 
@@ -67,41 +52,13 @@ The inspiration comes from two classic systems domains: **floating-point radix s
 
 Draw the bit layout of an IEEE 754 `float32`, and the derivation falls out visually:
 
-```text
-IEEE 754 float32 bit layout (32 bits total):
-  31 30          23 22                                           0
- ┌──┬──────────────┬──────────────────────────────────────────────┐
- │S │ Exponent(8b) │                 Mantissa (23b)               │
- └──┴──────────────┴──────────────────────────────────────────────┘
-  ▲
-  └── Sign bit S: 0 for positive, 1 for negative (sign-magnitude, NOT two's complement!)
-
-Viewed directly as an unsigned integer uint32, the real line is folded backward on negatives:
-  Numeric order:   -inf  ──────►  -0.0   │   +0.0  ──────►  +inf
-  Raw bits (hex): 0xFF800000 ──► 0x80000000 │ 0x00000000 ──► 0x7F800000
-                  (S=1: more negative = larger bits, inverted!) (S=0: already monotonic!)
-
-A symmetric bit transform unfolds the entire real line monotonically onto uint32:
-  • Negatives (S=1) -> bitwise NOT all 32 bits (~bits): MSB flips to 0 (lower half) & order reverses!
-  • Positives (S=0) -> XOR only the sign bit (^ 0x80000000): MSB flips to 1 (upper half), order stays!
-
-  Transformed:    0x007FFFFF ──► 0x7FFFFFFF │ 0x80000000 ──► 0xFF800000
-                     (-inf)        (-0)         (+0)           (+inf)
-```
+![IEEE 754 float32 bit layout and order-preserving bit transform](../assets/04-sampler-tail-and-bit-hack-fig3-en.svg)
 
 Why does this work so cleanly? IEEE 754 designed its biased exponent specifically so non-negative floats could be compared with integer hardware; the only obstacles are the sign bit and the reversed magnitude of negatives. Canonicalizing `-0.0` to `+0.0` first, flipping the sign bit on non-negatives to lift them into the upper half, and complementing all 32 bits on negatives to drop and reverse them into the lower half maps every finite float strictly in order onto `uint32`.
 
 Take one more step: shift that 32-bit ordered float into the upper half of a `uint64`, pack `0xFFFFFFFF - token_id` into the lower 32 bits (turning smaller token IDs into larger unsigned values), and reserve `0` for masked `-inf` entries:
 
-```text
-Composite uint64 sort key (a single integer key_a > key_b resolves score + tie-break):
-  63                              32 31                               0
- ┌──────────────────────────────────┬──────────────────────────────────┐
- │    Order-preserving float32      │       0xFFFFFFFF - token_id      │
- └──────────────────────────────────┴──────────────────────────────────┘
-       High 32 bits: logit descending     Low 32 bits: token_id ascending
-                   (All-zero key 0 reserved for -inf, sorting last)
-```
+![Composite uint64 sort key bit layout](../assets/04-sampler-tail-and-bit-hack-fig4-en.svg)
 
 Translated into Triton, encoding and decoding are symmetric and fit in ten lines:
 

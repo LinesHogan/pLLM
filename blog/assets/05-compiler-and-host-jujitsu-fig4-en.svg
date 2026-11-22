@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 400" width="100%" role="img" aria-label="Dual FakeTensor graph diffing to prove TP greater than 1 sharding safety at startup">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; fill: #111111; }
+    .red { fill: #e62b2b; }
+    .blue { fill: #0047ab; }
+    .green { fill: #059669; }
+    .white { fill: #ffffff; }
+  </style>
+  <defs>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+  </defs>
+
+  <rect x="4" y="4" width="912" height="392" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <rect x="28" y="22" width="66" height="22" rx="4" fill="#111111"/>
+  <text x="61" y="37" text-anchor="middle" class="badge white">FIG 04</text>
+  <text x="108" y="39" class="title">Dual FakeTensor Graph Diffing: Proving <tspan class="mono">TP &gt; 1</tspan> Sharding Safety at Startup</text>
+  <text x="28" y="64" class="sub">Trace twice with <tspan class="mono">make_fx</tspan> (global width <tspan class="mono">H</tspan> vs. rank shard <tspan class="mono">H/2</tspan>), prune dead code, and check sharded axis scaling</text>
+  <line x1="28" y1="76" x2="892" y2="76" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Left Card: Case A -->
+  <rect x="28" y="90" width="422" height="284" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <rect x="44" y="104" width="268" height="24" rx="4" fill="#059669"/>
+  <text x="178" y="120" text-anchor="middle" class="badge white">CASE A · ADMITTED (0 COLLECTIVES)</text>
+
+  <rect x="44" y="140" width="390" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="239" y="162" text-anchor="middle" class="label">Outer product: <tspan class="mono">values.T @ inputs</tspan></text>
+
+  <!-- Global row -->
+  <text x="44" y="213" class="label">Global</text>
+  <rect x="106" y="190" width="138" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="175" y="212" text-anchor="middle" class="mono">inputs [C, H]</text>
+  <line x1="244" y1="208" x2="272" y2="208" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+  <rect x="276" y="190" width="158" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="355" y="212" text-anchor="middle" class="mono">update [Out, H]</text>
+
+  <!-- Shard row -->
+  <text x="44" y="265" class="label blue">Shard</text>
+  <rect x="106" y="242" width="138" height="36" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <text x="175" y="264" text-anchor="middle" class="mono blue">inputs [C, H/2]</text>
+  <line x1="244" y1="260" x2="272" y2="260" stroke="#0047ab" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+  <rect x="276" y="242" width="158" height="36" rx="6" fill="#eef4ff" stroke="#059669" stroke-width="2"/>
+  <text x="355" y="264" text-anchor="middle" class="mono green">update [Out, H/2]</text>
+
+  <!-- Verdict A -->
+  <rect x="44" y="294" width="390" height="64" rx="6" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <text x="239" y="319" text-anchor="middle" class="label green">✓ Axis 1 scales by 1/2 — shard preserved</text>
+  <text x="239" y="342" text-anchor="middle" class="sub">Contraction along <tspan class="mono">C</tspan>; each rank matches 1-GPU math</text>
+
+  <!-- Right Card: Case B -->
+  <rect x="470" y="90" width="422" height="284" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.75"/>
+  <rect x="486" y="104" width="218" height="24" rx="4" fill="#e62b2b"/>
+  <text x="595" y="120" text-anchor="middle" class="badge white">CASE B · REJECTED AT STARTUP</text>
+
+  <rect x="486" y="140" width="390" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="681" y="162" text-anchor="middle" class="label">Reconstruction: <tspan class="mono">inputs @ base.T</tspan></text>
+
+  <!-- Global row -->
+  <text x="486" y="213" class="label">Global</text>
+  <rect x="548" y="190" width="138" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="617" y="212" text-anchor="middle" class="mono">inputs [C, H]</text>
+  <line x1="686" y1="208" x2="714" y2="208" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+  <rect x="718" y="190" width="158" height="36" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="797" y="212" text-anchor="middle" class="mono">pred [C, Out]</text>
+
+  <!-- Shard row -->
+  <text x="486" y="265" class="label blue">Shard</text>
+  <rect x="548" y="242" width="138" height="36" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <text x="617" y="264" text-anchor="middle" class="mono blue">inputs [C, H/2]</text>
+  <line x1="686" y1="260" x2="714" y2="260" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arr-red)"/>
+  <rect x="718" y="242" width="158" height="36" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="2"/>
+  <text x="797" y="264" text-anchor="middle" class="mono red">pred [C, Out]</text>
+
+  <!-- Verdict B -->
+  <rect x="486" y="294" width="390" height="64" rx="6" fill="#ffffff" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="681" y="319" text-anchor="middle" class="label red">✕ Sharded input, unscaled output — contracted!</text>
+  <text x="681" y="342" text-anchor="middle" class="sub">Axis <tspan class="mono">H</tspan> contracted in op; missing <tspan class="mono">all-reduce</tspan></text>
+</svg>

@@ -30,17 +30,7 @@ That one division solves half the mystery before opening a single source file: h
 
 Checking the launched grid dimensions in the profiler confirmed the diagnosis on the spot:
 
-```text
-1. Full decode (grid organized by 2 KV heads — 7:1 GQA packing active, 16.6 µs):
-   ┌───────────────────┐
-   │ KV Head 0 in HBM  │ ──(loaded once)──► [ Shared inside 1 CTA: Q0, Q1, Q2, Q3, Q4, Q5, Q6 ]
-   └───────────────────┘
-
-2. Raw FA2 window decode (grid falls back to 14 Query heads — packing lost, 91.5 µs):
-   ┌───────────────────┐   ┌──────────────► [ CTA 0: Q0 ]
-   │ KV Head 0 in HBM  │───┼──────────────► [ CTA 1: Q1 ]  ... (7 separate CTAs reload the same KV!)
-   └───────────────────┘   └──────────────► [ CTA 6: Q6 ]
-```
+![GQA Grid Dispatch Comparison: 7:1 Head Packing vs. Window Regression](../assets/08-attention-from-gqa-to-mla-fig1-en.svg)
 
 Enabling `window_size` on this decode shape dropped FA2 out of its KV-head-packed path into a 14-query-head grid, trading away sequence-length savings for redundant page fetches and window-bound overhead.
 
@@ -48,12 +38,7 @@ Switching windowed GQA reads to FlashInfer—whose decode kernel keeps packing Q
 
 Reclaiming physical HBM blocks on sliding-window layers (`RSWASpec`: retain prompt prefix + recent window, recycling evicted middle blocks to `null_block`) surfaced a reusable lesson for debugging silently ignored config overrides in large frameworks. Setting only a subset of layers to `RSWASpec` while leaving Layer 0 on `FullAttentionSpec` reclaimed zero blocks at runtime. Inspecting vLLM's ten-line KV-cache group merger exposed classic OOP inheritance swallowing:
 
-```text
-Class hierarchy:   AttentionSpec ──► FullAttentionSpec ──► RSWASpec (subclass!)
-
-vLLM group check:  Pick entry #0 (FullAttentionSpec) and ask: "Are all remaining layers isinstance(..., FullAttentionSpec)?"
-                   ──► Returns True! The permissive parent swallowed its stricter sliding-window subclass.
-```
+![vLLM KV-Group Trap: Parent isinstance Swallows Window Subclass](../assets/08-attention-from-gqa-to-mla-fig2-en.svg)
 
 Tightening equality on a thin subclass and sorting `RSWASpec` entries ahead of `FullAttentionSpec` (`sink_first`) before handing the dict to vLLM let the stricter subclass speak first—activating native physical block eviction without touching upstream code.
 
@@ -63,14 +48,7 @@ Now look at the second wall on DeepSeek V2 and V3: **how do you formulate custom
 
 Compare the two physical paged-cache layouts side by side:
 
-```text
-Standard GQA paged cache (Qwen / Llama):
-  Stored per KV head at each token: [ KV Head 0: K, V ] [ KV Head 1: K, V ] ...
-
-DeepSeek MLA compressed latent cache (V2 / V3):
-  All heads share ONE low-rank vector: [ Shared latent c_KV (e.g. 512d) | Shared k_rope (64d) ]
-  Logical reconstruction (H heads):    K_h^nope = c_KV @ W_UK[h],    V_h = c_KV @ W_UV[h]
-```
+![Physical Paged-Cache Layout: Standard GQA vs. DeepSeek MLA](../assets/08-attention-from-gqa-to-mla-fig3-en.svg)
 
 MLA slashes KV-cache memory precisely because all $H$ heads share that single 512-dim $c_{KV}$ vector. If a custom attention API demands unfolded `[seq_len L, heads H, head_dim]` `K` and `V` tensors, the backend has to multiply all $L$ historical $c_{KV}$ vectors by $W_{UK}$ and $W_{UV}$ on every step—exploding $O(L)$ compressed reads into $O(L \cdot H)$ HBM traffic and wiping out MLA's entire advantage.
 
@@ -80,17 +58,7 @@ Let **tensor dimension complexity** guide the algebra—the exact same associati
 
 Follow the parentheses across both stages:
 
-```text
-Decode step: query length = 1, history length = L (L >> 1), attention heads = H
-
-[Scoring stage]
-  Naive order:      q_nope [1, H, 128]  ·  (c_KV [L, 512] @ W_UK [H, 512, 128])^T   ──► O(L · H) HBM expansion!
-  Reassociated:    (q_nope [1, H, 128] @ W_UK^T [H, 128, 512])  ·  c_KV^T [512, L] ──► O(1 · H) entry projection!
-
-[Aggregation stage]
-  Naive order:      sum_t  weights [1, H, L]  ·  (c_KV [L, 512] @ W_UV [H, 512, 128]) ──► O(L · H) HBM expansion!
-  Reassociated:    (weights [1, H, L] @ c_KV [L, 512])  @  W_UV [H, 512, 128]        ──► O(1 · H) exit projection!
-```
+![MLA Latent Matrix Absorption: Moving Projections from L to 1](../assets/08-attention-from-gqa-to-mla-fig4-en.svg)
 
 Once the dimensions line up, the implementation writes itself. Paired with tiled online `logaddexp` rescaling over 128-token compressed page tiles for numerical stability at any context length, streaming latent attention fits in fifteen lines of plain PyTorch:
 

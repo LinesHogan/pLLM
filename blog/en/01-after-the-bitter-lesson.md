@@ -26,10 +26,7 @@ That premise has stalled. Foundry node names keep marching down to two nanometer
 
 That imbalance has pulled **training** and **inference** onto diverging economic tracks:
 
-```text
-Training economics:  User volume grows ──► Labs pool capital into 10x clusters ──► Uniform scaling still pays
-Inference economics: Token price sets margin ──► Annual price cuts required ──► Trade structural purity for fewer bytes moved
-```
+![Silicon unit economics pull training and inference onto diverging tracks](../assets/01-after-the-bitter-lesson-fig1-en.svg)
 
 Viewed along the inference track, recent architectures are all making variations of the same trade—**spending structural priors or local state to save memory bandwidth**:
 - **Exploiting discrete language priors to skip dense routers**: Mapping continuous activations back to sparse buckets normally requires dense router GEMMs. DeepSeek's Engram leans on two human priors instead: human civilization already discretized reality into words, and natural language concentrates heavily on bigram and trigram collocations—so hashing recent tokens straight into a static table fetches vectors with zero router matmuls (with a real catch: strong memorization paired with weak compute often drives training loss down while validation loss rises on multi-epoch runs).
@@ -50,13 +47,7 @@ Why, then, is the ecosystem still bottlenecked on `bs=1` scripts and abandoned `
 
 Because the bottleneck moved from inventing the math to surviving the serving engine. Production engines like vLLM extract an order-of-magnitude throughput advantage from one strict invariant: **aside from an append-only paged KV cache, the model is stateless and read-only across concurrent requests.**
 
-```text
-Research-script model (bs = 1, mutable):
-  One sequence owns the model ──► Python hooks fire per layer ──► Weights mutate via param.add_() in place
-
-Serving-engine model (100+ concurrent sequences, static & read-only):
-  Tokens flatten into 2D [tokens, H] ──► Fused ops freeze inside CUDA Graphs ──► Lock-free multi-stream pipeline
-```
+![Architecture mismatch between research scripts and production serving engines](../assets/01-after-the-bitter-lesson-fig2-en.svg)
 
 Drop per-request mutable state into that pipeline and both standard options break down: staying in a single-stream Hugging Face loop forfeits continuous batching and CUDA Graphs, serializing concurrent callers in a queue; forking vLLM recovers hardware efficiency at the price of three weeks of systems plumbing—reconstructing row ownership from flattened batches, reserving constant base pointers for CUDA Graphs, preventing torn reads across streams, rewinding state on KV preemption, and aligning tensor-parallel shards. Pay a three-week engine-surgery tax per candidate and automated search stalls at the starting line.
 

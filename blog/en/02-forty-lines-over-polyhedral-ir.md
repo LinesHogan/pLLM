@@ -28,21 +28,7 @@ Why did a proven loop-compiler model misfire inside an LLM serving engine? Sketc
 
 Polyhedral tools shine on dense, multi-dimensional loop nests like image stencils or blocked GEMMs. In a modern PyTorch serving stack, intra-task operator fusion is already handled far better by `torch.compile` (Inductor) than by custom middle-ends. What remains for the outer step runtime is not a high-dimensional lattice, but **a one-dimensional timeline of $M = 8$ ordered step anchors**:
 
-```text
-One-dimensional step timeline (M = 8 fixed anchors):
-  0:request.prepare ─► 1:model.execute ─► 2:state.publish ─► 3:sampler.pre_draw
-    ─► 4:sampler.complete ─► 5:token.commit ─► 6:request.finish ─► 7:next.prepare
-
-Unrolled cross-step loop (Step t-k -> Step t)       Folded finite uniform graph (weight = d - 8k)
-  Step t-k:  [ Writer u @ a_u ]                          ┌──────────────────────┐
-                     │                                   │    weight: d - 0*8   ▼
-                     │ (lag k steps, min sep d)      ┌──────┐               ┌──────┐
-                     ▼                               │Task u│               │Task v│
-  Step t:    [ Reader v @ a_v ] ──(intra k=0, d)───► └──────┘               └──────┘
-                                                         ▲                      │
-                                                         └──────────────────────┘
-                                                             weight: d - 8k
-```
+![One-dimensional step timeline and uniform-dependence folding diagram](../assets/02-forty-lines-over-polyhedral-ir-fig1-en.svg)
 
 Each task's declared inputs and effects give it an initial valid window $[a_u^{\min}, a_u^{\max})$. Every dependency—whether intra-step ($k = 0$) or reading a state version written $k \ge 1$ steps ago with minimum separation $d$—maps step $t$, anchor $a$ onto global tick $T = 8t + a$, canceling $t$ from both sides:
 
@@ -82,15 +68,7 @@ Once the compiler monument was gone and we opened Nsight Systems instead, we lea
 
 Whenever overlapping a side stream fails to deliver expected speedups, checking three physical contention points—**VRAM bus saturation, multi-GPU collective barriers, and host memory pageability**—usually catches the culprit:
 
-```text
-Case A (Unfenced early side launch on 1 GPU —— VRAM bus collision):
-  Main stream: [ Model Forward ] ──► [ Sampler sweeping 80 MB vocabulary buffer ]
-  Side stream:                   ──► [ Early train copy + AdamW ]  ◄── Fights over GDDR/HBM bus; net slowdown!
-
-Case B (Multi-GPU TP > 1 with stream priority —— riding inter-GPU wait gaps):
-  Main stream (priority -1): [ Layer GEMM ] ──► [ Custom All-Reduce (NVLink/PCIe) ] ──► [ Next Layer ]
-  Side stream (priority  0):                    [ Local replicated state update    ] ◄── Zero bus collision!
-```
+![Nsight Systems multi-stream physical contention comparison](../assets/02-forty-lines-over-polyhedral-ir-fig2-en.svg)
 
 1. **Check memory-bus saturation before launching early**: On a 0.5B run, ~70 µs of side-stream training poked past the forward pass. Removing the pre-sampler fence shrank the visible tail to 8 µs on the timeline—yet end-to-end throughput *dropped* by nearly two points. At that exact instant, the main-stream sampler was sweeping an 80 MB logits table at peak memory bandwidth; unleashing side-stream kernels into a saturated memory bus simply slowed both streams down.
 2. **Check cross-GPU barriers under Tensor Parallelism**: Side-stream training that ran smoothly on one GPU sagged to **87%** of native throughput across multi-GPU TP (where small request states are replicated per rank to avoid extra collectives). Under TP, every layer ends with a tight Custom All-Reduce barrier; whenever a side-stream backward kernel delayed *one* GPU's arrival at the collective by tens of microseconds, every other GPU stalled waiting for the straggler. Giving the main TP stream high priority (`torch.cuda.Stream(priority=-1)`), keeping the side stream at `0`, and staggering publication eliminated collective overlap stalls and lifted TP throughput to **97.6%**.

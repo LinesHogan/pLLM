@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 476" width="100%" role="img" aria-label="字段级零拷贝共享与融合写时重定向（Redirect-on-Write）示意图">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.04em; }
+    .pill-text { font: 700 11.5px "DM Sans", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  </style>
+
+  <defs>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#e62b2b"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Zine Card -->
+  <rect x="4" y="4" width="912" height="468" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="28" y="34" class="title">FIG 01 · 字段级零拷贝共享与融合写时重定向（Redirect-on-Write）</text>
+  <text x="28" y="54" class="sub">版本根只是一组整数槽号；未改写字段引用计数 +1 零拷贝共享，分页 AdamW 算子直写新槽省掉预拷贝</text>
+
+  <!-- Left Card: Version Root v7 -->
+  <rect x="31" y="83" width="216" height="168" rx="6" fill="#111111"/>
+  <rect x="28" y="80" width="216" height="168" rx="6" fill="#eef4ff" stroke="#111111" stroke-width="1.75"/>
+  <text x="44" y="103" class="label">版本根 v7</text>
+  <text x="122" y="103" class="sub">主流无锁读取</text>
+  <line x1="28" y1="114" x2="244" y2="114" stroke="#111111" stroke-width="1.2"/>
+
+  <rect x="40" y="122" width="192" height="32" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <text x="52" y="143" class="mono">bias</text>
+  <text x="148" y="143" class="mono">→ 槽 #00</text>
+
+  <rect x="40" y="170" width="192" height="32" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <text x="52" y="191" class="mono">weight</text>
+  <text x="148" y="191" class="mono">→ 槽 #00</text>
+
+  <!-- Center Container: Physical Field Pools -->
+  <rect x="300" y="72" width="320" height="190" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.5" stroke-dasharray="5 3"/>
+  <text x="316" y="94" class="badge" fill="#3f3f46">PHYSICAL FIELD POOLS · 固定基地址字段池</text>
+
+  <!-- bias slot #00 -->
+  <rect x="316" y="114" width="288" height="46" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <text x="330" y="142" class="mono">bias · 槽 #00</text>
+  <rect x="454" y="125" width="138" height="24" rx="4" fill="#059669"/>
+  <text x="523" y="141" text-anchor="middle" class="pill-text" fill="#ffffff">ref+1 · 零拷贝共享</text>
+
+  <!-- weight slot #00 -->
+  <rect x="316" y="168" width="288" height="38" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="330" y="192" class="mono">weight · 槽 #00</text>
+  <text x="486" y="192" class="sub">v7 钉住的旧快照</text>
+
+  <!-- weight slot #03 -->
+  <rect x="316" y="214" width="288" height="38" rx="6" fill="#fefce8" stroke="#0047ab" stroke-width="1.75"/>
+  <text x="330" y="238" class="mono">weight · 槽 #03</text>
+  <rect x="466" y="222" width="126" height="22" rx="4" fill="#0047ab"/>
+  <text x="529" y="237" text-anchor="middle" class="pill-text" fill="#ffffff">新领私有槽写入</text>
+
+  <!-- Right Card: Version Root v8 -->
+  <rect x="679" y="83" width="216" height="168" rx="6" fill="#111111"/>
+  <rect x="676" y="80" width="216" height="168" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+  <text x="692" y="103" class="label">版本根 v8</text>
+  <text x="768" y="103" class="sub">旁路流已发布</text>
+  <line x1="676" y1="114" x2="892" y2="114" stroke="#111111" stroke-width="1.2"/>
+
+  <rect x="688" y="122" width="192" height="32" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.4"/>
+  <text x="700" y="143" class="mono">bias</text>
+  <text x="796" y="143" class="mono">→ 槽 #00</text>
+
+  <rect x="688" y="214" width="192" height="26" rx="5" fill="#ffffff" stroke="#0047ab" stroke-width="1.4"/>
+  <text x="700" y="232" class="mono">weight</text>
+  <text x="796" y="232" class="mono">→ 槽 #03</text>
+
+  <!-- Horizontal Connector Arrows -->
+  <line x1="244" y1="137" x2="313" y2="137" stroke="#059669" stroke-width="1.9" marker-end="url(#arrow-emerald)"/>
+  <line x1="676" y1="137" x2="607" y2="137" stroke="#059669" stroke-width="1.9" marker-end="url(#arrow-emerald)"/>
+  <line x1="244" y1="186" x2="313" y2="186" stroke="#111111" stroke-width="1.9" marker-end="url(#arrow-ink)"/>
+  <line x1="676" y1="230" x2="607" y2="230" stroke="#0047ab" stroke-width="1.9" marker-end="url(#arrow-blue)"/>
+
+  <!-- Divider -->
+  <line x1="28" y1="278" x2="892" y2="278" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Bottom Row 1: Naive Copy-on-Write -->
+  <rect x="28" y="294" width="864" height="72" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.75"/>
+  <rect x="44" y="308" width="166" height="24" rx="4" fill="#e62b2b"/>
+  <text x="127" y="324" text-anchor="middle" class="badge" fill="#ffffff">朴素写时复制 (COW)</text>
+  <text x="44" y="352" class="sub">先整页拷贝，再原地更新</text>
+
+  <rect x="234" y="310" width="112" height="40" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="290" y="335" text-anchor="middle" class="mono">槽 #00</text>
+
+  <line x1="346" y1="330" x2="438" y2="330" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arrow-red)"/>
+  <text x="392" y="322" text-anchor="middle" class="sub">1. 先拷页</text>
+
+  <rect x="442" y="310" width="118" height="40" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="501" y="335" text-anchor="middle" class="mono">槽 #03</text>
+
+  <line x1="560" y1="330" x2="672" y2="330" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arrow-red)"/>
+  <text x="616" y="322" text-anchor="middle" class="sub">2. 原地 AdamW</text>
+
+  <rect x="676" y="310" width="200" height="40" rx="5" fill="#ffe4e6" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="776" y="335" text-anchor="middle" class="label" fill="#b91c1c">多一趟显存整页读写！</text>
+
+  <!-- Bottom Row 2: Fused Redirect-on-Write -->
+  <rect x="31" y="383" width="864" height="72" rx="6" fill="#111111"/>
+  <rect x="28" y="380" width="864" height="72" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <rect x="44" y="394" width="166" height="24" rx="4" fill="#059669"/>
+  <text x="127" y="410" text-anchor="middle" class="badge" fill="#ffffff">融合写时重定向</text>
+  <text x="44" y="438" class="sub">零预拷贝 · 省一趟 HBM</text>
+
+  <rect x="234" y="396" width="136" height="40" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>
+  <text x="302" y="421" text-anchor="middle" class="mono">sources[槽#00]</text>
+
+  <line x1="370" y1="416" x2="454" y2="416" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+  <text x="412" y="408" text-anchor="middle" class="sub">读入寄存器</text>
+
+  <rect x="458" y="396" width="166" height="40" rx="5" fill="#fefce8" stroke="#111111" stroke-width="1.6"/>
+  <text x="541" y="421" text-anchor="middle" class="label">分页 AdamW 内核</text>
+
+  <line x1="624" y1="416" x2="698" y2="416" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+  <text x="661" y="408" text-anchor="middle" class="sub">算完直写</text>
+
+  <rect x="702" y="396" width="174" height="40" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.6"/>
+  <text x="789" y="421" text-anchor="middle" class="mono">destinations[槽#03]</text>
+</svg>

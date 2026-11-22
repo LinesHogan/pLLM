@@ -6,17 +6,7 @@ After getting an online learning loop working in a single-request script—say, 
 
 During autoregressive decode, each request processes 1 token per step. A tiny GPU kernel finishes in a few microseconds, whereas launching it from Python walks through the interpreter, the PyTorch dispatcher, and the CUDA driver. Add backward gradients and optimizer updates, and a single step fires fifty to sixty small kernels:
 
-```text
-Eager execution (CPU dispatches one kernel at a time; launch gaps starve the GPU):
-  CPU: [launch k1][launch k2][launch k3][launch k4]...
-                    \          \          \
-  GPU:             [k1] idle  [k2] idle  [k3]...   (Disabling CUDA Graphs on 0.5B cuts throughput in half)
-
-Static replay (CUDA Graph — recorded once at warmup, replayed in a single driver call):
-  Warmup (once):   Run stream ──► driver freezes grid dims & every tensor's raw address (data_ptr)
-  Runtime (step):  CPU: [ cudaGraphLaunch ]
-                   GPU: [k1][k2][k3][k4][k5]...    (Hardware queue runs back-to-back, zero Python)
-```
+![Eager execution launch gaps vs. static CUDA Graph replay timeline](../assets/06-cuda-graph-pointer-smuggling-fig1-en.svg)
 
 To erase that launch tax, online training has to live inside a static CUDA Graph just like the trunk model.
 
@@ -42,16 +32,7 @@ Suppose capacity is $R = 128$ rows and $S = 128$ states, yet an off-peak step ar
 
 Capturing **one single full-capacity graph** takes an asymmetric column split in the routing table: size the read table `sources` to `S + 1` columns (`0..S`), size the write table `destinations` to only `S` columns (`0..S-1`), and dedicate column `S` as a sentinel **Padding Sink**:
 
-```text
-Fixed-shape routing table (R = 128)        Fixed-base state pool
-┌────────────────────────────┐
-│ Rows 0..29  (active=1)     │──────────► States 0..29 : read sources[s], write destinations[s]
-├────────────────────────────┤
-│ Rows 30..127 (active=0)    │──────────► State S (Padding Sink):
-│ All mapped to state S      │            • Read sources[F, S+1]  : slot -1, masked load returns 0.0 (no NaN)
-└────────────────────────────┘            • Loss * active         : weight 0.0, zero gradient into live states
-                                          • Write destinations[F,S]: no column S, write kernel skips store
-```
+![Fixed-shape routing table and asymmetric Padding Sink sentinel](../assets/06-cuda-graph-pointer-smuggling-fig2-en.svg)
 
 Whether 1 request or 128 requests show up, the frozen graph runs the exact same dense tensor shapes without generating `NaN`s or stray HBM stores. (By the same token, when a workload updates only requests satisfying a dynamic data-dependent condition, the CPU never calls `.tolist()` to check the mask—it pre-allocates fresh destination slots for every live request, and an in-graph kernel copies old slots forward whenever a row's runtime predicate evaluates false.)
 
@@ -67,21 +48,7 @@ Step beneath PyTorch's `Tensor` wrapper to the hardware truth: **under 64-bit un
 
 CUDA Graphs forbid changing a kernel's entry argument pointers; they never forbid changing `int64` values stored inside a fixed-address buffer. So we never pass the external tensor into the graph at all—before replay, the CPU calls `external_tensor.data_ptr()` and writes its raw 64-bit address plus `(stride0, stride1)` as three plain `int64` integers into the `descriptor` segment of the fixed routing table:
 
-```text
-Fixed-address routing table (0xAAAA0000 — bound once at capture, never moves)
-┌─────────────────────────────────────────────────────────────┐
-│ descriptor[0]: 0x7f8812340000  (external_tensor.data_ptr()) │
-│ descriptor[1]: 3584            (stride 0)                   │
-│ descriptor[2]: 1               (stride 1)                   │
-└───────────────────────┬─────────────────────────────────────┘
-                        │ 1. tl.load(descriptor) loads 64-bit integer
-                        │ 2. .to(tl.pointer_type(...)) casts back to T* in registers
-                        ▼
-Relocated upstream tensor (allocated at 0x7f8812340000 on this step)
-┌─────────────────────────────────────────────────────────────┐
-│ [ row 0 ][ row 1 ][ row 2 ] ...                             │
-└─────────────────────────────────────────────────────────────┘
-```
+![Smuggling relocated upstream tensor pointers via fixed-address descriptor table](../assets/06-cuda-graph-pointer-smuggling-fig3-en.svg)
 
 Inside Triton, reconstructing the typed device pointer and gathering rows takes ten lines:
 

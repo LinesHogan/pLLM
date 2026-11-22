@@ -6,16 +6,7 @@ In a single-request research script, activations arrive as a 3D `[batch_size, se
 
 Inside a production vLLM engine running continuous batching and chunked prefill, the scheduler assigns each active request a variable token budget per step and concatenates them end to end into a 2D `[num_tokens, hidden_size]` tensor; under static CUDA Graphs, extra padding rows may also trail at the end to match a captured bucket width:
 
-```text
-Single-request 3D tensor [B, S, H]:       Continuous-batching 2D tensor [num_tokens, H]:
-┌───────────────────────────┐            ┌──────────────────────────────────────────────────┐
-│ Req 0_0 (decode): [1 tok] │            │ Row 0:     Req 0_0, token offset 5 (decode)      │
-├───────────────────────────┤            │ Row 1..2:  Other active decode tokens            │
-│ Req 1   (decode): [1 tok] │    ───►    │ Row 3..63: Req 2, offsets 52..112 (prefill chunk)│
-├───────────────────────────┤            │ Row 64..:  Optional trailing CUDA Graph padding  │
-│ Req 2   (chunk):  [61 tok]│            └──────────────────────────────────────────────────┘
-└───────────────────────────┘
-```
+![Flattening batched activations from 3D slices to 2D packed rows](../assets/09-anatomy-of-attn-metadata-fig1-en.svg)
 
 Any custom operator that depends on sequence structure—sparse or windowed attention, adaptive layer skipping, or per-request stateful adaptation—must first establish an exact mapping from **flat row index `r`** to **`(request_index, logical_offset, lifecycle_phase)`**.
 
@@ -27,14 +18,7 @@ Rather than reading twenty thousand lines of backend code and guessing, a reliab
 
 Setting `max_num_batched_tokens = 64` to force chunked prefill with CUDA Graphs enabled and submitting three small requests—a 5-token prompt with parallel sampling `n = 2` (splitting into `0_0` and `1_0`), a 2-token prompt (`1`), and a 150-token prompt (`2`)—exercises prefill chunking, multi-sample fan-out, decode transitions, and `FULL` CUDA Graph padding within **5 steps** (`tools/probe_attention_metadata.py`):
 
-```text
-Step Graph   Batch req order     scheduled    computed     query_start_loc   seq_lens       logits_indices  is_prefilling
-1    NONE    [1, 0_0, 1_0, 2]    [2,5,5,52]   [0,0,0,0]    [0,2,7,12,64]     [2,5,5,52]     [1,6,11,63]     [T,T,T,T]
-2    NONE    [0_0, 1_0, 1, 2]    [1,1,1,61]   [5,5,2,52]   [0,1,2,3,64]      [6,6,3,113]    [0,1,2,63]      [F,F,F,T]
-3    NONE    [0_0, 1_0, 1, 2]    [1,1,1,37]   [6,6,3,113]  [0,1,2,3,40]      [7,7,4,150]    [0,1,2,39]      [F,F,F,T]
-4    FULL    [0_0, 1_0, 1, 2]    [1,1,1,1]    [7,7,4,150]  [0,1,2,3,4]       [8,8,5,151]    [0,1,2,3]       [F,F,F,F]
-5    FULL    [0_0, 1_0, 1, pad]  [1,1,1]      [8,8,5]      [0,1,2,3,3]       [9,9,6,0]      [0,1,2]         [F,F,F]
-```
+![5-step runtime probe snapshot of vLLM attn_metadata](../assets/09-anatomy-of-attn-metadata-fig2-en.svg)
 
 Every quirk in that table makes immediate sense once you model what `attn_metadata` actually is: **it is not a high-level request-lifecycle ledger—it is a low-level kernel launch packet shaped around GPU grid partitioning and static graph buckets.** Three structural consequences follow directly:
 
@@ -54,14 +38,7 @@ With the layout clear, consider the in-graph problem: **when custom code runs in
 
 Evaluating `torch.searchsorted(query_start_loc[1:], rows, right=True)` finds the first right endpoint strictly greater than `row` in $O(\log B)$ parallel work per thread—and clamping to `len(seq_lens) - 1` handles Step 5's trailing zero-length graph-padding interval `[0, 1, 2, 3, 3]` cleanly:
 
-```text
-Step 5 padded CSR offsets:  query_start_loc = [0, 1, 2, 3, 3],  seq_lens = [9, 9, 6, 0]
-Right endpoints:            query_start_loc[1:] = [1, 2, 3, 3]
-
-torch.searchsorted(query_start_loc[1:], rows=[0, 1, 2, 3], right=True):
-  • row 0 (< 1) ──► 0 (Req 0_0)    • row 1 (< 2) ──► 1 (Req 1_0)    • row 2 (< 3) ──► 2 (Req 1)
-  • row 3 (not < trailing 3) ──► returns 4 ──► `.clamp(max=len(seq_lens)-1)` maps safely to slot 3 (padding)!
-```
+![Step 5 CSR binary search and clamp under static graph padding](../assets/09-anatomy-of-attn-metadata-fig3-en.svg)
 
 Once `requests` is known, subtracting the request's batch end offset from its post-step `seq_lens` recovers every row's exact logical sequence position `positions` (`pllm/execution/attention.py`):
 
@@ -100,13 +77,6 @@ No. Because `attn_metadata` carries neither original prompt lengths nor eviction
 
 Whenever a workload needs **Layer-0 hidden capture, side-stream state prefetching, per-request state routing, or preemption replay filtering**, stepping one call upstream on the CPU to `GPUModelRunner.prepare_attn`—before `InputBatch` is lowered into `attn_metadata`—exposes three plain CPU integers (`scheduled`, `prompt`, `computed`). Paired with one monotonic per-request high-water mark `frontier`, a 30-line GIL-free Rust loop (`~122 µs`) resolves every lifecycle label deterministically:
 
-```text
-Upstream CPU 3-integer labeling (suppose `prompt = 150`, and Steps 1–2 advanced `frontier = 113`):
-  For token k in 0..scheduled-1, logical offset = computed + k:
-
-  • Exact prompt completion:  offset == prompt - 1  (fires once at offset 149; ignores Step 1 & 2 chunk tails)
-  • Latest decode token:      offset >= prompt and k == scheduled - 1
-  • Preemption replay filter: Evicted & replaying 0..63? `offset < frontier (113)` ──► marked RECOMPUTED!
-```
+![Upstream CPU 3-integer labeling and monotonic frontier](../assets/09-anatomy-of-attn-metadata-fig4-en.svg)
 
 In **[pLLM](https://github.com/LinesHogan/pLLM)** (`pllm`), both layers work in tandem: **cross-layer state routing and lifecycle checks stay upstream on three CPU integers, while in-layer custom attention stays on-GPU with `searchsorted` and metadata masks** (guarded at entry by `num_draft_tokens == 0`, since multi-token speculative decoding breaks the one-sample-slot-per-request invariant). Matching each problem to the layer that actually owns its invariant keeps both paths simple.

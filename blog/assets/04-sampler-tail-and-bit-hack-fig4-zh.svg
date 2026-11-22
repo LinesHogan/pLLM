@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 296" width="100%" role="img" aria-label="复合排序键 uint64 内存位布局">
+  <defs>
+    <style>
+      .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+      .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+      .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+    </style>
+    <clipPath id="uint64-clip">
+      <rect x="36" y="92" width="848" height="66" rx="6"/>
+    </clipPath>
+  </defs>
+
+  <!-- Outer card -->
+  <rect x="4" y="4" width="912" height="288" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <rect x="28" y="22" width="136" height="22" rx="4" fill="#111111"/>
+  <text x="96" y="37" text-anchor="middle" class="badge" fill="#ffffff">UINT64 SORT KEY</text>
+  <text x="178" y="39" class="title">复合排序键 uint64（单条整数指令 <tspan class="mono">key_a &gt; key_b</tspan> 完成复合决胜）</text>
+  <line x1="28" y1="56" x2="892" y2="56" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Bit boundaries -->
+  <text x="42" y="83" class="mono">63</text>
+  <text x="450" y="83" text-anchor="end" class="mono">32</text>
+  <text x="470" y="83" class="mono">31</text>
+  <text x="878" y="83" text-anchor="end" class="mono">0</text>
+
+  <!-- 64-bit register box with offset shadow -->
+  <rect x="39" y="95" width="848" height="66" rx="6" fill="#111111"/>
+  <g clip-path="url(#uint64-clip)">
+    <rect x="36" y="92" width="424" height="66" fill="#eef4ff"/>
+    <rect x="460" y="92" width="424" height="66" fill="#fefce8"/>
+    <line x1="460" y1="92" x2="460" y2="158" stroke="#111111" stroke-width="2"/>
+  </g>
+  <rect x="36" y="92" width="848" height="66" rx="6" fill="none" stroke="#111111" stroke-width="1.75"/>
+
+  <!-- High 32 bits content -->
+  <rect x="52" y="102" width="166" height="18" rx="3" fill="#0047ab"/>
+  <text x="135" y="115" text-anchor="middle" class="badge" fill="#ffffff">HIGH 32 BITS [63:32]</text>
+  <text x="248" y="142" text-anchor="middle" class="label">保序变换后的 <tspan class="mono">float32</tspan> 得分</text>
+
+  <!-- Low 32 bits content -->
+  <rect x="476" y="102" width="154" height="18" rx="3" fill="#d99b26"/>
+  <text x="553" y="115" text-anchor="middle" class="badge" fill="#ffffff">LOW 32 BITS [31:0]</text>
+  <text x="672" y="142" text-anchor="middle" class="mono">0xFFFFFFFF - token_id</text>
+
+  <!-- Descriptions below each half -->
+  <text x="248" y="184" text-anchor="middle" class="label" fill="#0047ab">高 32 位决定浮点得分降序</text>
+  <text x="248" y="203" text-anchor="middle" class="sub">logit 越大，变换后高 32 位整数越大</text>
+
+  <text x="672" y="184" text-anchor="middle" class="label" fill="#b45309">同分时低 32 位决定下标升序</text>
+  <text x="672" y="203" text-anchor="middle" class="sub">token_id 越小，差值越接近 0xFFFFFFFF</text>
+
+  <!-- Bottom reserved 0 pill -->
+  <rect x="36" y="224" width="848" height="40" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <text x="460" y="249" text-anchor="middle" class="sub">全 0 键（<tspan class="mono">0x00000000_00000000</tspan>）专用于已过滤淘汰的 <tspan class="mono">-inf</tspan> 位置，比较时自动垫底</text>
+</svg>

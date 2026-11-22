@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 480" width="100%" role="img" aria-label="MLA Latent Matrix Absorption: Moving Projections from L to 1">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+  </style>
+
+  <rect x="4" y="4" width="912" height="472" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <text x="28" y="34" class="title">MLA Latent Matrix Absorption: Moving Projections from L to 1</text>
+  <text x="28" y="54" class="sub">Decode step: query length = 1, history length = L (L &gt;&gt; 1), attention heads = H</text>
+
+  <!-- Stage 1: Scoring -->
+  <rect x="28" y="72" width="864" height="184" rx="8" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="44" y="84" width="76" height="22" rx="4" fill="#0047ab"/>
+  <text x="82" y="99" text-anchor="middle" class="badge" fill="#ffffff">STAGE 1</text>
+  <text x="132" y="100" class="label">Scoring Stage</text>
+
+  <!-- Naive Scoring -->
+  <rect x="44" y="116" width="832" height="60" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <rect x="56" y="128" width="82" height="22" rx="4" fill="#e62b2b"/>
+  <text x="97" y="143" text-anchor="middle" class="badge" fill="#ffffff">NAIVE</text>
+  <text x="150" y="143" class="mono">q_nope [1, H, 128] · (c_KV [L, 512] @ W_UK [H, 512, 128])^T</text>
+  <text x="150" y="164" class="sub">Decompresses all L history slots across H heads before dot product</text>
+  <rect x="716" y="125" width="148" height="42" rx="5" fill="#ffffff" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="790" y="143" text-anchor="middle" class="mono" fill="#e62b2b">O(L · H)</text>
+  <text x="790" y="160" text-anchor="middle" class="sub">HBM expansion</text>
+
+  <!-- Reassociated Scoring -->
+  <rect x="44" y="184" width="832" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <rect x="56" y="196" width="82" height="22" rx="4" fill="#059669"/>
+  <text x="97" y="211" text-anchor="middle" class="badge" fill="#ffffff">ABSORBED</text>
+  <text x="150" y="211" class="mono">(q_nope [1, H, 128] @ W_UK^T [H, 128, 512]) · c_KV^T [512, L]</text>
+  <text x="150" y="232" class="sub">Entry absorption: project length-1 query into 512-d latent space once</text>
+  <rect x="716" y="193" width="148" height="42" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <text x="790" y="211" text-anchor="middle" class="mono" fill="#059669">O(1 · H)</text>
+  <text x="790" y="228" text-anchor="middle" class="sub">Entry proj only</text>
+
+  <!-- Stage 2: Aggregation -->
+  <rect x="28" y="272" width="864" height="184" rx="8" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="44" y="284" width="76" height="22" rx="4" fill="#0047ab"/>
+  <text x="82" y="299" text-anchor="middle" class="badge" fill="#ffffff">STAGE 2</text>
+  <text x="132" y="300" class="label">Aggregation Stage</text>
+
+  <!-- Naive Aggregation -->
+  <rect x="44" y="316" width="832" height="60" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <rect x="56" y="328" width="82" height="22" rx="4" fill="#e62b2b"/>
+  <text x="97" y="343" text-anchor="middle" class="badge" fill="#ffffff">NAIVE</text>
+  <text x="150" y="343" class="mono">sum_t weights [1, H, L] · (c_KV [L, 512] @ W_UV [H, 512, 128])</text>
+  <text x="150" y="364" class="sub">Materializes all L x H Value vectors before weighted reduction</text>
+  <rect x="716" y="325" width="148" height="42" rx="5" fill="#ffffff" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="790" y="343" text-anchor="middle" class="mono" fill="#e62b2b">O(L · H)</text>
+  <text x="790" y="360" text-anchor="middle" class="sub">HBM expansion</text>
+
+  <!-- Reassociated Aggregation -->
+  <rect x="44" y="384" width="832" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <rect x="56" y="396" width="82" height="22" rx="4" fill="#059669"/>
+  <text x="97" y="411" text-anchor="middle" class="badge" fill="#ffffff">ABSORBED</text>
+  <text x="150" y="411" class="mono">(weights [1, H, L] @ c_KV [L, 512]) @ W_UV [H, 512, 128]</text>
+  <text x="150" y="432" class="sub">Exit absorption: accumulate in 512-d latent space, project output once</text>
+  <rect x="716" y="393" width="148" height="42" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <text x="790" y="411" text-anchor="middle" class="mono" fill="#059669">O(1 · H)</text>
+  <text x="790" y="428" text-anchor="middle" class="sub">Exit proj only</text>
+</svg>

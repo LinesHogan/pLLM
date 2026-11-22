@@ -28,12 +28,7 @@ A far sharper first filter is zero-byte **`device="meta"` symbolic tracing**: ex
 
 Because the production Rust `RowLabeler` and state executor consume plain `(request_id, scheduled, computed)` integer triples, offline verification needs zero mock schedulers—three lines of Python tuples script an interleaved chunked-prefill, decode, and mid-flight preemption scenario against a tiny synthetic CPU Transformer:
 
-```text
-Three lines of static tuples script chunked prefill + mixed decode + KV preemption replay:
-  Step 1: [("req_b", scheduled=3, computed=0), ("req_a", scheduled=2, computed=0)]  # Mixed prefill chunks
-  Step 2: [("req_b", scheduled=1, computed=3), ("req_a", scheduled=3, computed=2)]  # req_b decodes; req_a finishes prompt
-  Step 3: [("req_a", scheduled=5, computed=0)]                                      # req_a evicted & replayed from 0!
-```
+![Three tuple lines script chunked prefill, mixed decode, and KV preemption replay](../assets/10-schedule-as-data-verification-fig1-en.svg)
 
 Without hand-written golden outputs for arbitrary user math, how does that miniature engine know whether outputs are right or leaking?
 
@@ -45,16 +40,7 @@ Borrow **Metamorphic Testing** (invariant checking under equivalence transformat
 
 Why add a **Million-Salt Perturbation** on top of solo-vs.-batched comparisons? Suppose buggy code hides behind `if h.shape[0] > 4:`, or you want to pinpoint *which exact method* leaked. Holding the flattened batch shape `[51, Hidden]` and row seating identical across two runs isolates cross-row dataflow surgically:
 
-```text
-Hold flattened batch shape [51, Hidden] and row order identical; seed row activations deterministically:
-  activation = salt + 10000 * req_index + 100 * token_offset + channel
-
-  Run 1 (Baseline):   Neighbor req_b (rows 0..49, salt = 0)         + Target req_a (row 50, salt = 0)
-  Run 2 (Salted):     Neighbor req_b (rows 0..49, salt = 1_000_000) + Target req_a (row 50, salt = 0)
-                                                                            │
-                 Compare `req_a` slices entering and leaving every hook ◄───┘
-                 Identical on entry, shifted on exit ══► Pinpoints the exact leaking user method!
-```
+![Million-salt perturbation: entry vs. exit slice diffs pinpoint leaking hooks](../assets/10-schedule-as-data-verification-fig2-en.svg)
 
 With batch dimensions unchanged, even a `1e-6` shift in `req_a` proves cross-tenant coupling mathematically, while entry-vs.-exit slice diffs separate user `dim=0` bugs from framework routing bugs immediately. All suites finish in under two seconds on CPU.
 

@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 452" width="100%" role="img" aria-label="通道 B 字节账对比：部分行早退仍需流式读取 466 MB 整层权重导致吞吐微跌至 98%，只有全批 32 行跳过才能短路省下 1.86 GB 读取使吞吐升至 112%">
+  <defs>
+    <style>
+      .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+      .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+      .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+      .badge { font: 700 11px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.04em; }
+      .metric { font: 700 22px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+    </style>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Zine Card -->
+  <rect x="4" y="4" width="912" height="444" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="32" y="38" class="title">通道 B 字节账：为什么让 23% 的词跳层连 1 毫秒都省不下来</text>
+  <text x="32" y="59" class="sub">7B BF16 每层权重约 466 MB；在瘦矩阵乘区间，只要还剩哪怕 1 行活跃就须读完一整层权重</text>
+  <line x1="32" y1="74" x2="888" y2="74" stroke="#e4e4e7" stroke-width="1.5"/>
+
+  <!-- Case A Card -->
+  <rect x="35" y="93" width="856" height="138" rx="6" fill="#111111"/>
+  <rect x="32" y="90" width="856" height="138" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.75"/>
+
+  <rect x="48" y="102" width="76" height="22" rx="4" fill="#d99b26"/>
+  <text x="86" y="117" text-anchor="middle" class="badge" fill="#ffffff">情形 A</text>
+  <text x="136" y="118" class="label">阈值 0.85：32 行里有 8 行早退（~23%），剩 24 行继续算第 16–19 层</text>
+
+  <!-- Case A Batch Strip -->
+  <rect x="48" y="138" width="140" height="38" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.6"/>
+  <text x="118" y="161" text-anchor="middle" class="mono" fill="#0047ab">24 行活跃</text>
+  <rect x="190" y="138" width="52" height="38" rx="4" fill="#f5f5f4" stroke="#111111" stroke-width="1.4" stroke-dasharray="4,2"/>
+  <text x="216" y="161" text-anchor="middle" class="sub">8 跳</text>
+  <text x="145" y="198" text-anchor="middle" class="sub">活跃 &gt; 0（哪怕 1 行）</text>
+
+  <!-- Arrow 1 -->
+  <line x1="246" y1="157" x2="268" y2="157" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Case A Middle Explanation -->
+  <rect x="274" y="136" width="428" height="76" rx="5" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="290" y="158" class="label">SM 仍须流式读取 100% 层权重（4 × 466 MB）</text>
+  <text x="290" y="179" class="sub">+ 跳过行 7% 键值补写费 + argsort 压紧与写回搬运</text>
+  <text x="290" y="199" class="sub" fill="#e62b2b">权重带宽零节省，反倒多付分支调度与搬运税</text>
+
+  <!-- Arrow 2 -->
+  <line x1="706" y1="174" x2="730" y2="174" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Case A Throughput Box -->
+  <rect x="736" y="136" width="136" height="76" rx="5" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="804" y="168" text-anchor="middle" class="metric" fill="#e62b2b">98%</text>
+  <text x="804" y="189" text-anchor="middle" class="sub">吞吐微跌</text>
+  <text x="804" y="205" text-anchor="middle" class="sub">(基准 99%)</text>
+
+  <!-- Case B Card -->
+  <rect x="35" y="247" width="856" height="138" rx="6" fill="#111111"/>
+  <rect x="32" y="244" width="856" height="138" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.75"/>
+
+  <rect x="48" y="256" width="76" height="22" rx="4" fill="#059669"/>
+  <text x="86" y="271" text-anchor="middle" class="badge" fill="#ffffff">情形 B</text>
+  <text x="136" y="272" class="label">全员跳过：整批 32 行全部早退（活跃行数 = 0）</text>
+
+  <!-- Case B Batch Strip -->
+  <rect x="48" y="292" width="194" height="38" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="1.6" stroke-dasharray="4,2"/>
+  <text x="145" y="315" text-anchor="middle" class="mono" fill="#059669">32 行全部跳过</text>
+  <text x="145" y="352" text-anchor="middle" class="sub">活跃行数 == 0</text>
+
+  <!-- Arrow 1 -->
+  <line x1="246" y1="311" x2="268" y2="311" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Case B Middle Explanation -->
+  <rect x="274" y="290" width="428" height="76" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="290" y="312" class="label">条件图 IF 节点直接短路第 16–19 层切片</text>
+  <text x="290" y="333" class="sub">省下整整 4 层权重读取：4 × 466 MB ≈ 1.86 GB</text>
+  <text x="290" y="353" class="sub" fill="#059669">真正削减了 Channel B 显存带宽消耗！</text>
+
+  <!-- Arrow 2 -->
+  <line x1="706" y1="328" x2="730" y2="328" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Case B Throughput Box -->
+  <rect x="736" y="290" width="136" height="76" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="804" y="322" text-anchor="middle" class="metric" fill="#059669">112%</text>
+  <text x="804" y="343" text-anchor="middle" class="sub">吞吐跃升</text>
+  <text x="804" y="359" text-anchor="middle" class="sub">(+13% vs 基准)</text>
+
+  <!-- Bottom Verification Guardrail Bar -->
+  <rect x="32" y="396" width="856" height="30" rx="5" fill="#f5f5f4" stroke="#111111" stroke-width="1.25"/>
+  <text x="460" y="415" text-anchor="middle" class="sub">核验纪律：哪怕 100% 跳层句子仍流利，教师强制 KL 散度已达 0.868（23% 跳层时为 0.131）。</text>
+</svg>

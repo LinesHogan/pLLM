@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 500" width="100%" role="img" aria-label="pLLM 端到端架构图：声明式负载、CPU 启动前编译核验与未修改 vLLM 双流运行时">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .hdr { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+  </style>
+  <defs>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Card -->
+  <rect x="4" y="4" width="912" height="492" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="28" y="34" class="title">pLLM (Programmable LLM) — “vLLM 的 eBPF 层”端到端架构</text>
+  <text x="892" y="34" text-anchor="end" class="sub">零引擎魔改 · 启动前 CPU 核验 · 静态图双流重叠</text>
+
+  <!-- LEFT: Declarative pllm.Workload -->
+  <rect x="31" y="55" width="208" height="416" rx="6" fill="#111111"/>
+  <rect x="28" y="52" width="208" height="416" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+  <rect x="28" y="52" width="208" height="42" rx="6" fill="#111111"/>
+  <rect x="28" y="82" width="208" height="12" fill="#111111"/>
+  <text x="132" y="77" text-anchor="middle" class="hdr">声明式 pllm.Workload</text>
+
+  <!-- Read Box -->
+  <rect x="40" y="106" width="184" height="106" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.25"/>
+  <rect x="50" y="116" width="54" height="20" rx="4" fill="#0047ab"/>
+  <text x="77" y="130" text-anchor="middle" class="badge" fill="#ffffff">READ</text>
+  <text x="112" y="130" class="sub">只读内部表示</text>
+  <text x="50" y="156" class="mono">hidden, residual</text>
+  <text x="50" y="177" class="mono">layer_logits</text>
+  <text x="50" y="198" class="mono">input_tokens</text>
+
+  <!-- State Box -->
+  <rect x="40" y="224" width="184" height="86" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.25"/>
+  <rect x="50" y="234" width="60" height="20" rx="4" fill="#d99b26"/>
+  <text x="80" y="248" text-anchor="middle" class="badge" fill="#111111">STATE</text>
+  <text x="118" y="248" class="sub">版本化状态</text>
+  <text x="50" y="274" class="mono">RequestState</text>
+  <text x="50" y="295" class="mono">InstanceState</text>
+
+  <!-- Effects Box -->
+  <rect x="40" y="322" width="184" height="132" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.25"/>
+  <rect x="50" y="332" width="70" height="20" rx="4" fill="#e62b2b"/>
+  <text x="85" y="346" text-anchor="middle" class="badge" fill="#ffffff">EFFECTS</text>
+  <text x="128" y="346" class="sub">挂载效果</text>
+  <text x="50" y="372" class="mono">@train</text>
+  <text x="50" y="394" class="mono">@guide_sampling</text>
+  <text x="50" y="416" class="mono">Adapter</text>
+  <text x="50" y="438" class="mono">@custom_attention</text>
+
+  <!-- Arrow Left -> Middle -->
+  <line x1="236" y1="260" x2="252" y2="260" stroke="#111111" stroke-width="2" marker-end="url(#arrow-ink)"/>
+
+  <!-- MIDDLE: CPU Pre-Flight Compiler & Verifier -->
+  <rect x="259" y="55" width="194" height="416" rx="6" fill="#111111"/>
+  <rect x="256" y="52" width="194" height="416" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.75"/>
+  <rect x="256" y="52" width="194" height="42" rx="6" fill="#0047ab"/>
+  <rect x="256" y="82" width="194" height="12" fill="#0047ab"/>
+  <text x="353" y="77" text-anchor="middle" class="hdr">CPU 预编译与核验</text>
+
+  <!-- CPU Badge -->
+  <rect x="278" y="106" width="150" height="26" rx="13" fill="#eef4ff" stroke="#0047ab" stroke-width="1.25"/>
+  <text x="353" y="123" text-anchor="middle" class="badge" fill="#0047ab">0 GPU · 0 WEIGHTS</text>
+
+  <!-- pllm.explain card -->
+  <rect x="268" y="144" width="170" height="134" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.25"/>
+  <rect x="278" y="154" width="114" height="22" rx="4" fill="#111111"/>
+  <text x="335" y="169" text-anchor="middle" class="badge" fill="#ffffff">pllm.explain</text>
+  <text x="278" y="198" class="label">静态计划与预算</text>
+  <text x="278" y="220" class="sub">• 8 刻度最长路时间线</text>
+  <text x="278" y="242" class="sub">• 页预算与版本数估算</text>
+  <text x="278" y="264" class="sub">• 隐式同步静态拦截</text>
+
+  <!-- testing.check card -->
+  <rect x="268" y="292" width="170" height="162" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.25"/>
+  <rect x="278" y="302" width="122" height="22" rx="4" fill="#059669"/>
+  <text x="339" y="317" text-anchor="middle" class="badge" fill="#ffffff">testing.check</text>
+  <text x="278" y="346" class="label">三整数调度契约核验</text>
+  <text x="278" y="368" class="sub">• 行排列置换不变性</text>
+  <text x="278" y="390" class="sub">• 多租户加盐隔离性</text>
+  <text x="278" y="412" class="sub">• 分块预填充与抢占</text>
+  <text x="278" y="434" class="sub">  回滚一致性（无需 GPU）</text>
+
+  <!-- Arrow Middle -> Right -->
+  <line x1="450" y1="260" x2="466" y2="260" stroke="#111111" stroke-width="2" marker-end="url(#arrow-ink)"/>
+
+  <!-- RIGHT: Unmodified vLLM Runtime (0.27-0.34) -->
+  <rect x="473" y="55" width="422" height="416" rx="6" fill="#111111"/>
+  <rect x="470" y="52" width="422" height="416" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.75"/>
+  <rect x="470" y="52" width="422" height="42" rx="6" fill="#111111"/>
+  <rect x="470" y="82" width="422" height="12" fill="#111111"/>
+  <text x="681" y="77" text-anchor="middle" class="hdr">未修改的 vLLM 运行时 (0.27–0.34)</text>
+
+  <!-- Lane 1: Main Stream (CUDA Graph) -->
+  <rect x="482" y="106" width="398" height="170" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="494" y="116" width="198" height="22" rx="4" fill="#0047ab"/>
+  <text x="593" y="131" text-anchor="middle" class="badge" fill="#ffffff">MAIN STREAM (CUDA GRAPH)</text>
+  <text x="868" y="131" text-anchor="end" class="sub">主流关键路径</text>
+
+  <!-- Main Stage 1 -->
+  <rect x="494" y="148" width="106" height="90" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="547" y="177" text-anchor="middle" class="label">连续批处理</text>
+  <text x="547" y="201" text-anchor="middle" class="mono">[tokens, H]</text>
+  <text x="547" y="223" text-anchor="middle" class="sub">紧缩行输入</text>
+
+  <line x1="600" y1="193" x2="611" y2="193" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Main Stage 2 -->
+  <rect x="614" y="148" width="146" height="90" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="687" y="175" text-anchor="middle" class="label">Transformer 层</text>
+  <text x="687" y="197" text-anchor="middle" class="sub">+ 内联覆盖插桩</text>
+  <text x="687" y="219" text-anchor="middle" class="mono">Patch / Adapter</text>
+
+  <line x1="760" y1="193" x2="771" y2="193" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Main Stage 3 -->
+  <rect x="774" y="148" width="96" height="90" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="822" y="177" text-anchor="middle" class="label">幸存词过滤</text>
+  <text x="822" y="201" text-anchor="middle" class="label">采样器</text>
+  <text x="822" y="223" text-anchor="middle" class="sub">Logit 引导</text>
+
+  <text x="494" y="262" class="sub">读边界快照 (publish_lag=1)，零等待侧流</text>
+
+  <!-- Lane 2: Side Stream (CUDA Graph, overlapped) -->
+  <rect x="482" y="314" width="398" height="142" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <rect x="494" y="324" width="246" height="22" rx="4" fill="#059669"/>
+  <text x="617" y="339" text-anchor="middle" class="badge" fill="#ffffff">SIDE STREAM (OVERLAPPED)</text>
+  <text x="868" y="339" text-anchor="end" class="sub">旁路并发流</text>
+
+  <!-- Side Stage A -->
+  <rect x="494" y="356" width="166" height="86" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="577" y="386" text-anchor="middle" class="label">逐请求 Autograd</text>
+  <text x="577" y="408" text-anchor="middle" class="label">反向传播</text>
+  <text x="577" y="428" text-anchor="middle" class="sub">与下一步前向重叠</text>
+
+  <line x1="660" y1="399" x2="677" y2="399" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+
+  <!-- Side Stage B -->
+  <rect x="680" y="356" width="190" height="86" rx="5" fill="#fff1f2" stroke="#111111" stroke-width="1.3"/>
+  <text x="775" y="382" text-anchor="middle" class="label">无锁 MVCC / 写时重定向</text>
+  <text x="775" y="405" text-anchor="middle" class="mono">AdamW State Pool</text>
+  <text x="775" y="427" text-anchor="middle" class="sub">新版本写完整体发布</text>
+
+  <!-- Async state publish link cleanly in the 38px gap between lanes -->
+  <path d="M 790 356 L 790 295 L 728 295 L 728 243" fill="none" stroke="#0047ab" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#arrow-blue)"/>
+  <rect x="708" y="285" width="128" height="20" rx="4" fill="#ffffff" stroke="#0047ab" stroke-width="1.2"/>
+  <text x="772" y="299" text-anchor="middle" class="badge" fill="#0047ab">STATE.PUBLISH</text>
+</svg>

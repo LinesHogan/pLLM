@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 480" width="100%" role="img" aria-label="MLA 潜空间矩阵吸收：利用矩阵乘法结合律把投影从 L 移到 1">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+  </style>
+
+  <rect x="4" y="4" width="912" height="472" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <text x="28" y="34" class="title">MLA 潜空间矩阵吸收：利用乘法结合律把投影从 L 移到 1</text>
+  <text x="28" y="54" class="sub">解码单步设定：当前查询长度 = 1，历史缓存长度 = L (L &gt;&gt; 1)，注意力头数 = H</text>
+
+  <!-- Stage 1: Scoring -->
+  <rect x="28" y="72" width="864" height="184" rx="8" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="44" y="84" width="76" height="22" rx="4" fill="#0047ab"/>
+  <text x="82" y="99" text-anchor="middle" class="badge" fill="#ffffff">STAGE 1</text>
+  <text x="132" y="100" class="label">打分阶段（Scoring）</text>
+
+  <!-- Naive Scoring -->
+  <rect x="44" y="116" width="832" height="60" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <rect x="56" y="128" width="82" height="22" rx="4" fill="#e62b2b"/>
+  <text x="97" y="143" text-anchor="middle" class="badge" fill="#ffffff">朴素顺序</text>
+  <text x="150" y="143" class="mono">q_nope [1, H, 128] · (c_KV [L, 512] @ W_UK [H, 512, 128])^T</text>
+  <text x="150" y="164" class="sub">先按每个头解压全部 L 个历史位置，再做点积</text>
+  <rect x="716" y="125" width="148" height="42" rx="5" fill="#ffffff" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="790" y="143" text-anchor="middle" class="mono" fill="#e62b2b">O(L · H)</text>
+  <text x="790" y="160" text-anchor="middle" class="sub">显存读写爆炸</text>
+
+  <!-- Reassociated Scoring -->
+  <rect x="44" y="184" width="832" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <rect x="56" y="196" width="82" height="22" rx="4" fill="#059669"/>
+  <text x="97" y="211" text-anchor="middle" class="badge" fill="#ffffff">结合律后</text>
+  <text x="150" y="211" class="mono">(q_nope [1, H, 128] @ W_UK^T [H, 128, 512]) · c_KV^T [512, L]</text>
+  <text x="150" y="232" class="sub">入口吸收：先把长度为 1 的查询投影至 512 维潜空间，直接点积压缩页</text>
+  <rect x="716" y="193" width="148" height="42" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <text x="790" y="211" text-anchor="middle" class="mono" fill="#059669">O(1 · H)</text>
+  <text x="790" y="228" text-anchor="middle" class="sub">仅入口投影一次</text>
+
+  <!-- Stage 2: Aggregation -->
+  <rect x="28" y="272" width="864" height="184" rx="8" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="44" y="284" width="76" height="22" rx="4" fill="#0047ab"/>
+  <text x="82" y="299" text-anchor="middle" class="badge" fill="#ffffff">STAGE 2</text>
+  <text x="132" y="300" class="label">加权求和阶段（Aggregation）</text>
+
+  <!-- Naive Aggregation -->
+  <rect x="44" y="316" width="832" height="60" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <rect x="56" y="328" width="82" height="22" rx="4" fill="#e62b2b"/>
+  <text x="97" y="343" text-anchor="middle" class="badge" fill="#ffffff">朴素顺序</text>
+  <text x="150" y="343" class="mono">sum_t weights [1, H, L] · (c_KV [L, 512] @ W_UV [H, 512, 128])</text>
+  <text x="150" y="364" class="sub">先把全部 L 个历史位置展开成 H 个头的 Value，再做加权求和</text>
+  <rect x="716" y="325" width="148" height="42" rx="5" fill="#ffffff" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="790" y="343" text-anchor="middle" class="mono" fill="#e62b2b">O(L · H)</text>
+  <text x="790" y="360" text-anchor="middle" class="sub">显存读写爆炸</text>
+
+  <!-- Reassociated Aggregation -->
+  <rect x="44" y="384" width="832" height="60" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <rect x="56" y="396" width="82" height="22" rx="4" fill="#059669"/>
+  <text x="97" y="411" text-anchor="middle" class="badge" fill="#ffffff">结合律后</text>
+  <text x="150" y="411" class="mono">(weights [1, H, L] @ c_KV [L, 512]) @ W_UV [H, 512, 128]</text>
+  <text x="150" y="432" class="sub">出口吸收：先在潜空间归并所有历史分块，仅在最终输出乘一次 W_UV</text>
+  <rect x="716" y="393" width="148" height="42" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <text x="790" y="411" text-anchor="middle" class="mono" fill="#059669">O(1 · H)</text>
+  <text x="790" y="428" text-anchor="middle" class="sub">仅出口投影一次</text>
+</svg>

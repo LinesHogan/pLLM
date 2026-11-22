@@ -46,7 +46,7 @@ python-source = "."
 module-name = "pllm._core"
 features = ["pyo3/extension-module"]
 include = ["pllm/_skill/*.md"]
-exclude = ["blog/**", "doc/**", "test/**", "tools/**", "examples/**"]
+exclude = ["blog/**", "doc/**", "doc_en/**", "test/**", "tools/**", "examples/**"]
 
 [tool.ruff]
 line-length = 120

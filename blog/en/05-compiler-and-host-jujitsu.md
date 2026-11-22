@@ -18,16 +18,7 @@ Stage 1: **Find the missing `+` node, and cross `@torch.library.custom_op` witho
 
 Textbooks write Transformer sublayers as `x = x + sublayer(norm(x))`. Print vLLM's actual execution graph, however, and no standalone residual `+` exists anywhere. To save a full-hidden-width HBM round-trip at every sublayer, vLLM fuses the end-of-sublayer addition into the *next* sublayer's `fused_add_rms_norm` C++ kernel across all `2L + 1` norms:
 
-```text
-Textbook sublayer boundary:             vLLM's actual boundary (all 2L + 1 norms):
-  Sublayer output branch                  Sublayer output branch    Trunk residual
-        │                                          │                      │
-        ▼                                          └──────────┬───────────┘
-   (+) Residual add                                           ▼
-        │                                       fused_add_rms_norm(branch, residual)
-        ▼                                       (1 HBM pass emitting BOTH normed_x & new residual!)
-   RMSNorm
-```
+![Textbook sublayer boundary vs. vLLM actual 2L + 1 fused_add_rms_norm seams](../assets/05-compiler-and-host-jujitsu-fig1-en.svg)
 
 What looks like a locked door is actually the cleanest seam in the model: precisely because the preceding sublayer deferred its addition, **both `branch` and `residual` arrive unmerged right at the norm's front door**. Unhooked layers keep their untouched native norms at zero overhead.
 
@@ -35,12 +26,7 @@ How do you invoke session-owned logic at that boundary without breaking `torch.c
 
 Passing `session_id: int` into a global `_SESSIONS[session_id]` dict works on Engine #1—and silently corrupts activations as soon as the same process closes Engine #1 and starts Engine #2 on the same architecture. Why? Dynamo bakes every non-`Tensor` scalar argument as a **compile-time constant** inside AOT-cached code, so Engine #2 hits the cache and keeps reading `_SESSIONS[1]`!
 
-```text
-How Dynamo treats @torch.library.custom_op("pllm::model_site", ...) arguments:
-
-  Pass session_id: int        ──► Baked as a compile-time constant into AOT cache; cross-talks on reuse!
-  Read reads[0].data_ptr()    ──► Tensor stays a dynamic runtime input; persistent table address is unique!
-```
+![How Dynamo treats custom_op integer constants vs. tensor pointer addressing](../assets/05-compiler-and-host-jujitsu-fig2-en.svg)
 
 Aligning with Dynamo's rule solves it cleanly: every engine session already owns a persistent GPU routing tensor `reads[0]` whose 64-bit physical address `reads[0].data_ptr()` cannot be reused while the session is alive. Keying `_SITES` by `reads[0].data_ptr()` routes sessions dynamically, while the static topological site index `hook: int` *should* be baked in as a constant. *(Checking repeated in-process lifecycles caught a companion VRAM leak: vLLM appends closures to `torch._dynamo.convert_frame._bytecode_hooks` and never cleans them up, pinning compiled models in HBM across teardown; snapshot-diffing `_bytecode_hooks` and `CleanupManager` on `close()` reclaims tens of gigabytes cleanly.)*
 
@@ -70,10 +56,7 @@ if isinstance(tail, fx.Node) and tail.target == torch.ops.aten.add.Tensor and no
     body.recompile()
 ```
 
-```text
-Before surgery: x, y ──► [ gate / LoRA subtree ] ──► [ standalone BF16 add to HBM ] ──► [ rms_norm ]
-After surgery:  x, y ──► [ gate / LoRA subtree ] ──► snip root add, emit (left, right) ──► [ native fused_add_rms_norm ]
-```
+![Pipeline comparison before and after 10-line make_fx root-add snipping surgery](../assets/05-compiler-and-host-jujitsu-fig3-en.svg)
 
 The boundary of this trick follows directly from the hardcoded C++ kernel entry: whenever the **outermost root node** is `+`—no matter how much gating, low-rank projection, or nonlinearity lives inside its left and right subtrees (such as `x + gate * silu(y @ W)`, covering the vast majority of residual edits)—the terminal add vanishes, extra kernels drop to **0**, and throughput returns to **99.5%** (pure `x + y` identities even uninstall the hook outright). Only when the root itself is non-additive (e.g., `tanh(x + y)`) does an isolated `torch.compile` pass fuse the user's math and output-port write into one Inductor kernel, paying a single HBM pass instead of 61,440 eager launches.
 
@@ -112,17 +95,7 @@ In-forward updates (`@pllm.train_in_forward`) are where silent corruption lurks.
 
 Rather than building a massive distributed sharding analyzer across a thousand ATen ops, trace the update function twice on FakeTensors and play "spot the difference":
 
-```text
-Trace the update function twice with make_fx (full feature width H  vs  rank shard width H / 2):
-
-  Case A (Outer product `values.T @ inputs` — ADMITTED):
-    Global graph: inputs [C, H]   ──► update [Out, H]
-    Shard graph:  inputs [C, H/2] ──► update [Out, H/2]  (Axis 1 still scales by 1/2 — shard preserved!)
-
-  Case B (Reconstruction `inputs @ base.T` — REJECTED AT STARTUP):
-    Global graph: inputs [C, H]   ──► pred [C, Out]
-    Shard graph:  inputs [C, H/2] ──► pred [C, Out]      (Consumed sharded input, output stopped scaling ══► contracted!)
-```
+![Dual FakeTensor graph diffing proving TP > 1 sharding safety at startup](../assets/05-compiler-and-host-jujitsu-fig4-en.svg)
 
 After dead-code elimination, aligning live nodes between the two graphs proves sharding conservation in under a hundred lines: if any operator consumes a sharded operand (`axis is not None`) yet produces identically shaped outputs in both graphs (`axis is None`), the sharded dimension vanished inside a contraction—so startup fails fast with a clear diagnostic.
 

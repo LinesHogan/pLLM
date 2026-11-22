@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 500" width="100%" role="img" aria-label="Two-Tier Non-Blocking Slot Reclamation (ready vs. reuse) Diagram">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .label { font: 600 13.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 12.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .mono-sm { font: 600 11.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 11px "JetBrains Mono", monospace; letter-spacing: 0.04em; }
+    .pill-text { font: 700 11.5px "DM Sans", "JetBrains Mono", sans-serif; }
+  </style>
+
+  <defs>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#e62b2b"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Zine Card -->
+  <rect x="4" y="4" width="912" height="492" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="28" y="34" class="title">FIG 02 · TWO-TIER NON-BLOCKING SLOT RECLAMATION (ready vs. reuse)</text>
+  <text x="28" y="54" class="sub">Pool::allocate scans holders == 0 slots without ever calling CPU event.synchronize(); GPU queues order themselves</text>
+
+  <!-- Top Scanner Bar -->
+  <rect x="28" y="72" width="864" height="50" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.75"/>
+  <rect x="42" y="83" width="152" height="28" rx="4" fill="#111111"/>
+  <text x="118" y="101" text-anchor="middle" class="mono" style="fill: #ffffff;">Pool::allocate()</text>
+  <text x="212" y="102" class="label">Writer requests free slot → scan all holders == 0 slots against active fences bitmaps</text>
+
+  <!-- Down connector -->
+  <line x1="460" y1="122" x2="460" y2="141" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+
+  <!-- Tier 1: ready slots -->
+  <rect x="28" y="144" width="864" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.75"/>
+  <rect x="44" y="158" width="164" height="24" rx="4" fill="#059669"/>
+  <text x="126" y="174" text-anchor="middle" class="badge" fill="#ffffff">TIER 1 · ready</text>
+  <text x="44" y="206" class="label">Fast Path: Hardware Idle</text>
+
+  <rect x="226" y="156" width="328" height="60" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <text x="242" y="179" class="mono">holders == 0</text>
+  <text x="342" y="179" class="sub">AND absent from</text>
+  <text x="242" y="201" class="sub">every active Event bitmap in fences</text>
+
+  <line x1="554" y1="186" x2="590" y2="186" stroke="#059669" stroke-width="1.8" marker-end="url(#arrow-emerald)"/>
+
+  <rect x="594" y="156" width="282" height="60" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.6"/>
+  <text x="610" y="179" class="label" style="fill: #047857;">Hand out immediately!</text>
+  <text x="610" y="201" class="sub">0 CPU wait · 0 GPU stream wait</text>
+
+  <!-- Tier 2: reuse slots -->
+  <rect x="31" y="247" width="864" height="190" rx="6" fill="#111111"/>
+  <rect x="28" y="244" width="864" height="190" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.75"/>
+
+  <rect x="44" y="260" width="164" height="24" rx="4" fill="#d99b26"/>
+  <text x="126" y="276" text-anchor="middle" class="badge" fill="#111111">TIER 2 · reuse</text>
+  <text x="44" y="308" class="label">Async Fence: In-Flight</text>
+
+  <rect x="226" y="258" width="328" height="60" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <text x="242" y="281" class="mono">holders == 0</text>
+  <text x="342" y="281" class="sub">, BUT still guarded</text>
+  <text x="242" y="303" class="sub">by uncompleted Event #42 in fences</text>
+
+  <line x1="554" y1="288" x2="590" y2="288" stroke="#0047ab" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+
+  <rect x="594" y="258" width="282" height="60" rx="5" fill="#eef4ff" stroke="#0047ab" stroke-width="1.6"/>
+  <text x="610" y="281" class="label" style="fill: #0047ab;">Hand out now! (0 CPU block)</text>
+  <text x="610" y="303" class="mono">Return waits = [Event #42]</text>
+
+  <!-- Bottom async strip inside Tier 2 -->
+  <rect x="44" y="332" width="236" height="88" rx="5" fill="#f5f5f4" stroke="#111111" stroke-width="1.4"/>
+  <rect x="56" y="342" width="96" height="22" rx="4" fill="#111111"/>
+  <text x="104" y="357" text-anchor="middle" class="badge" fill="#ffffff">HOST CPU</text>
+  <text x="56" y="384" class="sub">Never calls synchronize()</text>
+  <text x="56" y="405" class="label" style="fill: #047857;">Keeps launching kernels!</text>
+
+  <rect x="294" y="332" width="582" height="88" rx="5" fill="#ffffff" stroke="#0047ab" stroke-width="1.5"/>
+  <!-- Old stream row -->
+  <text x="308" y="359" class="mono-sm">Old Stream</text>
+  <rect x="408" y="342" width="116" height="24" rx="4" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.4"/>
+  <text x="466" y="358" text-anchor="middle" class="pill-text" fill="#b91c1c">Old Kernel</text>
+  <line x1="524" y1="354" x2="558" y2="354" stroke="#e62b2b" stroke-width="1.6" marker-end="url(#arrow-red)"/>
+  <rect x="562" y="342" width="108" height="24" rx="4" fill="#e62b2b"/>
+  <text x="616" y="358" text-anchor="middle" class="pill-text" fill="#ffffff">Event #42</text>
+
+  <!-- Vertical GPU fence arrow -->
+  <line x1="616" y1="366" x2="616" y2="383" stroke="#0047ab" stroke-width="1.8" stroke-dasharray="3 2" marker-end="url(#arrow-blue)"/>
+  <text x="684" y="378" class="sub" style="fill: #0047ab; font-size: 11px;">device-side fence</text>
+
+  <!-- Writer stream row -->
+  <text x="308" y="403" class="mono-sm">Writer</text>
+  <rect x="408" y="386" width="274" height="24" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.4"/>
+  <text x="545" y="402" text-anchor="middle" class="mono-sm" style="fill: #0047ab;">writer_stream.wait_event(event_42)</text>
+  <line x1="682" y1="398" x2="710" y2="398" stroke="#0047ab" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <rect x="714" y="386" width="148" height="24" rx="4" fill="#ecfdf5" stroke="#059669" stroke-width="1.4"/>
+  <text x="788" y="402" text-anchor="middle" class="pill-text" fill="#047857">New Kernel (GPU)</text>
+
+  <!-- Bottom Takeaway Bar -->
+  <rect x="28" y="450" width="864" height="34" rx="5" fill="#111111"/>
+  <text x="460" y="472" text-anchor="middle" class="label" style="fill: #ffffff;">Capacity Invariant: Zero slack pages reserved for in-flight GPU kernels · Cross-stream safety via wait_event</text>
+</svg>
