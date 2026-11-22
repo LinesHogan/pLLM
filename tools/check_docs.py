@@ -948,7 +948,7 @@ def reference_failures(text: str) -> list[str]:
 
 def runs_code(path: Path) -> bool:
     """Whether the Python blocks of a markdown document are executed."""
-    return path in (ROOT / "README.md", ROOT / "README.en.md") or path.parent in EXECUTED_DOCS
+    return path in (ROOT / "README.md", ROOT / "README.zh.md") or path.parent in EXECUTED_DOCS
 
 
 def check_file(
@@ -1008,8 +1008,8 @@ def documents() -> list[Path]:
         *(path for path in (ROOT / "doc").rglob("*.md") if not path.is_relative_to(DEV_DOCS)),
         *(path for path in (ROOT / "doc").rglob("*.ipynb") if not path.is_relative_to(DEV_DOCS)),
     ]
-    if (ROOT / "README.en.md").exists():
-        paths.append(ROOT / "README.en.md")
+    if (ROOT / "README.zh.md").exists():
+        paths.append(ROOT / "README.zh.md")
     paths += (ROOT / "examples").rglob("*.py")
     return sorted(path for path in paths if ".ipynb_checkpoints" not in path.parts)
 

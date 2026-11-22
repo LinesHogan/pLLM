@@ -1,5 +1,5 @@
-# pLLM (`pllm`)
-> Write inference-time LLM algorithms declaratively in Python/PyTorch; run inside vLLM (0.27–0.34) under continuous batching, CUDA graphs, and per-request paged state management.
+# pLLM (`pllm` — Programmable LLM)
+> Declarative programmability layer for running stateful and adaptive inference-time PyTorch algorithms inside unmodified vLLM (0.27–0.34) under continuous batching, CUDA graphs, and per-request paged state management.
 
 ## Coding Agent Entry Points (Read These First)
 - [SKILL.md](doc/agent/SKILL.md): Core workflow, declarations, `explain` -> `testing.check` -> `make_llm` / `make_async_llm`
@@ -12,7 +12,7 @@
 Or via CLI after `pip install pllm`: `pllm skill --print` or `pllm skill --install claude|codex|cursor`.
 
 ## User Guides & Howtos
-- [README (中文)](README.md) | [README (English)](README.en.md)
+- [README (English)](README.md) | [README (中文)](README.zh.md)
 - [Online Serving (AsyncVllmLlm & pllm serve)](doc/howto/online-serving.md)
 - [Production Deployment](doc/howto/production.md)
 - [Support Matrix](doc/reference/support-matrix.md)
