@@ -137,6 +137,40 @@ rounds = "预热 1 轮，3 轮中位数"
 "官方实现，prompt 16384" = "34.89 tok/s"
 
 [[run]]
+what = "激活引导（ActivationPatch）与隐藏状态异步导出到 CPU（@pllm.export），单请求 TPOT"
+date = "2026-11-22"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "1"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数（0 丢行，后台线程逐行还原为 CPU 张量）"
+[run.results]
+"原生 vLLM" = "60.6 tok/s，TPOT 16.50 ms"
+"激活引导（第 14 层 add）" = "60.4 tok/s，99.7%，TPOT 16.52 ms"
+"SAE 特征异步导出到 CPU（64 维）" = "60.6 tok/s，100%，TPOT 16.50 ms"
+"全宽残差异步导出到 CPU（3584 维 BF16，7 KiB/token）" = "60.6 tok/s，100%，TPOT 16.47 ms"
+"激活引导 + SAE 特征异步导出到 CPU" = "60.5 tok/s，99.8%，TPOT 16.51 ms"
+"激活引导 + 全宽残差异步导出到 CPU" = "60.6 tok/s，100%，TPOT 16.48 ms"
+
+[[run]]
+what = "激活引导（ActivationPatch）与隐藏状态异步导出到 CPU（@pllm.export），128 并发 TPOT 与吞吐"
+date = "2026-11-22"
+model = "Qwen/Qwen2.5-7B-Instruct"
+gpu = "RTX 4090 24 GiB"
+vllm = "0.32.0"
+rows = "8 × 16"
+tokens = 256
+rounds = "预热 1 轮，3 轮中位数（0 丢行，每轮 32,640 行全部在后台线程还原为 CPU 张量）"
+[run.results]
+"原生 vLLM" = "5,719 tok/s，TPOT 21.97 ms"
+"激活引导（第 14 层 add）" = "5,623 tok/s，98.3%，TPOT 22.02 ms"
+"SAE 特征异步导出到 CPU（64 维，每步 32 KiB）" = "5,726 tok/s，100%，TPOT 21.90 ms"
+"全宽残差异步导出到 CPU（3584 维 BF16，每步 896 KiB）" = "5,691 tok/s，99.5%，TPOT 22.06 ms"
+"激活引导 + SAE 特征异步导出到 CPU" = "5,639 tok/s，98.6%，TPOT 21.95 ms"
+"激活引导 + 全宽残差异步导出到 CPU" = "5,604 tok/s，98.0%，TPOT 22.17 ms（比原生多 0.20 ms）"
+
+[[run]]
 what = "示例 09：第 12 层的逐行加法写成 Triton 算子或 PyTorch"
 date = "2026-11-09"
 model = "Qwen/Qwen2.5-7B-Instruct"

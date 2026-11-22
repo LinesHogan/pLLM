@@ -127,6 +127,7 @@ with pllm.make_llm(esamp_cfg, workload=ESampLite()) as llm:
 
 **实测吞吐开销**：
 - **Qwen2.5-7B-Instruct 上的 ESamp**（单张 RTX 4090，8 条 prompt × 16 个样本，各生成 256 token）：仅开启每请求在线训练时，吞吐达原生 vLLM 的 **97.4%**；同时开启在线训练与采样引导时，达原生 vLLM 的 **96.3%**（详见 [实测记录](doc/reference/measurements.toml) 与 [教程 03](doc/tutorials/03_decode_training.ipynb)）。
+- **Qwen2.5-7B-Instruct 上的激活引导与隐藏状态异步导出到 CPU**（RTX 4090，第 14 层 `ActivationPatch` 加法引导 + `@pllm.export` 逐 token 异步传回宿主机并还原为 CPU 张量，0 丢行）：单请求流式生成时，同时开启激活引导与整层 **3584 维**全宽残差导出的纯 decode **TPOT 为 16.48 ms**，与原生 vLLM（**16.50 ms**，**60.6 token/s**，**100%**）持平；在 **128 并发序列**（8 × 16，全宽导出每步跨 PCIe 传输 896 KiB）下，纯特征导出（64 维 SAE / 全宽 3584 维）吞吐达原生的 **100% / 99.5%**（TPOT **21.90 / 22.06 ms** 对原生 **21.97 ms**），同时叠加激活引导与全宽导出仍达原生的 **98.0%**（**5,604** 对 **5,719 token/s**，TPOT **22.17 ms**，仅多 **0.20 ms**）。
 - **4B In-Place TTT 社区检查点**（[示例 08](doc/examples/08_inplace_ttt.ipynb)，vLLM 0.32.0，CUDA graph 开启，贪心生成 256 token）：仅用约 25 行数学公式声明更新规则，pLLM 自动编译出多请求分页隔离、FP32 残差增量、跨步攒块、CUDA graph 条件块更新与非边界步零拷贝流式读取——单请求、prompt 4096 / 16384 token 时达 **73.02 / 47.97 token/s**，官方硬编码 `bs=1` 的 Hugging Face 实现为 **54.79 / 34.89 token/s**；4 请求并发时 pLLM 合计达 **171.56 token/s**（官方单请求吞吐的 3.13 倍）。
 
 ---

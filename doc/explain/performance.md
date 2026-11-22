@@ -207,7 +207,8 @@ FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2
 
 ### 4.4 模型层内残差改写
 
-`pllm.model.ActivationPatch` 通过同一套 `custom_residual` 模型站点在 CUDA Graph 内修改层输出。
+`pllm.model.ActivationPatch` 通过同一套 `custom_residual` 模型站点在 CUDA Graph 内修改层输出。配合 `@pllm.export` 将中间层特征或整条残差向量经锁页内存异步传回宿主机 CPU 线程时，GPU 解码流水线无需等待主机消费：在 RTX 4090 上测 `Qwen/Qwen2.5-7B-Instruct`（第 14 层加性引导 `decode=True` + 逐 token 异步导出并在后台还原为 CPU 张量，0 丢行），单请求流式生成的纯 decode **TPOT 为 $16.48\text{ ms}$**，与原生 vLLM（**$16.50\text{ ms}$**，$60.6\text{ tok/s}$，**100%**）一致；在 **128 并发序列**（$8 \times 16$）下，单独异步导出 64 维 SAE 特征或全宽 3584 维 BF16 残差（每步 $896\text{ KiB}$）分别为原生的 **100%** 与 **99.5%**（TPOT **$21.90 / 22.06\text{ ms}$** 对原生 **$21.97\text{ ms}$**），单独开启激活引导为 **98.3%**（$5,623\text{ tok/s}$，TPOT **$22.02\text{ ms}$**），同时开启激活引导与全宽残差导出仍达原生吞吐的 **98.0%**（$5,604$ 对 $5,719\text{ tok/s}$，TPOT **$22.17\text{ ms}$**，仅增加 **$0.20\text{ ms}$**）。
+
 而 `@pllm.custom_residual` 会被 pLLM 降级为具名算子 `pllm::model_site`，并用设备端索引读写私有状态页，使 vLLM 在录制整模型 CUDA Graph 时**把你的残差改写一并录进图里**。
 
 示例 07 在 RTX 4090、7B、生成 256 token 下的实测吞吐占原生图模式比例：

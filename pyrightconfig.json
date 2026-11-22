@@ -4,6 +4,7 @@
     "pllm",
     "tools/benchmark_esamp.py",
     "tools/benchmark_lora.py",
+    "tools/benchmark_steer_capture.py",
     "tools/check_docs.py",
     "examples",
     "test/gpu/vllm_esamp_smoke.py",

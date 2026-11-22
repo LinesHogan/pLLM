@@ -204,7 +204,9 @@ Dynamic attention-score-based physical block eviction (SnapKV, H2O) is impossibl
 
 ### 4.4 In-Layer Residual Rewrites
 
-`pllm.model.ActivationPatch` modifies layer outputs inside CUDA Graphs via the same `custom_residual` model-site machinery. `@pllm.custom_residual` lowers to a named `pllm::model_site` op reading and writing private state pages by device-side index, letting vLLM **capture your residual rewrites directly into the whole-model CUDA Graph**.
+`pllm.model.ActivationPatch` modifies layer outputs inside CUDA Graphs via the same `custom_residual` model-site machinery. Combined with `@pllm.export` to copy intermediate features or full residual vectors asynchronously to pinned host memory and reconstruct CPU tensors on a background thread, GPU decode never waits on host consumption: on RTX 4090 with `Qwen/Qwen2.5-7B-Instruct` (layer-14 additive steering with `decode=True` + per-token async CPU export with 0 dropped rows), single-request pure decode **TPOT is $16.48\text{ ms}$**, matching native vLLM (**$16.50\text{ ms}$**, $60.6\text{ tok/s}$, **100%**); across **128 concurrent sequences** ($8 \times 16$), async CPU export alone (64-dim SAE features or full 3584-dim BF16 residuals at $896\text{ KiB}$/step) retains **100%** and **99.5%** of native throughput (TPOT **$21.90 / 22.06\text{ ms}$** vs. native **$21.97\text{ ms}$**), steering alone retains **98.3%** ($5,623\text{ tok/s}$, TPOT **$22.02\text{ ms}$**), and enabling both steering and full-residual CPU export together retains **98.0%** ($5,604$ vs. $5,719\text{ tok/s}$, TPOT **$22.17\text{ ms}$**, adding only **$0.20\text{ ms}$**).
+
+`@pllm.custom_residual` lowers to a named `pllm::model_site` op reading and writing private state pages by device-side index, letting vLLM **capture your residual rewrites directly into the whole-model CUDA Graph**.
 
 Measured throughput in Example 07 on RTX 4090 (7B, 256 generated tokens) as a percentage of native graph mode:
 * **Value Residual** (rewriting values across 27 layers, concurrency 32): **99%**
