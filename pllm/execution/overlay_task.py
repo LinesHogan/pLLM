@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from pllm.contracts.hidden_locator import HiddenPhase
-from pllm.contracts.packed_rows import PackedPhaseRow
+from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     FieldView,
     ParameterOverlayOperator,
@@ -24,7 +24,7 @@ from pllm.contracts.parameter_overlay import (
     ProjectionOperands,
     ProjectionShape,
 )
-from pllm.contracts.request_identity import RequestIdentity
+from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.sampler import PackedSamplerRowBatch
 from pllm.contracts.semantic_graph import StateResource, TaskId, TaskSymbol
 from pllm.contracts.tensor_layout import LayoutFieldId
@@ -326,12 +326,14 @@ class ProjectionTask:
         self.driver, self.context, self.rows, self.task = driver, context, rows, task
         self.pending = set(targets)
 
-    def prepare(self, math: OverlayTransition) -> TensorBatch:
-        """Open the ordinary private transition before a captured model fills its tensor ports."""
+    def prepare(self, math: OverlayTransition) -> tuple[TensorBatch, tuple[tuple[LayoutFieldId, ...], ...]]:
+        """Open the private transition before replay; carries with incomplete chunks stay shared."""
         selection = self.context.selection.for_resource(math.resource)
-        # Completion comes from carried device tails, so every carry needs a private destination.
-        self.context.prepare_owned_write(selection.refs, copy_fields=None)
-        return read_batch(self.context, "private", math.resource)
+        written = math.row_written_fields(
+            self.rows.row_batch, self.context.selection, tuple(range(len(selection.refs)))
+        )
+        self.context.prepare_owned_write(selection.refs, fields=written, copy_fields=None)
+        return read_batch(self.context, "private", math.resource), written
 
     def complete(
         self,
@@ -389,6 +391,8 @@ class OverlayTransition:
     invariants: Mapping[str, tuple[str, tuple[FieldView, ...]]]
     chunk: ChunkUpdate | GradientUpdate | None = None
     executor: OverlayBatch | None = None
+    keys: tuple[RequestKeyField, ...] = (RequestKeyField.REQUEST_ID,)
+    custom_forward: bool = False
 
     @property
     def targets(self) -> tuple[Projection, ...]:
@@ -507,6 +511,8 @@ class OverlayTransition:
         if (
             isinstance(self.chunk, ChunkUpdate)
             and self.visibility.in_forward
+            and RequestKeyField.REQUEST_ID in self.keys
+            and not self.custom_forward
             and row.prompt_length
             and row.phase in self.phases
         ):
@@ -516,8 +522,8 @@ class OverlayTransition:
             return offset
         return None
 
-    def written_fields(
-        self, data: TensorFrame, selection: RequestStateSelection, selected: tuple[int, ...]
+    def row_written_fields(
+        self, rows: PackedPhaseRowBatch, selection: RequestStateSelection, selected: tuple[int, ...]
     ) -> tuple[tuple[LayoutFieldId, ...], ...]:
         """Share unchanged chunk carries; tails still receive private writable pages."""
         fields = tuple(LayoutFieldId(i) for i in range(len(self.targets) * len(self.buffers)))
@@ -525,16 +531,22 @@ class OverlayTransition:
             return (fields,) * len(selected)
         carry = self.buffers.index(self.arguments[self.chunk.arguments[0]])
         tails = tuple(field for field in fields if field % len(self.buffers) != carry)
-        counts = Counter(row.identity for row in data.step.rows.rows if row.phase in self.phases)
-        rows = dict(zip(selection.for_resource(self.resource).state_indices, selection.rows, strict=True))
+        counts = Counter(row.identity for row in rows.rows if row.phase in self.phases)
+        by_state = dict(zip(selection.for_resource(self.resource).state_indices, selection.rows, strict=True))
         writes: list[tuple[LayoutFieldId, ...]] = []
         for index in selected:
-            row = rows[index]
+            row = by_state[index]
             count = counts[row.identity]
             offset = self.chunk_offset(row, count)
             complete = offset is None or offset % self.chunk.chunk + count >= self.chunk.chunk
             writes.append(fields if complete else tails)
         return tuple(writes)
+
+    def written_fields(
+        self, data: TensorFrame, selection: RequestStateSelection, selected: tuple[int, ...]
+    ) -> tuple[tuple[LayoutFieldId, ...], ...]:
+        """Share unchanged chunk carries during eager task execution."""
+        return self.row_written_fields(data.step.rows, selection, selected)
 
     def bind(
         self,

@@ -523,6 +523,107 @@ def chunk_readout(
     return None if source is None else prepare_readout(source) if specs[0][3].type == "cuda" else source
 
 
+@dataclass(frozen=True, slots=True)
+class DenseReadout:
+    """One row column right-projected by a transposed 2D carry, with optional input-dtype cast and scale."""
+
+    column: int
+    cast_input: bool
+    scale: float = 1.0
+
+
+def _transposed_carry(rhs: Node, carry: Node, input_dtype: torch.dtype, visited: set[Node]) -> bool | None:
+    transposed = False
+    cast_input = False
+    current = rhs
+    while current is not carry:
+        if current.op != "call_function" or current.kwargs and current.target != torch.ops.aten._to_copy.default:
+            return None
+        visited.add(current)
+        if current.target == torch.ops.aten.t.default and len(current.args) == 1 and isinstance(current.args[0], Node):
+            transposed = not transposed
+            current = current.args[0]
+        elif current.target == torch.ops.aten.transpose.int:
+            match current.args:
+                case (Node() as prev, int() as d0, int() as d1) if {d0 % 2, d1 % 2} == {0, 1}:
+                    transposed = not transposed
+                    current = prev
+                case _:
+                    return None
+        elif current.target == torch.ops.aten.permute.default:
+            match current.args:
+                case (Node() as prev, [1, 0]):
+                    transposed = not transposed
+                    current = prev
+                case (Node() as prev, [0, 1]):
+                    current = prev
+                case _:
+                    return None
+        elif (
+            current.target == torch.ops.aten._to_copy.default
+            and len(current.args) == 1
+            and isinstance(current.args[0], Node)
+        ):
+            prev = current.args[0]
+            before: torch.Tensor = prev.meta["val"]
+            after: torch.Tensor = current.meta["val"]
+            if after.device != before.device or after.shape != before.shape or after.dtype != input_dtype:
+                return None
+            cast_input = cast_input or after.dtype != before.dtype
+            current = prev
+        else:
+            return None
+    carry_dtype: torch.dtype = carry.meta["val"].dtype
+    if not transposed or (carry_dtype != input_dtype and not cast_input):
+        return None
+    return cast_input
+
+
+@lru_cache(maxsize=128)
+def dense_readout(
+    step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs, columns: int
+) -> DenseReadout | None:
+    """Identify pure ``column @ carry[.to(column.dtype)].T`` readouts that can stream directly from PTTS pages."""
+    source = readout_graph(step, specs)
+    if source is None:
+        return None
+    placeholders = tuple(node for node in source.graph.nodes if node.op == "placeholder")
+    carry, rows = placeholders[0], placeholders[1 : 1 + columns]
+    output = next(node for node in source.graph.nodes if node.op == "output")
+    if not isinstance(output.args[0], Node):
+        return None
+    expr = output.args[0]
+    visited: set[Node] = set()
+    scale = 1.0
+    if expr.op == "call_function" and expr.target == torch.ops.aten.mul.Tensor and not expr.kwargs:
+        match expr.args:
+            case (Node() as inner, int() | float() as factor) | (int() | float() as factor, Node() as inner):
+                visited.add(expr)
+                expr, scale = inner, float(factor)
+            case _:
+                return None
+    if (
+        expr.op != "call_function"
+        or expr.target not in (torch.ops.aten.mm.default, torch.ops.aten.matmul.default)
+        or len(expr.args) != 2
+        or expr.kwargs
+    ):
+        return None
+    visited.add(expr)
+    lhs, rhs = expr.args
+    if not isinstance(lhs, Node) or lhs not in rows or not isinstance(rhs, Node):
+        return None
+    lhs_val: torch.Tensor = lhs.meta["val"]
+    carry_val: torch.Tensor = carry.meta["val"]
+    if lhs_val.ndim != 2 or carry_val.ndim != 2 or carry_val.shape[1] != lhs_val.shape[1]:
+        return None
+    cast_input = _transposed_carry(rhs, carry, lhs_val.dtype, visited)
+    calls = {node for node in source.graph.nodes if node.op == "call_function"}
+    if cast_input is None or visited != calls:
+        return None
+    return DenseReadout(rows.index(lhs), cast_input, scale)
+
+
 @lru_cache(maxsize=128)
 def row_readout(
     step: Callable[..., tuple[torch.Tensor, torch.Tensor]], specs: Specs, columns: int

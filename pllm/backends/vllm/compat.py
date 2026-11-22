@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import torch
+import vllm.envs as vllm_envs
 from vllm import __version__
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -114,6 +115,7 @@ __all__ = [
     "CudaGraphManager",
     "Sampler",
     "admit_parallel",
+    "batch_invariant_enabled",
     "build_openai_server_app",
     "clone_graph_manager",
     "enable_batch_invariance",
@@ -690,6 +692,14 @@ class Sampler(VllmSampler):
                 )
 
 
+_batch_invariant_enabled = False
+
+
+def batch_invariant_enabled() -> bool:
+    """Whether vLLM installed its batch-invariant ATen kernels in this process."""
+    return bool(vllm_envs.VLLM_BATCH_INVARIANT or _batch_invariant_enabled)
+
+
 def enable_batch_invariance() -> torch.library.Library:
     """Install vLLM's batch-invariant kernels in a process started with VLLM_BATCH_INVARIANT=1, before its engines.
 
@@ -699,8 +709,10 @@ def enable_batch_invariance() -> torch.library.Library:
     dispatch modes (pLLM's memory tracing would launch it on fake tensors); its aten::bmm kernel already covers bmm,
     so torch's binding stays. Keep the returned library alive as long as the process trains.
     """
+    global _batch_invariant_enabled
     bmm = torch.bmm
     batch_invariant.init_batch_invariance()
+    _batch_invariant_enabled = True
     torch.bmm = bmm
     autograd = torch.library.Library("aten", "IMPL")
     for operator in (torch.ops.aten.matmul.default, torch.ops.aten.linear.default):

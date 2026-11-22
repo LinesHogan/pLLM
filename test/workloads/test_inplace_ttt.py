@@ -843,3 +843,121 @@ def test_paper_ttt_matches_fake_decoder_oracle(tmp_path, track, scale):
     if track == "T2":
         assert all((norm > 1e-5) == (scale == 1.0) for _, _, norms in expected for norm in norms)
     assert not body.layers[0]["input_layernorm"]._forward_pre_hooks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DecodeOverlay pinned staging uses CUDA")
+@pytest.mark.gpu
+def test_decode_overlay_shares_incomplete_carries_and_borrows_checkpoint_invariants(tmp_path):
+    """Pinned decode shares unchanged dense carries, borrows checkpoint invariants and updates on completion."""
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from pllm.backends.vllm.parameter_overlay import ParameterOverlay
+    from pllm.contracts.backend_attachment import AttachmentGraphMode
+    from pllm.contracts.semantic_graph import AnchorId
+    from pllm.execution.overlay_task import ProjectionTask
+    from pllm.testing_contracts import scheduled_step
+    from pllm.workloads import InPlaceTTTConfig, InPlaceTTTWorkload
+
+    torch.manual_seed(23)
+    cpu_body = PaperDecoder()
+    cpu_convs = tuple(torch.randn(3, 1, 5) for _ in range(2))
+    cpu_projs = tuple(torch.randn(3, 3) for _ in range(2))
+    cpu_prompts = (torch.randn(6, 3), torch.randn(6, 3))
+    expected = tuple(paper_oracle(cpu_body, x, cpu_convs, cpu_projs, "T1", 3.0) for x in cpu_prompts)
+    body = cpu_body.cuda()
+    prompts = tuple(x.cuda() for x in cpu_prompts)
+    save_file(
+        {
+            f"model.layers.{i}.mlp.ttt_{name}.weight": tensor
+            for i, pair in enumerate(zip(cpu_convs, cpu_projs, strict=True))
+            for name, tensor in zip(("conv", "proj"), pair, strict=True)
+        },
+        tmp_path / "model.safetensors",
+    )
+    targets = tuple(Projection("down_proj", i) for i in range(2))
+    workload = InPlaceTTTWorkload(InPlaceTTTConfig(targets, 4, 3.0))
+    facts = replace(
+        backend_facts(
+            3,
+            device="cuda",
+            memory_bytes=1 << 20,
+            max_rows=16,
+            layer_count=2,
+            targets={t: (5, 3) for t in targets},
+        ),
+        checkpoint=str(tmp_path),
+    )
+    facts = replace(facts, probe=replace(facts.probe, graph_mode=AttachmentGraphMode.CUDA_GRAPH))
+    deployed = workload.compile_backend(facts)
+    execution = deployed.execution
+    stream = torch.cuda.current_stream()
+    execution.admit_instances(stream)
+    ids = (RequestIdentity("a", 0, 0), RequestIdentity("b", 1, 0))
+    decoder = SimpleNamespace(model=SimpleNamespace(model=body), projection=body.projection)
+    overlay = ParameterOverlay(
+        decoder,
+        deployed.attachment.spec.overlay_bindings,
+        execution.arena,
+        16,
+        2,
+        1 << 20,
+        deployed.attachment.spec.overlay_phases,
+        in_forward=True,
+        graphs=True,
+        math=execution.math.parameter_overlay,
+    )
+    try:
+        for reader in overlay.readers:
+            assert reader.decode is not None
+            assert not reader.decode.mutable_invariants
+        refs = tuple(
+            ref for ref in execution.admit(ids, stream) if execution.arena.root(ref).resource == "dense_fast_weights"
+        )
+        task_id = deployed.attachment.plan.scheduled(deployed.attachment.spec.in_forward).task_id
+        done = [0, 0]
+        with (
+            patch("pllm.backends.vllm.parameter_overlay.frozen_weight", side_effect=lambda m: m.weight.detach()),
+            torch.no_grad(),
+        ):
+            # Step 1: 2-token prefill (done=[2, 2], incomplete chunk).
+            # Step 2: uniform decode (done=[3, 3], incomplete chunk -> delta slots stay shared).
+            # Step 3: uniform decode (done=[4, 4], completes chunk -> delta slots allocate private pages).
+            # Step 4: uniform decode (done=[5, 5], incomplete chunk -> updated delta stays shared).
+            for counts, completes in (((2, 2), False), ((1, 1), False), ((1, 1), True), ((1, 1), False)):
+                value = scheduled_step(ids, list(counts), [2, 2], done, {})
+                overlay.reserve()
+                context = execution.start_step(value, stream)
+                execution.advance_to(context, "request.prepare")
+                task = ProjectionTask(
+                    StepDriver(execution, deployed.attachment), context, value.sampler_rows, task_id, targets
+                )
+                free_delta_before = execution.arena.pools["dense_fast_weights"].free_count(0)
+                overlay.prepare(value.rows, context, execution.directory, task)
+                if counts == (1, 1) and not completes:
+                    assert execution.arena.pools["dense_fast_weights"].free_count(0) == free_delta_before
+                elif counts == (1, 1) and completes:
+                    assert execution.arena.pools["dense_fast_weights"].free_count(0) == free_delta_before - 2
+                result = body(
+                    torch.cat(tuple(x[start : start + n] for x, start, n in zip(prompts, done, counts, strict=True)))
+                )
+                overlay.take_operands()
+                overlay.clear()
+                for anchor in execution.arena.plan.timeline.anchors[2:]:
+                    execution.execute_anchor(context, AnchorId(anchor.ordinal))
+                    if anchor.ordinal == execution.sampler_anchor_id:
+                        execution.complete_sampler(context, stream)
+                execution.finish_step(context, stream)
+                for i, (ref, actual) in enumerate(zip(refs, torch.split(result, counts), strict=True)):
+                    end = done[i] + counts[i]
+                    torch.testing.assert_close(actual.cpu(), expected[i][0][done[i] : end], rtol=1e-4, atol=1e-5)
+                    fields = execution.snapshot(execution.arena.latest(ref.lineage_id), stream)
+                    for layer in range(2):
+                        torch.testing.assert_close(
+                            fields[4 * layer].cpu(), expected[i][1][layer][end // 4], rtol=1e-4, atol=1e-5
+                        )
+                    done[i] = end
+        execution.retire(ids, wait=True)
+    finally:
+        overlay.close()

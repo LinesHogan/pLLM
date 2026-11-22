@@ -15,18 +15,20 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import TaskResourceFact
+from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.cuda_graph import device_branch
 from pllm.execution.cuda_stream import PinnedStaging
 from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, save_tail
 from pllm.execution.scan import execute_scan
-from pllm.execution.scan_analysis import chunk_step, row_readout
+from pllm.execution.scan_analysis import DenseReadout, chunk_step, dense_readout, row_readout
 from pllm.execution.scan_execution import PreparedScan
 from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_frame import Tensors, UpdateOutput
 from pllm.execution.tensor_program import TensorBatch
 from pllm.execution.torch_private import measure
 from pllm.kernels.page_copy import copy_pages
+from pllm.kernels.paged_projection import paged_dense_mv
 
 if TYPE_CHECKING:
     from pllm.execution.overlay_task import OverlayTransition
@@ -343,31 +345,45 @@ class DecodeOverlay:
         requests: int,
         policy: TensorPolicy,
         key_fields: tuple[RequestKeyField, ...],
+        *,
+        mutable_invariants: frozenset[str] | None = None,
+        batch_invariant: bool = False,
     ) -> None:
         self.key_fields = key_fields
         self.math, self.target, self.pools, self.policy = math, target, pools, policy
         self.invariants = dict(invariants)
-        self.table = torch.zeros((len(pools) + 1, requests), device=pools[0].device, dtype=torch.long)
+        self.mutable_invariants = frozenset(invariants) if mutable_invariants is None else mutable_invariants
+        self.batch_invariant = batch_invariant
+        width = len(pools)
+        self.table = torch.zeros((2 * width + 1, requests), device=pools[0].device, dtype=torch.long)
+        self.table[width : 2 * width].fill_(-1)
         self.source = self.table.new_zeros((1,))
+        self.sources = torch.arange(requests, device=pools[0].device, dtype=torch.long)
         self.staging = PinnedStaging(capacity=self.table.numel(), slots=2)
         self.host = np.empty(0, dtype=np.int64)
         self.outputs: dict[int, tuple[UpdateOutput, ...]] = {}
         self.plan: PreparedScan | None = None
         self.read_full: Callable[..., torch.Tensor] | None = None
         self.read_row: Callable[..., torch.Tensor] | None = None
+        self.dense_readout: DenseReadout | None = None
         self.prompt_end = self.table.new_zeros((), dtype=torch.bool)
 
     @property
     def buffers(self) -> list[torch.Tensor]:
         """All mutable storage passed through the model's opaque projection op."""
-        return [*self.pools, self.table, *self.invariants.values()]
+        return [*self.pools, self.table, *(self.invariants[name] for name in self.mutable_invariants)]
 
     def reserve(self) -> None:
         """Acquire the staging slot before the invocation opens private pages."""
         self.host = self.staging.take(self.table.numel()).reshape(self.table.shape)
 
-    def prepare(self, batch: TensorBatch, identities: tuple[RequestIdentity, ...]) -> None:
-        """Upload the task's private slots; padded requests have no write destination."""
+    def prepare(
+        self,
+        batch: TensorBatch,
+        identities: tuple[RequestIdentity, ...],
+        written: tuple[tuple[LayoutFieldId, ...], ...],
+    ) -> None:
+        """Upload read and writable slots; shared carries and padded lanes get -1 write destinations."""
         width = len(self.math.buffers)
         batch = batch.for_resource(self.math.resource)
         indices = {
@@ -375,17 +391,29 @@ class DecodeOverlay:
             for row, index in zip(batch.selection.rows, batch.selection.state_indices, strict=True)
         }
         fields = tuple(batch.field_slots(self.target * width + i) for i in range(width))
+        self.host[width : 2 * width] = -1
         self.host[-1, : len(identities)] = 1
         for i, (_, slots) in enumerate(fields):
+            field_id = LayoutFieldId(self.target * width + i)
             self.host[i, : len(identities)] = tuple(slots[indices[identity]] for identity in identities)
+            self.host[width + i, : len(identities)] = tuple(
+                slots[indices[identity]] if field_id in written[indices[identity]] else -1 for identity in identities
+            )
         self.staging.copy_to(self.table)
-        for name, value in self.math.invariant_values(self.target, batch).items():
-            self.invariants[name].copy_(value)
+        if self.mutable_invariants:
+            values = self.math.invariant_values(self.target, batch)
+            for name in self.mutable_invariants:
+                self.invariants[name].copy_(values[name])
 
     def page(self, index: int, name: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """A request's issued page of one field: the field's pool and a one-element slot index."""
+        """A request's readable page of one field: the field's pool and a one-element slot index."""
         field = self.math.buffers.index(name)
         return self.pools[field], self.table[field, index : index + 1]
+
+    def write_page(self, index: int, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """A request's writable destination slot (-1 when the field is shared or idle)."""
+        field = self.math.buffers.index(name)
+        return self.pools[field], self.table[len(self.pools) + field, index : index + 1]
 
     def read(self, index: int, name: str) -> torch.Tensor:
         pool, slot = self.page(index, name)
@@ -417,16 +445,61 @@ class DecodeOverlay:
         self.read_full = chunk.readout(arguments)
         if self.policy.allow_numerical_transforms:
             self.read_row = row_readout(chunk.step, specs, len(columns))
+            if not self.batch_invariant:
+                self.dense_readout = dense_readout(chunk.step, specs, len(columns))
 
     def store(self, index: int, values: Tensors, active: torch.Tensor) -> None:
-        """Write only issued destinations, leaving padding and inactive carries untouched."""
+        """Write only issued destinations, leaving shared carries and padding untouched."""
+        width = len(self.pools)
         store_fields(
             self.math.buffers,
             self.pools,
             {name: value.unsqueeze(0) for name, value in values.items()},
             self.source,
-            self.table[:-1, index : index + 1].masked_fill(~active, -1),
+            self.table[width : 2 * width, index : index + 1].masked_fill(~active, -1),
         )
+
+    def decode_batch(
+        self, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[UpdateOutput, ...]]:
+        """Stream paged dense readouts and append tails across all decode lanes at once."""
+        chunk, readout_spec = self.math.chunk, self.dense_readout
+        assert isinstance(chunk, ChunkUpdate) and readout_spec is not None
+        carry, *columns = chunk.arguments
+        width, count = len(self.pools), len(hidden)
+        counts = self.table[-1, :count]
+        idle = counts == 0
+        bound = self.arguments({}, hidden, desired, embedding[:count], base)
+        carry_field = self.math.buffers.index(self.math.arguments[carry])
+        output = paged_dense_mv(
+            bound[columns[readout_spec.column]],
+            self.pools[carry_field],
+            self.table[carry_field, :count],
+            counts,
+            readout_spec.cast_input,
+            readout_spec.scale,
+        )
+        len_field = self.math.buffers.index("_pending_length")
+        lengths = self.pools[len_field].index_select(0, self.table[len_field, :count]).masked_fill(idle, 0)
+        sources = self.sources[:count]
+        for name in columns:
+            tail_field = self.math.buffers.index(f"_pending_rows_{name}")
+            slots = self.table[width + tail_field, :count]
+            destinations = (slots * chunk.chunk + lengths).masked_fill(idle | (slots < 0), -1)
+            copy_pages(bound[name], self.pools[tail_field].flatten(0, 1), sources, destinations)
+        valid = lengths + counts
+        complete, remaining = (valid == chunk.chunk) & ~idle, valid % chunk.chunk
+        copy_pages(
+            remaining, self.pools[len_field], sources, self.table[width + len_field, :count].masked_fill(idle, -1)
+        )
+        updates = complete.to(torch.int64)
+        trained = updates * chunk.chunk
+        results = [
+            UpdateOutput(output[i : i + 1], complete[i], updates[i], trained[i], {"tail_rows": remaining[i]})
+            for i in range(count)
+        ]
+        self.complete_bucket(tuple(range(count)), results, hidden[:0], desired[:0], embedding[:0], base)
+        return output, tuple(results)
 
     def run(
         self, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
@@ -435,11 +508,15 @@ class DecodeOverlay:
         if isinstance(self.math.chunk, ChunkUpdate) and self.plan is None:
             arguments = self.arguments(self.values(0), hidden[:1], desired[:1], embedding[:1], base)
             self.prepare_scan(arguments)
+        local = RequestKeyField.REQUEST_ID in self.key_fields
+        if local and self.dense_readout is not None:
+            output, results = self.decode_batch(hidden, desired, embedding, base)
+            self.outputs[len(hidden)] = results
+            return output
         if self.read_full is None:
             results = tuple(self.counted(index, hidden, desired, embedding, base) for index in range(len(hidden)))
         else:
             results_list: list[UpdateOutput] = []
-            local = RequestKeyField.REQUEST_ID in self.key_fields
             for index in range(len(hidden)):
                 results_list.append(self.decode_row(index, hidden, desired, embedding, base))
                 if not local:
@@ -534,8 +611,10 @@ class DecodeOverlay:
         rows = tuple(bound[name] for name in columns)
         invariants = tuple(bound[name] for name in chunk.invariants)
         for name, row in zip(columns, rows, strict=True):
-            pool, slot = self.page(index, f"_pending_rows_{name}")
-            copy_pages(row, pool.flatten(0, 1), self.source, (slot * chunk.chunk + length).masked_fill(idle, -1))
+            pool, slot = self.write_page(index, f"_pending_rows_{name}")
+            copy_pages(
+                row, pool.flatten(0, 1), self.source, (slot * chunk.chunk + length).masked_fill(idle | (slot < 0), -1)
+            )
         if self.read_row is None:
             tails = tuple(self.read(index, f"_pending_rows_{name}") for name in columns)
             output = self.read_full(state, *tails, *invariants).index_select(0, length.reshape(1))
@@ -543,7 +622,7 @@ class DecodeOverlay:
             output = self.read_row(state, *rows, *invariants)
         valid = length + count
         complete, remaining = (valid == chunk.chunk) & ~idle, valid % chunk.chunk
-        pool, slot = self.page(index, "_pending_length")
+        pool, slot = self.write_page(index, "_pending_length")
         copy_pages(remaining.reshape(1), pool, self.source, slot.masked_fill(idle, -1))
         updates = complete.to(torch.int64)
         return UpdateOutput(output, complete, updates, updates * chunk.chunk, {"tail_rows": remaining})
