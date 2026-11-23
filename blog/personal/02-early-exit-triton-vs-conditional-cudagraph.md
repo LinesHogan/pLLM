@@ -1,57 +1,48 @@
-# 不重录 CUDA Graph 怎么在运行时动态切层？对比条件子图、掩码求值与 L2 早退 Triton 内核
+# 不重录 CUDA Graph 实现动态切层：条件子图、掩码求值与早退 Triton 内核的比较
 
-> **TL;DR**：在线推理服务录好 CUDA Graph 后，想把激活干预或 LoRA 的作用位置从第 8 层切到第 20 层，或者让同批次的不同请求各自命中不同层，直接重录整套图会带来数秒停服；而在候选层全挂上朴素 `torch.where` 掩码又会让未命中层白跑全量显存读写与矩阵乘。对比过 CUDA 条件子图的私有工作区显存账之后，我们最终采用 **L2 标量早退 Triton 内核 + 借用边界输出端口原地累加** 的方案，让未命中候选层在 ~1 微秒内零 HBM 读写退出。文末复盘为什么大秩回退路径上一句不起眼的 `if bool(mask.any()):` 平时测不出来、上线调参却会炸毁图捕获。
+> **TL;DR**：在线推理服务完成 CUDA Graph 捕获后，如果希望动态切换激活干预、探针或 LoRA 的目标层，重新捕获整套分档位静态图会带来数秒停顿；而在所有候选层做全量计算再 `torch.where` 掩码，又会让未命中层额外消耗显存带宽。对比 CUDA 条件子图的私有工作区显存开销后，我们采用了基于片上 L2 标量判定的早退 Triton 内核，并复用层间归一化输出端口原地累加，使未命中候选层跳过权重池与激活池的 HBM 读写。文末记录了 `rank > 256` 回退分支里 `bool(mask.any())` 导致图捕获失败的排查过程。
 
-做模型内部可解释性实验或者在线激活引导（Steering）时，常会遇到这样一个需求：7B 或 70B 的模型已经在显卡上跑起来了，分档位的 CUDA Graph 也花十几秒钟全部预热捕获完毕；这时候你想把读取残差探针或注入干预向量的位置从第 8 层换到第 20 层，甚至希望同一个连续批次里的请求 A 走第 4 层的 LoRA、请求 B 走第 18 层的 LoRA、请求 C 传 `-1` 走原版基座模型。
+在做模型内部表征分析或在线激活引导（Steering）时，经常会遇到这样的场景：模型已经加载并完成了各个批次档位的 CUDA Graph 预热捕获，此时希望把读取残差或注入干预向量的位置从第 8 层调整到第 20 层，或者在同一个连续批处理步中让请求 A 走第 4 层 LoRA、请求 B 走第 18 层 LoRA、请求 C 传 `-1` 保持原模型输出。
 
-如果把层号当成静态结构参数，每换一次层就得拆掉旧钩子、重新触发 Dynamo 编译并把 `[1, 2, 4, 8, ..., 256]` 十来个批次档位的 CUDA Graph 全部重录一遍。离线脚本里等十秒尚可忍受，放到交互式探索或在线服务里，每次切层卡顿十秒基本没法用。
+如果把层号作为静态图结构的一部分，每次换层都需要卸载旧钩子、重新走一遍编译并重录 `[1, 2, 4, 8, ..., 256]` 等全部批次档位的 CUDA Graph，一次切换通常耗时数秒到十余秒，不适合交互式实验或在线服务。
 
-既然不想重录图，自然就得提前把候选层集合 `over=(4, 12, 20, ...)` 的钩子全埋进图里，运行时靠状态池里的一个 `0-d int64` 标量控制哪一层真正干活。
-
-想法听起来简单，但只要算一算显存和带宽账，“怎么让没选中的那批候选层闭嘴”就成了真问题。假如有人想在 28 层模型上做逐层扫描，把 `over=tuple(range(28))` 全挂上 LoRA：每一步每行其实只有 1 层需要修正，另外 27 层全是陪跑。如果陪跑层的代价压不下去，动态切层的吞吐就会退化成“同时挂了 28 层静态适配器”。
+要避免重录图，自然需要在构建期把候选层集合 `over=(4, 12, 20, ...)` 的钩子预先放进图里，运行时通过状态池里的一个 `0-d int64` 标量控制当前哪一层生效。随之而来的工程问题是：当候选层较多时（例如在 28 层模型上做逐层扫描，`over=tuple(range(28))`），每一步只有 1 层真正生效，其余 27 个未命中层的运行开销该如何控制。
 
 ---
 
-在冻结的 CUDA Graph 里实现“命中才算、未命中跳过”，手头主要有三条技术路线可选。我们把三条路线的硬件账挨个摆在桌面上比了一遍。
+围绕“在已捕获的静态图里跳过未命中层计算”，我们比较了三种实现方案。
 
-**第一条路：用 CUDA 12.4+ 的设备端条件图节点（Conditional CUDA Graph / `device_branch`）。**  
-从直觉上看，这最像教科书标准答案——在每个候选层放一个硬件级 `IF (active_count > 0)` 条件节点，只有本步真有请求命中第 $l$ 层时，GPU 硬件调度器才展开执行子图里的矩阵乘。
+**第一种方案是使用 CUDA 12.4+ 的设备端条件图节点（Conditional CUDA Graph / `device_branch`）。**  
+思路是在每个候选层放置一个硬件级 `IF (active_count > 0)` 条件节点，仅当本步存在命中该层的请求时才执行分支子图内的矩阵乘。
 
-但它有一个在多档位推理引擎里吃不消的隐性显存开销：**每个条件子图分支内部的算子库（如 cuBLAS）会在各自的分支流上独立申请私有工作区（Workspace）显存池。**
-
-```text
-【路线 A：CUDA 条件子图】
-  档位 1, 2, 4, ..., 256 (共 9 档) × 28 个候选层 IF 子图
-  ──▶ 每个子图分支一旦调 cuBLAS BMM，都会在条件流内存池里圈走数 MiB 私有工作区
-  ──▶ 256 MiB 的图显存预算（cuda_graph_pool_budget）尚未跑完预热就会直接耗尽报错
-```
-
-更何况，在异构连续批处理里，哪怕批次中只有 1 个请求命中第 $l$ 层，整层 `IF` 条件依然为真，子图还是得照常进去区分哪几行有效、哪几行无效。单靠层级的布尔分支，既省不下异构批次的行级过滤，还会把原本留给 KV Cache 的几百 MiB 显存赔进去。
-
-**第二条路：朴素全算后掩码（`torch.where(mask, h + delta, h)`）。**  
-这是写起来最快、也最容易通过功能测试的写法：每层照常按槽位收集权重因子 `A, B` 或仿射矩阵 `W, b, R`，照常跑完批量矩阵乘算出 `delta`，最后用一行 `torch.where` 把未命中行的增量抹掉。
-
-它不占额外工作区，也能录进 CUDA Graph，但带宽账全盘亏空——未命中的 27 层照样要把全部权重块和隐藏状态从高带宽显存（HBM）搬进寄存器算完再丢掉。在排查第一版实现时，我们还顺带发现静态适配器路径里藏着一句无条件拷贝 `captured[:len(hidden)].copy_(hidden)`：原本那是为了给“边前向边求导训练”保留前向输入激活的，结果纯推理模式的适配器也跟着每层白拷一遍 `[rows, hidden]` 的激活进显存。
-
-**第三条路：基于 L2 缓存标量判定的线程块早退（CTA Early-Exit）Triton 内核 + 借用已有输出端口原地累加。**  
-回过头看 GPU 的存储层次：每一步前向开始前，我们把各行对应的目标层号比对结果写进一张只有几百字节的 `int64` 归属表 `owners[rows]`（未命中行记为 `-1`）。这张小表在整趟前向期间常驻片上 L2 缓存。
-
-如果我们不用 cuBLAS，而是写一个按 `(row, col_block)` 划分网格的轻量 Triton 内核，让每个线程块（CTA）一进门先花几百纳秒去 L2 里读一个 8 字节整数 `owner = tl.load(owners_ptr + row)`，发现 `owner < 0` 立刻 `return` 退出呢？
+实际验证下来，它的主要限制在于显存占用：每个条件子图分支在捕获其内部算子（如 cuBLAS 批量矩阵乘）时，会在各自的分支流内存池上独立申请私有工作区（Workspace）。
 
 ```text
-【路线 B：朴素掩码求值（未命中层照付 100% HBM 带宽）】
-  HBM(hidden) + HBM(A, B 权重池) ──▶ 全量加载进 SM 算完 BMM ──▶ torch.where 丢弃结果 ──▶ 写回 HBM
-
-【路线 C：L2 标量早退 + 原地累加（未命中层 0 字节 HBM 读写）】
-  L2 Cache(owners[row] == -1) ──▶ CTA 第一条指令判定 < 0 ──▶ 直接 return 退出（耗时 ~1 µs，不碰 HBM！）
-  L2 Cache(owners[row] >=  0) ──▶ 按 owner // block_rows 算槽位 ──▶ 读 HBM(hidden, A, B) ──▶ 原地加进输出切片
+【方案一：CUDA 条件子图】
+  多个批次捕获档位 (1, 2, 4, ..., 256) × 28 个候选层 IF 子图
+  ──▶ 子图内调用 cuBLAS 时各自保留独立工作区，累计容易超出 256 MiB 的图显存预算
 ```
 
-算清楚这笔账后，还要小心最后一个带宽漏勺：**千万别给激活补丁分配新的输出张量。**
+此外，在异构连续批处理中，只要批次里有 1 个请求命中第 $l$ 层，整层的 `IF` 条件就为真，子图内部仍然需要做行级过滤。用层级条件分支既多占了留给 KV Cache 的显存，也省不掉异构批次的行掩码处理。
 
-哪怕你在内核里判断 `if active == 0: return` 跳过了权重池读取，只要算子签名设计成返回新张量的 `out = masked_patch_add(hidden, table, pool)`，那未命中行的 `hidden` 怎么去到 `out` 里？内核还是得老老实实把整行 `hidden` 从 HBM 读出来再原封不动写进新分配的 `out` 里——27 个未命中层照样白跑 27 遍全宽激活拷贝！
+**第二种方案是全算后掩码（`torch.where(mask, h + delta, h)`）。**  
+做法最直接：每个候选层照常按槽位收集参数并执行矩阵乘算出 `delta`，最后用 `torch.where` 将未命中行的增量置零。这种方式不引入额外工作区，也兼容 CUDA Graph，但未命中的 27 层仍然会把参数和隐藏状态从高带宽显存（HBM）完整读入计算一遍。排查这部分开销时，我们还注意到原有的静态适配器路径里有一句无条件的 `captured[:len(hidden)].copy_(hidden)`——原本只用于在线求导保留前向输入，纯推理模式下省去这步拷贝也能减少每层的写带宽。
 
-怎么把这遍无用拷贝也省掉？去看模型层间边界的调用上下文：在 `RMSNorm` 融合残差边界上，外层本来就已经准备好了两个现成的输出端口 `(residual, normed)`，并先把本层分支输出 `branch` 拷进了 `normed` 端口等待归一化。既然 `normed` 里已经躺着现成的值，补丁算子只需改成原地修改该端口的 `masked_patch_add_into(normed, table, pool)`：
+**第三种方案是基于片上 L2 标量检查的线程块早退（CTA Early-Exit）Triton 内核，配合已有输出端口原地累加。**  
+每步前向开始前，引擎在设备端生成一张几百字节的 `int64` 归属表 `owners[rows]`（未命中行记为 `-1`），这张小表在前向期间常驻片上 L2 缓存。自定义 Triton 内核按 `(row, col_block)` 划分网格，每个线程块启动后的第一条指令先从 L2 读取 `owner = tl.load(owners_ptr + row)`，若小于 `0` 则直接 `return`：
+
+```text
+【方案二：全算后掩码】
+  HBM(hidden, 参数池) ──▶ 全部加载计算矩阵乘 ──▶ torch.where 丢弃未命中行结果 ──▶ 写回 HBM
+
+【方案三：L2 标量早退 + 原地累加】
+  L2 Cache(owners[row] == -1) ──▶ 首条指令判断 < 0 ──▶ 直接 return（跳过 HBM 读写）
+  L2 Cache(owners[row] >=  0) ──▶ 计算参数槽位 ──▶ 读取 HBM(hidden, 参数) ──▶ 原地累加至输出端口
+```
+
+这里还有一个容易忽略的细节：如果把激活补丁算子设计成返回新张量的函数 `out = masked_patch_add(hidden, table, pool)`，即使未命中行跳过了参数池读取，为了保证返回的 `out` 中包含原有的 `hidden`，仍需把整行 `hidden` 从 HBM 读出再写入 `out`，相当于每个未命中层多做一次全宽拷贝。
+
+结合层间 `RMSNorm` 边界的上下文看，外层在调用边界钩子时已经备好了 `(residual, normed)` 两个输出端口，并已将分支输出拷入 `normed`。因此把补丁算子改为对 `normed` 原地累加的 `masked_patch_add_into(normed, table, pool)`，未命中行就可以不触碰 `normed` 所在的 HBM 地址：
 
 ```python
 @triton.jit
@@ -60,7 +51,7 @@ def _masked_patch_add_into_kernel(
     table_stride, target_stride, pool_stride, width, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    # 先查常驻 L2 的掩码行；未命中时连 target_ptr 和 pool_ptr 的地址都不解引用，直接退出
+    # 先读 L2 中的掩码标志；未命中时直接返回，不读写 target_ptr 与 pool_ptr
     if tl.load(table_ptr + row) == 0:
         return
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -72,35 +63,32 @@ def _masked_patch_add_into_kernel(
     tl.store(dst_ptrs, h + delta.to(target_ptr.dtype.element_ty), mask=col_mask)
 ```
 
-同理，在低秩 LoRA 适配器上，我们预先分配一块 `[max_rows, rank]` 的 `float32` 中间缓冲 `routed_mid`，用两阶段早退内核（第一阶段 `[rows, rank]` 算下投影，第二阶段 `[rows, cdiv(out_features, 256)]` 算上投影并原地加进 `output[:, offset:offset+width]`）替代通用分块 `bmm`。顺带还有一个意外收获：由于内核直接用 `owner // block_rows` 反查请求的参数槽号，当外层跑在自定义前向 `@pllm.custom_forward` 的抽样重排子批次（Wave，`call_rows != None`）上时，只需先做一次 `owners.index_select(0, call_rows)`，同一套早退内核连一行代码都不用改就能直接复用。
+低秩 LoRA 适配器也采用了同样的思路：预留一块 `[max_rows, rank]` 的 `float32` 中间缓冲 `routed_mid`，分两阶段执行早退内核并在第二阶段直接累加到 `output[:, offset:offset+width]`。当外层运行在 `@pllm.custom_forward` 的子批次重排（`call_rows != None`）模式下时，只需对 `owners` 做一次 `index_select(0, call_rows)` 即可复用同一套内核。
 
 ---
 
-这套早退内核写完后，代码审查揪出了一个极具代表性的潜伏炸弹——它藏在我们平时根本不会测到的“大秩回退分支”里。
+在审查上述内核的外围分派逻辑时，我们发现了一处藏在低频参数分支里的图捕获问题。
 
-由于两阶段低秩内核把中间激活存在寄存器和 `routed_mid` 里，我们给快路径设了一个上限 `rank <= 256`；当用户声明的秩超过 `256`（或者张量是双精度 `float64`、或者最后一维步长非连续）时，代码回退到常规的 PyTorch 算子路径。为了“顺手省点未命中时的计算”，我们在回退分支里随手写了一句和 CPU 分支一模一样的判断：
+由于两阶段低秩内核设定了 `rank <= 256` 的快路径上限，当 `rank > 256`、输入为 `float64` 或末维步长非连续时，代码会回退到常规 PyTorch 算子组合。为了在回退路径下少做无用计算，初版代码直接沿用了 CPU 分支的短路判断：
 
 ```python
-# 潜伏在 rank > 256 回退路径里的图捕获炸弹：
 if target.dtype == torch.float64 or rank > 256 or target.stride(-1) != 1:
     mask = table[0, :rows].bool()
-    if bool(mask.any()):  # <-- 平时 rank=4 从不走这里；一旦 rank=260，捕获 CUDA Graph 立刻崩溃！
+    if bool(mask.any()):  # rank <= 256 时不会走到这里；一旦 rank = 260，图捕获会报错
         ...
 ```
 
-为什么这句话在平时所有 `rank = 4`、`rank = 8` 的 GPU 测试里全都蒙混过关了？
+平时常规测试使用的都是 `rank = 4` 或 `8`，GPU 执行一直走上面的 Triton 快路径，这段回退分支只在 CPU 测试里跑过；而在 CPU 上调 `bool(mask.any())` 是完全正常的。一旦用户在 GPU 上声明了 `rank = 260` 并开启 CUDA Graph，预热捕获走到 `bool(mask.any())` 时，PyTorch 需要同步流把布尔规约结果拷回主机转成 Python `bool`，CUDA 驱动就会报 `cudaErrorStreamCaptureUnsupported`。
 
-因为常规测试全都命中了上面的 Triton 快路径，这行回退代码在 GPU 上一次都没执行过；而在纯 CPU 测试里，`bool(mask.any())` 读的是主机内存，合法且飞快。直到某天有人把低秩仿射的秩设成 `260` 并在 GPU 上启动引擎，预热录制 CUDA Graph 走到这行 `bool(mask.any())`，PyTorch 试图调用 `cudaStreamSynchronize` 把 GPU 上的布尔规约结果拉回 CPU 转成 Python `bool`——CUDA 驱动立刻抛出 `cudaErrorStreamCaptureUnsupported: operation not permitted when stream is capturing`。哪怕那一步所有候选层全都未命中（`mask` 全是 `False`），照样必崩无疑。
-
-排查这类问题可以提炼出一条铁律：**在编写任何可能进入 CUDA Graph 录制范围的算子时，CPU 分支与 CUDA 回退分支必须分开审视——CUDA 分支（哪怕是慢速兜底路径）严禁出现任何把 Tensor 转成 Python `bool` / `int` 的控制流（`if mask.any():`、`int(x.item())`、`nonzero()`），一律改写为无分支的设备端 `torch.where(mask[:, None], updated, target)`，并且必须专门配一条越过快路径阈值的 GPU 图捕获单测（如 `rank = 260`）。**
+修复方式是将 CPU 短路与 CUDA 兜底明确分开：CUDA 路径即使退回慢速实现，也只使用设备端的 `torch.where`，不把张量转换成 Python 标量；同时在 GPU 测试集里补一条 `rank = 260` 的图捕获用例覆盖该分支：
 
 ```python
 if not target.is_cuda or target.dtype == torch.float64 or rank > 256 or target.stride(-1) != 1:
     mask = table[0, :rows].bool()
     if not target.is_cuda and not bool(mask.any()):
-        # 只有纯 CPU 路径才允许用 Python bool 短路跳过计算！
+        # 仅在 CPU 路径使用 Python bool 短路
         return
-    # CUDA 兜底路径保持纯设备端张量掩码，零主机同步，保证任何秩都能安全捕获进 CUDA Graph
+    # CUDA 回退路径保持纯设备端掩码更新，避免流同步打断 CUDA Graph 捕获
     ...
     target.copy_(torch.where(mask[:, None], target + delta, target))
     return
@@ -108,9 +96,9 @@ if not target.is_cuda or target.dtype == torch.float64 or rank > 256 or target.s
 
 ---
 
-把未命中层的 HBM 读写清零之后，我们在单张 RTX 4090 上用 `Qwen2.5-7B-Instruct`（`batch=8, n=16` 共 128 并发解码行，以及 `rows=1` 单流解码）实测了真实吞吐代价：
+在单张 RTX 4090 上以 `Qwen2.5-7B-Instruct`（`bfloat16`，开启 CUDA Graph）测试这组实现的实际开销：
 
-- 在 4 个候选层（`over=(4, 12, 20, 26)`）上同时挂动态激活引导 + 异步残差导出，并在轮次间实时调用 `import_state` 切层：128 并发下 TPOT 为 `24.6 ms`（静态单层为 `24.4 ms`，原版 vLLM 为 `23.2 ms`），相比静态单层仅多出 `0.2 ms`；
-- 即便在最极端的 28 层全挂低秩 LoRA（`over=tuple(range(28))`，共 56 个 `q_proj` / `v_proj` 投影钩子，每步动态激活其中 1 层）场景下，得益于 27 个未命中层的 L2 早退与跳过无用输入拷贝，整套分档位 CUDA Graph 总共只占 `0.30 GiB` 显存，128 并发下 TPOT 为 `24.8 ms`（静态单层 LoRA 为 `24.0 ms`，27 个陪跑层合计仅增加 `0.8 ms`）。
+- 在 4 个候选层（`over=(4, 12, 20, 26)`）挂载动态激活引导与异步残差导出，并在轮次间调用 `import_state` 实时切层：128 并发（`batch=8, n=16`）下解码 TPOT 为 `24.6 ms`，静态单层版本为 `24.4 ms`，无钩子的原版 vLLM 为 `23.2 ms`，动态门控相比静态单层增加约 `0.2 ms`；
+- 将低秩 LoRA 挂在全部 28 层（`over=tuple(range(28))`，共 56 个 `q_proj` / `v_proj` 投影钩子，每步激活 1 层）时，整套分档位 CUDA Graph 共占用 `0.30 GiB` 显存，128 并发下 TPOT 为 `24.8 ms`（静态单层 LoRA 为 `24.0 ms`，27 个未命中层合计增加约 `0.8 ms`）。
 
-这套早退内核与路由表机制目前集成在开源项目 **[pLLM](https://github.com/LinesHogan/pLLM)** 的 `pllm.model.LayerRoute` 中。最后也必须把它的物理边界摊开讲明：L2 早退省掉的是参数池读取与矩阵乘，但并没有让图节点凭空消失——第一，每个候选层每次前向仍要付约 1 微秒的内核网格发射与 L2 标量检查开销；第二，对于挂在层间归一化上的激活补丁，外层自定义边界算子仍需把残差流和分支输出端口传递给原生归一化核；第三，`per_head` 算子与 `rank > 256` 的超大秩兜底路径仍走全算后掩码。正因如此，我们在 API 设计上拒绝把普通静态层号参数悄悄做成全局动态，而是要求用户显式写出 `LayerRoute(..., over=(...))`——你需要切哪几层，就只为那几层的门控买单。
+相关代码已合入 **[pLLM](https://github.com/LinesHogan/pLLM)** 的 `pllm.model.LayerRoute`。在使用上仍需注意它的边界成本：早退内核省去了未命中层的 HBM 读写与矩阵乘，但每个候选层仍保留一次轻量内核发射（单层十余微秒量级），且层间补丁所在的归一化边界需传递残差与分支端口，`per_head`、`rank > 256` 及末维非连续补丁输入则会回退至掩码求值。因此 API 上将 `LayerRoute(..., over=(...))` 设为独立入口，要求显式列出实际需要切换的候选层，而不是默认挂满全模型。

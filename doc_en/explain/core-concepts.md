@@ -276,5 +276,5 @@ These four examples illustrate why pLLM rejects certain patterns at build time a
 - Verify correctness contracts on CPU and GPU: [Checking Correctness](../guides/checking.md)
 - Review measured throughput and memory figures across mechanisms: [Performance & Memory](performance.md)
 - Understand why certain algorithm families are outside scope: [Design Tradeoffs](design-tradeoffs.md)
-- Further reading: [Standalone Technical Essays](../../blog/README.md) collects ten standalone deep dives on underlying mechanics, scheduling tradeoffs, and verification
+- Further reading: [Standalone Technical Essays](../../blog/README.md) collects eleven standalone deep dives on underlying mechanics, scheduling tradeoffs, and verification
 - Look up exact definitions of all terms: [Glossary](../reference/glossary.md)

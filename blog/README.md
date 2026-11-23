@@ -1,8 +1,8 @@
 # 技术随笔与机制拆解 / Engineering Essays & Deep Dives
 
-十篇面向推理系统社区的平权独立文章（中英双语），不设上下级阅读门槛，也不预设读者了解本仓库。其中两篇为行业趋势与系统复盘，八篇为单点技术深潜——从反常现象出发，用示意图还原问题建模、算法推导与通用排障思路。
+十一篇面向推理系统社区的平权独立文章（中英双语），不设上下级阅读门槛，也不预设读者了解本仓库。其中三篇聚焦行业趋势、系统复盘与状态层抽象，八篇为单点技术深潜——从反常现象出发，用示意图还原问题建模、算法推导与通用排障思路（另有四篇围绕动态切层开发过程的排障手记整理在 [blog/personal/](personal/README.md)）。
 
-Ten peer-independent articles (in Chinese and English) written for the inference-systems community, assuming zero prior familiarity with this repository. Two pieces examine macro economics and engineering postmortems; eight are focused deep-dives reconstructing problem modeling, derivations, and reusable debugging habits with diagrams.
+Eleven peer-independent articles (in Chinese and English) written for the inference-systems community, assuming zero prior familiarity with this repository. Three pieces examine macro economics, engineering postmortems, and unified state architecture; eight are focused deep-dives reconstructing problem modeling, derivations, and reusable debugging habits with diagrams (plus four debugging notes from the dynamic layer-routing build in [blog/personal/](personal/README.md)).
 
 ## 推理引擎解剖路标 / System Anatomy Map
 
@@ -12,11 +12,13 @@ Ten peer-independent articles (in Chinese and English) written for the inference
 
 ## 中文目录 (`blog/zh/`)
 
-### 观点思辨与工程复盘
+### 观点思辨、架构抽象与工程复盘
 1. **[`[观点思辨]` 《〈苦涩的教训〉还有后半句：当商业推理退回“脏先验”，真正卡脖子的是引擎试错税》](zh/01-after-the-bitter-lesson.md)**  
    *单晶体管造价企稳与 800:1 算存比把训练与推理拉向相反的经济轨道，促成多元语法查表、跨层索引复用与在线快权重回潮；当编码智能体让局部先验变成可规模化搜索时，无状态引擎征收的“三周拉分支税”成了新瓶颈。*
 2. **[`[工程复盘]` 《复盘一次过度设计：删掉 45 万行多面体编译器，换成 40 行最长路》](zh/02-forty-lines-over-polyhedral-ir.md)**  
    *复盘引进 45.7 万行 ISL 多面体库却只用来算 `lag >= 1` 的弯路；展示如何将跨步时间线折叠为 8 刻度一致依赖图，以及如何用剖析器定位双卡 All-Reduce 优先级抢占与可分页内存假异步。*
+11. **[`[架构抽象 · 状态底座]` 《PagedAttention 之后：用统一的张量状态层（PTTS）承接推理期算法》](zh/11-ptts-beyond-paged-attention.md)**  
+    *对比 PagedAttention 专管的一维序列块表与非 KV 推理期算法的多样状态需求；拆解 PTTS 如何用整字段固定基地址槽池、整数槽号版本根与因果读写划分统一瞬态探针、多租户引导/LoRA、在线学习、分块快权重零拷贝沿用与运行时免重录动态切层。*
 
 ### 硬核机制拆解与排障方法
 3. **[`[极客拆解 · 带宽与配额]` 《为什么 32 个线程块跑赢 9,600 个，跳过 23% 的词却省不下 1 毫秒？连续批处理的带宽配额分析》](zh/03-bandwidth-and-sm-quotas.md)**  
@@ -40,9 +42,10 @@ Ten peer-independent articles (in Chinese and English) written for the inference
 
 ## English Articles (`blog/en/`)
 
-### Positions & Engineering Postmortems
+### Positions, Architecture & Engineering Postmortems
 1. **[`[Position]` The Second Half of the Bitter Lesson: Why Commercial Inference Is Returning to Dirty Priors, and Why Engine Forks Break the Economics of Search](en/01-after-the-bitter-lesson.md)**
 2. **[`[Postmortem]` Deleting 450,000 Lines of Polyhedral C for 40 Lines of Longest-Path: An Over-Engineering Postmortem](en/02-forty-lines-over-polyhedral-ir.md)**
+11. **[`[Architecture · State Layer]` Beyond PagedAttention: Unifying Stateful Inference Algorithms on One Tensor State Layer (PTTS)](en/11-ptts-beyond-paged-attention.md)**
 
 ### Technical Deep Dives & Diagnostic Methods
 3. **[`[Deep Dive · Bandwidth & Quotas]` Why 32 Thread Blocks Beat 9,600—and Skipping 23% of Tokens Saves Zero Time: Bandwidth and SM Quotas in Continuous Batching](en/03-bandwidth-and-sm-quotas.md)**

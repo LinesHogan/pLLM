@@ -67,7 +67,7 @@ Organized by capability: each page explains what a feature is and when to use it
 
 ## Further Reading
 
-- [Standalone Technical Essays (EN / ZH)](../blog/README.md): ten standalone articles covering inference-time algorithm trends, scheduler retrospectives, bandwidth quotas, mantissa/bit tricks, compiled fast-weight training, static-graph pointer addressing, GPU memory MVCC/RCU, attention layouts, `attn_metadata` unpacking, and multi-tenant verification
+- [Standalone Technical Essays (EN / ZH)](../blog/README.md): eleven standalone articles covering inference-time algorithm trends, unified tensor state management, scheduler retrospectives, bandwidth quotas, mantissa/bit tricks, compiled fast-weight training, static-graph pointer addressing, GPU memory MVCC/RCU, attention layouts, `attn_metadata` unpacking, and multi-tenant verification
 
 ## Examples
 

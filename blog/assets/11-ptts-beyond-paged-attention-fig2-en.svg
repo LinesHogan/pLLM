@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 436" width="100%" role="img" aria-label="Three system mechanisms built on PTTS slot descriptors">
+  <style>
+    .title { font: 700 16px "DM Sans", -apple-system, sans-serif; fill: #111111; }
+    .label { font: 600 13px "DM Sans", -apple-system, sans-serif; fill: #111111; }
+    .sub { font: 400 12px "DM Sans", -apple-system, sans-serif; fill: #3f3f46; }
+    .mono { font: 600 12px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 10.5px "JetBrains Mono", monospace; }
+  </style>
+  <defs>
+    <marker id="arrow-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 1 1.5 L 8.5 5 L 1 8.5 z" fill="#0047ab"/>
+    </marker>
+  </defs>
+
+  <rect x="4" y="4" width="912" height="428" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+
+  <text x="28" y="34" class="title">FIG 02 · Three Mechanisms Built on the Same Slot-Tuple Primitive</text>
+  <text x="28" y="54" class="sub">Representing state versions as integer slot tuples turns sharing, layer routing, and KV safety into metadata rules</text>
+
+  <!-- Band 1: Chunked TTT Carry -->
+  <rect x="28" y="76" width="864" height="104" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <rect x="44" y="90" width="188" height="24" rx="4" fill="#059669"/>
+  <text x="138" y="106" text-anchor="middle" class="badge" fill="#ffffff">1. UNCHANGED SLOT CARRY</text>
+  <text x="44" y="136" class="sub">In-Place TTT decode</text>
+  <text x="44" y="158" class="mono">changed == False</text>
+
+  <rect x="248" y="96" width="192" height="64" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="262" y="122" class="label">Root v_t</text>
+  <text x="262" y="144" class="mono">(w_base=#0, delta=#4)</text>
+
+  <line x1="440" y1="128" x2="508" y2="128" stroke="#111111" stroke-width="1.8" marker-end="url(#arrow-ink)"/>
+  <text x="474" y="118" text-anchor="middle" class="sub">carry ID</text>
+
+  <rect x="512" y="96" width="192" height="64" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <text x="526" y="122" class="label">Root v_{t+1}</text>
+  <text x="526" y="144" class="mono">(w_base=#0, delta=#4)</text>
+
+  <text x="720" y="122" class="sub">0 pages allocated</text>
+  <text x="720" y="144" class="sub">Saves 570 MiB/req copy</text>
+
+  <!-- Band 2: LayerRoute -->
+  <rect x="28" y="196" width="864" height="104" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.6"/>
+  <rect x="44" y="210" width="188" height="24" rx="4" fill="#0047ab"/>
+  <text x="138" y="226" text-anchor="middle" class="badge" fill="#ffffff">2. LAYER-SLOT DECOUPLING</text>
+  <text x="44" y="256" class="sub">LayerRoute live switch</text>
+  <text x="44" y="278" class="mono">over = (4, 12, 20)</text>
+
+  <rect x="248" y="216" width="192" height="64" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="262" y="242" class="label">Single Parameter Slot</text>
+  <text x="262" y="264" class="mono">layer=20, vec=slot#2</text>
+
+  <line x1="440" y1="248" x2="508" y2="248" stroke="#0047ab" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="474" y="238" text-anchor="middle" class="sub">L2 check</text>
+
+  <rect x="512" y="216" width="192" height="64" rx="5" fill="#ffffff" stroke="#0047ab" stroke-width="1.5"/>
+  <text x="526" y="242" class="label">Layers 4, 12 exit early</text>
+  <text x="526" y="264" class="label">Layer 20 reads slot#2</text>
+
+  <text x="720" y="242" class="sub">O(1) parameter memory</text>
+  <text x="720" y="264" class="sub">Zero graph recapture</text>
+
+  <!-- Band 3: Causal Split -->
+  <rect x="28" y="316" width="864" height="96" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.6"/>
+  <rect x="44" y="330" width="188" height="24" rx="4" fill="#111111"/>
+  <text x="138" y="346" text-anchor="middle" class="badge" fill="#ffffff">3. STATIC CAUSAL SPLIT</text>
+  <text x="44" y="376" class="sub">Checked before GPU load</text>
+  <text x="44" y="396" class="mono">explain admission</text>
+
+  <rect x="248" y="332" width="294" height="64" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="262" y="356" class="mono">model_reads \ kv_model_reads</text>
+  <text x="262" y="378" class="sub">Read-only probes: prefix cache &amp; replay safe</text>
+
+  <rect x="560" y="332" width="314" height="64" rx="5" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="574" y="356" class="mono">kv_model_reads (live-mutated)</text>
+  <text x="574" y="378" class="sub">Alters K/V: disables prefix cache, guards replay</text>
+</svg>
