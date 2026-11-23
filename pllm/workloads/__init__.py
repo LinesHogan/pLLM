@@ -1,5 +1,10 @@
 """Maintained algorithms using the shared authoring and execution contracts."""
 
+from pllm.workloads.concertina import (
+    ConcertinaConfig as ConcertinaConfig,
+    ConcertinaWorkload as ConcertinaWorkload,
+    prepare_concertina_checkpoint as prepare_concertina_checkpoint,
+)
 from pllm.workloads.dola import DoLaWorkload as DoLaWorkload
 from pllm.workloads.dummy import DummyConfig as DummyConfig, DummyWorkload as DummyWorkload
 from pllm.workloads.esamp import (

@@ -85,7 +85,7 @@ from pllm.execution.token_program import Over, Segment, Tokens
 from pllm.execution.trace import TraceEvent
 
 if TYPE_CHECKING:
-    from pllm.usage import ActivationPatch, InstanceState
+    from pllm.usage import ActivationPatch, InstanceState, SharedLayers
     from pllm.workload import Workload
 
 
@@ -269,6 +269,7 @@ class WorkloadContext:
     # Each declared pllm.model.Adapter as the projection delta it applies.
     adapters: dict[str, ProjectionDelta] = field(default_factory=lambda: {})
     activations: dict[str, ActivationPatch] = field(default_factory=lambda: {})
+    shared_layers: dict[str, SharedLayers] = field(default_factory=lambda: {})
     position_definitions: dict[str, PositionState] = field(default_factory=lambda: {})
     # Ordered (name, digest) entries folded into the graph's execution parameters digest.
     operations: list[Operation] = field(default_factory=lambda: [])
@@ -887,6 +888,17 @@ def declare_patch(context: WorkloadContext, name: str, patch: ActivationPatch) -
 
 def lower_workload(context: WorkloadContext, b: TensorDeclaration, capabilities: tuple[str, ...] = ()) -> None:
     """Declare a reflected workload's states and operations into `b`, then compose and sign their graph."""
+    seen_shared: set[int] = set()
+    for name, shared in context.shared_layers.items():
+        for group in shared.groups:
+            for layer in group:
+                if layer >= b.dimensions.layer_count:
+                    raise ValueError(
+                        f"{name}: SharedLayers index {layer} is outside the model's {b.dimensions.layer_count} layers"
+                    )
+                if layer in seen_shared:
+                    raise ValueError(f"{name}: SharedLayers index {layer} overlaps another SharedLayers declaration")
+                seen_shared.add(layer)
     adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
     for component in context.components:
         component.binding = b

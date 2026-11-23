@@ -20,11 +20,12 @@ OverlayRefresh = Literal["step", "admission"]
 class ParameterOverlayOperator(StrEnum):
     DENSE_ADD = "dense_add"
     LOW_RANK_ADD = "low_rank_add"
+    GATED_LOW_RANK_ADD = "gated_low_rank_add"
     HEAD_ADD = "head_add"
 
 
 # Hugging Face module names of the projections pLLM can adapt, in their order inside one decoder layer.
-ProjectionName = Literal["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
+ProjectionName = Literal["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 _PROJECTION_ORDER: tuple[ProjectionName, ...] = get_args(ProjectionName)
 
 
@@ -146,7 +147,7 @@ class ProjectionDelta:
     targets: tuple[Projection, ...]
     weight: str = "value"
     operator: ParameterOverlayOperator = ParameterOverlayOperator.DENSE_ADD
-    factors: tuple[str, str] = ("a", "b")
+    factors: tuple[str, ...] = ("a", "b")
     scale: float = 1.0
     route: LayerRouteSelector | None = None
     refresh: OverlayRefresh = "admission"
@@ -155,7 +156,11 @@ class ProjectionDelta:
     @property
     def applied_fields(self) -> tuple[str, ...]:
         """The fields consumed by the declared projection operator."""
-        return self.factors if self.operator is ParameterOverlayOperator.LOW_RANK_ADD else (self.weight,)
+        return (
+            self.factors
+            if self.operator in (ParameterOverlayOperator.LOW_RANK_ADD, ParameterOverlayOperator.GATED_LOW_RANK_ADD)
+            else (self.weight,)
+        )
 
     def expand(self, layers: int) -> Self:
         """The same effect with layer=None or routed targets resolved against a model of `layers` layers."""

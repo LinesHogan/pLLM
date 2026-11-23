@@ -9,7 +9,12 @@ from pllm.contracts.parameter_overlay import Projection as Projection
 from pllm.execution.attention import PagedKV as PagedKV
 from pllm.execution.causal_batch import CausalModel as CausalModel
 from pllm.execution.token_program import LayerOutputs as LayerOutputs, Layers as Layers
-from pllm.usage import ActivationPatch as ActivationPatch, Adapter as Adapter, LayerRoute as LayerRoute
+from pllm.usage import (
+    ActivationPatch as ActivationPatch,
+    Adapter as Adapter,
+    LayerRoute as LayerRoute,
+    SharedLayers as SharedLayers,
+)
 
 __all__ = [
     "ActivationPatch",
@@ -20,4 +25,5 @@ __all__ = [
     "Layers",
     "Projection",
     "PagedKV",
+    "SharedLayers",
 ]

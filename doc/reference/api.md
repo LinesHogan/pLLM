@@ -536,7 +536,7 @@ says what a step without a new version does ("stop" the request or "hold" the la
 ### `pllm.model.Adapter`
 
 ```text
-pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, str]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = ())
+pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, ...]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = ())
 ```
 
 Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
@@ -582,6 +582,17 @@ at bind time. At runtime, the scalar int64 field `state.field` selects one physi
 or `-1` to disable the route for that row/step without recapturing CUDA graphs. Derived reads,
 `patch(decode=True)` and `adapter(...)` default to `refresh="step"` (Forward-only KV; `patch(decode=False)`
 defaults to `refresh="admission"`).
+
+### `pllm.model.SharedLayers`
+
+```text
+pllm.model.SharedLayers(groups: 'tuple[tuple[int, ...], ...]')
+```
+
+Tie each group's linear projection weights to its first layer at model load.
+
+Each layer keeps its own RMSNorm weights and KV cache slot; only linear projection weights
+(qkv_proj, o_proj, gate_up_proj, down_proj) share GPU storage across the layers in a group.
 
 ### `pllm.train_in_forward`
 

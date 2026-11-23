@@ -27,6 +27,7 @@ from pllm.contracts.semantic_graph import (
     SemanticOutputKind,
     SemanticTask,
     StateEffectKind,
+    StateScope,
     StateSelectionInputSource,
     StepIdInputSource,
     TaskResourceFact,
@@ -68,31 +69,66 @@ def attachment_buffer_bytes(
         buffers += probe.blas_workspace_bytes
     pinned_rows = min(rows, probe.causal_domain.requests) if graph.updates_in_forward and probe.causal_domain else rows
     decode_updates = graph.updates_in_forward and HiddenPhase.DECODE in attachment.overlay_phases
+    static_instances = {
+        state.resource for state in graph.states if state.scope is StateScope.INSTANCE and state.immutable
+    }
+    static_scratch = 0
     for binding in attachment.overlay_bindings:
+        is_static_instance = (
+            pinned
+            and not graph.updates_in_forward
+            and graph.custom_forward_task is None
+            and binding.route is None
+            and not attachment.overlay_phases
+            and binding.resource in static_instances
+        )
         if binding.reads_embedding:
             buffers += rows * hidden * width
-        buffers += rows  # Scalar prompt-end operands for the largest request set.
+        if not is_static_instance:
+            buffers += rows  # Scalar prompt-end operands for the largest request set.
         first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:
             outputs, inputs = first
             operands = rows * (width * (inputs + hidden) + 8)
-            buffers += rows * width * outputs
-            if pinned or graph.custom_forward_task is not None:
-                buffers += pinned_rows * (width * (inputs + hidden) + 8)
-            if not pinned or graph.updates_in_forward:
-                # Exact projections consume each layer's operands immediately.
-                # The context retains the previous segment until the next replaces it.
-                projection_operands.append(operands)
+            if is_static_instance:
+                static_scratch = max(static_scratch, rows * width * outputs)
+            else:
+                buffers += rows * width * outputs
+                if pinned or graph.custom_forward_task is not None:
+                    buffers += pinned_rows * (width * (inputs + hidden) + 8)
+                if not pinned or graph.updates_in_forward:
+                    # Exact projections consume each layer's operands immediately.
+                    # The context retains the previous segment until the next replaces it.
+                    projection_operands.append(operands)
         elif binding.operator is ParameterOverlayOperator.HEAD_ADD:
             heads, width_per_head, _ = first
             inputs = outputs = heads * width_per_head
-            # Owned capture, fp32 input/correction, layout copy, cast and addition.
-            buffers += rows * (6 * width * heads * width_per_head + 8)
+            scratch = rows * (6 * width * heads * width_per_head + 8)
+            if is_static_instance:
+                static_scratch = max(static_scratch, scratch)
+            else:
+                # Owned capture, fp32 input/correction, layout copy, cast and addition.
+                buffers += scratch
+        elif binding.operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD:
+            experts, rank, inputs = first
+            outputs = binding.fields[1].shape[-2]
+            gates = binding.fields[2].shape[0]
+            scratch = rows * (width * (inputs + gates + experts * rank + 2 * outputs) + 8)
+            if is_static_instance:
+                static_scratch = max(static_scratch, scratch)
+            else:
+                buffers += scratch
         else:
             rank, inputs = first
             outputs = binding.fields[1].shape[0]
-            buffers += rows * (width * (inputs + rank + 2 * outputs) + 8)
-        if probe.causal_domain is not None and pinned:
+            scratch = rows * (width * (inputs + rank + 2 * outputs) + 8)
+            if is_static_instance:
+                static_scratch = max(static_scratch, scratch)
+            else:
+                buffers += scratch
+        if is_static_instance:
+            buffers += 24  # Single-element address token for the captured custom op.
+        elif probe.causal_domain is not None and pinned:
             blocks = 1 if decode_updates else projection_blocks(pinned_rows, probe.causal_domain.requests)
             buffers += 24 * (blocks * (ROWS_PER_BLOCK + len(binding.fields)) + rows)
             buffers += 2 * blocks * sum(prod(field.shape) * width for field in binding.fields)
@@ -100,6 +136,7 @@ def attachment_buffer_bytes(
             if graph.custom_forward_task is not None and attachment.in_forward is None:
                 # Per-call row ownership, inverse span mapping and remapped projection ports.
                 buffers += 8 * (3 * rows + blocks * ROWS_PER_BLOCK + probe.causal_domain.requests * len(binding.fields))
+    buffers += static_scratch
     state_layouts = {entry.resource: entry.layout for entry in layouts.layouts}
     for binding in attachment.activation_bindings:
         shape = binding.fields[0].shape

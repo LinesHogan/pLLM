@@ -628,10 +628,10 @@ why_zh = '''MoE 层把 token 路由给不同专家，没有单一的稠密 MLP �
 fix_zh = '''改写该层的 `q_proj`、`k_proj` 或 `v_proj`'''
 
 [[section.error]]
-message = '''layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)'''
-why = '''Qwen3.5 linear-attention layers have no standard q/k/v projections.'''
+message = '''layer ... is a Gated DeltaNet layer without q/k/v/o projections; choose a full-attention layer (see layer_types in the model config)'''
+why = '''Qwen3.5 linear-attention layers have no standard q/k/v/o projections.'''
 fix = '''Target a full-attention layer (`layer_types` in the model config).'''
-why_zh = '''Qwen3.5 的线性 attention 层没有标准的 q/k/v 投影'''
+why_zh = '''Qwen3.5 的线性 attention 层没有标准的 q/k/v/o 投影'''
 fix_zh = '''改写全注意力层（见模型配置的 `layer_types`）'''
 
 [[section.error]]

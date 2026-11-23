@@ -70,7 +70,7 @@ from pllm.execution.workload_lowering import (
     model_declaration,
     reserve_resources,
 )
-from pllm.usage import ActivationPatch, Adapter, InstanceState, Phase, RequestState
+from pllm.usage import ActivationPatch, Adapter, InstanceState, Phase, RequestState, SharedLayers
 
 C = TypeVar("C")
 
@@ -203,6 +203,7 @@ class Workload:
                     trains_on_batch = True
                 inputs.update((name, tuple(arguments.values())) for name, arguments in sources.items())
         declared = BackendRequirements(
+            shared_layer_groups=tuple(group for shared in context.shared_layers.values() for group in shared.groups),
             parameter_targets=tuple(
                 target for delta in context.adapters.values() if delta.route is None for target in delta.targets
             ),
@@ -441,6 +442,7 @@ def read_workload(workload: Workload) -> WorkloadContext:
     root.state_definitions = {key: value for context in contexts for key, value in context.state_definitions.items()}
     root.adapters = {key: value for context in contexts for key, value in context.adapters.items()}
     root.activations = {key: value for context in contexts for key, value in context.activations.items()}
+    root.shared_layers = {key: value for context in contexts for key, value in context.shared_layers.items()}
     root.position_definitions = {
         key: value for context in contexts for key, value in context.position_definitions.items()
     }
@@ -461,6 +463,7 @@ def read_workload(workload: Workload) -> WorkloadContext:
         context.state_definitions = root.state_definitions
         context.adapters = root.adapters
         context.activations = root.activations
+        context.shared_layers = root.shared_layers
         context.position_definitions = root.position_definitions
         context.operations = root.operations
         context.custom_forwards = root.custom_forwards
@@ -494,6 +497,7 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
     context.state_definitions = _of_type(values, InstanceState)
     context.adapters = {key: value.delta for key, value in _of_type(values, Adapter).items()}
     context.activations = _of_type(values, ActivationPatch)
+    context.shared_layers = _of_type(values, SharedLayers)
     context.position_definitions = _of_type(values, PositionState)
     _namespace(context)
     return context
@@ -613,6 +617,7 @@ def _namespace(context: WorkloadContext) -> None:
         )
         for key, value in context.activations.items()
     }
+    context.shared_layers = {context.qualify(key): value for key, value in context.shared_layers.items()}
     context.position_definitions = {context.qualify(key): value for key, value in context.position_definitions.items()}
     context.in_forward_states = {context.qualify(key) for key in context.in_forward_states}
     context.custom_forwards = [(context.qualify(key), tokens, over) for key, tokens, over in context.custom_forwards]
@@ -643,7 +648,7 @@ def _members(owner: object) -> dict[str, object]:
 
 def _values(owner: object) -> dict[str, object]:
     """Authoring values: scalar and declaration class attributes plus instance and dataclass fields."""
-    markers = (InstanceState, ActivationPatch, Adapter, PositionState, Workload)
+    markers = (InstanceState, ActivationPatch, Adapter, PositionState, SharedLayers, Workload)
     result: dict[str, object] = {
         name: member
         for name, member in _members(owner).items()
@@ -685,7 +690,7 @@ def _property(member: object) -> FunctionType | None:
             f"property {getter.__name__!r} needs a return annotation; annotate state declarations with "
             "-> pllm.RequestState or -> pllm.InstanceState, and other properties with their return type"
         )
-    declared = (InstanceState, RequestState, ActivationPatch, Adapter, PositionState)
+    declared = (InstanceState, RequestState, ActivationPatch, Adapter, PositionState, SharedLayers)
     return getter if getter is not None and _return_type(getter) in declared else None
 
 
@@ -722,7 +727,7 @@ def _check_base_collisions(owner: Workload) -> None:
             if (
                 name in own_fields
                 or _property(value) is not None
-                or isinstance(value, (InstanceState, ActivationPatch, Adapter, PositionState))
+                or isinstance(value, (InstanceState, ActivationPatch, Adapter, PositionState, SharedLayers))
                 or isinstance(value, FunctionType)
                 and any(key.startswith("__pllm_") for key in vars(value))
             ):
