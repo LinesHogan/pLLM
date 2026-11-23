@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pllm"
-version = "0.5.0"
+version = "0.5.1"
 description = "Run stateful and adaptive inference-time PyTorch algorithms inside vLLM with CUDA graphs"
 readme = "README.md"
 requires-python = ">=3.11"

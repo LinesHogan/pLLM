@@ -35,19 +35,7 @@ AOTAutograd 中的 Functionalization 负责把包含原地修改的图转换成�
 
 把这三步放到时间线上对照，原因就清楚了：
 
-```text
-【即时模式 Eager】
-  tap_pool (初值 0) ──────────────────▶ Tap.copy 顺着 self.pool 引用直接写入 [7,7,7,7] ──▶ 结果: [7,7,7,7]
-
-【AOT Functionalization 模式下：声明了 writes，内部却走全局字典写原张量】
-  tap_pool (初值 0) ─┬─ 1. 编译器克隆 ─▶ writes_clone[0] (初值 0) ──▶ 传入 model_site(..., writes_clone)
-                     │                                                       │
-                     │                      (emit 未读取也未写入形参 writes_clone)
-                     │                                                       │
-                     ├─ 2. 旁路直接写 ◀── _SITES[ptr].hooks[h].emit 顺着 self.pool 写入 [7,7,7,7]
-                     │
-                     └─ 3. 尾声回写   ◀── tap_pool.copy_(writes_clone[0]) 用仍为 0 的克隆副本覆盖原张量
-```
+![即时模式写入与 AOT 函数化克隆回写覆盖对比](../assets/personal-01-fig1-zh.svg)
 
 `outputs` 之所以结果正常，是因为 `emit(inputs, outputs)` 确实往形参 `outputs` 上写了数据，克隆副本被更新成了 `[7, 7, 7, 7]`，回写时自然保留了下来。而 `tap_pool` 虽然被外层放进了 `writes` 列表告知编译器“该参数会被修改”，`emit` 内部却没有使用 `writes` 形参，而是直接修改了 Python 对象属性里持有的 `self.pool.tensors[0]`。
 
@@ -61,13 +49,7 @@ AOTAutograd 中的 Functionalization 负责把包含原地修改的图转换成�
 
 将 `self._copy_taps(normed, residual)` 从 `emit` 内部移到外层 `graph_forward` 中，放在 `run_hook` 之后直接调用：
 
-```text
-  branch, stream ──▶ pllm::model_site (只计算 normed 与 residual，不再声明也不触碰 tap_pool)
-                           │
-                           ▼
-                     normed, residual ──▶ pllm::routed_tap_copy(..., pool, slot_layers, layer_id)
-                                          (声明 mutates_args=("pool", "slot_layers")，内核直接写传入形参)
-```
+![拆分纯计算边界算子与显式形参写入算子](../assets/personal-01-fig2-zh.svg)
 
 拆分之后，`routed_tap_copy` 直接把 `pool` 和伴随的层号数组 `slot_layers` 作为张量形参接收并在内核里原地写入。AOT 函数化克隆形参、内核修改克隆副本、尾声拷回原池，数据流与编译器的假设保持一致。
 

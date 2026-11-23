@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 158" width="100%" role="img" aria-label="FIG 02 · Fix: Decoupling Pure Boundary Site Op from Explicit Tensor-Arg Copy">
+  <style>
+    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
+    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
+  </style>
+  <defs>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="952" height="150" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <text x="28" y="34" class="title">FIG 02 · Fix: Decoupling Pure Boundary Site Op from Explicit Tensor-Arg Copy</text>
+
+  <rect x="28" y="60" width="164" height="68" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.4"/>
+  <text x="110" y="90" text-anchor="middle" class="mono">branch, stream</text>
+  <text x="110" y="110" text-anchor="middle" class="muted">Layer inputs</text>
+
+  <line x1="192" y1="94" x2="228" y2="94" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+
+  <rect x="232" y="54" width="310" height="80" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.6"/>
+  <text x="387" y="80" text-anchor="middle" class="mono" fill="#0047ab">pllm::model_site</text>
+  <text x="387" y="101" text-anchor="middle" class="sub">Computes normed &amp; residual only</text>
+  <text x="387" y="120" text-anchor="middle" class="muted">Never declares or touches tap_pool</text>
+
+  <line x1="542" y1="94" x2="578" y2="94" stroke="#0047ab" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+
+  <rect x="582" y="54" width="350" height="80" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="757" y="80" text-anchor="middle" class="mono" fill="#059669">pllm::routed_tap_copy</text>
+  <text x="757" y="101" text-anchor="middle" class="sub">mutates_args = (pool, slot_layers)</text>
+  <text x="757" y="120" text-anchor="middle" class="muted">Mutates passed tensor args &amp; records layer_id</text>
+</svg>

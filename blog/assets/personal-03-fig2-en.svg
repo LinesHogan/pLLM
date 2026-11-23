@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 254" width="100%" role="img" aria-label="FIG 02 · PyTorch Weak-Scalar BF16 Rounding vs. Multi-GPU FP32 Partial-Sum Output">
+  <style>
+    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
+    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
+  </style>
+  <defs>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="952" height="246" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <text x="28" y="34" class="title">FIG 02 · PyTorch Weak-Scalar BF16 Rounding vs. Multi-GPU FP32 Partial-Sum Output</text>
+
+  <rect x="28" y="54" width="904" height="76" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="42" y="66" width="250" height="20" rx="4" fill="#0047ab"/>
+  <text x="167" y="80" text-anchor="middle" class="badge" fill="#ffffff">REFERENCE: (result_bf16 * 0.123).to(fp32)</text>
+  <text x="42" y="105" class="sub">bf16(27.0) * Python float(0.123) -> stays bf16 under weak-scalar rule -> 3.321 rounds to bf16(3.328125) -> fp32(3.328125)</text>
+
+  <rect x="28" y="142" width="904" height="94" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <rect x="42" y="154" width="290" height="20" rx="4" fill="#e62b2b"/>
+  <text x="187" y="168" text-anchor="middle" class="badge" fill="#ffffff">INITIAL TRITON: (corr_bf16.to(fp32) * scale)</text>
+  <text x="42" y="194" class="sub">• Single GPU (out_dtype = bf16): fp32(3.3210001) casts to bf16(3.328125) on store, masking the intermediate gap</text>
+  <text x="42" y="218" class="sub">• Multi-GPU TP down_proj (out_dtype = fp32): writes 3.3210001 directly into FP32 buffer (0.007125 drift vs. reference)</text>
+</svg>

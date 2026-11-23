@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 168" width="100%" role="img" aria-label="FIG 01 · Stale Admission Pin When schedule() Locks InstanceState Before StateImport">
+  <style>
+    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
+    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
+  </style>
+  <defs>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="952" height="160" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <text x="28" y="34" class="title">FIG 01 · Stale Admission Pin When schedule() Locks InstanceState Before StateImport</text>
+
+  <rect x="28" y="56" width="276" height="92" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="42" y="80" class="label" fill="#b91c1c">1. driver.schedule(new_reqs)</text>
+  <text x="42" y="103" class="sub">Reads current InstanceState v0 (layer=0)</text>
+  <text x="42" y="124" class="mono">inference_pin[req] = v0</text>
+
+  <line x1="304" y1="102" x2="334" y2="102" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+
+  <rect x="338" y="56" width="276" height="92" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <text x="352" y="80" class="label" fill="#0047ab">2. driver.begin -> prepare</text>
+  <text x="352" y="103" class="sub">Runs batched StateImport(layer=6)</text>
+  <text x="352" y="124" class="mono">publishes v1 (layer=6)</text>
+
+  <line x1="614" y1="102" x2="644" y2="102" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+
+  <rect x="648" y="56" width="284" height="92" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.5"/>
+  <text x="662" y="80" class="label">3. model.execute Split View</text>
+  <text x="662" y="103" class="sub">• refresh='step' sees v1 (layer=6)</text>
+  <text x="662" y="124" class="sub">• refresh='admission' stuck on v0</text>
+</svg>

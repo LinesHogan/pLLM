@@ -1,6 +1,6 @@
 # pLLM: Programmable LLM（可编程大语言模型推理层）
 
-[![Release: v0.5.0](https://img.shields.io/badge/Release-v0.5.0-e62b2b.svg)](https://github.com/LinesHogan/pLLM/releases/tag/v0.5.0)
+[![Release: v0.5.1](https://img.shields.io/badge/Release-v0.5.1-e62b2b.svg)](https://github.com/LinesHogan/pLLM/releases/tag/v0.5.1)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](pyproject.toml)
 [![vLLM 0.27–0.34](https://img.shields.io/badge/vLLM-0.27--0.34-111111.svg)](doc/reference/support-matrix.md)
@@ -22,7 +22,7 @@ pLLM 与 vLLM 的关系类似 eBPF 之于 Linux 内核：无需 fork 或改动 v
 | 推理期需求 | 直接改 PyTorch hook 或维护 vLLM 分支的阻碍 | 在 pLLM 中的声明式原语 |
 | --- | --- | --- |
 | **读取隐藏状态或逐层 logits**（探针、SAE、Logit Lens、DoLa） | 多请求交错排布，CUDA graph 重放时不触发 Python hook | `pllm.hidden(layer)`、`pllm.residual(layer)`、`pllm.layer_logits(...)`、`@pllm.export`、`@pllm.add_logits` |
-| **按请求或会话叠加激活 / 权重**（CAA、ReFT、超网络动态 LoRA） | 手工管理槽位分配、回收与量化投影叠加极易泄漏显存或跨租户串味 | `pllm.RequestState` + `pllm.model.ActivationPatch` / `pllm.model.Adapter` |
+| **按请求/会话叠加激活或权重，及在线动态切层**（CAA、ReFT、超网络 LoRA、免重录切层） | 手工管理槽位分配、回收、量化投影叠加与层切换极易泄漏显存或被迫重新录制 CUDA graph | `pllm.RequestState` + `pllm.model.ActivationPatch` / `pllm.model.Adapter` / `pllm.model.LayerRoute` |
 | **解码过程中在线训练快权重**（ESamp、In-Place TTT、测试时学习、TTRL） | 同步反向传播阻塞解码流，多流并发又会导致原地权重读写撕裂 | `@pllm.train` / `@pllm.train_in_forward`（捕获进静态 CUDA graph，按依赖内联融合或异步重叠） |
 | **改写 forward 循环、注意力读法或 KV 布局**（早退跳层、循环深度、滑窗/Sink、大表记忆） | 手改层调度与块表极易破坏只追加分页 KV 的底层内存不变量 | `@pllm.custom_forward`、`@pllm.custom_attention`、`@pllm.custom_residual`、`pllm.input_tokens` |
 
@@ -201,7 +201,7 @@ pllm skill --install cursor   # 写入 .cursor/rules/pllm/*.md
 - **项目主页与在线文档站**：[lineshogan.github.io/pllm](https://lineshogan.github.io/pllm/)
 - **完整中文文档**：[文档首页](doc/README.md) · [00 快速上手](doc/tutorials/00_quickstart.ipynb) · [在线服务指南](doc/howto/online-serving.md) · [上生产指南](doc/howto/production.md) · [API 参考](doc/reference/api.md)
 - **英文 Agent 与参考规范**：[SKILL.md](doc/agent/SKILL.md) · [migration.md](doc/agent/migration.md) · [reference.md](doc/agent/reference.md) · [llms.txt](llms.txt)
-- **独立技术随笔与机制拆解（中英双语）**：[随笔目录](blog/README.md)（同步发布于 [个人博客](https://lineshogan.github.io/blog/)），收录十一篇围绕推理期算法演进、统一张量状态层、40 行最长路调度、带宽与 SM 配额、IEEE 754 保序位变换、编译图快权重训练、静态图指针寻址、显存无锁 MVCC/RCU、GQA/MLA 注意力布局、`attn_metadata` 解包与多租户核验的深度文章。
+- **独立技术随笔与底层排障手记（中英双语）**：[主专栏目录](blog/README.md) 与 [动态切层排障手记](blog/personal/README.md)（同步分类发布于 [个人博客](https://lineshogan.github.io/blog/)），共十五篇中英双语文章，涵盖趋势与状态层抽象、引擎底层机制深潜，以及 `torch.compile` 函数化、早退 Triton 内核、IEEE 754 浮点舍入与多版本状态生命周期排障。
 
 ---
 

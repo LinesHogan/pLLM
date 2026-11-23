@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 332" width="100%" role="img" aria-label="动态切层（LayerRoute）四类底层排障落点">
+  <style>
+    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
+    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
+  </style>
+  <defs>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="952" height="324" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <text x="28" y="34" class="title">动态切层（LayerRoute）四类底层排障落点</text>
+  <text x="28" y="54" class="sub">四篇手记分别对应一次连续批处理推理步中的调度、静态图、算子数值与编译器阶段</text>
+  <rect x="28" y="74" width="266" height="46" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="40" y="87" width="68" height="20" rx="4" fill="#059669"/>
+  <text x="74" y="101" text-anchor="middle" class="badge" fill="#ffffff">STAGE 1</text>
+  <text x="118" y="102" class="label">请求准入与多步调度</text>
+  <line x1="294" y1="97" x2="320" y2="97" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+  <rect x="324" y="74" width="608" height="46" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <rect x="336" y="87" width="42" height="20" rx="4" fill="#111111"/>
+  <text x="357" y="101" text-anchor="middle" class="badge" fill="#ffffff">[04]</text>
+  <text x="390" y="102" class="sub">准入快照时机、抢占重算边界、AdamW 页类型与多词导出对齐</text>
+  <line x1="161" y1="120" x2="161" y2="136" stroke="#111111" stroke-width="1.6" marker-end="url(#arr-ink)"/>
+  <rect x="28" y="136" width="266" height="46" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="40" y="149" width="68" height="20" rx="4" fill="#0047ab"/>
+  <text x="74" y="163" text-anchor="middle" class="badge" fill="#ffffff">STAGE 2</text>
+  <text x="118" y="164" class="label">CUDA Graph 静态图</text>
+  <line x1="294" y1="159" x2="320" y2="159" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+  <rect x="324" y="136" width="608" height="46" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <rect x="336" y="149" width="42" height="20" rx="4" fill="#111111"/>
+  <text x="357" y="163" text-anchor="middle" class="badge" fill="#ffffff">[02]</text>
+  <text x="390" y="164" class="sub">条件子图工作区膨胀、L2 早退 Triton 内核与回退分支同步陷阱</text>
+  <line x1="161" y1="182" x2="161" y2="198" stroke="#111111" stroke-width="1.6" marker-end="url(#arr-ink)"/>
+  <rect x="28" y="198" width="266" height="46" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="40" y="211" width="68" height="20" rx="4" fill="#d99b26"/>
+  <text x="74" y="225" text-anchor="middle" class="badge" fill="#111111">STAGE 3</text>
+  <text x="118" y="226" class="label">融合算子数值一致性</text>
+  <line x1="294" y1="221" x2="320" y2="221" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+  <rect x="324" y="198" width="608" height="46" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <rect x="336" y="211" width="42" height="20" rx="4" fill="#111111"/>
+  <text x="357" y="225" text-anchor="middle" class="badge" fill="#ffffff">[03]</text>
+  <text x="390" y="226" class="sub">IEEE 754 FP16 尾数吸收效应、弱类型标量乘法截断与步长检查</text>
+  <line x1="161" y1="244" x2="161" y2="260" stroke="#111111" stroke-width="1.6" marker-end="url(#arr-ink)"/>
+  <rect x="28" y="260" width="266" height="46" rx="6" fill="#f5f5f4" stroke="#111111" stroke-width="1.5"/>
+  <rect x="40" y="273" width="68" height="20" rx="4" fill="#e62b2b"/>
+  <text x="74" y="287" text-anchor="middle" class="badge" fill="#ffffff">STAGE 4</text>
+  <text x="118" y="288" class="label">torch.compile 函数化</text>
+  <line x1="294" y1="283" x2="320" y2="283" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
+  <rect x="324" y="260" width="608" height="46" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.4"/>
+  <rect x="336" y="273" width="42" height="20" rx="4" fill="#111111"/>
+  <text x="357" y="287" text-anchor="middle" class="badge" fill="#ffffff">[01]</text>
+  <text x="390" y="288" class="sub">auto_functionalized 克隆回写覆盖问题与物理执行层号记录</text>
+</svg>

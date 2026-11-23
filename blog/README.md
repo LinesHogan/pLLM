@@ -38,6 +38,13 @@ Eleven peer-independent articles (in Chinese and English) written for the infere
 10. **[`[极客拆解 · 多租户核验]` 《`h - h.mean(dim=0)` 一行错都不报，却会让多租户推理串味：把连续批处理调度变成可测数据》](zh/10-schedule-as-data-verification.md)**  
    *用零字节 `meta` 追踪拦截隐式同步，将连续批处理压缩为静态整数三元组（Schedule-as-Data）；配合分块/抢占不变性、百万加盐蜕变测试与单行 `return None` 抢占注入，两秒内在笔记本 CPU 上抓出跨租户泄密。*
 
+### 编译、算子与多版本状态排障手记 (`blog/personal/`)
+- **[动态切层（`LayerRoute`）四篇排障手记总览](personal/README.md)**
+  1. **[`[编译与自定义算子]` 《自定义算子接入 `torch.compile` 后写入失效：从一次排障看 PyTorch AOT 函数化》](personal/01-aot-functionalization-and-custom-ops.md)**
+  2. **[`[静态图与早退内核]` 《不重录 CUDA Graph 实现动态切层：条件子图、掩码求值与早退 Triton 内核的比较》](personal/02-early-exit-triton-vs-conditional-cudagraph.md)**
+  3. **[`[浮点算术与张量并行]` 《融合 Triton 内核与 PyTorch 原生算子的两次舍入差异：FP16 吸收效应与弱类型标量》](personal/03-fp16-bf16-rounding-traps-in-fused-kernels.md)**
+  4. **[`[多版本状态与连续批处理]` 《连续批处理下的状态生命周期排障：准入快照时机、抢占重算边界与导出维度对齐》](personal/04-mvcc-pins-preemption-and-batch-dedup.md)**
+
 ---
 
 ## English Articles (`blog/en/`)
@@ -56,3 +63,10 @@ Eleven peer-independent articles (in Chinese and English) written for the infere
 8. **[`[Deep Dive · Attention Layouts]` Why Reading 98% Less History Ran 5x Slower—and Broke on DeepSeek: Rethinking Custom Attention from Memory Layouts](en/08-attention-from-gqa-to-mla.md)**
 9. **[`[Deep Dive · Unpacking Jagged Batches]` Reconstructing Token Coordinates in Flattened Batches: Probing vLLM's `attn_metadata` and Sync-Free On-GPU Parsing](en/09-anatomy-of-attn-metadata.md)**
 10. **[`[Deep Dive · Multi-Tenant Verification]` `h - h.mean(dim=0)` Throws Zero Errors While Leaking Prompts Across Tenants: Turning Batch Schedules into Testable Data](en/10-schedule-as-data-verification.md)**
+
+### Compiler, Kernel & State Lifecycle Debugging Postmortems (`blog/personal/en/`)
+- **[LayerRoute Debugging Postmortems Index](personal/README.md)**
+  1. **[`[Compiler & Custom Ops]` Why Custom Op Writes Disappear Under `torch.compile`: Debugging PyTorch AOT Functionalization](personal/en/01-aot-functionalization-and-custom-ops.md)**
+  2. **[`[CUDA Graphs & Triton]` Dynamic Layer Switching Without Recapturing CUDA Graphs: Conditional Subgraphs, Masked Evaluation, and Early-Exit Triton Kernels](personal/en/02-early-exit-triton-vs-conditional-cudagraph.md)**
+  3. **[`[IEEE 754 & Tensor Parallelism]` Two Rounding Divergences Between Fused Triton Kernels and Eager PyTorch: FP16 Absorption and Weak-Scalar Promotion](personal/en/03-fp16-bf16-rounding-traps-in-fused-kernels.md)**
+  4. **[`[MVCC & Continuous Batching]` Debugging State Lifecycles Under Continuous Batching: Admission Pins, Preemption Boundaries, and Export Dimensions](personal/en/04-mvcc-pins-preemption-and-batch-dedup.md)**

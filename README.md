@@ -1,6 +1,6 @@
 # pLLM: Programmable LLM
 
-[![Release: v0.5.0](https://img.shields.io/badge/Release-v0.5.0-e62b2b.svg)](https://github.com/LinesHogan/pLLM/releases/tag/v0.5.0)
+[![Release: v0.5.1](https://img.shields.io/badge/Release-v0.5.1-e62b2b.svg)](https://github.com/LinesHogan/pLLM/releases/tag/v0.5.1)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](pyproject.toml)
 [![vLLM 0.27–0.34](https://img.shields.io/badge/vLLM-0.27--0.34-111111.svg)](doc/reference/support-matrix.md)
@@ -22,7 +22,7 @@ pLLM acts like an eBPF layer for vLLM: instead of maintaining a private fork of 
 | Inference-Time Capability | Why Raw PyTorch Hooks or vLLM Forks Break | Declarative Primitive in pLLM |
 | --- | --- | --- |
 | **Inspect hidden states & per-layer logits** (probes, SAEs, Logit Lens, DoLa) | Concurrent requests interleave across dynamic token rows; Python hooks never fire during CUDA graph replay | `pllm.hidden(layer)`, `pllm.residual(layer)`, `pllm.layer_logits(...)`, `@pllm.export`, `@pllm.add_logits` |
-| **Apply per-request or session overlays** (CAA, ReFT, hypernetwork LoRA) | Manual slot allocation, eviction, and quantized projection overlays leak VRAM or corrupt state across tenants | `pllm.RequestState` + `pllm.model.ActivationPatch` / `pllm.model.Adapter` |
+| **Apply per-request or session overlays & dynamic layer routing** (CAA, ReFT, hypernetwork LoRA, live layer switching) | Manual slot allocation, eviction, quantized overlays, and runtime layer changes leak VRAM or force CUDA graph recapture | `pllm.RequestState` + `pllm.model.ActivationPatch` / `pllm.model.Adapter` / `pllm.model.LayerRoute` |
 | **Train fast weights online during decode** (ESamp, In-Place TTT, TLM, TTRL) | Synchronous autograd stalls decoding; uncoordinated streams tear in-place parameters and break KV preemption | `@pllm.train` / `@pllm.train_in_forward` (CUDA-graph captured; fused inline or overlapped when independent) |
 | **Customize forward schedules, attention & KV layouts** (early exit, looped depth, sliding/sink KV, lookup tables) | Ad-hoc layer loops and KV reads violate append-only block-table invariants | `@pllm.custom_forward`, `@pllm.custom_attention`, `@pllm.custom_residual`, `pllm.input_tokens` |
 
@@ -201,7 +201,7 @@ Recommended prompt for porting existing research code or authoring new workloads
 - **Project & Documentation Portal:** [lineshogan.github.io/pllm](https://lineshogan.github.io/pllm/)
 - **English Agent & API Reference:** [SKILL.md](doc/agent/SKILL.md) · [migration.md](doc/agent/migration.md) · [reference.md](doc/agent/reference.md) · [examples.md](doc/agent/examples.md) · [rules.md](doc/agent/rules.md) · [pitfalls.md](doc/agent/pitfalls.md) · [llms.txt](llms.txt)
 - **Guides, How-Tos & Reference Manuals (EN & 中文):** [English Docs Index](doc_en/README.md) · [Chinese Docs Index](doc/README.md) · [Capability Map](doc_en/guides/capability-map.md) · [Online Serving](doc_en/howto/online-serving.md) · [Production Deployment](doc_en/howto/production.md) · [API Reference](doc_en/reference/api.md)
-- **Engineering Essays & Systems Deep Dives (EN & ZH):** [blog/README.md](blog/README.md) (also published on [LinesHogan's Blog](https://lineshogan.github.io/blog/)) — eleven standalone articles covering post-*Bitter Lesson* inference economics, the unified paged tensor state layer, 40-line longest-path scheduling vs. polyhedral IRs, PCIe/weight bandwidth quotas, IEEE 754 order-preserving bit tricks, compiled fast-weight training, frozen CUDA Graph pointer tables, lock-free GPU MVCC/RCU, GQA/MLA attention memory layouts, sync-free `attn_metadata` unpacking, and schedule-as-data multi-tenant verification.
+- **Engineering Essays & Systems Deep Dives (EN & ZH):** [blog/README.md](blog/README.md) & [LayerRoute Debugging Postmortems](blog/personal/README.md) (also published on [LinesHogan's Blog](https://lineshogan.github.io/blog/)) — fifteen bilingual articles organized into architecture & postmortems, engine-internals deep dives, and compiler / Triton / IEEE 754 / multi-version state debugging notes.
 
 ---
 

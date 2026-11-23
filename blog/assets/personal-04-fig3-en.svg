@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 182" width="100%" role="img" aria-label="FIG 03 · Per-Field Unoptimized Pools vs. Flat AdamW Page Inheriting fields[0].dtype">
+  <style>
+    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
+    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
+    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
+    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
+    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
+  </style>
+  <defs>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="952" height="174" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <text x="28" y="34" class="title">FIG 03 · Per-Field Unoptimized Pools vs. Flat AdamW Page Inheriting fields[0].dtype</text>
+
+  <rect x="28" y="56" width="432" height="106" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="44" y="80" class="label">Unoptimized State: Separate Typed Pools</text>
+  <text x="44" y="104" class="mono">Pool 0 ("layer") : int64   ()</text>
+  <text x="44" y="124" class="mono">Pool 1 ("a_0")   : float32 [4, 896]</text>
+  <text x="44" y="144" class="mono">Pool 2 ("b_0")   : float32 [896, 4]</text>
+
+  <rect x="488" y="56" width="444" height="106" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="504" y="80" class="label" fill="#b91c1c">With AdamW: Flat 1D Page Uses fields[0].dtype</text>
+  <text x="504" y="104" class="mono">fields = (layer: int64, a_0: fp32, b_0: fp32)</text>
+  <text x="504" y="126" class="sub">-> Entire flat parameter page allocated as int64</text>
+  <text x="504" y="146" class="sub">-> Initializing fill_(0.5) into int64 view truncates to 0</text>
+</svg>
