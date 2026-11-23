@@ -594,7 +594,7 @@ class TensorExecutor:
         batch.results.update(((self.task.symbol, name), value) for name, value in zip(self.task.outputs, values))
         if self.optimizer is None:
             if self.task.export is not None:
-                return self.task.export.output(values[0], data, source_rows)
+                return self.task.export.output(values[0], data, batch, source_rows)
             if self.task.sampler_stage is not None:
                 return self.task.sampler_output(data, batch, self.forward_weights)
             return TaskOutput()

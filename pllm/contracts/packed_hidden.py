@@ -41,6 +41,8 @@ class HiddenRows:
     storage: torch.Tensor
     # Dense packed-row -> slot lookup. Rows without a tap address a valid padding slot.
     slots: npt.NDArray[np.int64]
+    # Optional [retained_rows] int64 resolved physical layer (-1 when unmatched) for routed taps.
+    layers: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

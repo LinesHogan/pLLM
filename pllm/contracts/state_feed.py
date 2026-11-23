@@ -21,3 +21,4 @@ class FeedBinding:
     resource: str
     order: FeedOrder
     fields: tuple[str, ...]
+    route_bounds: tuple[tuple[str, tuple[int, ...]], ...] = ()

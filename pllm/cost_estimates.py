@@ -9,7 +9,7 @@ import torch
 from torch.utils.flop_counter import FlopCounterMode
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, LayerRouteSelector
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -279,6 +279,7 @@ def estimate_tasks(
     estimates: dict[str, CostEstimate] = {}
     calls: OpCalls = {}
     projected: set[int] = set()
+    projected_routes: set[LayerRouteSelector] = set()
     first_addition = min(
         (
             task
@@ -331,15 +332,34 @@ def estimate_tasks(
                     * (delta.element_size() + (width + 4 if copies_logits else 0))
                 )
             if any(
-                isinstance(source, HiddenInputSource) and source.site is HiddenSite.LAYER_LOGITS
+                isinstance(source, HiddenInputSource)
+                and source.site is HiddenSite.LAYER_LOGITS
+                and source.route is None
                 for source in task.sources.values()
             ):
                 layers = set(facts.probe.layer_logits) - projected
-                projected_layers = len(layers)
+                projected_layers += len(layers)
                 projection += (
                     len(layers) * 2 * facts.max_admitted_lineages * facts.probe.hidden_size * padded_vocab_size
                 )
                 projected.update(layers)
+            routed_logit_sources = {
+                source.route
+                for source in task.sources.values()
+                if isinstance(source, HiddenInputSource)
+                and source.site is HiddenSite.LAYER_LOGITS
+                and source.route is not None
+            } - projected_routes
+            if routed_logit_sources:
+                projected_layers += len(routed_logit_sources)
+                projection += (
+                    len(routed_logit_sources)
+                    * 2
+                    * facts.max_admitted_lineages
+                    * facts.probe.hidden_size
+                    * padded_vocab_size
+                )
+                projected_routes.update(routed_logit_sources)
         estimates[symbol] = CostEstimate(
             facts.max_admitted_lineages,
             sum(

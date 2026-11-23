@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, NewType
 
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, LayerRouteSelector
 from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.contracts.visibility import VisibilitySource
@@ -48,6 +48,7 @@ class HiddenInputSource:
     layer: int
     site: HiddenSite
     phase: HiddenPhase
+    route: LayerRouteSelector | None = None
 
 
 @dataclass(frozen=True, slots=True)

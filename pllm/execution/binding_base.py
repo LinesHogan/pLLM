@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Literal
 
@@ -113,6 +113,54 @@ def overlay_fields(
         for index, projection in enumerate(projections)
         for key, field in fields.items()
     )
+
+
+def routed_overlay_fields(
+    fields: Mapping[str, Field],
+    effect: ProjectionDelta,
+    dimensions: Dimensions,
+    dtype: Callable[[str, Field], TensorDType],
+    *,
+    layer_bank: bool,
+) -> tuple[LayoutField, ...]:
+    """Validate projection homogeneity across `effect.route.over` and allocate single-slot or per-layer fields."""
+    assert effect.route is not None
+    projections = dimensions.projections(effect.targets)
+    by_name: dict[str, list[ProjectionShape]] = {}
+    for projection in projections:
+        by_name.setdefault(projection.target.name, []).append(projection)
+    for name, group in by_name.items():
+        first = group[0]
+        if any(
+            (item.input_size, item.output_size, item.input_partitions, item.output_partitions)
+            != (first.input_size, first.output_size, first.input_partitions, first.output_partitions)
+            for item in group[1:]
+        ):
+            raise ValueError(
+                f"LayerRoute.adapter: {name} does not have identical shapes across over={effect.route.over}"
+            )
+    if layer_bank:
+        if len(effect.target_names) == 1:
+
+            def bank_dtype(key_arg: str, value: Field) -> TensorDType:
+                if key_arg in fields:
+                    return dtype(f"{key_arg}_{projections[0].target.layer}", value)
+                head, _, tail = key_arg.rpartition("_")
+                return dtype(f"{head}_{projections[int(tail)].target.layer}", value)
+
+            validated = overlay_fields(fields, effect, dimensions, bank_dtype)
+            return tuple(
+                replace(item, name=f"{key}_{projection.target.layer}")
+                for item, (projection, key) in zip(
+                    validated,
+                    ((projection, key) for projection in projections for key in fields),
+                    strict=True,
+                )
+            )
+        return overlay_fields(fields, effect, dimensions, dtype)
+    # Single-slot O(1) mode: allocate one set of parameter fields per target projection name (using the first layer).
+    representatives = replace(effect, targets=tuple(by_name[name][0].target for name in effect.target_names))
+    return overlay_fields(fields, representatives, dimensions, dtype)
 
 
 def overlay_field(name: str, field: Field, projection: ProjectionShape, size: int, dtype: TensorDType) -> LayoutField:

@@ -201,7 +201,7 @@ pllm skill --install cursor   # 写入 .cursor/rules/pllm/*.md
 - **项目主页与在线文档站**：[lineshogan.github.io/pllm](https://lineshogan.github.io/pllm/)
 - **完整中文文档**：[文档首页](doc/README.md) · [00 快速上手](doc/tutorials/00_quickstart.ipynb) · [在线服务指南](doc/howto/online-serving.md) · [上生产指南](doc/howto/production.md) · [API 参考](doc/reference/api.md)
 - **英文 Agent 与参考规范**：[SKILL.md](doc/agent/SKILL.md) · [migration.md](doc/agent/migration.md) · [reference.md](doc/agent/reference.md) · [llms.txt](llms.txt)
-- **独立技术随笔与机制拆解（中英双语）**：[随笔目录](blog/README.md)（同步发布于 [个人博客](https://lineshogan.github.io/blog/)），收录十篇围绕推理期算法演进、40 行最长路调度、带宽与 SM 配额、IEEE 754 保序位变换、编译图快权重训练、静态图指针寻址、显存无锁 MVCC/RCU、GQA/MLA 注意力布局、`attn_metadata` 解包与多租户核验的深度文章。
+- **独立技术随笔与机制拆解（中英双语）**：[随笔目录](blog/README.md)（同步发布于 [个人博客](https://lineshogan.github.io/blog/)），收录十一篇围绕推理期算法演进、统一张量状态层、40 行最长路调度、带宽与 SM 配额、IEEE 754 保序位变换、编译图快权重训练、静态图指针寻址、显存无锁 MVCC/RCU、GQA/MLA 注意力布局、`attn_metadata` 解包与多租户核验的深度文章。
 
 ---
 

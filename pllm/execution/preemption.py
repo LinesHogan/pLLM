@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from pllm.contracts.backend_attachment import BackendAttachment
+from pllm.contracts.backend_attachment import BackendAttachment, DecodeRefresh
 from pllm.contracts.host_batch import StateImport
-from pllm.contracts.semantic_graph import HostServiceInputSource, SemanticGraph, StateEffectKind
+from pllm.contracts.request_identity import RequestKeyField
+from pllm.contracts.semantic_graph import HostServiceInputSource, SemanticGraph, StateEffectKind, StateScope
 
 if TYPE_CHECKING:
     from pllm.execution.model_sites import ResidualRewrite
@@ -22,10 +23,60 @@ def preemption_policy(attachment: BackendAttachment, sites: tuple[ResidualRewrit
     graph = attachment.plan.semantic_graph
     adaptive = any(task.custom_forward is not None and task.custom_forward.adaptive for task in graph.tasks)
     applied = {
-        binding.resource for binding in (*attachment.spec.overlay_bindings, *attachment.spec.activation_bindings)
+        *(str(binding.resource) for binding in attachment.spec.overlay_bindings),
+        *(binding.route.resource for binding in attachment.spec.overlay_bindings if binding.route is not None),
+        *(str(binding.resource) for binding in attachment.spec.activation_bindings),
+        *(
+            str(binding.route_resource)
+            for binding in attachment.spec.activation_bindings
+            if binding.route_resource is not None
+        ),
+    }
+    step_refreshed = {
+        *(
+            res
+            for binding in attachment.spec.overlay_bindings
+            if binding.route is not None and binding.route.refresh == "step"
+            for res in (str(binding.resource), binding.route.resource)
+        ),
+        *(
+            str(binding.resource)
+            for binding in attachment.spec.activation_bindings
+            if binding.decode_refresh is DecodeRefresh.STEP
+        ),
+        *(
+            str(binding.route_resource)
+            for binding in attachment.spec.activation_bindings
+            if binding.route_resource is not None and binding.route_refresh is DecodeRefresh.STEP
+        ),
     }
     custom = any(not rewrite.patch for rewrite in sites)
-    return "reset" if applied & _rewritten(graph) or custom or attachment.probe.custom_attention or adaptive else "keep"
+    if (
+        applied & _rewritten(graph)
+        or applied & _shared_imported_request(graph)
+        or step_refreshed & _live_imported_instance(graph)
+        or custom
+        or attachment.probe.custom_attention
+        or adaptive
+    ):
+        return "reset"
+    return "keep"
+
+
+def _live_imported_instance(graph: SemanticGraph) -> set[str]:
+    """Imported instance states that `llm.import_state` can mutate between steps while requests remain in flight."""
+    state = graph.host_state(StateImport.schema)
+    if state is not None and state.scope is StateScope.INSTANCE:
+        return {str(state.resource)}
+    return set()
+
+
+def _shared_imported_request(graph: SemanticGraph) -> set[str]:
+    """Imported request states whose keys omit `request_id`, so concurrent online admissions can overwrite a lineage."""
+    state = graph.host_state(StateImport.schema)
+    if state is not None and state.scope is StateScope.REQUEST and RequestKeyField.REQUEST_ID not in state.key_fields:
+        return {str(state.resource)}
+    return set()
 
 
 def _rewritten(graph: SemanticGraph) -> set[str]:

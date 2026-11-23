@@ -221,6 +221,14 @@ class SiteBody:
             stream, branch = tensors
             ((_, source),) = self.inputs
             assert isinstance(source, PatchInput)
+            if len(ports) == 2:
+                residual, normed = ports
+                if residual.data_ptr() != stream.data_ptr():
+                    residual.copy_(stream)
+                if normed.data_ptr() != branch.data_ptr():
+                    normed.copy_(branch)
+                source.apply_into(self.values, self.rewrite.depth(self.place), normed)
+                return
             patched = source.value(self.values, self.rewrite.depth(self.place))(branch)
             _copy_ports((stream, patched), ports)
             return

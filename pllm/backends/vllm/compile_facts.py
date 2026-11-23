@@ -16,7 +16,7 @@ from pllm.contracts.backend_attachment import (
     CausalModelDomain,
     ModelProbe,
 )
-from pllm.contracts.hidden_locator import HiddenPhase, logit_layers
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite, logit_layers
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import SchedulerTimeline
 from pllm.contracts.state_representation import StateDeviceKind
@@ -64,8 +64,9 @@ def compile_facts(
             raise ValueError(f"{feature} {rejection}")
     if requirements.causal_training and shape.read_only_reason:
         raise ValueError(f"causal training {shape.read_only_reason}")
-    if any(layer < 0 or layer >= shape.layer_count for layer in requirements.activation_layers):
+    if any(not -shape.layer_count <= layer < shape.layer_count for layer in requirements.activation_layers):
         raise ValueError("activation layer is outside the backend model")
+    activation_layers = tuple(layer % shape.layer_count for layer in requirements.activation_layers)
     if any(not -shape.layer_count <= layer < shape.layer_count for layer in requirements.layer_logits):
         raise ValueError(
             f"pllm.layer_logits{requirements.layer_logits} names a layer outside the model's {shape.layer_count} layers"
@@ -74,7 +75,7 @@ def compile_facts(
     hidden_resources = tuple(
         sorted(
             (
-                AttachmentHiddenResource(shape.hidden_binding(source.layer, source.site), source.phase)
+                AttachmentHiddenResource(shape.hidden_binding(source.layer, source.site, source.route), source.phase)
                 for source in requirements.hidden_inputs
             ),
             key=lambda resource: (*resource.resource_key, resource.phase is HiddenPhase.DECODE),
@@ -100,7 +101,7 @@ def compile_facts(
                 f"vocab_size={shape.vocab_size}",
                 *(f"hidden={resource.binding.tap}" for resource in hidden_resources),
                 f"layer_logits={layer_logits}",
-                *(f"activation_layer={layer}" for layer in requirements.activation_layers),
+                *(f"activation_layer={layer}" for layer in activation_layers),
                 *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in shape.targets),
             )
         ),
@@ -195,7 +196,17 @@ def input_reservations(
     )
     # Layer-logit projection retains gathered streams, norm operands and both model/FP32 logits.
     width = probe.tensor_dtype.itemsize
-    workspace += rows * len(probe.layer_logits) * (2 * width * probe.hidden_size + (width + 4) * vocab)
+    routed_logits = len(
+        {
+            resource.binding
+            for resource in probe.hidden_resources
+            if resource.binding.site is HiddenSite.LAYER_LOGITS
+            and resource.binding.layer_kind is HiddenLayerKind.WILDCARD
+        }
+    )
+    workspace += (
+        rows * (len(probe.layer_logits) + routed_logits) * (2 * width * probe.hidden_size + (width + 4) * vocab)
+    )
     retained = rows * (4 * vocab + 8) if feedback else 0
     # StepCapture retains its feedback pointers until the next table is prepared.
     # Budget both old and new private copies during handoff, including next forward.

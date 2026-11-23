@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Self
 
 import torch
@@ -26,9 +26,15 @@ from pllm.backends.vllm.architecture import (
     post_attention_norm_name,
 )
 from pllm.config import ModelConfig
-from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.hidden_locator import (
+    HiddenLayerKind,
+    HiddenSite,
+    LayerRouteSelector,
+    resolve_route_layers,
+    route_locator_tag,
+)
 from pllm.contracts.packed_hidden import PackedHiddenResourceBinding
-from pllm.contracts.parameter_overlay import Projection, ProjectionShape, expand_targets
+from pllm.contracts.parameter_overlay import Projection, ProjectionName, ProjectionShape, expand_targets
 
 if TYPE_CHECKING:
     from pllm.backends.vllm.architecture import Decoder
@@ -118,12 +124,17 @@ class _ConfigShape:
         for target in expanded:
             assert target.layer is not None
             if target.name not in heads and (routed := self.routed_mlp(target.layer)):
-                raise moe_projection_error(target.layer, routed)
+                dense = tuple(i for i in range(self.num_hidden_layers) if not self.routed_mlp(i))
+                err = moe_projection_error(target.layer, routed)
+                if dense:
+                    err = ValueError(f"{err}; dense MLP layers: {dense}")
+                raise err
             if target.name in heads and self.architectures[0] in HYBRID_NAMES:
                 assert self.layer_types is not None
                 if self.layer_types[target.layer] != "full_attention":
+                    full = tuple(i for i, kind in enumerate(self.layer_types) if kind == "full_attention")
                     raise ValueError(
-                        f"layer {target.layer} is a Gated DeltaNet layer; choose a full-attention layer for q/k/v overlays"
+                        f"layer {target.layer} is a Gated DeltaNet layer; choose a full-attention layer {full} for q/k/v overlays"
                     )
                 if target.name == "q_proj" and self.attn_output_gate:
                     raise ValueError("gated attention interleaves query and output-gate rows; overlay k_proj or v_proj")
@@ -198,12 +209,23 @@ class ModelShape:
     qk_nope_head_dim: int = 0
     qk_rope_head_dim: int = 0
 
-    def hidden_binding(self, layer: int, site: HiddenSite) -> PackedHiddenResourceBinding:
-        """Map a declared site to the residual-add module for this decoder."""
+    def hidden_binding(
+        self, layer: int, site: HiddenSite, route: LayerRouteSelector | None = None
+    ) -> PackedHiddenResourceBinding:
+        """Map a declared site or runtime LayerRoute to its residual-add or routed pool binding."""
+        if route is not None:
+            resolved = replace(route, over=resolve_route_layers(route.over, self.layer_count))
+            tag = route_locator_tag(resolved)
+            return PackedHiddenResourceBinding(tag, HiddenLayerKind.WILDCARD, site, f"routed:{tag}:{site.value}", 0)
         return hidden_binding(layer, site, self.layer_count, post_attention_norm_name(self.architecture))
 
     @classmethod
-    def of_config(cls, config: ModelConfig, targets: tuple[Projection, ...] = ()) -> Self:
+    def of_config(
+        cls,
+        config: ModelConfig,
+        targets: tuple[Projection, ...] = (),
+        routed_targets: tuple[tuple[ProjectionName, tuple[int, ...]], ...] = (),
+    ) -> Self:
         """Read only config.json; dense projection widths follow the decoder's q/v/down layouts."""
         from pllm.backends.vllm.architecture import admit_architecture
 
@@ -217,16 +239,22 @@ class ModelShape:
         # vLLM inspects lazy model classes in a subprocess; importing hybrids here would initialize CUDA.
         info, _ = ModelRegistry.inspect_model_cls(model.architectures, model)
         read_only = admit_architecture(info.architecture)
-        if targets and read_only:
+        if (targets or routed_targets) and read_only:
             raise ValueError(f"a parameter overlay {read_only}")
         shape = structure({**model.hf_text_config.to_dict(), "architectures": [info.architecture]}, _ConfigShape)
+        resolved_routed = tuple(
+            Projection(name, layer)
+            for name, over in routed_targets
+            for layer in resolve_route_layers(over, shape.num_hidden_layers)
+        )
+        all_targets = tuple(dict.fromkeys((*targets, *resolved_routed)))
         return cls(
             info.architecture,
             shape.hidden_size,
             shape.num_hidden_layers,
             shape.vocab_size,
             pad_vocab_size(shape.vocab_size),
-            shape.projections(targets, config.tensor_parallel_size),
+            shape.projections(all_targets, config.tensor_parallel_size),
             read_only,
             shape.forward_flops(),
             shape.num_attention_heads // config.tensor_parallel_size,
@@ -241,7 +269,13 @@ class ModelShape:
         )
 
     @classmethod
-    def of_model(cls, decoder: Decoder, targets: tuple[Projection, ...], dtype: torch.dtype) -> Self:
+    def of_model(
+        cls,
+        decoder: Decoder,
+        targets: tuple[Projection, ...],
+        dtype: torch.dtype,
+        routed_targets: tuple[tuple[ProjectionName, tuple[int, ...]], ...] = (),
+    ) -> Self:
         """Inspect the actual loaded projection slices, including architecture-specific admission."""
         from pllm.backends.vllm.architecture import guidance_rejection, lm_head_module
         from pllm.backends.vllm.parameter_overlay import inspect_parameter_targets
@@ -250,7 +284,11 @@ class ModelShape:
         head = lm_head_module(model)
         tp_size = get_tensor_model_parallel_world_size()
         layers = len(model.model.layers)
-        shapes = inspect_parameter_targets(decoder, expand_targets(targets, layers), dtype)
+        resolved_routed = tuple(
+            Projection(name, layer) for name, over in routed_targets for layer in resolve_route_layers(over, layers)
+        )
+        all_targets = tuple(dict.fromkeys((*expand_targets(targets, layers), *resolved_routed)))
+        shapes = inspect_parameter_targets(decoder, all_targets, dtype)
         config = structure({**model.config.to_dict(), "architectures": [type(model).__name__]}, _ConfigShape)
         return cls(
             type(model).__name__,

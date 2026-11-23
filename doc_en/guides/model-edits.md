@@ -316,6 +316,38 @@ When overriding the model's layer loop with [`@pllm.custom_forward`](../tutorial
 
 ---
 
+## Advanced Entry Point: Runtime Dynamic Layer Routing (`pllm.model.LayerRoute`)
+
+When a serving engine is already running with captured CUDA graphs and you need to switch hidden-state probes, activation steering layers, or LoRA target layers on the fly (for example, moving an observation or steering site from layer 8 to layer 20 via `llm.import_state(...)`, routing different requests in the same continuous batch to different layers via `RequestState`, or letting the model compute its next target layer on GPU via `@pllm.write`), use [`pllm.model.LayerRoute`](../reference/api.md#pllmmodellayerroute):
+
+```python
+class DynamicSteering(pllm.Workload):
+    ctrl = pllm.InstanceState(
+        {"layer": pllm.Field((), torch.int64), "vector": pllm.Field(lambda width, _: (width,))},
+        init=pllm.Imported(),
+    )
+    route = pllm.model.LayerRoute("ctrl", over=(4, 12, 20))
+    steer = route.patch(operator="add", decode=True)
+
+    @pllm.export(name="probe", max_rows=8, max_cols=1)
+    def capture(self, r: torch.Tensor = route.residual()) -> torch.Tensor:
+        return r.float().norm(dim=-1, keepdim=True)
+
+
+print(testing.check(DynamicSteering(), CONFIG).passed)
+```
+
+### Design Constraints and Cost Model
+
+Dynamic layer switching is exposed as the explicit `pllm.model.LayerRoute` entry point rather than overloading integer layer arguments because installing gated graph nodes across candidate layers has a bounded, non-zero cost:
+
+1. **Mandatory explicit candidate set `over=(...)`**: There is no implicit all-layer hook. Keep `over` to the candidate layers you actually switch among; on CUDA, routed taps (`hidden` / `residual` / `layer_logits`), `add` and `low_rank_affine` (`rank <= 256`) patches, and `dense` and `low_rank` (`rank <= 256`) adapters check the 0-d `int64` selector in L2 and skip pool HBM reads and GEMMs on inactive candidates (captured patch boundary norms still pass their stream/branch ports, and `per_head`, `rank > 256`, or non-contiguous last-dim patch inputs fall back to masked evaluation).
+2. **Integer encoding and `-1` kill-switch**: Declare the control field on an unoptimized state as a 0-d `int64` scalar `pllm.Field((), torch.int64)` holding a physical layer index in `over`, or `-1` to disable the route dynamically (identity for `patch` / `adapter`, exact zeros and `-1` in `event.layers` for disabled or unvisited `@pllm.custom_forward` layers). Host imports (`StateImport` / `import_state`) and `Feed` validate values against `over | {-1}` on CPU; GPU `@pllm.write` updates run with zero host synchronization and treat out-of-`over` values as `-1`.
+3. **Step-refreshed by default (`refresh="step"`, Forward-only KV)**: `route.adapter(...)` and `route.patch(decode=True)` default to `refresh="step"` (`decode=False` defaults to `refresh="admission"`), reading the step's latest version on both chunked-prefill and decode steps without pinning admission snapshots; live `llm.import_state(...)` updates take effect on the very next forward step for in-flight requests without recomputing historical KV cache entries.
+4. **Single-slot routing vs. per-layer parameter bank**: With default `layers=()`, the state stores a single set of steering vectors or LoRA factors ($O(1)$ memory) routed across `over` (requiring matching projection shapes across `over`); when `InstanceState(..., layers=over)` is declared, each candidate layer binds its own `{field}_{l}` slot for zero-copy GPU layer jumping.
+
+---
+
 ## Common Errors and Runtime Constraints: Preemption, Recomputation, and Prefix Caching
 
 When deploying model-editing algorithms, concurrent scheduling introduces a few boundary constraints.

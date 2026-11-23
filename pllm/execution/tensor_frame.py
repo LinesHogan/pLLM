@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from pllm import _core
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.hidden_locator import HiddenPhase, route_locator_tag
 from pllm.contracts.packed_rows import PackedRows
 from pllm.contracts.parameter_overlay import Projection
 from pllm.contracts.request_identity import RequestIdentity
@@ -368,11 +368,19 @@ def training_observations(
     )
 
 
+def hidden_locator_key(source: HiddenInputSource) -> tuple[str, str, str]:
+    """Lookup key matching `PackedHiddenResourceBinding.locator_key`."""
+    if source.route is not None:
+        return (route_locator_tag(source.route), "wildcard", source.site.value)
+    return (str(source.layer), "index", source.site.value)
+
+
 def hidden_port(source: HiddenInputSource) -> TensorPort:
     """Gather the declared module's slots, promoting model dtypes for FP32 consumer math."""
+    key = hidden_locator_key(source)
 
     def hidden(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        value, slots = data.table.hidden[str(source.layer), "index", source.site.value]
+        value, slots = data.table.hidden[key]
         result = value.index_select(0, slots)
         return result.to(torch.float32) if result.dtype in (torch.float16, torch.bfloat16) else result
 
@@ -382,11 +390,23 @@ def hidden_port(source: HiddenInputSource) -> TensorPort:
 def layer_logits_port(source: HiddenInputSource, columns: tuple[int, ...]) -> TensorPort:
     """Gather the step's layer logits, [rows, layers, vocab] in FP32, keeping the marker's `columns` of the probed
     layers; views and a stack keep the read free of host-to-device copies, so captured bodies replay it."""
+    key = hidden_locator_key(source)
 
     def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
-        value, slots = data.table.hidden[str(source.layer), "index", source.site.value]
+        value, slots = data.table.hidden[key]
         rows = value.index_select(0, slots)
         return rows if columns == tuple(range(rows.shape[1])) else torch.stack([rows[:, c] for c in columns], 1)
+
+    return TensorPort(source, read)
+
+
+def routed_layer_logits_port(source: HiddenInputSource) -> TensorPort:
+    """Gather the step's dynamically routed layer logits [rows, vocab] in FP32."""
+    key = hidden_locator_key(source)
+
+    def read(data: TensorFrame, batch: TensorBatch) -> torch.Tensor:
+        value, slots = data.table.hidden[key]
+        return value.index_select(0, slots)
 
     return TensorPort(source, read)
 

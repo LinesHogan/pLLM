@@ -4,6 +4,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Generic, TypeVar
 
+import torch
+
 from pllm.contracts.parameter_overlay import FieldView
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.request_state import RequestStateKey
@@ -114,6 +116,7 @@ def validate_host_batch(
     target_shape: tuple[int, ...] = (),
     prompt_count: int = 0,
     import_fields: tuple[tuple[str, FieldView], ...] = (),
+    route_bounds: tuple[tuple[str, str, FieldView, tuple[int, ...]], ...] = (),
 ) -> None:
     """Check a generate call's host batch once, before export, mapping or device copies; tasks trust it.
 
@@ -215,7 +218,7 @@ def validate_host_batch(
             state = graph.host_state(StateImport.schema)
             assert state is not None
             layout = next(entry.layout for entry in layouts.layouts if entry.resource == state.resource)
-            _validate_state_import(value, state, layout, import_fields, describe, prompt_count)
+            _validate_state_import(value, state, layout, import_fields, describe, prompt_count, route_bounds)
             return
     for task in consumers:
         limit = next((fact for fact in timeline.task_resources if fact.task == task.symbol), None)
@@ -239,12 +242,14 @@ def _validate_state_import(
     fields: tuple[tuple[str, FieldView], ...],
     describe: Callable[[T], TensorFieldSpec],
     prompt_count: int,
+    route_bounds: tuple[tuple[str, str, FieldView, tuple[int, ...]], ...] = (),
 ) -> None:
     """Validate logical import fields before storage mapping or execution."""
     values = value.values
     label = f"StateImport for {('RequestState' if state.scope is StateScope.REQUEST else 'InstanceState')} {state.resource!r}"
     if len(values) != len(fields):
         raise ValueError(f"{label} needs {len(fields)} field tensors in declaration order, got {len(values)}")
+    bounds = {field: over for resource, field, _, over in route_bounds if resource == state.resource}
     for tensor, (name, view) in zip(values, fields, strict=True):
         spec = describe(tensor)
         prefix = (prompt_count,) if state.scope is StateScope.REQUEST else ()
@@ -259,6 +264,15 @@ def _validate_state_import(
         dtype = layout.fields[view.field].dtype
         if spec.dtype != dtype and not (spec.dtype.torch.is_floating_point and dtype.torch.is_floating_point):
             raise ValueError(f"{label}: field {name!r} needs floating or matching {dtype} values")
+        if name in bounds and isinstance(tensor, torch.Tensor) and not tensor.is_meta:
+            allowed = {*bounds[name], -1}
+            flat = tensor.detach().cpu().reshape(-1)
+            actual = [int(flat[index].item()) for index in range(flat.numel())]
+            invalid = [item for item in actual if item not in allowed]
+            if invalid:
+                raise ValueError(
+                    f"LayerRoute {state.resource}.{name}: imported layer {invalid[0]} is not in over={bounds[name]} or -1 (disabled)"
+                )
 
 
 def map_host_batch(value: HostBatch[T] | None, convert: Callable[[T], U]) -> HostBatch[U] | None:

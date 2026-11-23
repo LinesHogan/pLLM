@@ -36,6 +36,7 @@ class SiteValues(Protocol):
     def earlier(self, source: EarlierInput) -> torch.Tensor: ...
     def result(self, source: ResultInput) -> torch.Tensor: ...
     def patch(self, source: PatchInput, layer: int) -> Callable[[torch.Tensor], torch.Tensor]: ...
+    def patch_into(self, source: PatchInput, layer: int, target: torch.Tensor) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,9 @@ class PatchInput:
 
     def value(self, values: SiteValues, depth: int) -> Callable[[torch.Tensor], torch.Tensor]:
         return values.patch(self, depth)
+
+    def apply_into(self, values: SiteValues, depth: int, target: torch.Tensor) -> None:
+        values.patch_into(self, depth, target)
 
 
 def activation_write(x: torch.Tensor, y: torch.Tensor, patch: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
@@ -258,6 +262,9 @@ class _ChunkValues:
         raise AssertionError("stateful custom residuals read no method results")
 
     def patch(self, source: PatchInput, layer: int) -> Callable[[torch.Tensor], torch.Tensor]:
+        raise AssertionError("stateful custom residuals apply no activation patch")
+
+    def patch_into(self, source: PatchInput, layer: int, target: torch.Tensor) -> None:
         raise AssertionError("stateful custom residuals apply no activation patch")
 
 

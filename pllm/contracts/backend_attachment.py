@@ -109,6 +109,9 @@ class ActivationPatchBinding:
     decode: DecodeWindow = DecodeWindow.NONE
     decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT
     on_missing: MissingPolicy = MissingPolicy.STOP
+    route_resource: StateResource | None = None
+    route_field: FieldView | None = None
+    route_refresh: DecodeRefresh = DecodeRefresh.STEP
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +143,10 @@ class BackendAttachmentSpec:
     in_forward: TaskSymbol | None = None
     overlay_phases: tuple[HiddenPhase, ...] = ()
     activation_bindings: tuple[ActivationPatchBinding, ...] = ()
+    # Declared LayerRoute bounds: (resource, field_name, field_view, allowed_layers) checked on host imports.
+    route_bounds: tuple[tuple[str, str, FieldView, tuple[int, ...]], ...] = ()
+    # Model-read resources that alter forward activations/KV (excludes observation-only LayerRoute selectors).
+    kv_model_reads: tuple[StateResource, ...] = ()
     # The task that runs the @pllm.custom_forward programs (the in-forward transition when both are declared).
     custom_forward: TaskSymbol | None = None
 

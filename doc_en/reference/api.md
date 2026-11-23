@@ -567,6 +567,19 @@ pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
 
 One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
 
+### `pllm.model.LayerRoute`
+
+```text
+pllm.model.LayerRoute(state: 'str', *, over: 'tuple[int, ...]', field: 'str' = 'layer')
+```
+
+Route hidden reads, residual patches or homogeneous projection adapters by an int64 state field.
+
+`over` names the explicit candidate layers installed into the model graph; negative indices resolve from the end
+at bind time. At runtime, the scalar int64 field `state.field` selects one physical layer index in `0..layers-1`,
+or `-1` to disable the route for that row/step without recapturing CUDA graphs. Derived reads, `patch(decode=True)`
+and `adapter(...)` default to `refresh="step"` (Forward-only KV; `patch(decode=False)` defaults to `refresh="admission"`).
+
 ### `pllm.train_in_forward`
 
 ```text

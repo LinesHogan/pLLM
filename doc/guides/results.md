@@ -79,6 +79,7 @@ with pllm.make_llm(GPU_CONFIG, workload=StreamNorm()) as llm:
   - `sample_index`：每个 Prompt 下采样的相对序号（首个采样为 0）；
   - `request_id`：pLLM 内部的请求标识（不同于 vLLM 的 `RequestOutput.request_id`）。
 - **位置索引 `event.positions`**：整型元组，指示各行在其请求内的 token 偏移量。
+- **动态层溯源 `event.layers`**：当导出方法读取单个 [`pllm.model.LayerRoute`](model-edits.md#高级入口运行时动态切层pllmmodellayerroute) 时，附带每行实际命中的物理层号元组（未命中或关闭时为 `-1`）；静态层读取时为空元组 `()`。
 - **获取 CPU 张量 `event.tensor()`**：调用该方法返回一个独立的 CPU 张量副本。
 - **全量 token 读取 `tokens="all"`**：默认情况下，方法读取当前步的最新行；若需要观测一个步骤内计算出的全部 token（包括 prompt 的全部切片分块），可在输入标记中指定 `tokens="all"`（例如 `pllm.residual(12, tokens="all")`）。全量 token 读取仅对 `@pllm.export` 方法开放。
 

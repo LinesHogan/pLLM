@@ -22,6 +22,7 @@ from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
 from pllm.contracts.parameter_overlay import (
     ParameterOverlayFieldBinding,
+    ParameterOverlayOperator,
     Projection,
     ProjectionOperands,
     ProjectionShape,
@@ -30,6 +31,7 @@ from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.semantic_graph import StateResource
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
+from pllm.execution.layer_route import RouteSlotGather, gate_owners_by_layer, gated_dense_add, gated_low_rank_add
 from pllm.execution.overlay_batch import DecodeOverlay
 from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay, ProjectionTask
 from pllm.execution.parameter_projection import (
@@ -243,6 +245,7 @@ class ProjectionReader:
         pinned: bool,
         math: OverlayTransition | None,
         in_program: bool,
+        captures_operands: bool = False,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
         self.hook = ProjectionHook(self.module)
@@ -250,6 +253,7 @@ class ProjectionReader:
         self.mlp_base = None if self.mlp is None else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
         self.pinned, self.in_program, self.embedding = pinned, in_program, embedding
+        self.captures_operands = captures_operands
         self.mlp_input: torch.Tensor | None = None
         self.apply_count = self.updated_apply_count = 0
         # This invocation's exact segments and their consumer: the step's task, or a custom forward's lanes.
@@ -270,6 +274,16 @@ class ProjectionReader:
         inputs = self.module.input_size_per_partition
         self.captured = embedding.new_zeros((ports, inputs), dtype=self.module.params_dtype)
         self.desired = self.captured.new_empty((ports, self.width) if self.mlp is not None else (0, 0))
+        self.routed_mid = (
+            torch.empty((rows, self.pools[0].shape[1]), dtype=torch.float32, device=embedding.device)
+            if pinned
+            and binding.route is not None
+            and binding.operator is ParameterOverlayOperator.LOW_RANK_ADD
+            and embedding.is_cuda
+            and self.module.params_dtype != torch.float64
+            and self.pools[0].shape[1] <= 256
+            else None
+        )
         self.staging = PinnedStaging(capacity=self.table.numel(), slots=2 if pinned else 0)
         self.host = np.empty(0, dtype=np.int64)
         if pinned:
@@ -419,9 +433,10 @@ class ProjectionReader:
         captured: torch.Tensor,
         desired_capture: torch.Tensor,
     ) -> None:
-        captured[: len(hidden)].copy_(hidden)
-        if self.mlp is not None:
-            desired_capture[: len(hidden)].copy_(desired)
+        if self.captures_operands or self.decode is not None:
+            captured[: len(hidden)].copy_(hidden)
+            if self.mlp is not None:
+                desired_capture[: len(hidden)].copy_(desired)
         if self.decode is not None:
             result = self.decode.run(
                 hidden,
@@ -432,6 +447,44 @@ class ProjectionReader:
             columns = output[:, self.offset : self.offset + self.width]
             columns.copy_((columns + result * self.binding.scale).to(output.dtype))
             return
+        if self.binding.route is not None and hidden.is_cuda and hidden.dtype != torch.float64:
+            count = (
+                self.rows
+                if self.call_rows is not None
+                else next(size for size in self.programs if size >= hidden.shape[0])
+            )
+            slots, rows_table, owners = self.ports(table, count)
+            active_owners = (
+                owners[: hidden.shape[0]] if self.call_rows is None else owners.index_select(0, self.call_rows)
+            )
+            if self.routed_mid is not None:
+                gated_low_rank_add(
+                    hidden,
+                    slots,
+                    active_owners,
+                    pools[0],
+                    pools[1],
+                    self.routed_mid[: hidden.shape[0]],
+                    output,
+                    self.offset,
+                    self.width,
+                    rows_table.shape[1],
+                    self.binding.scale,
+                )
+                return
+            if self.binding.operator is ParameterOverlayOperator.DENSE_ADD:
+                gated_dense_add(
+                    hidden,
+                    slots,
+                    active_owners,
+                    pools[0],
+                    output,
+                    self.offset,
+                    self.width,
+                    rows_table.shape[1],
+                    self.binding.scale,
+                )
+                return
         if self.call_rows is None:
             count = next(size for size in self.programs if size >= hidden.shape[0])
             padded = torch.nn.functional.pad(hidden, (0, 0, 0, count - hidden.shape[0]))
@@ -548,12 +601,18 @@ class ParameterOverlay:
                 pinned=self.pinned,
                 math=self.math,
                 in_program=in_program,
+                captures_operands=bool(self.phases),
             )
             for binding in bindings
         )
         if self.pinned and self.math is not None and HiddenPhase.DECODE in self.math.phases:
             self.install_decode(arena, self.math, requests)
         self.requests, self.device = requests, arena.device
+        self._route_gather = (
+            RouteSlotGather(rows, arena.device) if any(binding.route is not None for binding in bindings) else None
+        )
+        self._route_buffers: dict[tuple[str, int, bool], torch.Tensor] = {}
+        self._rows_capacity = rows
         self.operand_staging = PinnedStaging()
         self.task: ProjectionTask | None = None
         self.sources: Sequence[PackedPhaseRow] = ()
@@ -720,18 +779,59 @@ class ParameterOverlay:
         self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
         self.sources = rows.inspect(self.starts)
         self.total_rows = rows.total_rows
+        routed_layers: dict[tuple[str, int, bool], torch.Tensor] = {}
+        packed_range = np.arange(rows.total_rows, dtype=np.int64)
         for reader in self.readers:
+            route = reader.binding.route
+            latest = route is not None and route.refresh == "step"
             versions = context.read_versions(
-                tuple(row.identity for row in self.sources), StateResource(reader.binding.resource), directory
+                tuple(row.identity for row in self.sources),
+                StateResource(reader.binding.resource),
+                directory,
+                latest=latest,
             )
             pins = tuple(pin for pin, _ in versions)
             refs = StateRefs.of(tuple(ref for _, ref in versions))
+            if latest:
+                pin = context.pin_for(refs)
+                pins = (pin,) * len(refs)
+                for row, ref in zip(self.sources, refs, strict=True):
+                    context.injected_refs.setdefault(row.identity, set()).add(ref)
             _, slots = context.arena.slots(pins, np.arange(len(pins), dtype=np.int64), refs)
             reader.apply_count += rows.total_rows
             reader.updated_apply_count += int(np.diff(np.append(self.starts, rows.total_rows)) @ (refs.versions > 0))
             for value in (*reader.pools, reader.table, reader.captured, reader.desired):
                 value.record_stream(self.stream)
+            if reader.routed_mid is not None:
+                reader.routed_mid.record_stream(self.stream)
             reader.prepare(slots, self.starts, rows.total_rows)
+            if route is not None and rows.total_rows > 0:
+                assert self._route_gather is not None and reader.binding.target.layer is not None
+                route_key = (route.resource, int(route.field.field), latest)
+                if route_key not in routed_layers:
+                    if route_key not in self._route_buffers:
+                        self._route_buffers[route_key] = torch.full(
+                            (self._rows_capacity,), -1, dtype=torch.long, device=self.device
+                        )
+                    buf = self._route_buffers[route_key]
+                    buf.record_stream(self.stream)
+                    self._route_gather.gather(
+                        rows,
+                        packed_range,
+                        StateResource(route.resource),
+                        route.field,
+                        context,
+                        directory,
+                        latest=latest,
+                        out=buf,
+                    )
+                    routed_layers[route_key] = buf
+                gate_owners_by_layer(
+                    reader.table[-reader.rows :],
+                    routed_layers[route_key],
+                    rows.total_rows,
+                    reader.binding.target.layer,
+                )
         self.embedding.values.record_stream(self.stream)
 
     def take_operands(self) -> tuple[ProjectionOperands, ...]:

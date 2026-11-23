@@ -10,9 +10,11 @@ from typing import Literal, Self, get_args
 
 import torch
 
-from pllm.contracts.hidden_locator import HiddenPhase
+from pllm.contracts.hidden_locator import HiddenPhase, LayerRouteSelector, resolve_route_layers
 from pllm.contracts.request_identity import RequestIdentity
 from pllm.contracts.tensor_layout import LayoutFieldId
+
+OverlayRefresh = Literal["step", "admission"]
 
 
 class ParameterOverlayOperator(StrEnum):
@@ -101,6 +103,15 @@ class FieldView:
 
 
 @dataclass(frozen=True, slots=True)
+class OverlayRoute:
+    """Device field view selecting the active physical layer for a routed projection overlay."""
+
+    resource: str
+    field: FieldView
+    refresh: OverlayRefresh = "step"
+
+
+@dataclass(frozen=True, slots=True)
 class ParameterOverlayFieldBinding:
     target: Projection
     operator: ParameterOverlayOperator
@@ -110,6 +121,7 @@ class ParameterOverlayFieldBinding:
     # The overlay function reads operand("weight"): only then does a quantized projection get a dense copy.
     reads_weight: bool = False
     reads_embedding: bool = False
+    route: OverlayRoute | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +148,9 @@ class ProjectionDelta:
     operator: ParameterOverlayOperator = ParameterOverlayOperator.DENSE_ADD
     factors: tuple[str, str] = ("a", "b")
     scale: float = 1.0
+    route: LayerRouteSelector | None = None
+    refresh: OverlayRefresh = "admission"
+    target_names: tuple[ProjectionName, ...] = ()
 
     @property
     def applied_fields(self) -> tuple[str, ...]:
@@ -143,13 +158,52 @@ class ProjectionDelta:
         return self.factors if self.operator is ParameterOverlayOperator.LOW_RANK_ADD else (self.weight,)
 
     def expand(self, layers: int) -> Self:
-        """The same effect with layer=None targets resolved against a model of `layers` layers."""
+        """The same effect with layer=None or routed targets resolved against a model of `layers` layers."""
+        if self.route is not None:
+            over = resolve_route_layers(self.route.over, layers)
+            targets = tuple(Projection(name, layer) for layer in over for name in self.target_names)
+            return replace(self, targets=targets, route=replace(self.route, over=over))
         return replace(self, targets=expand_targets(self.targets, layers))
 
     def field_bindings(
-        self, view: Callable[[str], FieldView], *, reads_weight: bool = False, reads_embedding: bool = False
+        self,
+        view: Callable[[str], FieldView],
+        *,
+        reads_weight: bool = False,
+        reads_embedding: bool = False,
+        layer_bank: bool = False,
+        route: OverlayRoute | None = None,
     ) -> tuple[ParameterOverlayFieldBinding, ...]:
         """One binding per target; `view` finds each applied field's copy for target i, named `{field}_{i}`."""
+        if self.route is not None and not layer_bank:
+            names = self.target_names
+            return tuple(
+                ParameterOverlayFieldBinding(
+                    target,
+                    self.operator,
+                    tuple(view(f"{key}_{names.index(target.name)}") for key in self.applied_fields),
+                    self.state,
+                    self.scale,
+                    reads_weight,
+                    reads_embedding,
+                    route=route,
+                )
+                for target in self.targets
+            )
+        if self.route is not None and layer_bank and len(self.target_names) == 1:
+            return tuple(
+                ParameterOverlayFieldBinding(
+                    target,
+                    self.operator,
+                    tuple(view(f"{key}_{target.layer}") for key in self.applied_fields),
+                    self.state,
+                    self.scale,
+                    reads_weight,
+                    reads_embedding,
+                    route=route,
+                )
+                for target in self.targets
+            )
         return tuple(
             ParameterOverlayFieldBinding(
                 target,
@@ -159,15 +213,19 @@ class ProjectionDelta:
                 self.scale,
                 reads_weight,
                 reads_embedding,
+                route=route,
             )
             for i, target in enumerate(self.targets)
         )
 
 
 __all__ = [
+    "OverlayRefresh",
+    "OverlayRoute",
     "ProjectionDelta",
     "ParameterOverlayFieldBinding",
     "ParameterOverlayOperator",
     "Projection",
+    "ProjectionName",
     "ProjectionOperands",
 ]

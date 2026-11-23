@@ -73,7 +73,7 @@ def _compiler_backend(config: ModelConfig, requirements: BackendRequirements) ->
     if requirements.custom_residual:
         # All-site LAuReL is 4.8% slower with Inductor on 7B/4090; stateful residuals fail nested FX tracing.
         return "eager"
-    if requirements.parameter_targets:
+    if requirements.has_parameter_targets:
         # The projection op mutates pools: AOT rejects packed optimizer views with different autograd bases.
         # Exact updates also recompile inside conditional graphs ("Generator not registered").
         return "eager"

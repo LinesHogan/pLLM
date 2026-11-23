@@ -10,7 +10,7 @@ from pllm.execution.compile_facts import BackendRequirements
 def model_hooks(requirements: BackendRequirements) -> bool:
     """Whether projections, residuals or attention need hooks in the model's graph."""
     return bool(
-        requirements.parameter_targets
+        requirements.has_parameter_targets
         or requirements.custom_residual
         or requirements.custom_attention
         or requirements.activation_layers

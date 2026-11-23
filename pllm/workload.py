@@ -203,8 +203,20 @@ class Workload:
                     trains_on_batch = True
                 inputs.update((name, tuple(arguments.values())) for name, arguments in sources.items())
         declared = BackendRequirements(
-            parameter_targets=tuple(target for delta in context.adapters.values() for target in delta.targets),
-            activation_layers=tuple(layer for patch in context.activations.values() for layer in patch.layers),
+            parameter_targets=tuple(
+                target for delta in context.adapters.values() if delta.route is None for target in delta.targets
+            ),
+            routed_targets=tuple(
+                (name, delta.route.over)
+                for delta in context.adapters.values()
+                if delta.route is not None
+                for name in delta.target_names
+            ),
+            activation_layers=tuple(
+                layer
+                for patch in context.activations.values()
+                for layer in (patch.route.over if patch.route is not None else patch.layers)
+            ),
             position_states=context.position_states(),
             custom_forward=bool(context.custom_forwards),
             trains_on_batch=trains_on_batch,
@@ -586,11 +598,19 @@ def _namespace(context: WorkloadContext) -> None:
     """Qualify emitted names while retaining each method's bound owner and local configuration."""
     context.state_definitions = {context.qualify(key): value for key, value in context.state_definitions.items()}
     context.adapters = {
-        context.qualify(key): replace(value, state=context.qualify(value.state))
+        context.qualify(key): replace(
+            value,
+            state=context.qualify(value.state),
+            route=None if value.route is None else replace(value.route, resource=context.qualify(value.route.resource)),
+        )
         for key, value in context.adapters.items()
     }
     context.activations = {
-        context.qualify(key): replace(value, state=context.qualify(value.state))
+        context.qualify(key): replace(
+            value,
+            state=context.qualify(value.state),
+            route=None if value.route is None else replace(value.route, resource=context.qualify(value.route.resource)),
+        )
         for key, value in context.activations.items()
     }
     context.position_definitions = {context.qualify(key): value for key, value in context.position_definitions.items()}

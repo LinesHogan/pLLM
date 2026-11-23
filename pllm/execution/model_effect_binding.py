@@ -36,6 +36,7 @@ from pllm.contracts.semantic_graph import (
     SemanticInput,
     SemanticTask,
     StateEffectKind,
+    StateResource,
     StateScope,
     TaskResultInputSource,
     TaskSymbol,
@@ -275,16 +276,26 @@ def declare_activation_patch(
     decode: DecodeWindow = DecodeWindow.NONE,
     decode_refresh: DecodeRefresh = DecodeRefresh.INHERIT,
     on_missing: MissingPolicy = MissingPolicy.STOP,
+    route_resource: StateResource | None = None,
+    route_field: FieldView | None = None,
+    route_refresh: DecodeRefresh = DecodeRefresh.STEP,
+    layer_bank: bool = True,
 ) -> None:
     """Read logical state views at activation sites."""
     width = 1 if operator is ActivationPatchOperator.ADD else 3
-    views = tuple(view for (resource, _), view in b.field_views.items() if resource == state.declaration.resource)
+    views = tuple(
+        view
+        for (resource, _), view in b.field_views.items()
+        if resource == state.declaration.resource
+        and not (route_resource == state.declaration.resource and route_field is not None and view == route_field)
+    )
+    expected = (len(layers) if layer_bank else 1) * width
     if (
         not layers
         or tuple(sorted(set(layers))) != layers
         or layers[0] < 0
         or min(first_tokens, last_tokens) < 0
-        or len(views) != len(layers) * width
+        or len(views) != expected
     ):
         raise ValueError("activation fields must cover each ordered layer and operator")
     for start in range(0, len(views), width):
@@ -304,13 +315,16 @@ def declare_activation_patch(
             ActivationPatchBinding(
                 state.declaration.resource,
                 layer,
-                views[index * width : (index + 1) * width],
+                views[index * width : (index + 1) * width] if layer_bank else views,
                 first_tokens,
                 last_tokens,
                 operator,
                 decode=decode,
                 decode_refresh=decode_refresh,
                 on_missing=on_missing,
+                route_resource=route_resource,
+                route_field=route_field,
+                route_refresh=route_refresh,
             )
             for index, layer in enumerate(layers)
         )

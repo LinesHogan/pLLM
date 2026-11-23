@@ -647,12 +647,16 @@ class StateExecution:
         return self.arena.device
 
     def admit(
-        self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None
+        self,
+        identities: tuple[RequestIdentity, ...],
+        stream: torch.cuda.Stream | None = None,
+        *,
+        pin_instances: bool = True,
     ) -> tuple[StateRef, ...]:
         self._require_borrow_live()
         if not self.directory.states:
             return ()
-        receipt = self.directory.admit(identities, stream, self.math.initialize)
+        receipt = self.directory.admit(identities, stream, self.math.initialize, pin_instances=pin_instances)
         # One visible ref per unique admitted key, whether created or joined.
         refs = self.latest(identities)
         if receipt is None:
@@ -662,6 +666,10 @@ class StateExecution:
                 TraceEventKind.ADMIT, 0, identities=identities, refs=refs, operation_id=receipt.operation_id
             )
         return refs
+
+    def pin_admitted(self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None = None) -> None:
+        """Install admission instance pins after BEFORE_FORWARD publications."""
+        self.directory.pin_admitted(identities, stream)
 
     def latest(self, identities: tuple[RequestIdentity, ...]) -> tuple[StateRef, ...]:
         """The newest published version of each admitted state of `identities`; `()` names the instance states."""
