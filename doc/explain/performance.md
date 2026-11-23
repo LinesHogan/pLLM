@@ -207,7 +207,8 @@ FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2
 
 ### 4.4 模型层内残差改写
 
-`pllm.model.ActivationPatch` 通过同一套 `custom_residual` 模型站点在 CUDA Graph 内修改层输出。
+`pllm.model.ActivationPatch` 通过同一套 `custom_residual` 模型站点在 CUDA Graph 内修改层输出。配合 `@pllm.export` 将中间层特征或整条残差向量经锁页内存异步传回宿主机 CPU 线程时，GPU 解码流水线无需等待主机消费：在 RTX 4090 上测 `Qwen/Qwen2.5-7B-Instruct`（第 14 层加性引导 `decode=True` + 逐 token 异步导出并在后台还原为 CPU 张量，0 丢行），单请求流式生成的纯 decode **TPOT 为 $16.48\text{ ms}$**，与原生 vLLM（**$16.50\text{ ms}$**，$60.6\text{ tok/s}$，**100%**）一致；在 **128 并发序列**（$8 \times 16$）下，单独异步导出 64 维 SAE 特征或全宽 3584 维 BF16 残差（每步 $896\text{ KiB}$）分别为原生的 **100%** 与 **99.5%**（TPOT **$21.90 / 22.06\text{ ms}$** 对原生 **$21.97\text{ ms}$**），单独开启激活引导为 **98.3%**（$5,623\text{ tok/s}$，TPOT **$22.02\text{ ms}$**），同时开启激活引导与全宽残差导出仍达原生吞吐的 **98.0%**（$5,604$ 对 $5,719\text{ tok/s}$，TPOT **$22.17\text{ ms}$**，仅增加 **$0.20\text{ ms}$**）。
+
 而 `@pllm.custom_residual` 会被 pLLM 降级为具名算子 `pllm::model_site`，并用设备端索引读写私有状态页，使 vLLM 在录制整模型 CUDA Graph 时**把你的残差改写一并录进图里**。
 
 示例 07 在 RTX 4090、7B、生成 256 token 下的实测吞吐占原生图模式比例：
@@ -226,7 +227,7 @@ FlashInfer 的 softmax 分母累加 BF16 舍入后的概率，LSE 再由底数 2
 * **自动回退**：当状态维度很大（如 $d=896$）导致树形扫描不划算时，形状守卫会保留串行循环；CPU 上、部分扫描或需要求导的调用也保持串行。你也可以设 `ExecutionOptions(tuning="measured")` 让引擎在绑定时实测挑选最快实现，或用 `allow_numerical_transforms=False` 禁止并行重排。
 
 **前向内精确更新（`@pllm.train_in_forward(visibility="exact")`）。**默认情况下，`@pllm.train_in_forward` 使用 `visibility="forward_pinned"`（同一次前向的所有 chunk 读同一个起始状态）。对于 In-Place TTT 等要求“同一前向内后一个 chunk 必须读到前一个 chunk 更新后的快权重”的算法，需声明 `visibility="exact"`：
-* **实测表现**：pLLM 会把 `visibility="exact"` 的 decode 阶段捕获进 CUDA Graph（prefill 仍为 eager）。示例 08 在 RTX 4090 上跑 In-Place TTT 的 4B 社区检查点（vLLM 0.32.0，CUDA Graph 开启，FP32 快权重，贪心生成 256 token，预热 1 轮后 3 轮中位数）：1 个请求、4096 token 的 prompt 达 **$59.64\text{ tok/s}$**（16384 token 的 prompt 为 **$42.27\text{ tok/s}$**）；官方 HF 实现在同一张卡、同样协议下为 $54.79 / 34.89\text{ tok/s}$。4 个请求一起跑合计 **$111.38\text{ tok/s}$**（官方实现只支持 1 个请求）。
+* **自动降级与实测表现**：pLLM 会把 `visibility="exact"` 的 decode 阶段捕获进 CUDA Graph（prefill 仍为 eager），并用设备端条件节点（CUDA IF）包裹只在凑满整块时才触发的快权重更新。同时，pLLM 通过静态追踪方法体的计算图自动完成三项底层优化：① 在未凑满整块的非边界 decode 步直接共享只读快权重页（0 字节写时复制），只为尾行缓冲分配私有页；② 原地借用来自 `ModelCheckpoint` 的只读共享参数而不重复拷贝；③ 识别形如 `inputs @ delta.to(inputs.dtype).T` 的线性读出并降级为直接从分页状态池流式读取的内核（自动跳过未满批的空闲槽位）。示例 08 在 RTX 4090 上跑 In-Place TTT 的 4B 社区检查点（vLLM 0.32.0，CUDA Graph 开启，FP32 快权重，贪心生成 256 token，预热 1 轮后 3 轮中位数）：1 个请求、4096 token 的 prompt 达 **$73.02\text{ tok/s}$**（16384 token 的 prompt 为 **$47.97\text{ tok/s}$**）；官方 HF 实现在同一张卡、同样协议下为 $54.79 / 34.89\text{ tok/s}$。4 个请求一起跑合计 **$171.56\text{ tok/s}$**（官方实现硬编码 `bs=1` 只支持 1 个请求）。
 
 **自适应深度（`@pllm.custom_forward` + `active=`）。** 被跳过的层做的是状态传播：一行在某一段层上 `active=False` 时，它的残差流原样穿过这段层（等价于把这几层当作恒等映射）。但后面的 token 在每一层做 attention 时，仍然要读到这个位置在这一层的 K/V，所以 pLLM 会为这行补写被跳过层的 K/V：拿它停下时的隐藏状态，经过每个被跳过层自己的输入 norm、K/V 投影和 RoPE 算出 K/V 写进 KV cache（第一次跳过时补写一次，约占一层计算量的 7%；之后再跳过同一层时保留已写入的值）。这就是 CALM 提出的“状态传播”：它给出的 K/V，正是“这些层输出等于输入”这个假设下该位置本应有的 K/V，误差只局限在被跳过的 token 自己的深层状态上。
 

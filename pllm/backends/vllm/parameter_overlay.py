@@ -16,6 +16,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.model_executor.layers.linear import LinearBase, QKVParallelLinear, RowParallelLinear
 
+from pllm.backends.vllm import compat
 from pllm.backends.vllm.architecture import Decoder, LinearOutput, frozen_weight
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.packed_rows import PackedPhaseRow, PackedPhaseRowBatch
@@ -567,15 +568,33 @@ class ParameterOverlay:
         key_fields = next(
             state.key_fields for state in arena.plan.semantic_graph.states if state.resource == math.resource
         )
+        immutable = {
+            str(state.resource)
+            for state in arena.plan.semantic_graph.states
+            if state.immutable and str(state.resource) in arena.owned_resources
+        }
+        mutable = frozenset(name for name, (resource, _) in math.invariants.items() if resource not in immutable)
+        batch_invariant = compat.batch_invariant_enabled()
         for reader in self.readers:
             target = math.targets.index(reader.binding.target)
             pools = tuple(arena.field_pool(str(math.resource), LayoutFieldId(target * width + i)) for i in range(width))
             invariants = {
-                name: views[target].read(arena.field_pool(resource, views[target].field), pooled=True)[0].clone()
+                name: (
+                    view := views[target].read(arena.field_pool(resource, views[target].field), pooled=True)[0],
+                    view if resource in immutable else view.clone(),
+                )[1]
                 for name, (resource, views) in math.invariants.items()
             }
             reader.decode = DecodeOverlay(
-                math, target, pools, invariants, requests, arena.plan.timeline.tensor_policy, key_fields
+                math,
+                target,
+                pools,
+                invariants,
+                requests,
+                arena.plan.timeline.tensor_policy,
+                key_fields,
+                mutable_invariants=mutable,
+                batch_invariant=batch_invariant,
             )
 
     @property
@@ -681,7 +700,8 @@ class ParameterOverlay:
         """Open private pages and stage every decode target before replay starts."""
         assert self.math is not None
         self.task = task
-        batch = task.prepare(self.math).for_resource(self.math.resource)
+        prepared, written = task.prepare(self.math)
+        batch = prepared.for_resource(self.math.resource)
         identities = tuple(dict.fromkeys(rows.identities))
         self.sources = rows.inspect(np.arange(len(identities), dtype=np.int64))
         updated = int((batch.selection.refs.versions[list(batch.selection.state_indices)] > 0).sum())
@@ -689,7 +709,7 @@ class ParameterOverlay:
             assert reader.decode is not None
             reader.apply_count += rows.total_rows
             reader.updated_apply_count += updated
-            reader.decode.prepare(batch, identities)
+            reader.decode.prepare(batch, identities, written)
 
     def prepare_reads(
         self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory

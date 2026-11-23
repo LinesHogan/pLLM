@@ -190,7 +190,8 @@ pLLM 仓库在 `tools/` 目录下提供了数个维护中的基准测试场景�
 
 - **`tools/benchmark_esamp.py`**：测试 ESamp（解码期在线训练小网络并进行采样引导）。默认 rank 4，支持 `--beta` 调节引导强度，显式开启 `require_training=True`；
 - **`tools/benchmark_lora.py`**：测试 Output LoRA。支持 `--scope instance|request|both`（实例共享或每请求私有）、`--rank`、`--max-training-rows`、`--training-fraction` 与 `--state-groups`；
-- **`tools/benchmark_engram.py`**：测试 Engram 式 N-gram 查表内存算法。对比大表分别放置在主机内存（`--placement host`）与显存（`--placement device`）时的解码性能损耗。
+- **`tools/benchmark_engram.py`**：测试 Engram 式 N-gram 查表内存算法。对比大表分别放置在主机内存（`--placement host`）与显存（`--placement device`）时的解码性能损耗；
+- **`tools/benchmark_steer_capture.py`**：测试激活引导（`ActivationPatch`）与隐藏状态异步导出到 CPU（`@pllm.export`）相对原生 vLLM 的吞吐与纯 decode TPOT。
 
 ### 运行命令示例
 

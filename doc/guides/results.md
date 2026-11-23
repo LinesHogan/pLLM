@@ -104,7 +104,7 @@ print(testing.check(PromptEnd(), CONFIG).passed)
 
 ### 成本与开销
 
-- **设备到主机（D2H）传输**：每步产生非阻塞的 GPU 到 CPU 锁页内存异步拷贝，传输字节数为 $\text{rows} \times \text{cols} \times \text{element\_size}$（上界为 $\text{max\_rows} \times \text{max\_cols} \times 8$ 字节）。
+- **设备到主机（D2H）传输**：每步产生非阻塞的 GPU 到 CPU 锁页内存异步拷贝，传输字节数为 $\text{rows} \times \text{cols} \times \text{element\_size}$（上界为 $\text{max\_rows} \times \text{max\_cols} \times 8$ 字节）。在 RTX 4090 上实测 `Qwen/Qwen2.5-7B-Instruct`（0 丢行并在后台守护线程逐行还原为 CPU 张量）：单请求流式导出整层 3584 维残差（每步 7 KiB）的纯 decode TPOT 为 **16.47 ms**（原生 vLLM 为 **16.50 ms**，**100%**）；128 并发序列同时全宽导出（每步 896 KiB）时吞吐仍达原生的 **99.5%**（TPOT **22.06 ms** 对原生 **21.97 ms**）。
 - **静态成本展示**：`pllm.explain` 在计划阶段会直接输出每个导出任务每步传输的行数、上限字节数和拆分的事件数。
 
 ### 限制与设计原因

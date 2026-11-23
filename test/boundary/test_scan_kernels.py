@@ -90,3 +90,67 @@ def test_right_matrix_graph_matches_rowwise_oracle():
     values = torch.randn(5, 4, 2, 3, device="cuda:0", generator=generator)
     keys = torch.nn.functional.normalize(values, dim=-1)
     _check_right_matrix_graph(initial, values, keys)
+
+
+def test_paged_dense_mv_cpu_and_dense_readout():
+    """CPU fallback and FX dense_readout extraction cover casts, scales, idle rows and negative slots."""
+    from pllm.execution.scan_analysis import dense_readout
+    from pllm.kernels.paged_projection import paged_dense_mv
+
+    generator = torch.Generator().manual_seed(17)
+    inputs = torch.randn(4, 19, generator=generator, dtype=torch.bfloat16)
+    pool = torch.randn(5, 11, 19, generator=generator, dtype=torch.float32)
+    slots = torch.tensor([3, 1, -1, 4], dtype=torch.int64)
+    counts = torch.tensor([1, 1, 1, 0], dtype=torch.int64)
+    actual = paged_dense_mv(inputs, pool, slots, counts, True, 0.5)
+    expected = torch.zeros(4, 11, dtype=torch.bfloat16)
+    for row, slot in ((0, 3), (1, 1)):
+        expected[row : row + 1] = torch.mm(inputs[row : row + 1], pool[slot].to(torch.bfloat16).T) * 0.5
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def step(delta: torch.Tensor, x: torch.Tensor, y: torch.Tensor, base: torch.Tensor):
+        return delta + y.T @ x, (x @ delta.to(x.dtype).T) * 0.5
+
+    specs = (
+        (torch.Size((11, 19)), (19, 1), torch.float32, torch.device("cpu")),
+        (torch.Size((4, 19)), (19, 1), torch.bfloat16, torch.device("cpu")),
+        (torch.Size((4, 11)), (11, 1), torch.bfloat16, torch.device("cpu")),
+        (torch.Size((11, 19)), (19, 1), torch.bfloat16, torch.device("cpu")),
+    )
+    matched = dense_readout(step, specs, 2)
+    assert matched is not None and (matched.column, matched.cast_input, matched.scale) == (0, True, 0.5)
+
+    def nonlinear(delta: torch.Tensor, x: torch.Tensor, y: torch.Tensor):
+        return delta, torch.tanh(x @ delta.to(x.dtype).T)
+
+    assert dense_readout(nonlinear, specs[:3], 2) is None
+
+
+@pytest.mark.gpu
+def test_paged_dense_mv_cuda_graph_replay():
+    """CUDA paged readout matches BF16-cast GEMM and skips idle/unmapped lanes under graph replay."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from pllm.kernels.paged_projection import paged_dense_mv
+
+    generator = torch.Generator(device="cuda:0").manual_seed(31)
+    inputs = torch.randn(4, 608, device="cuda:0", generator=generator, dtype=torch.bfloat16)
+    pool = torch.randn(6, 160, 608, device="cuda:0", generator=generator, dtype=torch.float32)
+    slots = torch.tensor([2, 5, 0, -1], device="cuda:0", dtype=torch.int64)
+    counts = torch.tensor([1, 1, 0, 1], device="cuda:0", dtype=torch.int64)
+    paged_dense_mv(inputs, pool, slots, counts, True, 1.0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = paged_dense_mv(inputs, pool, slots, counts, True, 1.0)
+    for next_slots, next_counts in (([4, 1, 3, 2], [1, 0, 1, 0]), ([0, -1, 5, 3], [1, 1, 1, 1])):
+        slots.copy_(torch.tensor(next_slots, device="cuda:0", dtype=torch.int64))
+        counts.copy_(torch.tensor(next_counts, device="cuda:0", dtype=torch.int64))
+        graph.replay()
+        expected = torch.zeros_like(captured)
+        for row, (slot, count) in enumerate(zip(next_slots, next_counts, strict=True)):
+            if count > 0 and slot >= 0:
+                expected[row : row + 1] = torch.mm(inputs[row : row + 1], pool[slot].to(torch.bfloat16).T)
+        torch.testing.assert_close(captured, expected, rtol=1e-2, atol=2e-2)
+        assert not captured[
+            [i for i, (s, c) in enumerate(zip(next_slots, next_counts, strict=True)) if c <= 0 or s < 0]
+        ].any()

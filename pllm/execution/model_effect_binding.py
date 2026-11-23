@@ -153,6 +153,7 @@ def declare_parameter_overlay(
         state.declaration.resource,
         invariants,
         function if isinstance(function, (ChunkUpdate, GradientUpdate)) else None,
+        keys=keys,
     )
     b.overlay_math = math
     transition = b.compute(
@@ -387,8 +388,10 @@ def declare_custom_forward(
     _count_program_work(b, tuple(program for _, program in captured))
     applies_updates = any(isinstance(step, ApplyUpdates) for _, program in captured for step in program.steps)
     if composed:
+        if b.overlay_math is not None:
+            b.overlay_math = replace(b.overlay_math, custom_forward=True)
         select = partial(_program_states, b.parameter_phases, b.custom_forward_updates, tokens)
-        b.operations[symbol] = replace(b.operations[symbol], select=select)
+        b.operations[symbol] = replace(b.operations[symbol], select=select, select_fields=None)
     elif applies_updates:
         raise ValueError("apply_updates needs one trained parameter overlay on the same workload")
     b.custom_forward_programs = programs

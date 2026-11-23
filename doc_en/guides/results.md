@@ -104,7 +104,7 @@ print(testing.check(PromptEnd(), CONFIG).passed)
 
 ### Cost and overhead
 
-- **Device-to-host (D2H) transfer**: Issues a non-blocking asynchronous GPU-to-pinned-CPU copy of $\text{rows} \times \text{cols} \times \text{element\_size}$ bytes per step (upper-bounded by $\text{max\_rows} \times \text{max\_cols} \times 8$ bytes).
+- **Device-to-host (D2H) transfer**: Issues a non-blocking asynchronous GPU-to-pinned-CPU copy of $\text{rows} \times \text{cols} \times \text{element\_size}$ bytes per step (upper-bounded by $\text{max\_rows} \times \text{max\_cols} \times 8$ bytes). Measured on RTX 4090 with `Qwen/Qwen2.5-7B-Instruct` (0 dropped rows, reconstructing independent CPU tensors on the background daemon thread): streaming full 3584-dim residuals for a single request (7 KiB/step) yields a pure decode TPOT of **16.47 ms** vs. **16.50 ms** on native vLLM (**100%**), and exporting full residuals across 128 concurrent sequences (896 KiB/step) retains **99.5%** of native throughput (TPOT **22.06 ms** vs. native **21.97 ms**).
 - **Static cost reporting**: `pllm.explain` prints the per-step row limit, max bytes transferred, and event split count for every export channel.
 
 ### Constraints and rationale

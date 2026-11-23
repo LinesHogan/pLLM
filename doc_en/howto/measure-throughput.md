@@ -190,7 +190,8 @@ The pLLM repository provides several maintained benchmark scripts under `tools/`
 
 - **`tools/benchmark_esamp.py`**: Benchmarks ESamp (online training of a small distiller during decode + guided sampling). Defaults to rank 4, supports `--beta` for guidance strength, and sets `require_training=True`;
 - **`tools/benchmark_lora.py`**: Benchmarks Output LoRA. Supports `--scope instance|request|both` (shared instance vs. private per-request), `--rank`, `--max-training-rows`, `--training-fraction`, and `--state-groups`;
-- **`tools/benchmark_engram.py`**: Benchmarks Engram-style N-gram lookup memory, comparing host-resident (`--placement host`) vs. device-resident (`--placement device`) decode throughput overhead.
+- **`tools/benchmark_engram.py`**: Benchmarks Engram-style N-gram lookup memory, comparing host-resident (`--placement host`) vs. device-resident (`--placement device`) decode throughput overhead;
+- **`tools/benchmark_steer_capture.py`**: Benchmarks `ActivationPatch` steering and asynchronous CPU hidden-state export (`@pllm.export`) throughput and pure decode TPOT against native vLLM.
 
 ### Example CLI Commands
 
