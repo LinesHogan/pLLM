@@ -29,8 +29,8 @@
 
   <!-- Row 1: Before -->
   <rect x="28" y="72" width="864" height="116" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.75"/>
-  <rect x="44" y="84" width="308" height="24" rx="4" fill="#e62b2b"/>
-  <text x="198" y="100" text-anchor="middle" class="badge white">BEFORE · 65.8% THROUGHPUT (+61,440 KERNELS)</text>
+  <rect x="44" y="84" width="322" height="24" rx="4" fill="#e62b2b"/>
+  <text x="205" y="100" text-anchor="middle" class="badge white">BEFORE · 65.8% THROUGHPUT (+61,440 KERNELS)</text>
   <text x="876" y="100" text-anchor="end" class="sub red">12,288 extra adds + 49,152 copies / zero_</text>
 
   <rect x="44" y="124" width="76" height="42" rx="6" fill="#ffffff" stroke="#111111" stroke-width="1.5"/>

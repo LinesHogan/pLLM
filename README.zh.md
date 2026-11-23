@@ -7,11 +7,13 @@
 
 > **[English README](README.md)** · **[项目主页与文档站](https://lineshogan.github.io/pllm/)** · **[文档首页](doc/README.md)** · **[技术随笔与机制拆解 (中/英)](blog/README.md)** · **[在线服务指南](doc/howto/online-serving.md)** · **[Agent 迁移指南](doc/agent/migration.md)**
 
-**pLLM**（**Programmable LLM**，可编程大语言模型推理层）是一个直接运行在未修改的 [vLLM](https://github.com/vllm-project/vllm) 之上的声明式可编程层，用于在连续批处理与静态 CUDA graph 下高效执行有状态、自适应的推理期算法。
+**pLLM**（**Programmable LLM**，可编程大语言模型推理层）——**别再为了试个新算法去改 vLLM 源码了。** 读取内部隐藏状态、按请求挂载私有快权重，或在解码时运行在线训练——直接编译进未修改的 [vLLM](https://github.com/vllm-project/vllm) 连续批处理与静态 CUDA graph。
 
-在单序列 PyTorch 脚本里验证一个推理期算法（激活引导、探针监控、每请求动态 LoRA、decode 期在线训练），通常只需几十行代码；但一旦进入生产级 vLLM，连续批处理会把并发请求拼进同一张动态重排的二维张量，CUDA graph 重放会绕开运行期 Python hook，每请求分页状态的分配、抢占回滚与多流同步也都必须重新处理。
+现在做推理期算法创新——比如跨层对比解码、激活引导、动态挂载 Fast Weights，或者像 Test-Time Training 和 ESamp 那样在解码时做在线训练——往往卡在一个非常痛苦的断层上：在 Hugging Face 里写个 `bs=1` 的循环只要半天，但慢得没法做大规模评测；想上 vLLM 跑满吞吐，就得去 fork 引擎源码，跟分页 KV Cache、抢占调度和静态 CUDA graph 死磕好几周，vLLM 一升级代码就全废了。
 
-pLLM 与 vLLM 的关系类似 eBPF 之于 Linux 内核：无需 fork 或改动 vLLM 源码，只需继承 `pllm.Workload` 声明**读取模型的哪个内部表示、持有何种请求级或实例级状态、计算与参数更新作用于何处**，并编写标准 PyTorch 张量数学。pLLM 在接触 GPU 前先于 CPU 上完成形状追踪与多租户隔离契约检查，再将前向干预、自定义层/KV 调度、分页多版本状态与按需的在线训练直接编译进连续批处理与静态 CUDA graph。
+所以我们做了 pLLM，核心目标就一句话：**别再为了试个新想法去改 vLLM 源码。** 在 pLLM 里，你只需要用几十行纯 Python（`pllm.Workload`）声明三件事：**读哪一层的内部状态、每个请求维护什么私有状态或优化器、以及在哪里干预前向或采样。**
+
+它的底层就像 vLLM 上的 eBPF：运行前先在 CPU 上花不到 2 秒做静态契约校验，确保多租户状态隔离和抢占安全；然后自动把你的逻辑内联编译进原版未修改的 vLLM CUDA graph 里，独立的在线训练任务还会自动放到旁路 stream 并行重叠。零行引擎修改即可兼容 vLLM `0.27–0.34` 的 15 个主流模型家族——哪怕在 128 并发下给每个请求单独挂一个 MLP 边解码边跑 `AdamW` 在线训练，依然能跑出原版 vLLM **96.3%** 以上的吞吐；128 并发激活引导保持原版 **98.3%** 吞吐（TPOT `22.02 ms` 对 `21.97 ms`）；跑 4B 模型的 Test-Time Training 更是直接解锁并发批处理，达到 **171.56 token/s**（官方 `bs=1` 实现的 **3.13 倍**）。
 
 ![pLLM 架构总览](doc/assets/pllm-architecture-zh.svg)
 
