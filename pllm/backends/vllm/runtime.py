@@ -560,6 +560,7 @@ class VllmLlm:
             vocab_size=self.vocab_size,
             prompt_count=len(texts),
             import_fields=self.attachment.spec.import_fields,
+            route_bounds=self.attachment.spec.route_bounds,
         )
 
     def resolve_prompt_indices(self, texts: list[str], prompt_indices: tuple[int, ...] | None) -> tuple[int, ...]:
@@ -826,7 +827,9 @@ def create_vllm_llm(
 
 
 def probe_backend(requirements: BackendRequirements, runner: WorkloadModelRunner) -> BackendCompileFacts:
-    shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
+    shape = ModelShape.of_model(
+        runner.decoder, requirements.parameter_targets, runner.dtype, requirements.routed_targets
+    )
     free_bytes, _total_bytes = torch.cuda.mem_get_info(runner.device)
     dtypes: dict[torch.dtype, ModelDType] = {
         torch.float16: "float16",

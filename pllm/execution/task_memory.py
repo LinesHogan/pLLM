@@ -17,7 +17,7 @@ import torch
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import ModelProbe
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import WeightedCEBatch, WeightedRowBatch
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows, PackedHiddenResourceBinding
 from pllm.contracts.packed_rows import PackedSamplerRowBatch, label_rows
@@ -92,8 +92,10 @@ def meta(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
 
 
 def _hidden_storage(facts: BackendCompileFacts, resource: PackedHiddenResourceBinding, count: int) -> torch.Tensor:
-    """Shape-only rows of one hidden input: model-dtype hidden rows, or FP32 [layers, vocab] layer logits."""
+    """Shape-only rows of one hidden input: model-dtype hidden rows, or FP32 [layers, vocab] / [vocab] layer logits."""
     if resource.site is HiddenSite.LAYER_LOGITS:
+        if resource.layer_kind is HiddenLayerKind.WILDCARD:
+            return meta(count, facts.vocab_size, dtype=torch.float32)
         return meta(count, len(facts.probe.layer_logits), facts.vocab_size, dtype=torch.float32)
     return meta(count, facts.probe.hidden_size, dtype=facts.probe.tensor_dtype.torch)
 
@@ -126,7 +128,12 @@ def example(
         HiddenRowBatch(
             packed,
             tuple(
-                HiddenRows(resource, _hidden_storage(facts, resource, count), np.arange(count, dtype=np.int64))
+                HiddenRows(
+                    resource,
+                    _hidden_storage(facts, resource, count),
+                    np.arange(count, dtype=np.int64),
+                    layers=meta(count, dtype=torch.int64) if resource.layer_kind is HiddenLayerKind.WILDCARD else None,
+                )
                 for resource in dict.fromkeys(item.binding for item in facts.probe.hidden_resources)
             ),
         )

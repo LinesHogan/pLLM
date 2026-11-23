@@ -13,9 +13,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, get_args, ove
 
 import torch
 
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, LayerRouteSelector
 from pllm.contracts.kv_layout import Keep
-from pllm.contracts.parameter_overlay import ParameterOverlayOperator, Projection, ProjectionDelta
+from pllm.contracts.parameter_overlay import (
+    OverlayRefresh,
+    ParameterOverlayOperator,
+    Projection,
+    ProjectionDelta,
+    ProjectionName,
+)
 from pllm.contracts.request_identity import RequestKeyField, ordered_key_fields
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import StateScope
@@ -53,6 +59,8 @@ from pllm.execution.method_inputs import (
     OperandName,
     Parameter,
     Result,
+    RoutedHidden,
+    RoutedLayerLogits,
     SampledTokens,
     SampleIndex,
     StateIndex,
@@ -372,6 +380,7 @@ class ActivationPatch:
     decode: bool = False
     refresh: Literal["admission", "step"] = "admission"
     on_missing: Literal["stop", "hold"] = "stop"
+    route: LayerRouteSelector | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -418,15 +427,139 @@ class Adapter:
     operator: AdapterOperator = "dense"
     factors: tuple[str, str] = ("a", "b")
     scale: float = 1.0
+    _: KW_ONLY
+    route: LayerRouteSelector | None = None
+    refresh: OverlayRefresh = "admission"
+    target_names: tuple[ProjectionName, ...] = ()
 
     def __post_init__(self) -> None:
         if self.operator not in _OPERATORS:
             raise ValueError(f'Adapter(operator={self.operator!r}): use "dense", "low_rank" or "per_head"')
+        if self.refresh not in ("admission", "step"):
+            raise ValueError(f'Adapter(refresh={self.refresh!r}): use "admission" or "step"')
 
     @property
     def delta(self) -> ProjectionDelta:
         return ProjectionDelta(
-            self.state, self.targets, self.weight, _OPERATORS[self.operator], self.factors, self.scale
+            self.state,
+            self.targets,
+            self.weight,
+            _OPERATORS[self.operator],
+            self.factors,
+            self.scale,
+            route=self.route,
+            refresh=self.refresh,
+            target_names=self.target_names,
+        )
+
+
+@dataclass(frozen=True)
+class LayerRoute:
+    """Route hidden reads, residual patches or homogeneous projection adapters by an int64 state field.
+
+    `over` names the explicit candidate layers installed into the model graph; negative indices resolve from the end
+    at bind time. At runtime, the scalar int64 field `state.field` selects one physical layer index in `0..layers-1`,
+    or `-1` to disable the route for that row/step without recapturing CUDA graphs. Derived reads,
+    `patch(decode=True)` and `adapter(...)` default to `refresh="step"` (Forward-only KV; `patch(decode=False)`
+    defaults to `refresh="admission"`).
+    """
+
+    state: str
+    _: KW_ONLY
+    over: tuple[int, ...]
+    field: str = "layer"
+
+    def __post_init__(self) -> None:
+        if not self.state or not self.field:
+            raise ValueError("LayerRoute needs non-empty state and field names")
+        if type(self.over) is not tuple or not self.over or any(type(layer) is not int for layer in self.over):
+            raise TypeError("LayerRoute(over=...) requires a non-empty tuple of integer layer indices")
+        if len(set(self.over)) != len(self.over):
+            raise ValueError(f"LayerRoute(over={self.over!r}) contains duplicate layer indices")
+
+    @property
+    def _selector(self) -> LayerRouteSelector:
+        return LayerRouteSelector(self.state, self.field, self.over)
+
+    def hidden(self, *, tokens: Literal["decode", "prefill", "all"] = "decode") -> Any:
+        """Read the MLP output before the residual add at the dynamically selected layer (-1 yields zeros)."""
+        return RoutedHidden(self._selector, HiddenSite.BLOCK_OUTPUT, HiddenPhase(tokens))
+
+    def residual(
+        self,
+        *,
+        after: Literal["layer", "attention"] = "layer",
+        tokens: Literal["decode", "prefill", "all"] = "decode",
+    ) -> Any:
+        """Read the residual stream at the dynamically selected layer (-1 yields zeros)."""
+        if after not in ("layer", "attention"):
+            raise ValueError(f'LayerRoute.residual(after={after!r}): use "layer" or "attention"')
+        site = HiddenSite.RESIDUAL if after == "layer" else HiddenSite.ATTENTION_RESIDUAL
+        return RoutedHidden(self._selector, site, HiddenPhase(tokens))
+
+    def layer_logits(self) -> Any:
+        """Project the dynamically selected layer's residual stream through the final norm and LM head [rows, vocab]."""
+        return RoutedLayerLogits(self._selector)
+
+    def patch(
+        self,
+        state: str = "",
+        *,
+        first_tokens: int = 0,
+        last_tokens: int = 2,
+        operator: Literal["low_rank_affine", "add"] = "low_rank_affine",
+        decode: bool = True,
+        refresh: Literal["step", "admission"] | None = None,
+        on_missing: Literal["stop", "hold"] = "stop",
+    ) -> ActivationPatch:
+        """Apply an ActivationPatch at the dynamically selected layer in `over` (-1 skips).
+
+        Defaults to `refresh="step"` when `decode=True` (reading the step's latest version on both prefill and decode
+        without pinning admission snapshots) and `refresh="admission"` when `decode=False`.
+        """
+        effective_refresh: Literal["step", "admission"] = (
+            ("step" if decode else "admission") if refresh is None else refresh
+        )
+        return ActivationPatch(
+            state or self.state,
+            self.over,
+            first_tokens,
+            last_tokens,
+            operator,
+            decode=decode,
+            refresh=effective_refresh,
+            on_missing=on_missing,
+            route=self._selector,
+        )
+
+    def adapter(
+        self,
+        state: str = "",
+        *,
+        targets: tuple[ProjectionName, ...],
+        weight: str = "value",
+        operator: AdapterOperator = "dense",
+        factors: tuple[str, str] = ("a", "b"),
+        scale: float = 1.0,
+        refresh: OverlayRefresh = "step",
+    ) -> Adapter:
+        """Apply a homogeneous projection Adapter at the dynamically selected layer in `over` (-1 skips)."""
+        allowed = get_args(ProjectionName)
+        if type(targets) is not tuple or not targets or any(name not in allowed for name in targets):
+            raise ValueError(f"LayerRoute.adapter(targets=...) needs a non-empty tuple of {allowed}")
+        if len(set(targets)) != len(targets):
+            raise ValueError(f"LayerRoute.adapter(targets={targets!r}) contains duplicate projection names")
+        placeholders = tuple(Projection(name, 0) for name in targets)
+        return Adapter(
+            state or self.state,
+            placeholders,
+            weight,
+            operator,
+            factors,
+            scale,
+            route=self._selector,
+            refresh=refresh,
+            target_names=targets,
         )
 
 
@@ -875,5 +1008,6 @@ __all__ = [
     "differentiate",
     "ActivationPatch",
     "Adapter",
+    "LayerRoute",
     "SGD",
 ]

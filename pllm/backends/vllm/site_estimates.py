@@ -58,6 +58,7 @@ class _SiteExample(ModelSites):
         rewrites = binding.sites.rewrites
         self.streams = max((rewrite.streams for rewrite in rewrites), default=1)
         self.hidden, self.count = facts.probe.hidden_size, facts.max_admitted_lineages
+        self.taps = None
         self.rows, self.active = None, None
         self._prefetch = {}
         self._requests_of = torch.empty(self.count, dtype=torch.long, device="meta")
@@ -103,6 +104,9 @@ class _SiteExample(ModelSites):
     def patch(self, source: PatchInput, layer: int) -> Callable[[Tensor], Tensor]:
         # Activation-patch math is already traced by its tensor task.
         return _identity
+
+    def patch_into(self, source: PatchInput, layer: int, target: Tensor) -> None:
+        return None
 
 
 def _identity(value: Tensor) -> Tensor:

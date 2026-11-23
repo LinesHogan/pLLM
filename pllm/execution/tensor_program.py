@@ -113,6 +113,7 @@ class Observation:
     identities: tuple[RequestIdentity, ...] = ()
     # Each exported row's token position within its request.
     positions: tuple[int, ...] = ()
+    layers: torch.Tensor | None = None
     iteration: int = 0
     export: Literal["drop", "block"] | None = None
     dropped_rows: int = 0
@@ -613,6 +614,7 @@ class TensorOperation:
                             tensor_name=observation.name,
                             export=observation.export,
                             dropped_rows=observation.dropped_rows,
+                            layers=observation.layers,
                         )
                         continue
                     context.trace.observe(

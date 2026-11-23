@@ -250,14 +250,21 @@ class VllmCustomForward(CustomForwardPrimitive):
         previous = sites.rows, sites.active
         sites.rows, sites.active = packed, active
         taps = () if sites.taps is None else tuple(sites.taps.taps.values())
+        if taps:
+            lanes = torch.arange(len(packed), device=packed.device, dtype=torch.long)
+            if active is not None:
+                lanes = lanes.masked_fill(~active.flatten(), -1)
+            sites.wave_inverse.fill_(-1)
+            sites.wave_inverse.index_copy_(0, packed, lanes)
         for tap in taps:
-            tap.rows, tap.active = packed, active
+            tap.rows, tap.active, tap.inverse = packed, active, sites.wave_inverse
         try:
             yield sites.stream_after
         finally:
             sites.rows, sites.active = previous
             for tap in taps:
                 tap.rows, tap.active = previous
+                tap.inverse = None
 
     def prepare(self, rows: PackedPhaseRowBatch, context: StateTaskContext) -> None:
         self.clear()

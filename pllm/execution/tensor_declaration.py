@@ -19,6 +19,7 @@ from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import (
     ActivationPatchBinding,
     BackendAttachmentSpec,
+    DecodeRefresh,
     MissingPolicy,
     ModelProbe,
     SamplerBinding,
@@ -643,6 +644,7 @@ class TensorDeclaration:
             or self.imports
             or self.overlay_targets
             or self.effects.activation_bindings
+            or self.effects.route_bounds
             or any(
                 isinstance(port.source, HiddenInputSource) and port.source.phase is not HiddenPhase.DECODE
                 for task in self.graph.tasks
@@ -931,6 +933,11 @@ class TensorDeclaration:
                 pending.extend(
                     port.source.task for port in tasks[symbol].inputs if isinstance(port.source, TaskResultInputSource)
                 )
+        matching = tuple(
+            binding
+            for binding in self.effects.activation_bindings
+            if binding.resource == resource or binding.route_resource == resource
+        )
         self.graph = replace(
             self.graph,
             input_groups=(
@@ -940,11 +947,7 @@ class TensorDeclaration:
                     tuple(sorted(producers)),
                     publication.symbol,
                     readers,
-                    all(
-                        binding.on_missing is MissingPolicy.HOLD
-                        for binding in self.effects.activation_bindings
-                        if binding.resource == resource
-                    ),
+                    bool(matching) and all(binding.on_missing is MissingPolicy.HOLD for binding in matching),
                 ),
             ),
         )
@@ -1004,7 +1007,20 @@ class TensorDeclaration:
                 "a @pllm.train_in_forward method drives every projection hook of its workload, so it does not yet "
                 "combine with a pllm.model.Adapter; train the adapter's state in that method or use two workloads"
             )
-        self.model_reads(tuple(StateResource(binding.resource) for binding in bindings), at_admission=True)
+        all_reads = tuple(
+            StateResource(res)
+            for binding in bindings
+            for res in (binding.resource, *(() if binding.route is None else (binding.route.resource,)))
+        )
+        admission_reads = tuple(
+            StateResource(res)
+            for binding in bindings
+            if binding.route is None or binding.route.refresh == "admission"
+            for res in (binding.resource, *(() if binding.route is None else (binding.route.resource,)))
+        )
+        self.model_reads(all_reads, at_admission=False)
+        if admission_reads:
+            self.model_reads(admission_reads, at_admission=True)
         self.effects = replace(
             self.effects,
             overlay_bindings=(*self.effects.overlay_bindings, *bindings),
@@ -1014,20 +1030,58 @@ class TensorDeclaration:
 
     def activation_patch(self, bindings: tuple[ActivationPatchBinding, ...]) -> None:
         """Declare activation patches and the model state reads they need."""
-        self.model_reads(tuple(binding.resource for binding in bindings), at_admission=True)
+        all_reads = tuple(
+            res
+            for binding in bindings
+            for res in (binding.resource, *(() if binding.route_resource is None else (binding.route_resource,)))
+        )
+        admission_reads = tuple(
+            res
+            for binding in bindings
+            for res, refresh in (
+                (
+                    binding.resource,
+                    DecodeRefresh.INHERIT if binding.route_resource is None else binding.decode_refresh,
+                ),
+                *(() if binding.route_resource is None else ((binding.route_resource, binding.route_refresh),)),
+            )
+            if refresh is DecodeRefresh.INHERIT
+        )
+        self.model_reads(all_reads, at_admission=False)
+        if admission_reads:
+            self.model_reads(admission_reads, at_admission=True)
         self.effects = replace(self.effects, activation_bindings=(*self.effects.activation_bindings, *bindings))
+
+    def record_route_bound(self, resource: str, field: str, over: tuple[int, ...]) -> None:
+        """Record allowed LayerRoute indices and register the route state as a non-KV model read."""
+        self.model_reads((StateResource(resource),), at_admission=False, mutates_kv=False)
+        view = self.field_views[resource, field]
+        for existing_res, existing_field, _, existing_over in self.effects.route_bounds:
+            if (existing_res, existing_field) == (resource, field):
+                if existing_over != over:
+                    raise ValueError(
+                        f"LayerRoute {resource}.{field} is declared with conflicting candidate sets {existing_over} and {over}"
+                    )
+                return
+        self.effects = replace(self.effects, route_bounds=(*self.effects.route_bounds, (resource, field, view, over)))
 
     def custom_forward(self, task: TaskSymbol) -> None:
         """Select the task that supplies the model's custom forward."""
         self.effects = replace(self.effects, custom_forward=task)
 
-    def model_reads(self, resources: tuple[StateResource, ...], *, at_admission: bool = False) -> None:
+    def model_reads(
+        self, resources: tuple[StateResource, ...], *, at_admission: bool = False, mutates_kv: bool = True
+    ) -> None:
         """Note states the model forward reads, so planning keeps their versions readable. Reads `at_admission` see
         the version each request was admitted with, so planning keeps one version per admitted request."""
         graph = replace(self.graph, model_reads=tuple(sorted({*self.graph.model_reads, *resources})))
         if at_admission:
             graph = replace(graph, admission_reads=tuple(sorted({*graph.admission_reads, *resources})))
         self.graph = graph
+        if mutates_kv:
+            self.effects = replace(
+                self.effects, kv_model_reads=tuple(sorted({*self.effects.kv_model_reads, *resources}))
+            )
 
     @property
     def affects_model(self) -> bool:
@@ -1066,4 +1120,9 @@ class TensorDeclaration:
                     (resource, name, view) for (resource, name), view in self.field_views.items() if resource in trained
                 ),
             )
+        if self.feeds:
+            (feed,) = self.feeds
+            bounds = tuple((fname, over) for res, fname, _, over in self.effects.route_bounds if res == feed.resource)
+            if bounds:
+                self.feeds = (replace(feed, route_bounds=bounds),)
         return self.graph, self.layouts, self.effects

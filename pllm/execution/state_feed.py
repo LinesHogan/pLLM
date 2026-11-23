@@ -289,6 +289,14 @@ class Feed(_FeedWriter):
                 f"{self._binding.resource}: publish strided tensors on {self._device} matching "
                 f"{ {name: (field.shape, str(field.dtype)) for name, field in self._fields.items()} }"
             )
+        for field_name, allowed_over in self._binding.route_bounds:
+            allowed = {*allowed_over, -1}
+            flat = fields[field_name].detach().cpu().reshape(-1)
+            invalid = [int(flat[i].item()) for i in range(flat.numel()) if int(flat[i].item()) not in allowed]
+            if invalid:
+                raise ValueError(
+                    f"LayerRoute {self._binding.resource}.{field_name}: fed layer {invalid[0]} is not in over={allowed_over} or -1 (disabled)"
+                )
         with self._live():
             stream = torch.cuda.current_stream(self._device)
             arena = self._start(stream)

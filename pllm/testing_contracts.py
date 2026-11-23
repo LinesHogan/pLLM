@@ -21,7 +21,7 @@ from pllm.backends.vllm.model_shape import ModelShape
 from pllm.config import ModelConfig
 from pllm.contracts.backend_attachment import AttachmentGraphMode, AttachmentHiddenResource, BackendAttachment
 from pllm.contracts.codec import boundary_digest
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenLayerKind, HiddenPhase, HiddenSite
 from pllm.contracts.host_batch import StateImport
 from pllm.contracts.packed_hidden import HiddenRowBatch, HiddenRows
 from pllm.contracts.packed_rows import PackedRows, RowLabeler, label_rows
@@ -49,7 +49,7 @@ from pllm.execution.tensor_declaration import TensorDeclaration
 from pllm.execution.tensor_executor import reads_rows
 from pllm.execution.tensor_frame import TensorFrame
 from pllm.execution.tensor_task import TensorTask
-from pllm.execution.token_program import TokenProgram
+from pllm.execution.token_program import Segment, TokenProgram
 from pllm.execution.trace import TraceEventKind
 from pllm.testing_forward import CheckAttention, CheckForward
 from pllm.testing_kernels import check_sites, compare_method, replay_cells
@@ -247,6 +247,9 @@ def _hidden_values(
     perturbed: int | None,
 ) -> torch.Tensor:
     if resource.binding.site is HiddenSite.LAYER_LOGITS:
+        if resource.binding.layer_kind is HiddenLayerKind.WILDCARD:
+            total = sum(n for _, n, _ in counts)
+            return torch.zeros((total, shape.vocab_size), dtype=torch.float32)
         return torch.cat(
             tuple(
                 torch.stack(
@@ -265,9 +268,74 @@ def _hidden_values(
                 for i, n, done in counts
             )
         )
+    if resource.binding.layer_kind is HiddenLayerKind.WILDCARD:
+        total = sum(n for _, n, _ in counts)
+        return torch.zeros((total, shape.hidden_size), dtype=facts.probe.tensor_dtype.torch)
     return torch.cat(
         tuple(_token_values(i, range(done, done + n), shape.hidden_size, channel, perturbed) for i, n, done in counts)
     )
+
+
+def _resolve_routed_hidden(
+    shape: ModelShape,
+    facts: BackendCompileFacts,
+    declaration: TensorDeclaration,
+    execution: StateExecution,
+    perturbed: int | None,
+    value: StepInput,
+    context: StateTaskContext | None,
+    *,
+    forward: CheckForward | None = None,
+) -> StepInput:
+    """Populate simulated hidden or layer-logit rows for dynamically routed taps using the step's PTTS route values."""
+    if value.hidden is None or context is None:
+        return value
+    if not any(tap.resource.layer_kind is HiddenLayerKind.WILDCARD for tap in value.hidden.taps):
+        return value
+    route_map = {f"{res}.{fname}": (res, view, over) for res, fname, view, over in declaration.effects.route_bounds}
+    dtype = facts.probe.tensor_dtype.torch
+    taps: list[HiddenRows] = []
+    for tap in value.hidden.taps:
+        if tap.resource.layer_kind is not HiddenLayerKind.WILDCARD:
+            taps.append(tap)
+            continue
+        key_part = tap.resource.layer.split(":", 1)[0]
+        res_name, view, over = route_map[key_part]
+        storage = torch.zeros_like(tap.storage)
+        slot_layers = torch.full((len(storage),), -1, dtype=torch.int64)
+        phases = tuple(item.phase for item in facts.probe.hidden_resources if item.binding == tap.resource)
+        selected = tuple(row for phase in phases for row in value.rows.producer_rows(phase))
+        for row in selected:
+            slot_idx = int(tap.slots[row.packed_row_index])
+            ((pin, ref),) = context.read_versions(
+                (row.identity,), StateResource(res_name), execution.directory, latest=True
+            )
+            target_layer = int(view.read(execution.arena.borrow_field(pin, ref, view.field)).item())
+            if target_layer not in over:
+                continue
+            if forward is not None:
+                if not forward.visits(row.packed_row_index, target_layer, tap.resource.site):
+                    continue
+            elif declaration.custom_forward_programs:
+                program = declaration.custom_forward_programs.get(
+                    "decode" if row.phase is HiddenPhase.DECODE else "prefill"
+                )
+                if program is not None and not any(
+                    isinstance(step, Segment) and step.start <= target_layer < step.stop for step in program.steps
+                ):
+                    continue
+            slot_layers[slot_idx] = target_layer
+            prompt_idx = row.identity.prompt_index
+            offsets = range(row.token_offset, row.token_offset + 1)
+            if tap.resource.site is HiddenSite.LAYER_LOGITS:
+                chan = _LOGITS_CHANNEL if target_layer == shape.layer_count - 1 else 120 + target_layer
+                storage[slot_idx] = _token_values(prompt_idx, offsets, shape.vocab_size, chan, perturbed)[0].float()
+            else:
+                static_key = shape.hidden_binding(target_layer, tap.resource.site).locator_key
+                chan = int(boundary_digest(static_key)[:8], 16)
+                storage[slot_idx] = _token_values(prompt_idx, offsets, shape.hidden_size, chan, perturbed)[0].to(dtype)
+        taps.append(HiddenRows(tap.resource, storage, tap.slots, slot_layers))
+    return replace(value, hidden=HiddenRowBatch(value.rows, tuple(taps)))
 
 
 def scheduled_step(
@@ -471,6 +539,7 @@ def _drive_step(
     run: _Run,
     forward_anchor: AnchorId | None,
     sites: Callable[[Mapping[tuple[TaskSymbol, str], torch.Tensor]], None] | None,
+    resolve_routed: Callable[[StepInput, StateTaskContext | None], StepInput] | None = None,
 ) -> bool:
     """One step in VllmSession's order: begin, the CPU model's forward (a custom forward's anchor, residual methods),
     after_forward, sample, commit. False when the driver skipped it because the workload reads none of its rows."""
@@ -484,6 +553,8 @@ def _drive_step(
         driver.anchor(context, forward_anchor)
     if sites is not None:
         sites({} if context is None else context.results)
+    if resolve_routed is not None:
+        value = resolve_routed(value, context)
     driver.after_forward(value, None)
     if driver.step is None:
         run.timing.skip()
@@ -513,6 +584,11 @@ def _drive_step(
         if event.kind is TraceEventKind.TENSOR and event.step_id == value.rows.step_id:
             for identity, position, tensor in zip(event.identities, event.positions, event.tensor(), strict=True):
                 run.values[identity.request_id, position, f"export {event.tensor_name}"] = tensor
+            if event.layers:
+                for identity, position, layer in zip(event.identities, event.positions, event.layers, strict=True):
+                    run.values[identity.request_id, position, f"export_layer {event.tensor_name}"] = torch.tensor(
+                        layer, dtype=torch.int64
+                    )
     return True
 
 
@@ -527,8 +603,20 @@ def _imported_batch(
     if state.scope is not StateScope.REQUEST:
         return None
     layout = next(entry.layout for entry in declaration.layouts.layouts if entry.resource == resource)
+    route_views = {view: over for res, _, view, over in declaration.effects.route_bounds if res == resource}
     values = tuple(
-        torch.stack(
+        torch.tensor(
+            [
+                (*route_views[view], -1)[
+                    (identity.prompt_index + (1 if perturbed is not None and identity.prompt_index != perturbed else 0))
+                    % (len(route_views[view]) + 1)
+                ]
+                for identity in identities
+            ],
+            dtype=torch.int64,
+        ).reshape(len(identities), *view.shape)
+        if view in route_views
+        else torch.stack(
             tuple(
                 _token_values(identity.prompt_index, range(1), prod(view.shape), channel + 700, perturbed).reshape(
                     view.shape
@@ -648,7 +736,15 @@ def _run(
                     forward.prepare(value, tokens)
                 if declaration.sites.rewrites:
                     sites = partial(_site_step, declaration, facts, value, tokens, run)
-            if not _drive_step(driver, value, _feedback(value, shape, perturbed), run, forward_anchor, sites):
+            if not _drive_step(
+                driver,
+                value,
+                _feedback(value, shape, perturbed),
+                run,
+                forward_anchor,
+                sites,
+                partial(_resolve_routed_hidden, shape, facts, declaration, execution, perturbed, forward=forward),
+            ):
                 continue
             if forward is not None:
                 run.values.update(
@@ -760,7 +856,7 @@ def _compare(
 def contract_facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape, BackendCompileFacts]:
     """Build CPU contract-check facts and model dimensions without loading model weights."""
     requirements = workload.backend_requirements()
-    shape = ModelShape.of_config(config, requirements.parameter_targets)
+    shape = ModelShape.of_config(config, requirements.parameter_targets, requirements.routed_targets)
     facts = compile_facts(
         shape,
         requirements,
@@ -893,7 +989,7 @@ def _check_neutral(neutral: Workload, config: ModelConfig, failures: list[str]) 
         "stateful or multi-stream residual methods": any(
             rewrite.memory is not None or rewrite.streams > 1 for rewrite in neutral_declaration.sites.rewrites
         ),
-        "adapters": bool(requirements.parameter_targets),
+        "adapters": bool(requirements.has_parameter_targets),
         "activation patches": bool(requirements.activation_layers),
     }
     for effect, declared in unexecuted.items():
@@ -996,7 +1092,7 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         and not declaration.model_site_tasks
         or programs
         and (
-            requirements.parameter_targets
+            requirements.has_parameter_targets
             or requirements.activation_layers
             or any(program.over == "span" or program.entries for program in programs)
         )
@@ -1021,7 +1117,7 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         prefix
         for task in declaration.tensor_tasks.values()
         if task.export is not None
-        for prefix in (f"method {task.symbol}.", f"export {task.export.name}")
+        for prefix in (f"method {task.symbol}.", f"export {task.export.name}", f"export_layer {task.export.name}")
     )
     skipped.extend(_unchecked_effects(requirements, declaration, attachment, programs, exports))
     failures = _variants(workload, facts, declaration, shape, exports, skipped, device_equivalence=device_equivalence)
@@ -1048,7 +1144,12 @@ def _check_adaptive(
     for program in programs:
         if not program.adaptive:
             continue
-        if program.entries or declaration.overlay_targets or declaration.sites.rewrites:
+        if (
+            program.entries
+            or declaration.overlay_targets
+            or declaration.sites.rewrites
+            or declaration.effects.route_bounds
+        ):
             skipped.append(CheckSkip("adaptive decoder", "PositionState and model-site composition need GPU"))
             continue
         try:
@@ -1075,7 +1176,7 @@ def _unchecked_effects(
         skipped.append(
             CheckSkip("model attention / KV", "CPU decoder checks token math and state reads; real attention needs GPU")
         )
-    if requirements.parameter_targets:
+    if requirements.has_parameter_targets:
         skipped.append(
             CheckSkip(
                 "adapter application",

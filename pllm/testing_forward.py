@@ -15,12 +15,13 @@ if TYPE_CHECKING:
 
 import torch
 
+from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.kv_layout import storage_layout
 from pllm.contracts.packed_rows import PackedPhaseRow
 from pllm.execution.custom_forward import CustomForwardTask, SerialCustomForward
 from pllm.execution.state_execution import StateExecution
 from pllm.execution.step_input import StepInput
-from pllm.execution.token_program import KV
+from pllm.execution.token_program import KV, Segment
 
 
 class CheckForward(SerialCustomForward):
@@ -36,10 +37,14 @@ class CheckForward(SerialCustomForward):
         self._rows: Sequence[PackedPhaseRow] = ()
         self.inputs = torch.empty(0)
         self.output = torch.empty(0)
+        self.computed_layers: set[tuple[int, int]] = set()
+        self.frozen_layers: set[tuple[int, int]] = set()
 
     def prepare(self, value: StepInput, inputs: torch.Tensor) -> None:
         """Set this step's independently generated token embeddings."""
         self._rows, self.inputs = value.rows.rows, inputs
+        self.computed_layers.clear()
+        self.frozen_layers.clear()
 
     @property
     def rows(self) -> Sequence[PackedPhaseRow]:
@@ -57,10 +62,24 @@ class CheckForward(SerialCustomForward):
         residual: torch.Tensor | None,
         kv: KV = "commit",
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.computed_layers.add((row.packed_row_index, ordinal))
         stream = hidden if residual is None else hidden + residual
         if self.attention is not None and ordinal in self.attention.program.methods:
             return self.attention.layer((row,), ordinal, stream), torch.zeros_like(stream)
         return (stream.float() * 0.5 + (ordinal + 1) * 0.01).tanh().to(hidden.dtype), torch.zeros_like(hidden)
+
+    def masked_segment(
+        self, row: PackedPhaseRow, positions: torch.Tensor, step: Segment, hidden: torch.Tensor, active: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        if not bool(active[0, 0]):
+            self.frozen_layers.update((row.packed_row_index, ordinal) for ordinal in range(step.start, step.stop))
+        return super().masked_segment(row, positions, step, hidden, active)
+
+    def visits(self, packed_row_index: int, layer: int, site: HiddenSite) -> bool:
+        """Whether this row physically reached `layer` at `site` during the CPU custom forward."""
+        if (packed_row_index, layer) in self.computed_layers:
+            return True
+        return site is not HiddenSite.BLOCK_OUTPUT and (packed_row_index, layer) in self.frozen_layers
 
     def propagate(self, row: PackedPhaseRow, ordinal: int, positions: torch.Tensor, hidden: torch.Tensor) -> None:
         """Pointwise fake layers have no KV; the causal decoder oracle checks propagation."""

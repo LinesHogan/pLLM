@@ -49,7 +49,9 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm) -> Non
     expected = explain(workload, config)
     runner = handle.runner
     requirements = workload.backend_requirements()
-    shape = ModelShape.of_model(runner.decoder, requirements.parameter_targets, runner.dtype)
+    shape = ModelShape.of_model(
+        runner.decoder, requirements.parameter_targets, runner.dtype, requirements.routed_targets
+    )
     facts = probe_backend(requirements, runner)
     # The installed state already consumed memory; replay planning against its load-time capacity.
     assert handle.compile_facts is not None
@@ -76,7 +78,7 @@ def check_probe(workload: Workload, config: ModelConfig, handle: VllmLlm) -> Non
         failures.append("[explain/graphs] engine graph mode differs from explain; report a pLLM admission bug")
     if sum(state.reserved_bytes for state in actual.states) != handle.attachment.plan.states.reserved_bytes:
         failures.append("[explain/state] allocated state reservations differ; report a pLLM allocation bug")
-    if not requirements.parameter_targets:
+    if not requirements.has_parameter_targets:
         plan = handle.attachment.plan
         if (
             actual.peak_memory_bytes != plan.schedule.peak_memory_bytes

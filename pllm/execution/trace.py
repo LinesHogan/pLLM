@@ -78,6 +78,8 @@ class TraceEvent:
     refs: tuple[StateRef, ...] = ()
     # An export row's token position within its request, beside its identity.
     positions: tuple[int, ...] = ()
+    # Each exported row's resolved physical layer index when reading a single LayerRoute (-1 when unmatched).
+    layers: tuple[int, ...] = ()
     operation_id: int | None = None
     pin_id: int | None = None
     release_id: int | None = None
@@ -193,11 +195,12 @@ class _TraceEntry:
     timing: tuple[torch.cuda.Event, torch.cuda.Event] | None
     payload: tuple[torch.Tensor, torch.cuda.Event | None] | None
     pending: bool
+    layers: torch.Tensor | None = None
 
     def snapshot(self) -> TraceEvent:
         """Materialize retained immutable refs and encode a completed owned host value on inspection."""
         event = self.make_event()
-        if self.payload is None and not self.refs:
+        if self.payload is None and not self.refs and self.layers is None:
             return event
         payload = None
         if self.payload is not None:
@@ -205,7 +208,12 @@ class _TraceEntry:
             if ready is not None:
                 ready.synchronize()
             payload = b64encode(host.reshape(-1).view(torch.uint8).numpy().tobytes()).decode("ascii")
-        return replace(event, refs=tuple(self.refs), tensor_data=payload)
+        if self.layers is None:
+            layers = event.layers
+        else:
+            flat_layers = self.layers.reshape(-1)
+            layers = tuple(int(flat_layers[index].item()) for index in range(flat_layers.numel()))
+        return replace(event, refs=tuple(self.refs), tensor_data=payload, layers=layers)
 
 
 class ExecutionTrace:
@@ -460,6 +468,7 @@ class ExecutionTrace:
         device_duration_ns: int | None = None,
         export: Literal["drop", "block"] | None = None,
         dropped_rows: int = 0,
+        layers: torch.Tensor | None = None,
     ) -> None:
         if tensor is not None and tensor.is_meta:
             return
@@ -484,6 +493,7 @@ class ExecutionTrace:
                 return
             dtype, shape = None, ()
             payload = None
+            host_layers = None
             if tensor is not None:
                 assert tensor_name and tensor.numel() * tensor.element_size() <= MAX_SNAPSHOT_BYTES
                 dtype = TensorDType(str(tensor.dtype).removeprefix("torch."))
@@ -491,6 +501,9 @@ class ExecutionTrace:
                 # Own a bounded host copy; delivery or explicit snapshot reads wait for it.
                 host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=tensor.is_cuda)
                 host.copy_(tensor.detach(), non_blocking=True)
+                if layers is not None:
+                    host_layers = torch.empty(layers.shape, dtype=torch.int64, device="cpu", pin_memory=layers.is_cuda)
+                    host_layers.copy_(layers.detach(), non_blocking=True)
                 ready = torch.cuda.Event() if tensor.is_cuda else None
                 if ready is not None:
                     ready.record(torch.cuda.current_stream(tensor.device))
@@ -508,6 +521,7 @@ class ExecutionTrace:
                         identities,
                         (),
                         positions,
+                        (),
                         operation_id,
                         pin_id,
                         release_id,
@@ -528,6 +542,7 @@ class ExecutionTrace:
                     timing,
                     payload,
                     export is not None and self._on_export is not None,
+                    host_layers,
                 )
             )
 

@@ -104,7 +104,7 @@ logits = pllm.layer_logits((6, 12, -1))
 - **与模型输出逐位相同**：`layer_logits` 对中间层使用独立开辟的矩阵乘法（GEMM）计算 logits，完全不侵入基座模型本身的 LM head 路径。因此，模型自身采样的输出 logits 与原生 vLLM 保持严格的逐位相同（bitwise identical）。
 - **行对齐**：为采样器抽取的每个 token 生成一行（包括 prompt 的最后一个 token 以及每个 decode token）。
 
-详细的对比实验可参阅 [示例 06：读模型内部与 DoLa](../examples/06_reading_inside.ipynb)。
+详细的对比实验可参阅 [示例 06：读模型内部与 DoLa](../examples/06_reading_inside.ipynb)。如果需要在服务运行期间不重捕获 CUDA graph 动态切换读取哪一层的 `residual`、`hidden` 或 `layer_logits`，可使用高级入口 [`pllm.model.LayerRoute`](model-edits.md#高级入口运行时动态切层pllmmodellayerroute)。
 
 ---
 

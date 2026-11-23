@@ -104,7 +104,7 @@ logits = pllm.layer_logits((6, 12, -1))
 - **Bitwise identical model output**: `layer_logits` runs an independent GEMM for intermediate layers without touching the base model's own LM head path, so the base model's sampled logits remain bitwise identical to native vLLM.
 - **Row alignment**: Produces one row per token drawn by the sampler (including the last token of each prompt and every decode token).
 
-For a detailed contrastive decoding walkthrough, see [Example 06: Reading Model Internals and DoLa](../examples/06_reading_inside.ipynb).
+For a detailed contrastive decoding walkthrough, see [Example 06: Reading Model Internals and DoLa](../examples/06_reading_inside.ipynb). If you need to switch which layer's `residual`, `hidden`, or `layer_logits` is read at runtime without recapturing CUDA graphs, see [`pllm.model.LayerRoute`](model-edits.md#advanced-entry-point-runtime-dynamic-layer-routing-pllmmodellayerroute).
 
 ---
 

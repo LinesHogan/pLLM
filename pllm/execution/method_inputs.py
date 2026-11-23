@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite
+from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, LayerRouteSelector
 from pllm.contracts.semantic_graph import HiddenInputSource, StateScope, TaskResultInputSource, TaskSymbol
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.attention_methods import AttentionFact, Fact
@@ -35,6 +35,7 @@ from pllm.execution.tensor_frame import (
     input_tokens_port,
     layer_logits_port,
     result_port,
+    routed_layer_logits_port,
     sample_index_port,
 )
 
@@ -139,6 +140,57 @@ class LayerLogits(InputMarker):
 
 
 @dataclass(frozen=True)
+class RoutedHidden(InputMarker):
+    """Hidden or residual stream read through a runtime `pllm.model.LayerRoute`."""
+
+    route: LayerRouteSelector
+    site: HiddenSite
+    phase: HiddenPhase
+
+    def bind(self, context: WorkloadContext) -> RoutedHidden:
+        return replace(self, route=replace(self.route, resource=context.qualify(self.route.resource)))
+
+    def resolve(self) -> HiddenInputSource:
+        return HiddenInputSource(-1, self.site, self.phase, route=self.route)
+
+    def requirements(self) -> BackendRequirements:
+        return BackendRequirements(hidden_inputs=(self.resolve(),))
+
+    def port(self, context: WorkloadContext) -> TensorPort:
+        resolved = context.bind_layer_route(self.route)
+        return hidden_port(HiddenInputSource(-1, self.site, self.phase, route=resolved))
+
+
+@dataclass(frozen=True)
+class RoutedLayerLogits(InputMarker):
+    """Final norm and LM head applied to a dynamically routed layer's residual stream."""
+
+    route: LayerRouteSelector
+
+    def bind(self, context: WorkloadContext) -> RoutedLayerLogits:
+        return replace(self, route=replace(self.route, resource=context.qualify(self.route.resource)))
+
+    def resolve(self) -> HiddenInputSource:
+        return HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, HiddenPhase.NONE, route=self.route)
+
+    def requirements(self) -> BackendRequirements:
+        return BackendRequirements(
+            hidden_inputs=tuple(
+                HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, phase, route=self.route)
+                for phase in (HiddenPhase.PREFILL, HiddenPhase.DECODE)
+            )
+        )
+
+    def port(self, context: WorkloadContext) -> TensorPort:
+        if context.binding.probe is None:
+            raise ValueError("LayerRoute.layer_logits reads the model's LM head; compile this workload with make_llm")
+        resolved = context.bind_layer_route(self.route)
+        return routed_layer_logits_port(
+            HiddenInputSource(-1, HiddenSite.LAYER_LOGITS, HiddenPhase.NONE, route=resolved)
+        )
+
+
+@dataclass(frozen=True)
 class SampleIndex(InputMarker):
     limit: int | None
 
@@ -228,6 +280,11 @@ class CausalModelInput(InputMarker):
         adapter = context.adapters.get(self.name)
         if adapter is None:
             raise ValueError(f"pllm.causal_model({self.name!r}) must name a pllm.model.Adapter of the workload")
+        if adapter.route is not None:
+            raise ValueError(
+                f"pllm.causal_model({self.name!r}) does not support dynamically routed LayerRoute.adapter; "
+                "use a static pllm.model.Adapter for differentiable causal_model training"
+            )
         state = context.states[adapter.state]
         bindings = context.adapter_bindings(adapter)
         forward = None if context.binding.causal is None else context.binding.causal(bindings)

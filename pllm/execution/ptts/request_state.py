@@ -199,8 +199,10 @@ class RequestStateDirectory:
         identities: tuple[RequestIdentity, ...],
         stream: torch.cuda.Stream | None,
         initialize: Callable[[tuple[tuple[torch.Tensor, ...], ...], tuple[StateAddress, ...]], None],
+        *,
+        pin_instances: bool = True,
     ) -> PagePublication | None:
-        """Initialize and publish new lineages, then install their holders and inference pins."""
+        """Initialize and publish new lineages, then install their holders and optional inference pins."""
         addresses = self._addresses(identities)
         if not identities:
             new = tuple(key for key in addresses if key.key is None)
@@ -213,8 +215,12 @@ class RequestStateDirectory:
                 for s in self.request_states
                 for identity in identities
             )
-            instances = StateRefs.of(
-                tuple(self.arena.latest(self._lineages[StateAddress(s.resource, None)]) for s in self.pinned_states)
+            instances = (
+                StateRefs.of(
+                    tuple(self.arena.latest(self._lineages[StateAddress(s.resource, None)]) for s in self.pinned_states)
+                )
+                if pin_instances
+                else StateRefs.of(())
             )
         write = self.arena.prepare_admission(tuple(str(key.resource) for key in new), stream) if new else None
         pins: list[tuple[RequestIdentity, PagePin]] = []
@@ -241,6 +247,24 @@ class RequestStateDirectory:
         self._inference_pins.update(pins)
         self._bind(identities)
         return receipt
+
+    def pin_admitted(self, identities: tuple[RequestIdentity, ...], stream: torch.cuda.Stream | None) -> None:
+        """Pin current versions of `pinned_states` for already-admitted requests after BEFORE_FORWARD publications."""
+        if not identities or not self.pinned_states:
+            return
+        instances = StateRefs.of(
+            tuple(self.arena.latest(self._lineages[StateAddress(s.resource, None)]) for s in self.pinned_states)
+        )
+        pins: list[tuple[RequestIdentity, PagePin]] = []
+        try:
+            for identity in identities:
+                if identity not in self._inference_pins:
+                    pins.append((identity, self.arena.pin_exact(instances, stream)))
+        except Exception:
+            for _, pin in pins:
+                self.arena.release_pin(pin)
+            raise
+        self._inference_pins.update(pins)
 
     def _bind(self, identities: tuple[RequestIdentity, ...]) -> None:
         """Install numeric projection bindings at admission, including shared route keys."""

@@ -11,7 +11,7 @@ import torch
 from pllm.contracts.backend_attachment import BackendAttachmentSpec, ModelProbe
 from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.kv_layout import KVLayout
-from pllm.contracts.parameter_overlay import Projection
+from pllm.contracts.parameter_overlay import Projection, ProjectionName
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -52,6 +52,7 @@ class BackendRequirements:
     # The layers pllm.layer_logits reads, as declared (negative from the end).
     layer_logits: tuple[int, ...] = ()
     parameter_targets: tuple[Projection, ...] = ()
+    routed_targets: tuple[tuple[ProjectionName, tuple[int, ...]], ...] = ()
     activation_layers: tuple[int, ...] = ()
     sampler_stages: tuple[SamplerStage, ...] = ()
     sampler_feedback: bool = False
@@ -72,6 +73,11 @@ class BackendRequirements:
     feeds: bool = False
     # The smallest pllm.sample_index(limit=); requests must use a lower sample index.
     sample_limit: int | None = None
+
+    @property
+    def has_parameter_targets(self) -> bool:
+        """Whether the workload adapts any static or dynamically routed projection."""
+        return bool(self.parameter_targets or self.routed_targets)
 
     @property
     def custom_attention_tp_unsafe(self) -> bool:
@@ -103,7 +109,7 @@ class BackendRequirements:
             (
                 (state.resource, state.scope, state.resource in written or state.resource in external_states)
                 for state in graph.states
-                if state.resource in graph.model_reads
+                if state.resource in attachment.kv_model_reads
             ),
             custom_attention=custom_attention,
             in_forward=attachment.in_forward is not None,
@@ -123,6 +129,7 @@ class BackendRequirements:
             input_token_history=max((part.input_token_history for part in parts), default=-1),
             layer_logits=tuple(layer for part in parts for layer in part.layer_logits),
             parameter_targets=tuple(target for part in parts for target in part.parameter_targets),
+            routed_targets=tuple(target for part in parts for target in part.routed_targets),
             activation_layers=tuple(layer for part in parts for layer in part.activation_layers),
             sampler_stages=tuple(stage for part in parts for stage in part.sampler_stages),
             sampler_feedback=any(part.sampler_feedback for part in parts),

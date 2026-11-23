@@ -128,6 +128,7 @@ class ModelSites:
         self._activation = activation
         self.count = 0  # rows of the current hook call (vLLM may pad the step's rows)
         self._requests_of = torch.zeros(rows, dtype=torch.long, device=weight.device)
+        self.wave_inverse = torch.full((rows,), -1, dtype=torch.long, device=weight.device)
         self.state_inputs = state_inputs(rewrites, attention_program)
         self._memories = {
             rewrite.name: SiteMemorySchedule(rewrite, arena, requests, rows)
@@ -273,10 +274,11 @@ class ModelSites:
 
     def run_hook(self, hook: int, inputs: list[Tensor], outputs: list[Tensor]) -> None:
         """Keep orchestration opaque to Dynamo; declare only scratch and private pools writable."""
-        reads = [self._requests_of, *self.state_values.values(), *self.result_values.values()]
-        if self._activation is not None:
-            reads.extend(self._activation.buffers)
+        reads = [self._requests_of, self.wave_inverse, *self.state_values.values(), *self.result_values.values()]
         writes = [*self.earlier_values.values()]
+        if self._activation is not None:
+            reads.extend(self._activation.read_buffers)
+            writes.extend(self._activation.write_buffers)
         for memory in self._memories.values():
             reads.extend((memory.table, memory.rows))
             writes.extend(memory.pools)
@@ -345,6 +347,10 @@ class ModelSites:
     def patch(self, source: PatchInput, layer: int) -> Callable[[Tensor], Tensor]:
         assert self._activation is not None
         return self._activation.patch(source.resource, layer, self.rows)
+
+    def patch_into(self, source: PatchInput, layer: int, target: Tensor) -> None:
+        assert self._activation is not None
+        self._activation.patch_into(source.resource, layer, self.rows, target)
 
     def store_rows(self, buffer: Tensor, values: Tensor) -> None:
         """Write current rows, preserving destinations of inactive custom-forward lanes."""
@@ -448,10 +454,14 @@ class SublayerBoundary:
         normed = torch.empty_like(branch)
         if stream is None:
             self.sites.run_hook(self.index, [branch], [normed])
+            normalized = self.taps[0]
+            if normalized is not None:
+                normalized.copy(normed)
             return normed
         width = self.sites.hidden * (self.sites.streams if self.final is None else 1)
         residual = branch.new_empty((branch.shape[0], width))
         self.sites.run_hook(self.index, [branch, stream], [normed, residual])
+        self._copy_taps(normed, residual)
         return normed, residual
 
     def emit(self, inputs: list[Tensor], outputs: list[Tensor]) -> None:
@@ -459,9 +469,7 @@ class SublayerBoundary:
         branch, stream = inputs[0], inputs[1] if len(inputs) == 2 else None
         self.sites.count = len(branch)
         if stream is None:
-            result = self(branch)
-            assert isinstance(result, Tensor)
-            outputs[0].copy_(result)
+            outputs[0].copy_(self._normalize_single(branch))
             return
         normed, residual = outputs
         if (
@@ -493,7 +501,8 @@ class SublayerBoundary:
                 assert self.read is not None
                 self.read.emit((self.streams_of(residual),), (normed,))
                 self._normalize(normed, torch.zeros_like(normed))
-        self._keep(normed, residual)
+        for source in self.keeps:
+            self.sites.keep(source, residual)
 
     def _normalize(self, branch: Tensor, stream: Tensor) -> None:
         normed, residual = self.norm(branch, stream)
@@ -538,16 +547,20 @@ class SublayerBoundary:
                 else [torch.empty_like(branch), branch.new_empty((len(branch), width))]
             )
             self.emit([branch, stream], outputs)
+            self._copy_taps(outputs[0], outputs[1])
             return outputs[0], outputs[1]
-        x = branch if self.before is not None else self.streams_of(branch).reshape(len(branch), -1)
-        if self.final is not None:
-            x = self._final(x)
-        u = x if self.reader is None else self._read(x)
-        normed = self.norm(u)
+        normed = self._normalize_single(branch)
         normalized = self.taps[0]
         if normalized is not None:
             normalized.copy(normed)
         return normed
+
+    def _normalize_single(self, branch: Tensor) -> Tensor:
+        x = branch if self.before is not None else self.streams_of(branch).reshape(len(branch), -1)
+        if self.final is not None:
+            x = self._final(x)
+        u = x if self.reader is None else self._read(x)
+        return self.norm(u)
 
     def _read(self, stream: Tensor) -> Tensor:
         assert self.after is not None
@@ -570,9 +583,10 @@ class SublayerBoundary:
         if residual is not None:
             residual.copy(stream)
 
-    def _keep(self, normed: Tensor, stream: Tensor) -> None:
-        self.keep_stream(stream)
-        normalized = self.taps[0]
+    def _copy_taps(self, normed: Tensor, stream: Tensor) -> None:
+        residual, normalized = self.taps[1], self.taps[0]
+        if residual is not None:
+            residual.copy(stream)
         if normalized is not None:
             normalized.copy(normed)
 

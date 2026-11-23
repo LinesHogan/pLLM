@@ -76,7 +76,7 @@ print(testing.check(Lens(), CONFIG).passed)
 | --- | --- |
 | `@pllm.export(*, name="value", every=1, max_rows=1, max_cols=16, enabled=True, overflow="drop")` | Deliver the method's `[rows, cols]` result to `on_export`: per step at most `max_rows` rows (the rest of that step's rows are dropped and counted in `event.dropped_rows`) and the first `max_cols` columns, every `every` steps, split into events of whole rows of at most 32 KiB each. `max_cols * 8` must be at most 32768 bytes, so one row fits an event. Runs after the forward by default. `overflow="block"` waits on a full delivery queue (256 events) instead of dropping the event. `pllm.explain` prints each export's rows, bytes and events per step. |
 | `pllm.Workload.on_export(self, event)` | Override to receive each export as a `pllm.io.TraceEvent`, in the process that runs the model, asynchronously; `close()` (or leaving `with`) drains delivery. Never call the engine from it. |
-| `pllm.io.TraceEvent` | One trace record. For exports: `tensor_name` (the export name), `identities` (one `pllm.testing.RequestIdentity` per row: `prompt_index` is the prompt's position in the `generate` call, or the value from `generate(..., prompt_indices=...)`; `sample_index`; `request_id` is pLLM's internal id, not vLLM's `RequestOutput.request_id`), `positions` (each row's token position in its request), `step_id`, `dropped_rows`, `tensor()` (an independent CPU tensor). |
+| `pllm.io.TraceEvent` | One trace record. For exports: `tensor_name` (the export name), `identities` (one `pllm.testing.RequestIdentity` per row: `prompt_index` is the prompt's position in the `generate` call, or the value from `generate(..., prompt_indices=...)`; `sample_index`; `request_id` is pLLM's internal id, not vLLM's `RequestOutput.request_id`), `positions` (each row's token position in its request), `layers` (resolved physical layer index per row, or `-1` when disabled, if the export reads one `pllm.model.LayerRoute`; empty `()` for static reads), `step_id`, `dropped_rows`, `tensor()` (an independent CPU tensor). |
 | `pllm.io.TraceSnapshot` | `llm.trace_snapshot()`: the retained events (`events`), drop counters (`export_dropped`: events dropped on a full queue) and host/device task timings. |
 | `pllm.io.TraceSelection` | `llm.select_trace(TraceSelection(...))` opts into extra tensor/gradient snapshots and kernel profiling; empty filters match everything. |
 
@@ -339,6 +339,7 @@ forward.
 | `pllm.model.ActivationPatch(state, layers, first_tokens=0, last_tokens=2, operator="low_rank_affine", *, decode=False, refresh="admission", on_missing="stop")` | Edit the output of `layers` (the residual stream after them) from a state, whoever writes it. `operator="add"` adds one vector field per layer; `"low_rank_affine"` reads three fields per layer (ReFT). Applies to the first `first_tokens` and last `last_tokens` prompt tokens, and with `decode=True` to every decode token. `refresh="step"` reads the newest version every decode step. Runs inside the model's CUDA graphs. |
 | `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0)` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `"dense"` and `"per_head"` read the field `weight`. A trainable `"low_rank"` state needs a non-zero `init=` (e.g. `pllm.Computed` with random A, zero B): with both factors at zero every gradient is zero, so it is rejected. Both `RequestState` and `InstanceState` adapters run inside the model's CUDA graphs. Inside `@pllm.custom_forward` the delta applies at every projection call, including repeated layers. |
 | `pllm.model.Projection(name, layer=None)` | A linear projection by its Hugging Face module name: `"q_proj"`, `"k_proj"`, `"v_proj"`, `"gate_proj"`, `"up_proj"` or `"down_proj"`; `layer=None` means every layer. |
+| `pllm.model.LayerRoute(state, *, over, field="layer")` | Advanced runtime layer selector over explicit candidate layers `over` without recapturing CUDA graphs. Reads a 0-d `int64` field `state.field` (`pllm.Field((), torch.int64)`) holding an active layer in `over` or `-1` to disable (zeros for reads, identity for edits). Methods: `.hidden(tokens=...)`, `.residual(after=..., tokens=...)`, `.layer_logits()`, `.patch(state="", ..., refresh="step")`, `.adapter(state="", *, targets=(...), ..., refresh="step")`. |
 
 Declare both as class attributes or typed properties. A `pllm.Field` shape callable of a state an `Adapter`
 reads receives each target's `(in_features, out_features)`; the state then has one copy of each field per
@@ -378,6 +379,25 @@ class PromptLoRA(pllm.Workload):
 
 
 print(pllm.explain(Steering(), CONFIG).eager_reason)
+```
+
+To switch target layers at runtime without recapturing CUDA graphs (across global `import_state`, per-request `RequestState`, or on-device `@pllm.write`), declare a `pllm.model.LayerRoute` over an explicit candidate tuple `over`:
+
+```python
+class DynamicProbeAndSteer(pllm.Workload):
+    ctrl = pllm.InstanceState(
+        {"layer": pllm.Field((), torch.int64), "vector": pllm.Field(lambda width, _: (width,))},
+        init=pllm.Imported(),
+    )
+    route = pllm.model.LayerRoute("ctrl", over=(4, 12, 20))
+    steer = route.patch(operator="add", decode=True)
+
+    @pllm.export(name="routed_norm", max_rows=8, max_cols=1)
+    def capture(self, r: torch.Tensor = route.residual()) -> torch.Tensor:
+        return r.float().norm(dim=-1, keepdim=True)
+
+
+print(testing.check(DynamicProbeAndSteer(), CONFIG).passed)
 ```
 
 ## Import or feed state from outside
@@ -870,14 +890,16 @@ pllm.UpdateOutput(output: 'torch.Tensor', changed: 'torch.Tensor', update_count:
 ### pllm.model
 
 ```text
-pllm.model.ActivationPatch(state: 'str', layers: 'tuple[int, ...]', first_tokens: 'int' = 0, last_tokens: 'int' = 2, operator: "Literal['low_rank_affine', 'add']" = 'low_rank_affine', *, decode: 'bool' = False, refresh: "Literal['admission', 'step']" = 'admission', on_missing: "Literal['stop', 'hold']" = 'stop')
+pllm.model.ActivationPatch(state: 'str', layers: 'tuple[int, ...]', first_tokens: 'int' = 0, last_tokens: 'int' = 2, operator: "Literal['low_rank_affine', 'add']" = 'low_rank_affine', *, decode: 'bool' = False, refresh: "Literal['admission', 'step']" = 'admission', on_missing: "Literal['stop', 'hold']" = 'stop', route: 'LayerRouteSelector | None' = None)
     Edit the hidden state at `layers` from a state, whoever writes it (ReFT-style): the first and last prompt tokens, and with decode=True every decode token.
-pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, str]' = ('a', 'b'), scale: 'float' = 1.0)
+pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, str]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = ())
     Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
 pllm.model.CausalModel(forward: 'CausalForward | None', factors: 'tuple[torch.Tensor, ...] | None')
     The method's callable model argument; `base` is the same model without the declared overlay.
 pllm.model.LayerOutputs(values: tuple[torch.Tensor, ...], start: int, layer_count: int)
     Post-layer residual streams indexed by absolute layer, negative from the model end.
+pllm.model.LayerRoute(state: 'str', *, over: 'tuple[int, ...]', field: 'str' = 'layer')
+    Route hidden reads, residual patches or homogeneous projection adapters by an int64 state field.
 pllm.model.Layers(embeddings: torch.Tensor, position: torch.Tensor, layer_count: int, generated: torch.Tensor, entries: dict[str, torch.Tensor], over: Literal['token', 'span'] = 'token', namespace: str = '')
     Public model slices and position state used inside custom_forward methods.
 pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
@@ -923,7 +945,7 @@ pllm.io.Feed(plan: 'PlanBundle', binding: 'FeedBinding', control: 'Connection', 
     Publish complete tensor fields into a declared state, with bounded backpressure.
 pllm.io.StateImport(values: tuple[~T, ...])
     External tensors in field order, visible from the importing call's first step.
-pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), positions: 'tuple[int, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
+pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), positions: 'tuple[int, ...]' = (), layers: 'tuple[int, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
 pllm.io.TraceSelection(tasks: 'tuple[TaskId, ...]' = (), identities: 'tuple[RequestIdentity, ...]' = (), iterations: 'tuple[int, ...]' = (), names: 'tuple[str, ...]' = (), tensors: 'bool' = False, gradients: 'bool' = False, states: 'bool' = False, max_events: 'int' = 0, max_tensor_bytes: 'int' = 32768, kernel_calls: 'int' = 0)
     Explicit observations only; empty filters match all, disabled flags retain nothing.
 pllm.io.TraceSnapshot(execution_id: 'str', process_id: 'int', events: 'tuple[TraceEvent, ...]', dropped: 'int', capacity: 'int', pending_device_timings: 'int' = 0, export_dropped: 'int' = 0, schema_version: 'int' = 10)

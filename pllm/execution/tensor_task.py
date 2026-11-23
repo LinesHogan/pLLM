@@ -29,6 +29,7 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
+from pllm.execution.cuda_stream import upload
 from pllm.execution.declaration import Call, State
 from pllm.execution.module_graph import ModuleCall
 from pllm.execution.ptts.request_state import RequestStateSelection
@@ -110,6 +111,7 @@ class TensorExport:
     max_cols: int
     enabled: bool
     overflow: Literal["drop", "block"]
+    route_locator_key: tuple[str, str, str] | None = None
 
     def __post_init__(self) -> None:
         if min(self.every, self.max_rows, self.max_cols) < 1 or self.max_cols * 8 > MAX_SNAPSHOT_BYTES:
@@ -124,10 +126,25 @@ class TensorExport:
             return None
         return replace(data, rows=data.rows[: self.max_rows], plan=None)
 
-    def output(self, value: torch.Tensor, data: TensorFrame, source_rows: int) -> TaskOutput:
+    def _route_layers(self, data: TensorFrame, count: int) -> torch.Tensor | None:
+        if self.route_locator_key is None or count == 0 or data.step.hidden is None:
+            return None
+        tap = next(
+            (item for item in data.step.hidden.taps if item.resource.locator_key == self.route_locator_key),
+            None,
+        )
+        if tap is None or tap.layers is None:
+            return None
+        chosen = tuple(int(tap.slots[row.packed_row_index]) for row in data.rows[:count])
+        if tap.layers.is_meta:
+            return torch.zeros(count, dtype=torch.long, device="meta")
+        return tap.layers.index_select(0, upload(chosen, tap.layers.device))
+
+    def output(self, value: torch.Tensor, data: TensorFrame, batch: TensorBatch, source_rows: int) -> TaskOutput:
         """Publish the bounded result with each row's request and token position, in events of whole rows."""
         value = value[: self.max_rows, : self.max_cols]
         identities, positions = data.rows.identities, tuple(data.rows.token_offsets.tolist())
+        layers = self._route_layers(data, len(value))
         rows = MAX_SNAPSHOT_BYTES // value[0].nbytes
         return TaskOutput(
             observations=tuple(
@@ -137,6 +154,7 @@ class TensorExport:
                     step_id=data.step.rows.step_id,
                     identities=identities[start : start + rows],
                     positions=positions[start : start + rows],
+                    layers=None if layers is None else layers[start : start + rows],
                     export=self.overflow,
                     dropped_rows=source_rows - len(data.rows) if start == 0 else 0,
                 )

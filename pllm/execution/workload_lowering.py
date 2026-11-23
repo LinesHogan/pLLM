@@ -5,7 +5,7 @@ or host build around that lowering."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from inspect import signature
@@ -17,10 +17,22 @@ import torch
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.backend_attachment import ActivationPatchOperator, DecodeRefresh, DecodeWindow, MissingPolicy
-from pllm.contracts.hidden_locator import HiddenSite
+from pllm.contracts.hidden_locator import (
+    HiddenLayerKind,
+    HiddenSite,
+    LayerRouteSelector,
+    resolve_route_layers,
+    route_locator_tag,
+)
 from pllm.contracts.host_batch import StateImport, validate_host_batch
 from pllm.contracts.member import MemberDeclaration
-from pllm.contracts.parameter_overlay import ParameterOverlayFieldBinding, ParameterOverlayOperator, ProjectionDelta
+from pllm.contracts.parameter_overlay import (
+    OverlayRoute,
+    ParameterOverlayFieldBinding,
+    ParameterOverlayOperator,
+    ProjectionDelta,
+)
+from pllm.contracts.request_identity import RequestKeyField
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     AnchorSymbol,
@@ -32,18 +44,30 @@ from pllm.contracts.semantic_graph import (
     SemanticOutputKind,
     SemanticTask,
     StateEffectKind,
+    StateResource,
+    StateScope,
     TaskResultInputSource,
+    TaskSymbol,
     TimingConstraint,
     TrainingMode,
 )
 from pllm.contracts.tensor_layout import TensorDType
-from pllm.execution.binding_base import Field, layout_field, overlay_fields
+from pllm.execution.binding_base import Field, layout_field, overlay_fields, routed_overlay_fields
 from pllm.execution.causal_batch import CausalBinder
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.declaration import Call, Dimensions, LayoutField, State, When
 from pllm.execution.host_runtime import HostConfig, bind_host
 from pllm.execution.method_effects import TRAINING_INPUTS, Effect, Gradient, Sampler
-from pllm.execution.method_inputs import Carried, Carry, InputMarker, Parameter, Result, method_inputs
+from pllm.execution.method_inputs import (
+    Carried,
+    Carry,
+    InputMarker,
+    Parameter,
+    Result,
+    RoutedHidden,
+    RoutedLayerLogits,
+    method_inputs,
+)
 from pllm.execution.model_effect_binding import declare_activation_patch, declare_custom_forward
 from pllm.execution.model_sites import StateInput
 from pllm.execution.position_state import PositionState
@@ -138,6 +162,21 @@ class Operation:
             arguments, carries = self.arguments()
         context, effect = self.context, self.effect
         inputs = {key: source.port(context) for key, source in arguments.items()}
+        routed_sources = tuple(
+            source for source in arguments.values() if isinstance(source, (RoutedHidden, RoutedLayerLogits))
+        )
+        unique_routes = tuple(dict.fromkeys(source.route for source in routed_sources))
+        if export is not None and len(unique_routes) == 1:
+            first_source = routed_sources[0]
+            resolved = context.bind_layer_route(first_source.route)
+            export = replace(
+                export,
+                route_locator_key=(
+                    route_locator_tag(resolved),
+                    HiddenLayerKind.WILDCARD.value,
+                    first_source.resolve().site.value,
+                ),
+            )
         demand = self.gradient or Gradient((), effect.training)
         math = demand.contract(self, arguments)
         update = context.states[effect.state] if effect.training else None
@@ -291,7 +330,43 @@ class WorkloadContext:
 
     def adapter_bindings(self, delta: ProjectionDelta) -> tuple[ParameterOverlayFieldBinding, ...]:
         """The field views an adapter applies, shared by inference and differentiable model calls."""
-        return delta.field_bindings(lambda name: self.binding.field_views[delta.state, name])
+        definition = self.state_definitions[delta.state]
+        if delta.route is None:
+            return delta.field_bindings(lambda name: self.binding.field_views[delta.state, name])
+        resolved = self.bind_layer_route(delta.route)
+        if delta.refresh == "admission":
+            _reject_mutable_request_admission(self, delta.state)
+            _reject_mutable_request_admission(self, resolved.resource)
+        if definition.layers and definition.layers != resolved.over:
+            raise ValueError(
+                f"{delta.state}.layers={definition.layers} must match LayerRoute(over={resolved.over}) or be omitted"
+            )
+        route_view = self.binding.field_views[resolved.resource, resolved.field]
+        return delta.field_bindings(
+            lambda name: self.binding.field_views[delta.state, name],
+            layer_bank=bool(definition.layers),
+            route=OverlayRoute(resolved.resource, route_view, delta.refresh),
+        )
+
+    def bind_layer_route(self, route: LayerRouteSelector) -> LayerRouteSelector:
+        """Validate a LayerRoute's int64 scalar control field and resolve its candidate layers."""
+        definition = self.state_definition(route.resource, "pllm.model.LayerRoute needs a declared state")
+        if definition.optimizer is not None:
+            raise ValueError(
+                f"LayerRoute state {route.resource!r} cannot declare optimizer=...: discrete int64 layer indices are "
+                "not differentiable; put the int64 route field in a separate state without an optimizer"
+            )
+        self.parameter(route.resource, route.field)
+        view = self.binding.field_views[route.resource, route.field]
+        layout = next(item.layout for item in self.binding.layouts.layouts if item.resource == route.resource)
+        spec = layout.fields[view.field]
+        if view.shape != () or spec.dtype is not TensorDType.INT64:
+            raise ValueError(
+                f"LayerRoute field {route.resource}.{route.field} must be a 0-d int64 scalar: pllm.Field((), torch.int64)"
+            )
+        over = resolve_route_layers(route.over, self.binding.dimensions.layer_count)
+        self.binding.record_route_bound(route.resource, route.field, over)
+        return replace(route, over=over)
 
     def qualify(self, name: str) -> str:
         """Keep references within one component; dots are reserved for framework paths."""
@@ -399,10 +474,20 @@ class WorkloadContext:
         for name, delta in self.adapters.items():
             with self.declaring(name), self.binding.member(name, MemberDeclaration("Adapter")):
                 self.binding.overlay(self.adapter_bindings(delta))
-        # The writes of states activation patches read: a custom forward reads their versions, and a fed chain
-        # (feed -> @pllm.write -> patch) closes its conditional input at that publication.
+        # The before-forward writes of states activation patches or routed adapters read: a custom forward reads their
+        # versions, and a fed chain (feed -> @pllm.write -> patch) closes its conditional input at that publication.
+        tasks_by_symbol = {task.symbol: task for task in self.binding.graph.tasks}
         publications = tuple(
-            self.writes[patch.state][1] for patch in self.activations.values() if patch.state in self.writes
+            dict.fromkeys(
+                self.writes[state][1]
+                for state in (
+                    *(patch.state for patch in self.activations.values()),
+                    *(patch.route.resource for patch in self.activations.values() if patch.route is not None),
+                    *(delta.state for delta in self.adapters.values() if delta.route is not None),
+                    *(delta.route.resource for delta in self.adapters.values() if delta.route is not None),
+                )
+                if state in self.writes and _can_precede_forward(tasks_by_symbol, self.writes[state][1].symbol)
+            )
         )
         if self.custom_forwards:
             declare_custom_forward(
@@ -622,9 +707,22 @@ def declare_state(context: WorkloadContext, name: str, definition: InstanceState
 def _layout_fields(context: WorkloadContext, name: str, definition: InstanceState) -> tuple[LayoutField, ...]:
     """The allocated fields: plain shapes in the state's dtype, or pllm.Field values sized by the hidden width or,
     when a pllm.model.Adapter reads the state, once per adapter target."""
+    consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
     if definition.layers:
         if definition.layers[-1] >= context.binding.dimensions.layer_count:
             raise ValueError(f"{name}.layers exceeds the model layer count")
+        if consumer is not None and consumer.route is not None:
+            resolved_over = resolve_route_layers(consumer.route.over, context.binding.dimensions.layer_count)
+            if definition.layers != resolved_over:
+                raise ValueError(f"{name}.layers={definition.layers} must match LayerRoute(over={resolved_over})")
+            context.binding.overlay_targets = consumer.targets
+            return routed_overlay_fields(
+                definition.field_specs(),
+                consumer,
+                context.binding.dimensions,
+                lambda key, value: context.field_dtype(name, key, value.dtype),
+                layer_bank=True,
+            )
         return tuple(
             layout_field(
                 f"{key}_{layer}",
@@ -635,7 +733,6 @@ def _layout_fields(context: WorkloadContext, name: str, definition: InstanceStat
             for layer in definition.layers
             for key, value in definition.field_specs().items()
         )
-    consumer = next((adapter for adapter in context.adapters.values() if adapter.state == name), None)
     if consumer is None:
         return tuple(
             layout_field(
@@ -655,12 +752,93 @@ def _layout_fields(context: WorkloadContext, name: str, definition: InstanceStat
             "every gradient is zero and the adapter never learns"
         )
     context.binding.overlay_targets = consumer.targets
+    specs = definition.field_specs()
+    if consumer.route is not None:
+        route_key = consumer.route.field if consumer.route.resource == name else ""
+        if route_key and definition.optimizer is not None:
+            raise ValueError(
+                f"LayerRoute state {name!r} cannot declare optimizer=...: discrete int64 layer indices are "
+                "not differentiable; put the int64 route field in a separate state without an optimizer"
+            )
+        extra: tuple[LayoutField, ...] = ()
+        if route_key and route_key in specs:
+            raw_route = definition.fields[route_key]
+            route_dtype = context.field_dtype(name, route_key, specs[route_key].dtype)
+            valid_shape = raw_route == () or (
+                isinstance(raw_route, Field) and not callable(raw_route.shape) and raw_route.shape == ()
+            )
+            if not valid_shape or route_dtype is not TensorDType.INT64:
+                raise ValueError(
+                    f"LayerRoute field {name}.{route_key} must be a 0-d int64 scalar: pllm.Field((), torch.int64)"
+                )
+            extra = (LayoutField(route_key, (), route_dtype, 8),)
+        adapter_specs = {k: v for k, v in specs.items() if k != route_key}
+        routed = routed_overlay_fields(
+            adapter_specs,
+            consumer,
+            context.binding.dimensions,
+            lambda key, value: context.field_dtype(name, key, value.dtype),
+            layer_bank=False,
+        )
+        if not extra:
+            return routed
+        keys = tuple(specs)
+        pos = keys.index(route_key)
+        if len(consumer.target_names) == 1:
+            return (*routed[:pos], *extra, *routed[pos:])
+        if pos not in (0, len(keys) - 1):
+            raise ValueError(
+                f"{name}.{route_key}: place the LayerRoute control field first or last when adapting multiple projections"
+            )
+        return (*extra, *routed) if pos == 0 else (*routed, *extra)
     return overlay_fields(
-        definition.field_specs(),
+        specs,
         consumer,
         context.binding.dimensions,
         lambda key, value: context.field_dtype(name, key, value.dtype),
     )
+
+
+def _can_precede_forward(tasks_by_symbol: Mapping[TaskSymbol, SemanticTask], symbol: TaskSymbol) -> bool:
+    """Whether `symbol` and its upstream task-result closure can execute before `model.execute`."""
+    pending, visited = [symbol], set[TaskSymbol]()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        task = tasks_by_symbol[current]
+        if task.timing.after != AnchorSymbol("request.prepare") or task.custom_forward is not None:
+            return False
+        for port in task.inputs:
+            if isinstance(port.source, (HiddenInputSource, SamplerFeedbackInputSource)):
+                return False
+            if isinstance(port.source, TaskResultInputSource):
+                pending.append(port.source.task)
+    return True
+
+
+def _reject_mutable_request_admission(context: WorkloadContext, state_name: str) -> None:
+    definition = context.state_definitions[state_name]
+    if definition.scope is not StateScope.REQUEST:
+        return
+    written_by_task = any(
+        any(
+            effect.resource == state_name and effect.kind not in (StateEffectKind.READ, StateEffectKind.PUBLISH)
+            for effect in task.effects
+        )
+        and not any(
+            isinstance(port.source, HostServiceInputSource) and port.source.schema == StateImport.schema
+            for port in task.inputs
+        )
+        for task in context.binding.graph.tasks
+    )
+    shared_import = isinstance(definition.init, Imported) and RequestKeyField.REQUEST_ID not in definition.request_keys
+    if definition.optimizer is not None or written_by_task or shared_import:
+        raise ValueError(
+            f'{state_name}: refresh="admission" on RequestState requires a frozen per-request state '
+            '(key_fields including "request_id" without @pllm.write/@pllm.train); use refresh="step" or InstanceState'
+        )
 
 
 def declare_patch(context: WorkloadContext, name: str, patch: ActivationPatch) -> None:
@@ -670,17 +848,40 @@ def declare_patch(context: WorkloadContext, name: str, patch: ActivationPatch) -
         raise ValueError(
             "pllm.model.ActivationPatch reads a state the workload writes; it cannot read a fed state directly"
         )
+    layers = patch.layers
+    route_resource: StateResource | None = None
+    route_field = None
+    route_refresh = DecodeRefresh.STEP
+    layer_bank = True
+    if patch.route is not None:
+        resolved = context.bind_layer_route(patch.route)
+        if patch.refresh == "admission":
+            _reject_mutable_request_admission(context, patch.state)
+            _reject_mutable_request_admission(context, resolved.resource)
+        layers = resolved.over
+        route_resource = StateResource(resolved.resource)
+        route_field = context.binding.field_views[resolved.resource, resolved.field]
+        route_refresh = DecodeRefresh.STEP if patch.refresh == "step" else DecodeRefresh.INHERIT
+        if definition.layers and definition.layers != layers:
+            raise ValueError(
+                f"{patch.state}.layers={definition.layers} must match LayerRoute(over={layers}) or be omitted"
+            )
+        layer_bank = bool(definition.layers)
     declare_activation_patch(
         context.binding,
         name,
         context.states[patch.state],
-        layers=patch.layers,
+        layers=layers,
         operator=ActivationPatchOperator(patch.operator),
         first_tokens=patch.first_tokens,
         last_tokens=patch.last_tokens,
         decode=DecodeWindow.ALL if patch.decode else DecodeWindow.NONE,
         decode_refresh=DecodeRefresh.STEP if patch.refresh == "step" else DecodeRefresh.INHERIT,
         on_missing=MissingPolicy(patch.on_missing),
+        route_resource=route_resource,
+        route_field=route_field,
+        route_refresh=route_refresh,
+        layer_bank=layer_bank,
     )
 
 

@@ -79,6 +79,7 @@ with pllm.make_llm(GPU_CONFIG, workload=StreamNorm()) as llm:
   - `sample_index`: Relative sample index under that prompt (`0` for the first sample);
   - `request_id`: pLLM's internal request identifier (distinct from vLLM's `RequestOutput.request_id`).
 - **Token positions `event.positions`**: Integer tuple giving each row's token offset within its request.
+- **Dynamic layer provenance `event.layers`**: When an export method reads a single [`pllm.model.LayerRoute`](model-edits.md#advanced-entry-point-runtime-dynamic-layer-routing-pllmmodellayerroute), carries a tuple of each row's resolved physical layer index (`-1` when disabled or unmatched); empty `()` for static layer reads.
 - **CPU tensor `event.tensor()`**: Returns an independent CPU tensor copy.
 - **All-token reads `tokens="all"`**: By default, methods read the latest row per request; to observe every fresh token computed in a step (including all prefill-chunk tokens), pass `tokens="all"` on the input marker (e.g., `pllm.residual(12, tokens="all")`). All-token reads are available only to `@pllm.export` methods.
 

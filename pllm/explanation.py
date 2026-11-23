@@ -417,8 +417,20 @@ def _taps(
             for port in task.inputs:
                 source = port.source
                 if isinstance(source, HiddenInputSource) and (
-                    shape.hidden_binding(source.layer, source.site).tap == layout.tap
-                    or (source.site is HiddenSite.LAYER_LOGITS and layout.tap in logit_taps)
+                    shape.hidden_binding(source.layer, source.site, source.route).tap == layout.tap
+                    or (
+                        source.site is HiddenSite.LAYER_LOGITS
+                        and (
+                            (source.route is None and layout.tap in logit_taps)
+                            or (
+                                source.route is not None
+                                and layout.route is not None
+                                and layout.site is HiddenSite.RESIDUAL
+                                and layout.route.resource == source.route.resource
+                                and layout.route.field == source.route.field
+                            )
+                        )
+                    )
                 ):
                     users.update(binding.task_members.get(task.symbol, (task.symbol,)))
         result.append(
@@ -481,6 +493,16 @@ def _settings(
         result.extend(_member_settings(name, member, custom_forward=custom_forward))
     for task in plan.semantic_graph.tasks:
         result.extend(_task_settings(task))
+    for resource, field_name, _, over in binding.effects.route_bounds:
+        result.append(
+            EscapeHatch(
+                f"{resource}.{field_name}",
+                "LayerRoute",
+                f"over={over}",
+                False,
+                f"device-gated hooks installed on {len(over)} candidate layers (-1 disables); CUDA taps, add/low_rank_affine<=256 patches and dense/low_rank<=256 adapters skip inactive pool reads/GEMMs (patch boundaries still pass norm ports; per_head/rank>256 mask after evaluation)",
+            )
+        )
     if config.cuda_graphs is False:
         result.append(EscapeHatch("", "cuda_graphs", "False", False, "model forward runs eagerly"))
     return tuple(result)
@@ -685,7 +707,7 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
 
     requirements = workload.backend_requirements()
     reason = admit_workload(config, requirements)
-    shape = ModelShape.of_config(config, requirements.parameter_targets)
+    shape = ModelShape.of_config(config, requirements.parameter_targets, requirements.routed_targets)
     layouts = HiddenTapAnnouncement.declared(requirements, config).resolve(
         shape.layer_count, shape.hidden_size, shape.vocab_size, post_attention_norm_name(shape.architecture)
     )

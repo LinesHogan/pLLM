@@ -523,7 +523,7 @@ Refer to a workload attribute or dotted path in a decorator or marker setting.
 ### `pllm.model.ActivationPatch`
 
 ```text
-pllm.model.ActivationPatch(state: 'str', layers: 'tuple[int, ...]', first_tokens: 'int' = 0, last_tokens: 'int' = 2, operator: "Literal['low_rank_affine', 'add']" = 'low_rank_affine', *, decode: 'bool' = False, refresh: "Literal['admission', 'step']" = 'admission', on_missing: "Literal['stop', 'hold']" = 'stop')
+pllm.model.ActivationPatch(state: 'str', layers: 'tuple[int, ...]', first_tokens: 'int' = 0, last_tokens: 'int' = 2, operator: "Literal['low_rank_affine', 'add']" = 'low_rank_affine', *, decode: 'bool' = False, refresh: "Literal['admission', 'step']" = 'admission', on_missing: "Literal['stop', 'hold']" = 'stop', route: 'LayerRouteSelector | None' = None)
 ```
 
 Edit the hidden state at `layers` from a state, whoever writes it (ReFT-style): the first and last prompt
@@ -536,7 +536,7 @@ says what a step without a new version does ("stop" the request or "hold" the la
 ### `pllm.model.Adapter`
 
 ```text
-pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, str]' = ('a', 'b'), scale: 'float' = 1.0)
+pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, str]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = ())
 ```
 
 Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
@@ -568,6 +568,20 @@ pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
 ```
 
 One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
+
+### `pllm.model.LayerRoute`
+
+```text
+pllm.model.LayerRoute(state: 'str', *, over: 'tuple[int, ...]', field: 'str' = 'layer')
+```
+
+Route hidden reads, residual patches or homogeneous projection adapters by an int64 state field.
+
+`over` names the explicit candidate layers installed into the model graph; negative indices resolve from the end
+at bind time. At runtime, the scalar int64 field `state.field` selects one physical layer index in `0..layers-1`,
+or `-1` to disable the route for that row/step without recapturing CUDA graphs. Derived reads,
+`patch(decode=True)` and `adapter(...)` default to `refresh="step"` (Forward-only KV; `patch(decode=False)`
+defaults to `refresh="admission"`).
 
 ### `pllm.train_in_forward`
 
@@ -697,7 +711,7 @@ must be immutable; pass varying tensor values through explicit arguments.
 ### `pllm.io.TraceEvent`
 
 ```text
-pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), positions: 'tuple[int, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
+pllm.io.TraceEvent(sequence: 'int', host_time_ns: 'int', kind: 'TraceEventKind', invocation_id: 'int', task_id: 'TaskId | None' = None, identities: 'tuple[RequestIdentity, ...]' = (), refs: 'tuple[StateRef, ...]' = (), positions: 'tuple[int, ...]' = (), layers: 'tuple[int, ...]' = (), operation_id: 'int | None' = None, pin_id: 'int | None' = None, release_id: 'int | None' = None, row: 'PackedPhaseRow | None' = None, iteration: 'int | None' = None, relative_l2: 'float | None' = None, device_ordinal: 'int | None' = None, device_duration_ns: 'int | None' = None, tensor_name: 'str | None' = None, tensor_dtype: 'TensorDType | None' = None, tensor_shape: 'tuple[int, ...]' = (), tensor_data: 'str | None' = None, step_id: 'int | None' = None, source_shape: 'tuple[int, ...]' = (), dropped_rows: 'int' = 0, kernel_name: 'str | None' = None)
 ```
 
 ### `pllm.io.TraceSelection`

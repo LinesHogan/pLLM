@@ -2,7 +2,34 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
+
+
+@dataclass(frozen=True, slots=True)
+class LayerRouteSelector:
+    """State field holding a runtime physical layer index (or -1 to skip) over candidate layers."""
+
+    resource: str
+    field: str
+    over: tuple[int, ...]
+
+
+def resolve_route_layers(over: tuple[int, ...], layer_count: int) -> tuple[int, ...]:
+    """Normalize candidate layer indices into sorted unique 0..layer_count - 1 values."""
+    if not over or any(not -layer_count <= layer < layer_count for layer in over):
+        raise ValueError(f"LayerRoute(over={over!r}) must name layers within 0..{layer_count - 1}")
+    resolved = tuple(layer % layer_count for layer in over)
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(
+            f"LayerRoute(over={over!r}) names duplicate layers after resolving against {layer_count} layers"
+        )
+    return tuple(sorted(resolved))
+
+
+def route_locator_tag(route: LayerRouteSelector) -> str:
+    """Stable locator tag for a resolved LayerRoute tap."""
+    return f"{route.resource}.{route.field}:{','.join(map(str, route.over))}"
 
 
 class HiddenLayerKind(StrEnum):
@@ -53,5 +80,8 @@ __all__ = [
     "HiddenLayerKind",
     "HiddenPhase",
     "HiddenSite",
+    "LayerRouteSelector",
     "logit_layers",
+    "resolve_route_layers",
+    "route_locator_tag",
 ]

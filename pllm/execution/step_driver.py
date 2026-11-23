@@ -68,6 +68,7 @@ class StepOpen(Enum):
         reads = (
             spec.overlay_bindings
             or spec.activation_bindings
+            or spec.route_bounds
             or custom_forward
             or graph.trains_on_batch
             or graph.input_token_history >= 0
@@ -211,6 +212,7 @@ class StepDriver:
             hidden_size=self.attachment.probe.hidden_size,
             vocab_size=vocab_size,
             import_fields=self.attachment.spec.import_fields,
+            route_bounds=self.attachment.spec.route_bounds,
             prompt_count=prompt_count,
         )
 
@@ -298,7 +300,7 @@ class StepDriver:
                 execution.arena.collect_completed()
             return
         if execution.directory.request_states:
-            execution.admit(admitted, self._stream())
+            execution.admit(admitted, self._stream(), pin_instances=False)
         for identity in admitted:
             self.labeler.admit(identity)
             self.admitted[identity.request_id] = identity
@@ -387,15 +389,16 @@ class StepDriver:
         execution = self.execution
         if self.open in (StepOpen.AFTER_FORWARD, StepOpen.AFTER_EVERY_FORWARD):
             return None
-        if self.open is StepOpen.IN_FORWARD:
-            step.context = execution.begin(rows.row_batch.request_rows, stream, retain_gradients=False)
-            execution.advance_to(step.context, "request.prepare")
-            return step.context
         held_input = self._receive_feed(rows, stream)
         step.context = execution.start_step(self._staged(value), stream, held_input=held_input, retain_gradients=False)
         self._consume_host_batch()
         execution.advance_to(step.context, "request.prepare")
+        self._pin_pending_instances(rows, stream)
+        return step.context
+
+    def _pin_pending_instances(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream | None) -> None:
         # Offline publication precedes admission; existing request pins remain unchanged.
+        execution = self.execution
         pending = tuple(
             identity
             for identity in sorted(
@@ -404,8 +407,7 @@ class StepDriver:
             if execution.directory.pinned_states and not execution.directory.has_inference_pin(identity)
         )
         if pending:
-            execution.admit(pending, stream)
-        return step.context
+            execution.pin_admitted(pending, stream)
 
     def _receive_feed(self, rows: PackedSamplerRowBatch, stream: torch.cuda.Stream | None) -> HeldInput | None:
         if self.receiver is None:

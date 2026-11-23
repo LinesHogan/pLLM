@@ -153,6 +153,7 @@ API_GROUPS = (
             "model.ActivationPatch",
             "model.Adapter",
             "model.Projection",
+            "model.LayerRoute",
             "train_in_forward",
             "custom_residual",
             "custom_attention",

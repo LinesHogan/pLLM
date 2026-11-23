@@ -32,6 +32,7 @@ from pllm.backends.vllm.sampler import (
 )
 from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.codec import encode_boundary
+from pllm.contracts.hidden_locator import HiddenSite
 from pllm.contracts.host_batch import HostBatch
 from pllm.contracts.packed_rows import PackedSamplerRowBatch
 from pllm.contracts.request_identity import RequestIdentity
@@ -88,11 +89,23 @@ class VllmSession:
         self.trace = deployment.execution.trace
         probe = attachment.probe
         self._hidden_resources = tuple(dict.fromkeys(resource.binding for resource in probe.hidden_resources))
+        self._route_views = {
+            (resource, field_name): view for resource, field_name, view, _ in attachment.spec.route_bounds
+        }
         self.hidden_taps = taps
         self._layer_logits = None
-        if probe.layer_logits:
+        routed_logits = (
+            ()
+            if taps is None
+            else tuple(
+                layout.route
+                for layout in taps.layouts
+                if layout.site is HiddenSite.LAYER_LOGITS and layout.route is not None
+            )
+        )
+        if probe.layer_logits or routed_logits:
             assert taps is not None
-            self._layer_logits = LayerLogits(decoder, taps, probe.layer_logits)
+            self._layer_logits = LayerLogits(decoder, taps, probe.layer_logits, routed_logits)
         overlay_bindings = attachment.spec.overlay_bindings
         custom_forward_task = plan.semantic_graph.custom_forward_task
         program_overlay = attachment.spec.in_forward is not None and custom_forward_task is not None
@@ -265,6 +278,8 @@ class VllmSession:
         context = self.driver.begin(StepInput(rows.row_batch, rows, input_tokens=self.input_tokens), stream)
         if context is None:
             return
+        if self.hidden_taps is not None and self._route_views:
+            self.hidden_taps.bind_routes(rows.row_batch, context, execution.directory, self._route_views)
         if adapter is not None:
             projection = None
             if self.driver.open is StepOpen.IN_FORWARD:
