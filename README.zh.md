@@ -203,7 +203,7 @@ pllm skill --install cursor   # 写入 .cursor/rules/pllm/*.md
 - **项目主页与在线文档站**：[lineshogan.github.io/pllm](https://lineshogan.github.io/pllm/)
 - **完整中文文档**：[文档首页](doc/README.md) · [00 快速上手](doc/tutorials/00_quickstart.ipynb) · [在线服务指南](doc/howto/online-serving.md) · [上生产指南](doc/howto/production.md) · [API 参考](doc/reference/api.md)
 - **英文 Agent 与参考规范**：[SKILL.md](doc/agent/SKILL.md) · [migration.md](doc/agent/migration.md) · [reference.md](doc/agent/reference.md) · [llms.txt](llms.txt)
-- **独立技术随笔与底层排障手记（中英双语）**：[主专栏目录](blog/README.md) 与 [动态切层排障手记](blog/personal/README.md)（同步分类发布于 [个人博客](https://lineshogan.github.io/blog/)），共十五篇中英双语文章，涵盖趋势与状态层抽象、引擎底层机制深潜，以及 `torch.compile` 函数化、早退 Triton 内核、IEEE 754 浮点舍入与多版本状态生命周期排障。
+- **技术文章与工程排障笔记（中英双语）**：[系统与架构专栏](blog/README.md) 与 [工程与排障笔记](blog/personal/README.md)（同步发布于 [个人博客](https://lineshogan.github.io/blog/)），持续收录围绕系统设计、现代推理引擎底层机制与一线疑难排障的独立双语文章。
 
 ---
 

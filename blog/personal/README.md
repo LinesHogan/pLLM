@@ -1,10 +1,10 @@
-# 动态切层开发笔记与排障记录 / LayerRoute Debugging Postmortems
+# 工程与排障笔记 / Engineering & Debugging Notes
 
-这里整理了四篇围绕运行时动态切层（`LayerRoute`）开发过程的独立技术笔记（提供中英双语）。起因是在连续批处理推理引擎中支持不重新录制 CUDA Graph 的在线切层能力，并在与独立代码审查模型（`gpt-6.2-astra`）交叉验证的过程中，陆续排查出编译器函数化回写覆盖、图录制回退分支流同步、半精度中间舍入偏差以及多版本状态生命周期错位四类问题。每篇笔记只聚焦其中一个具体机制：先记录故障现象，再梳理背后的编译器、硬件或运行时原理，最后总结对应的验证方法与适用边界。
+这里持续记录开发与维护过程中的一线工程与疑难排障笔记（中英双语）——涵盖编译器变换、GPU 内核实现、浮点数值行为与并发运行时边界等真实问题。每篇笔记聚焦一个独立机制：先还原故障现象，再拆解背后的底层原理，最后总结可复用的验证与排障方法。
 
-Four standalone technical debugging notes (in Chinese and English) distilled from building runtime dynamic layer routing (`LayerRoute`) without recapturing CUDA Graphs. Cross-validating against an independent review model (`gpt-6.2-astra`) uncovered four subtle systems traps spanning PyTorch AOT functionalization, conditional CUDA Graph workspaces vs. L2 early-exit Triton kernels, IEEE 754 half-precision rounding rules, and PTTS multi-version state lifecycles.
+Ongoing bilingual engineering and debugging notes from building and maintaining inference systems—covering compiler passes, GPU kernels, floating-point numerics, and concurrent runtime edge cases. Each standalone note reconstructs a concrete failure mode, explains the underlying mechanism, and distills reusable diagnostic techniques.
 
-## 问题分布概览 / Pipeline Map
+## 近期笔记落点示意 / Recent Notes Map
 
 **中文视图**
 

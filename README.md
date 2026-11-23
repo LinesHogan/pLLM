@@ -203,7 +203,7 @@ Recommended prompt for porting existing research code or authoring new workloads
 - **Project & Documentation Portal:** [lineshogan.github.io/pllm](https://lineshogan.github.io/pllm/)
 - **English Agent & API Reference:** [SKILL.md](doc/agent/SKILL.md) · [migration.md](doc/agent/migration.md) · [reference.md](doc/agent/reference.md) · [examples.md](doc/agent/examples.md) · [rules.md](doc/agent/rules.md) · [pitfalls.md](doc/agent/pitfalls.md) · [llms.txt](llms.txt)
 - **Guides, How-Tos & Reference Manuals (EN & 中文):** [English Docs Index](doc_en/README.md) · [Chinese Docs Index](doc/README.md) · [Capability Map](doc_en/guides/capability-map.md) · [Online Serving](doc_en/howto/online-serving.md) · [Production Deployment](doc_en/howto/production.md) · [API Reference](doc_en/reference/api.md)
-- **Engineering Essays & Systems Deep Dives (EN & ZH):** [blog/README.md](blog/README.md) & [LayerRoute Debugging Postmortems](blog/personal/README.md) (also published on [LinesHogan's Blog](https://lineshogan.github.io/blog/)) — fifteen bilingual articles organized into architecture & postmortems, engine-internals deep dives, and compiler / Triton / IEEE 754 / multi-version state debugging notes.
+- **Engineering Essays & Debugging Notes (EN & ZH):** [blog/README.md](blog/README.md) & [Engineering & Debugging Notes](blog/personal/README.md) (also published on [LinesHogan's Blog](https://lineshogan.github.io/blog/)) — standalone bilingual articles spanning system design, serving-engine internals, and real-world debugging notes.
 
 ---
 
