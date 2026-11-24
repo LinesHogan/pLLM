@@ -238,13 +238,15 @@ class Decoder:
                 return mlp.down_proj, 0, mlp.down_proj.output_size_per_partition, mlp
             width = mlp.gate_up_proj.output_size_per_partition // 2
             return mlp.gate_up_proj, 0 if target.name == "gate_proj" else width, width, None
-        if target.name in ("q_proj", "k_proj", "v_proj"):
+        if target.name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             if isinstance(layer, Qwen3_5DecoderLayer) and layer.layer_type != "full_attention":
                 raise ValueError(
-                    f"layer {target.layer} is a Gated DeltaNet layer without q/k/v projections; choose a full-attention "
+                    f"layer {target.layer} is a Gated DeltaNet layer without q/k/v/o projections; choose a full-attention "
                     "layer (see layer_types in the model config)"
                 )
             attention = layer.self_attn
+            if target.name == "o_proj":
+                return attention.o_proj, 0, attention.o_proj.output_size_per_partition, None
             # Gated attention stores qkv_proj rows as [per-head (query, gate) pairs, key, value].
             gated = isinstance(attention, Qwen3NextAttention) and attention.attn_output_gate
             if target.name == "q_proj":
@@ -258,7 +260,7 @@ class Decoder:
             if target.name == "v_proj":
                 start += attention.kv_size
             return attention.qkv_proj, start, attention.kv_size, None
-        raise ValueError("parameter overlay requires an attention q/k/v or dense MLP gate/up/down projection")
+        raise ValueError("parameter overlay requires an attention q/k/v/o or dense MLP gate/up/down projection")
 
     def value_rows(self, layer: int) -> tuple[LinearBase, int, int, int]:
         """A full-attention layer's value slice of its qkv projection and the width of one head."""

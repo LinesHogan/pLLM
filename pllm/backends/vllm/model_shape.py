@@ -112,6 +112,7 @@ class _ConfigShape:
             "q_proj": (self.hidden_size, head * self.num_attention_heads),
             "k_proj": (self.hidden_size, head * kv_heads),
             "v_proj": (self.hidden_size, head * kv_heads),
+            "o_proj": (head * self.num_attention_heads, self.hidden_size),
             "gate_proj": (self.hidden_size, self.intermediate_size),
             "up_proj": (self.hidden_size, self.intermediate_size),
             "down_proj": (self.intermediate_size, self.hidden_size),
@@ -120,7 +121,12 @@ class _ConfigShape:
         if any(target.layer is None or target.layer >= self.num_hidden_layers for target in expanded):
             raise ValueError("choose projection layers below the model's num_hidden_layers")
         projections: list[ProjectionShape] = []
-        heads = {"q_proj": self.num_attention_heads, "k_proj": kv_heads, "v_proj": kv_heads}
+        heads = {
+            "q_proj": self.num_attention_heads,
+            "k_proj": kv_heads,
+            "v_proj": kv_heads,
+            "o_proj": self.num_attention_heads,
+        }
         for target in expanded:
             assert target.layer is not None
             if target.name not in heads and (routed := self.routed_mlp(target.layer)):
@@ -140,8 +146,8 @@ class _ConfigShape:
                     raise ValueError("gated attention interleaves query and output-gate rows; overlay k_proj or v_proj")
             inputs, outputs = sizes[target.name]
             partitions = _head_partitions(target.name, heads[target.name], size) if target.name in heads else size
-            # down_proj is row-parallel and splits its input features; the others split their outputs.
-            row = target.name == "down_proj"
+            # o_proj and down_proj are row-parallel and split their input features; the others split their outputs.
+            row = target.name in ("o_proj", "down_proj")
             if (inputs if row else outputs) % partitions:
                 raise ValueError(f"{target.name} features must divide tensor_parallel_size evenly")
             projections.append(

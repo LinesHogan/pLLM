@@ -36,6 +36,7 @@ _OVERLAY_CAPABILITIES = (
     "operand_capture/mlp_down_projection_pair@1",
     "overlay/dense_add@1",
     "overlay/low_rank_add@1",
+    "overlay/gated_low_rank_add@1",
     "overlay/head_add_fp32@1",
     "operand_capture/projection_input@1",
 )

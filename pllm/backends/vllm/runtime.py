@@ -721,7 +721,7 @@ def workload_engine_setup(
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
     engine_options: dict[str, Any] = {
         **options,
-        **load_options(requirements.checkpoint_names),
+        **load_options(requirements.checkpoint_names, shared_layer_groups=requirements.shared_layer_groups),
         "worker_cls": WORKER_CLASS,
         # The supported uni-process, non-speculative decoder enables async by default.
         "async_scheduling": True,

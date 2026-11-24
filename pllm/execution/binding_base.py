@@ -72,7 +72,13 @@ def overlay_fields(
     dtype: Callable[[str, Field], TensorDType],
 ) -> tuple[LayoutField, ...]:
     """One copy of the fields per overlay target, laid out target by target and shaped by that target."""
-    arity = 2 if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD else 1
+    arity = (
+        4
+        if effect.operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD
+        else 2
+        if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD
+        else 1
+    )
     applied = effect.applied_fields
     if (
         not effect.targets
@@ -96,6 +102,10 @@ def overlay_fields(
     if dimensions.tensor_parallel_size > 1:
         if effect.operator is ParameterOverlayOperator.HEAD_ADD:
             raise ValueError("per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP")
+        if effect.operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD:
+            raise ValueError(
+                "gated_low_rank adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP"
+            )
         for projection in projections:
             _check_target_fields(
                 effect,
@@ -195,6 +205,21 @@ def _check_target_fields(
         case ParameterOverlayOperator.LOW_RANK_ADD:
             rank = shapes[0][0] if shapes[0] else 0
             rule, valid = "(rank, inputs) and (outputs, rank)", rank > 0 and shapes == ((rank, inputs), (outputs, rank))
+        case ParameterOverlayOperator.GATED_LOW_RANK_ADD:
+            a_shape, b_shape, wg_shape, gb_shape = shapes
+            experts = a_shape[0] if len(a_shape) == 3 else 0
+            rank = a_shape[1] if len(a_shape) == 3 else 0
+            gates = wg_shape[0] if len(wg_shape) == 2 else 0
+            rule = "(experts, rank, inputs), (experts, outputs, rank), (gates, inputs) and (gates,) with gates in (experts, experts + 1)"
+            valid = (
+                experts > 0
+                and rank > 0
+                and a_shape == (experts, rank, inputs)
+                and b_shape == (experts, outputs, rank)
+                and gates in (experts, experts + 1)
+                and wg_shape == (gates, inputs)
+                and gb_shape == (gates,)
+            )
         case ParameterOverlayOperator.HEAD_ADD:
             (shape,) = shapes
             rule = "(heads, width, width) with heads * width == inputs == outputs"

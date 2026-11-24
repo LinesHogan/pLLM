@@ -28,7 +28,7 @@ from pllm.contracts.parameter_overlay import (
     ProjectionShape,
 )
 from pllm.contracts.request_identity import RequestIdentity
-from pllm.contracts.semantic_graph import StateResource
+from pllm.contracts.semantic_graph import StateResource, StateScope
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, PinnedStaging
 from pllm.execution.layer_route import RouteSlotGather, gate_owners_by_layer, gated_dense_add, gated_low_rank_add
@@ -36,6 +36,7 @@ from pllm.execution.overlay_batch import DecodeOverlay
 from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay, ProjectionTask
 from pllm.execution.parameter_projection import (
     ROWS_PER_BLOCK,
+    parameter_correction,
     prepare_projection_read,
     projection_block_rows,
     projection_blocks,
@@ -64,7 +65,7 @@ def inspect_parameter_targets(
             or offset + size > module.output_size_per_partition
         ):
             raise ValueError("parameter overlay needs unique attention or dense MLP projections matching model dtype")
-        row = target.name == "down_proj"
+        row = target.name in ("o_proj", "down_proj")
         partitions = module.tp_size
         if isinstance(module, QKVParallelLinear) and target.name in ("k_proj", "v_proj"):
             partitions //= module.num_kv_head_replicas
@@ -246,14 +247,16 @@ class ProjectionReader:
         math: OverlayTransition | None,
         in_program: bool,
         captures_operands: bool = False,
+        static_instance: bool = False,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
         self.hook = ProjectionHook(self.module)
         self.forward_base = self.hook.base
-        self.mlp_base = None if self.mlp is None else self.mlp.forward
+        self.mlp_base = None if self.mlp is None or static_instance else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
         self.pinned, self.in_program, self.embedding = pinned, in_program, embedding
         self.captures_operands = captures_operands
+        self.static_instance = static_instance
         self.mlp_input: torch.Tensor | None = None
         self.apply_count = self.updated_apply_count = 0
         # This invocation's exact segments and their consumer: the step's task, or a custom forward's lanes.
@@ -263,20 +266,26 @@ class ProjectionReader:
         self.call_rows: torch.Tensor | None = None
         self.decode: DecodeOverlay | None = None
         self.programs: dict[int, Callable[..., tuple[torch.Tensor, ...]]] = {}
-        ports = (requests if math is not None else rows) if pinned else 0
+        ports = (requests if math is not None else rows) if pinned and not static_instance else 0
         self.pools = [view.read(arena.field_pool(binding.resource, view.field), pooled=True) for view in binding.fields]
-        self.table = torch.zeros(
-            projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows if pinned else 0,
-            device=embedding.device,
-            dtype=torch.long,
-        )
-        self.table[-rows:].fill_(-1)
+        if static_instance:
+            self.table = torch.zeros(1, device=embedding.device, dtype=torch.long)
+        else:
+            self.table = torch.zeros(
+                projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows if pinned else 0,
+                device=embedding.device,
+                dtype=torch.long,
+            )
+            self.table[-rows:].fill_(-1)
         inputs = self.module.input_size_per_partition
         self.captured = embedding.new_zeros((ports, inputs), dtype=self.module.params_dtype)
-        self.desired = self.captured.new_empty((ports, self.width) if self.mlp is not None else (0, 0))
+        self.desired = self.captured.new_empty(
+            (ports, self.width) if self.mlp is not None and not static_instance else (0, 0)
+        )
         self.routed_mid = (
             torch.empty((rows, self.pools[0].shape[1]), dtype=torch.float32, device=embedding.device)
             if pinned
+            and not static_instance
             and binding.route is not None
             and binding.operator is ParameterOverlayOperator.LOW_RANK_ADD
             and embedding.is_cuda
@@ -284,13 +293,16 @@ class ProjectionReader:
             and self.pools[0].shape[1] <= 256
             else None
         )
-        self.staging = PinnedStaging(capacity=self.table.numel(), slots=2 if pinned else 0)
+        self.staging = PinnedStaging(
+            capacity=0 if static_instance else self.table.numel(), slots=2 if pinned and not static_instance else 0
+        )
         self.host = np.empty(0, dtype=np.int64)
         if pinned:
-            self.prepare_programs(budget, math)
+            if not static_instance:
+                self.prepare_programs(budget, math)
             _READERS[self.table.data_ptr()] = self
         self.hook.install(self.forward)
-        if self.mlp is not None:
+        if self.mlp is not None and not static_instance:
             self.mlp.forward = self.forward_mlp
 
     def prepare_programs(self, budget: int, math: OverlayTransition | None) -> None:
@@ -314,6 +326,8 @@ class ProjectionReader:
             self.read(self.captured[:count], self.pools, self.table, count)
 
     def reserve(self) -> None:
+        if self.static_instance:
+            return
         if self.decode is None:
             self.host = self.staging.take(self.table.numel())
         else:
@@ -371,7 +385,7 @@ class ProjectionReader:
         if self.segments:
             self.run_segments(hidden.detach(), base[0])
         elif self.pinned:
-            desired = hidden if self.mlp is None else self.mlp_input
+            desired = hidden if self.mlp is None or self.static_instance else self.mlp_input
             assert desired is not None
             buffers = self.pools if self.decode is None else self.decode.buffers
             pinned_projection(hidden, desired, buffers, self.table, base[0], self.captured, self.desired)
@@ -446,6 +460,11 @@ class ProjectionReader:
             )
             columns = output[:, self.offset : self.offset + self.width]
             columns.copy_((columns + result * self.binding.scale).to(output.dtype))
+            return
+        if self.static_instance:
+            weights = tuple(pool[0] for pool in pools)
+            result = parameter_correction(hidden, weights, self.binding.operator, batched=False)
+            output[:, self.offset : self.offset + self.width].add_((result * self.binding.scale).to(output.dtype))
             return
         if self.binding.route is not None and hidden.is_cuda and hidden.dtype != torch.float64:
             count = (
@@ -589,6 +608,11 @@ class ParameterOverlay:
         self.embedding = _EmbeddingRows(
             decoder, rows, arena.device, enabled=any(binding.reads_embedding for binding in bindings)
         )
+        static_instances = {
+            str(state.resource)
+            for state in arena.plan.semantic_graph.states
+            if state.scope is StateScope.INSTANCE and state.immutable
+        }
         self.readers = tuple(
             ProjectionReader(
                 decoder,
@@ -602,6 +626,14 @@ class ParameterOverlay:
                 math=self.math,
                 in_program=in_program,
                 captures_operands=bool(self.phases),
+                static_instance=(
+                    self.pinned
+                    and not in_program
+                    and self.math is None
+                    and not self.phases
+                    and binding.route is None
+                    and binding.resource in static_instances
+                ),
             )
             for binding in bindings
         )
@@ -782,6 +814,11 @@ class ParameterOverlay:
         routed_layers: dict[tuple[str, int, bool], torch.Tensor] = {}
         packed_range = np.arange(rows.total_rows, dtype=np.int64)
         for reader in self.readers:
+            if reader.static_instance:
+                reader.apply_count += rows.total_rows
+                for value in (*reader.pools, reader.table):
+                    value.record_stream(self.stream)
+                continue
             route = reader.binding.route
             latest = route is not None and route.refresh == "step"
             versions = context.read_versions(
