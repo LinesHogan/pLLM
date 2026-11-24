@@ -66,7 +66,7 @@ An IEEE 754 `float16` value has 1 sign bit, 5 exponent bits, and 10 explicit man
 - On $[1, 2)$, the interval width is $1$, so adjacent `float16` values sit $1 / 1024 \approx 0.000977$ apart;
 - On **$[2048, 4096)$ ($[2^{11}, 2^{12})$)**, the interval width is $2048$, so dividing into $1024$ steps makes **the spacing between adjacent `float16` numbers (`1 ULP`) exactly `2.0`!**
 
-![Trap 1: IEEE 754 float16 Tick Spacing (ULP = 2.0) on [2048, 4096) Swallows +1.0](../../assets/personal-03-fig1-en.svg)
+![Trap 1: IEEE 754 float16 Tick Spacing (ULP = 2.0) Near 2048 Swallows +1.0](../../assets/personal-03-fig1-en.svg)
 
 Think of a kitchen scale whose smallest tick mark above 2,048 grams jumps to 2 grams: in `float16`, `2048.0`, `2050.0`, and `2052.0` exist, **but `2049.0` does not exist at all**.
 

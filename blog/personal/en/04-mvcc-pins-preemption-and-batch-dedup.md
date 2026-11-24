@@ -132,7 +132,7 @@ def allocate_state_pool(fields, optimizer):
         ...
 ```
 
-![Bug 3: Fused AdamW Flat Page Inherits fields[0].dtype (int64), Truncating 0.5 -> 0](../../assets/personal-04-fig3-en.svg)
+![Bug 3: Fused AdamW Flat Page Inherits First-Field Dtype (int64), Truncating 0.5 to 0](../../assets/personal-04-fig3-en.svg)
 
 To update all trainable parameters and moments (`exp_avg`, `exp_avg_sq`) in one fused kernel launch, the optimizer allocator packed every field into one flat 1D buffer typed as `fields[0].dtype`. Previous tests always listed float weights first; putting `layer: int64` at index 0 turned the entire parameter page into an `int64` tensor, silently truncating `0.5` to `0` on copy!
 
