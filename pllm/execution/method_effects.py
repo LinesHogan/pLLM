@@ -528,7 +528,7 @@ class TrainInForward(Effect):
     targets: tuple[Projection, ...]
     weight: str
     operator: ParameterOverlayOperator
-    factors: tuple[str, str]
+    factors: tuple[str, ...]
     scale: float
     tokens: Tokens
     visibility: VisibilityKind

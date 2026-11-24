@@ -10,6 +10,7 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from pllm.config import ExecutionOptions
 from pllm.contracts.hidden_locator import HiddenPhase, HiddenSite, LayerRouteSelector
+from pllm.contracts.parameter_overlay import ParameterOverlayOperator
 from pllm.contracts.sampler import SamplerStage
 from pllm.contracts.semantic_graph import (
     HiddenInputSource,
@@ -127,6 +128,29 @@ def _estimate_ops(
                 1,
             )
             _append_calls(calls, trace, f"{task.symbol if task else 'forward'} [{role}]", rows)
+    if binding.overlay_operators:
+        layouts = {layout.resource: layout.layout for layout in binding.layouts.layouts}
+        target_shapes = {target.target: target for target in facts.probe.targets}
+        rows = facts.max_admitted_lineages
+        for overlay in binding.effects.overlay_bindings:
+            if overlay.operator is not ParameterOverlayOperator.CUSTOM:
+                continue
+            fn = binding.overlay_operators[overlay.operator_id]
+            shape = target_shapes[overlay.target]
+            layout = layouts[overlay.resource]
+            with FakeTensorMode(), CustomOpTrace() as trace, KernelCountMode() as kernels:
+                hidden = torch.empty((rows, shape.input_size), dtype=facts.probe.tensor_dtype.torch, device="meta")
+                weights = tuple(
+                    torch.empty(view.shape, dtype=layout.fields[view.field].dtype.torch, device="meta")
+                    for view in overlay.fields
+                )
+                fn(hidden, *weights)
+            _append_calls(calls, trace, f"Adapter [{overlay.target.name}]", rows)
+            adapter_member = next(
+                (name for name, decl in binding.members.items() if decl.effect == "Adapter"),
+                "Adapter",
+            )
+            model_kernels[adapter_member] = model_kernels.get(adapter_member, 0) + kernels.count
     return tuple(_op_cost(name, entries) for name, entries in sorted(calls.items())), model_kernels
 
 

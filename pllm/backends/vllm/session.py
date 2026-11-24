@@ -122,6 +122,7 @@ class VllmSession:
                 graphs=probe.graph_mode is AttachmentGraphMode.CUDA_GRAPH,
                 in_program=custom_forward_task is not None,
                 math=deployment.execution.math.parameter_overlay,
+                overlay_operators=deployment.execution.math.overlay_operators,
             )
             if overlay_bindings
             else None

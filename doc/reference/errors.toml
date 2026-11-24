@@ -649,7 +649,35 @@ why_zh = '''按头的增量没有按张量并行切分'''
 fix_zh = '''多卡时用 `"dense"` 或 `"low_rank"`，或单卡'''
 
 [[section.error]]
-message = '''pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host'''
+message = '''custom projection operators need tensor_parallel_size=1; use dense or low_rank deltas under TP'''
+why = '''User-supplied projection operator callables are not sharded across tensor-parallel ranks.'''
+fix = '''Use `"dense"` or `"low_rank"` under TP, or `tensor_parallel_size=1`.'''
+why_zh = '''自定义投影算子未按张量并行切分'''
+fix_zh = '''多卡时用 `"dense"` 或 `"low_rank"`，或改用单卡 `tensor_parallel_size=1`'''
+
+[[section.error]]
+message = '''custom projection operator for ... must return shape ...; got ...'''
+why = '''A custom projection operator passed to `pllm.model.Adapter(operator=fn)` must return `[rows, out_features]` in the input dtype or float32 on the input device.'''
+fix = '''Return a tensor shaped `[rows, out_features]` matching the target projection output width.'''
+why_zh = '''传给 `pllm.model.Adapter(operator=fn)` 的自定义投影算子必须返回 `[rows, out_features]`，精度与输入一致或为 float32，且在输入设备上'''
+fix_zh = '''返回与目标投影输出宽度匹配的 `[rows, out_features]` 张量'''
+
+[[section.error]]
+message = '''pllm.model.SharedLayers needs a dense decoder architecture; got ...'''
+why = '''Zero-copy linear weight tying via `SharedLayers` is defined for unquantized dense decoders.'''
+fix = '''Use a dense decoder model (`Qwen2`, `Qwen3`, `Llama`, `Mistral`, `Phi3`, `Glm4`, `Gemma2`, `Gemma3`).'''
+why_zh = '''`SharedLayers` 零拷贝线性权重共享目前仅支持未量化的稠密解码器架构'''
+fix_zh = '''改用稠密解码器模型（如 `Qwen2`、`Qwen3`、`Llama`、`Mistral`、`Glm4`、`Gemma2/3`）'''
+
+[[section.error]]
+message = '''pllm.model.SharedLayers requires unquantized linear layers; ...'''
+why = '''Quantized linear layers store packed weights and scales whose layouts cannot be safely tied across layers.'''
+fix = '''Use an unquantized dense checkpoint with `pllm.model.SharedLayers`.'''
+why_zh = '''量化线性层包含打包权重与缩放因子，无法安全跨层绑定共享'''
+fix_zh = '''使用未量化的稠密模型权重'''
+
+[[section.error]]
+message = '''pllm.model.Adapter, pllm.model.ActivationPatch, pllm.model.SharedLayers and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host'''
 why = '''`make_host` compiles without a model.'''
 fix = '''Use `make_llm`, or keep only `pllm.batch` training for `make_host`.'''
 why_zh = '''`make_host` 没有模型'''

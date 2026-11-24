@@ -1,4 +1,6 @@
-"""Register vLLM's ordinary loader with exact exclusions, layer weight tying and folded key remapping."""
+"""Register vLLM's ordinary loader with exact exclusions, explicit 1-to-1 renames and layer weight tying."""
+
+from __future__ import annotations
 
 from collections.abc import Generator
 from dataclasses import replace
@@ -7,7 +9,7 @@ from typing import Any
 import torch
 from cattrs import structure
 from vllm.config import LoadConfig, ModelConfig
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
@@ -25,31 +27,48 @@ _LINEAR_SUFFIXES = (
     "mlp.down_proj",
     "mlp.gate_up_proj",
 )
-_NORM_SUFFIXES = (
-    "input_layernorm",
-    "post_attention_layernorm",
-    "self_attn.q_norm",
-    "self_attn.k_norm",
-)
+
+_LoaderExtraValue = tuple[str, ...] | tuple[tuple[int, ...], ...] | tuple[tuple[str, str], ...]
 
 
 def load_options(
-    names: tuple[str, ...], *, shared_layer_groups: tuple[tuple[int, ...], ...] = ()
-) -> dict[str, str | dict[str, tuple[str, ...] | tuple[tuple[int, ...], ...]]]:
-    """Carry workload exclusions and shared-layer groups through vLLM's serialized loader configuration."""
-    if not names and not shared_layer_groups:
+    names: tuple[str, ...],
+    *,
+    shared_layer_groups: tuple[tuple[int, ...], ...] = (),
+    checkpoint_rename: tuple[tuple[str, str], ...] = (),
+    checkpoint_exclude: tuple[str, ...] = (),
+) -> dict[str, str | dict[str, _LoaderExtraValue]]:
+    """Carry workload exclusions, explicit renames and shared-layer groups through vLLM's loader configuration."""
+    if not names and not shared_layer_groups and not checkpoint_rename and not checkpoint_exclude:
         return {}
-    extra: dict[str, tuple[str, ...] | tuple[tuple[int, ...], ...]] = {"checkpoint_names": names}
+    extra: dict[str, _LoaderExtraValue] = {"checkpoint_names": names}
     if shared_layer_groups:
         extra["shared_layer_groups"] = shared_layer_groups
+    if checkpoint_rename:
+        extra["checkpoint_rename"] = checkpoint_rename
+    if checkpoint_exclude:
+        extra["checkpoint_exclude"] = checkpoint_exclude
     return {"load_format": "pllm", "model_loader_extra_config": extra}
 
 
 def _tie_linear(leader: LinearBase, follower: LinearBase) -> None:
-    """Point a follower linear module's weight (and optional bias) at the leader's GPU storage."""
-    follower.register_parameter("weight", leader.get_parameter("weight"))
-    if leader.bias is not None:
-        follower.register_parameter("bias", leader.bias)
+    """Point every parameter of an unquantized follower linear module at its leader's GPU storage."""
+    if not isinstance(leader.quant_method, UnquantizedLinearMethod) or not isinstance(
+        follower.quant_method, UnquantizedLinearMethod
+    ):
+        raise ValueError(
+            "pllm.model.SharedLayers requires unquantized linear layers; "
+            f"got {type(leader.quant_method).__name__} and {type(follower.quant_method).__name__}"
+        )
+    leader_params = dict(leader.named_parameters(recurse=False))
+    follower_params = dict(follower.named_parameters(recurse=False))
+    if set(leader_params) != set(follower_params) or not leader_params:
+        raise ValueError(
+            "pllm.model.SharedLayers requires identical parameter sets on tied linear layers; "
+            f"got {sorted(leader_params)} and {sorted(follower_params)}"
+        )
+    for name, parameter in leader_params.items():
+        follower.register_parameter(name, parameter)
 
 
 def tie_shared_layers(model: torch.nn.Module, groups: tuple[tuple[int, ...], ...]) -> None:
@@ -74,33 +93,6 @@ def tie_shared_layers(model: torch.nn.Module, groups: tuple[tuple[int, ...], ...
         torch.cuda.empty_cache()
 
 
-def _remap_folded_weight(name: str, group_starts: dict[int, tuple[int, ...]]) -> tuple[str | None, bool]:
-    """Remap Concertina `model.layers.{start}.shared.*` keys to native decoder names; drop adapter tensors."""
-    prefix = "model.layers."
-    if not name.startswith(prefix):
-        return name, False
-    rest = name[len(prefix) :]
-    layer_str, sep, tail = rest.partition(".")
-    if not sep or not layer_str.isdigit() or not tail.startswith("shared."):
-        return name, False
-    start = int(layer_str)
-    group = group_starts.get(start)
-    if group is None:
-        return None, True
-    shared_tail = tail[len("shared.") :]
-    if shared_tail.endswith(".base.weight"):
-        proj = shared_tail[: -len(".base.weight")]
-        if proj in _LINEAR_SUFFIXES:
-            return f"model.layers.{start}.{proj}.weight", True
-    if ".weight." in shared_tail:
-        norm, _, step_str = shared_tail.rpartition(".weight.")
-        if norm in _NORM_SUFFIXES and step_str.isdigit():
-            step = int(step_str)
-            if 0 <= step < len(group):
-                return f"model.layers.{group[step]}.{norm}.weight", True
-    return None, True
-
-
 def _is_follower_linear(name: str, followers: frozenset[int]) -> bool:
     """Whether a standard checkpoint weight belongs to a tied follower layer's linear projection."""
     prefix = "model.layers."
@@ -115,12 +107,14 @@ def _is_follower_linear(name: str, followers: frozenset[int]) -> bool:
 
 @register_model_loader("pllm")
 class CheckpointLoader(DefaultModelLoader):
-    """Load every base tensor normally, omitting workload-owned tensors and tying shared layer groups."""
+    """Load base tensors normally, honoring workload exclusions, explicit 1-to-1 renames and shared layers."""
 
     def __init__(self, load_config: LoadConfig) -> None:
         options: dict[str, Any] = dict(load_config.model_loader_extra_config)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
         self.excluded = frozenset(structure(options.pop("checkpoint_names", ()), tuple[str, ...]))
         self.shared_layer_groups = structure(options.pop("shared_layer_groups", ()), tuple[tuple[int, ...], ...])
+        self.renamed = dict(structure(options.pop("checkpoint_rename", ()), tuple[tuple[str, str], ...]))
+        self.skipped = frozenset(structure(options.pop("checkpoint_exclude", ()), tuple[str, ...]))
         super().__init__(replace(load_config, load_format="auto", model_loader_extra_config=options))
 
     def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
@@ -131,22 +125,16 @@ class CheckpointLoader(DefaultModelLoader):
     def get_all_weights(
         self, model_config: ModelConfig, model: torch.nn.Module
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Retain vLLM's sharding, quantization and name mapping while handling exclusions and shared layers."""
+        """Retain vLLM's sharding, quantization and name mapping while applying explicit exclusions and renames."""
         super().download_model(model_config)
         if self.excluded:
             checkpoint = checkpoint_directory(model_config.model, model_config.revision)
             checkpoint_files(checkpoint, tuple(sorted(self.excluded)))
-        group_starts = {group[0]: group for group in self.shared_layer_groups}
         followers = frozenset(layer for group in self.shared_layer_groups for layer in group[1:])
         for name, tensor in super().get_all_weights(model_config, model):
-            if name in self.excluded:
+            if name in self.excluded or name in self.skipped:
                 continue
-            if group_starts:
-                mapped, handled = _remap_folded_weight(name, group_starts)
-                if handled:
-                    if mapped is not None:
-                        yield mapped, tensor
-                    continue
-            if _is_follower_linear(name, followers):
+            mapped = self.renamed.get(name, name)
+            if _is_follower_linear(mapped, followers):
                 continue
-            yield name, tensor
+            yield mapped, tensor

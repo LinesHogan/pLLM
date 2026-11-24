@@ -133,19 +133,23 @@ pllm.model.Adapter(
     state: str,
     targets: tuple[pllm.model.Projection, ...],
     weight: str = "value",
-    operator: Literal["dense", "low_rank", "per_head"] = "dense",
-    factors: tuple[str, str] = ("a", "b"),
+    operator: Literal["dense", "low_rank", "per_head"] | Callable[..., torch.Tensor] = "dense",
+    factors: tuple[str, ...] = ("a", "b"),
     scale: float = 1.0,
+    *,
+    share: Mapping[str, tuple[tuple[int, ...], ...]] = {},
 )
 ```
 
-- **`targets`**：目标投影元组。投影名称由 `pllm.model.Projection(name, layer=None)` 声明，可选名称为 Hugging Face 标准的 `"q_proj"`、`"k_proj"`、`"v_proj"`、`"gate_proj"`、`"up_proj"`、`"down_proj"`；`layer=None` 表示对模型所有层生效。
+- **`targets`**：目标投影元组。投影名称由 `pllm.model.Projection(name, layer=None)` 声明，可选名称为 Hugging Face 标准的 `"q_proj"`、`"k_proj"`、`"v_proj"`、`"o_proj"`、`"gate_proj"`、`"up_proj"`、`"down_proj"`；`layer=None` 表示对模型所有层生效。
 - **`operator`**：
   - `"low_rank"`：低秩乘积 $\text{scale} \cdot (x A^T) B^T$，读取 `factors`（默认 `("a", "b")`）命名的两个字段。
   - `"dense"`：稠密矩阵加法 $\text{scale} \cdot x W_{\text{delta}}^T$，读取 `weight`（默认 `"value"`）命名的字段。
   - `"per_head"`：按注意力头独立施加形状为 `(head_dim, head_dim)` 的块变换，读取 `weight` 字段。
+  - 自定义可调用对象 `fn(hidden, *weights) -> delta`：纯 PyTorch 函数或 `torch.library.custom_op`（须为 `mutates_args=()` 且注册 `register_fake`），按顺序读取 `factors` 命名的字段（声明期使用 `FakeTensorMode` 与 `fixed_shapes` 校验；要求 `tensor_parallel_size=1`）。
+- **`share`**：可选字段共享映射，从字段名映射到层号分组，使组内同名投影共享同一份状态字段（例如 Concertina 折叠架构在相邻层间共享低秩因子 `a`/`b`）。
 - **多目标字段展开规则**：
-  当一个 `Adapter` 作用于多个 `targets` 时，状态中的 `pllm.Field` 形状回调 `lambda in_features, out_features: (...)` 会按目标投影的输入与输出宽度被依次调用。底层分配的私有字段将按照 targets 列表的顺序自动展开并命名为 `a_0`, `b_0`, `a_1`, `b_1`, ...。
+  当一个 `Adapter` 作用于多个 `targets` 时，状态中的 `pllm.Field` 形状回调 `lambda in_features, out_features: (...)` 会按目标投影的输入与输出宽度被依次调用。底层分配的私有字段将按照 targets 列表的顺序自动展开并命名为 `a_0`, `b_0`, `a_1`, `b_1`, ...（声明在 `share=` 中的字段每组只在领头层分配一份）。
 
 ### `RequestState` 与 `InstanceState` 都能进图
 
@@ -170,9 +174,9 @@ pllm.model.Adapter(
 
 在 `tensor_parallel_size > 1`（vLLM 0.32）下，`"dense"` 与 `"low_rank"` 算子严格遵循底座投影的通信切分：
 - **列并行投影（q_proj, k_proj, v_proj, gate_proj, up_proj）**：按输出特征切分。稠密权重按行切分；低秩补丁中 $B$ 按输出维度分片，$A$ 在各卡间复制。
-- **行并行投影（down_proj）**：按输入特征切分。稠密权重按列切分；低秩补丁中 $A$ 按输入维度分片，$B$ 在各卡间复制。
+- **行并行投影（o_proj, down_proj）**：按输入特征切分。稠密权重按列切分；低秩补丁中 $A$ 按输入维度分片，$B$ 在各卡间复制。
 - 状态必须由 `pllm.Zeros` 或 `pllm.Computed` 初始化，且只能由 `@pllm.train_in_forward` 在单卡本地分片上更新（禁止跨卡从列切分输出反向训练复制的 $A$，或从行切分输入反向训练复制的 $B$）。
-- `"per_head"` 算子以及携带优化器或其他外部导入（`Imported` / Checkpoint）的状态目前要求 `tensor_parallel_size=1`。
+- `"per_head"` 算子、自定义投影算子可调用对象，以及携带优化器或其他外部导入（`Imported` / Checkpoint）的状态目前要求 `tensor_parallel_size=1`。
 
 ---
 
@@ -366,7 +370,7 @@ print(testing.check(DynamicSteering(), CONFIG).passed)
 ### 为什么 Prefix Caching 与 Overlay / 激活补丁互斥
 
 在 vLLM 配置中，`enable_prefix_caching=True` 会在不同的请求之间共享具有相同前缀文本的 KV 块。
-**在 pLLM 中，所有 Overlay（Adapter、train_in_forward）与 ActivationPatch 均与 Prefix Caching 严格互斥，组合时会在构建期直接拒绝。**
+**在 pLLM 中，除仅读取不可变 `InstanceState` 的 `Adapter` 与 `last_tokens=0` 的 `ActivationPatch` 外，其余 Overlay（`Adapter`、`train_in_forward`）与 `ActivationPatch` 均与 Prefix Caching 严格互斥，组合时会在构建期直接拒绝。**
 
 **原因**：
 Prefix Caching 的基本假设是“相同的 token 序列产生完全相同的 KV 张量”。但无论是每请求的 LoRA 权重，还是逐步更新的快权重，亦或是逐层注入的激活引导，都会改变前向传播的实际数学计算：

@@ -202,8 +202,25 @@ class Workload:
                 if any(isinstance(marker, Batch) for markers in sources.values() for marker in markers.values()):
                     trains_on_batch = True
                 inputs.update((name, tuple(arguments.values())) for name, arguments in sources.items())
+        writers = {op.effect.state for op in context.operations if op.effect.training or isinstance(op.effect, Write)}
+        has_dynamic_parameter_targets = any(isinstance(op.effect, TrainInForward) for op in context.operations) or any(
+            delta.route is not None
+            or (state := definitions.get(delta.state)) is None
+            or state.scope.value != "instance"
+            or state.optimizer is not None
+            or isinstance(state.init, (Fed, Imported))
+            or delta.state in writers
+            for delta in context.adapters.values()
+        )
         declared = BackendRequirements(
+            checkpoint_rename=tuple(
+                pair for shared in context.shared_layers.values() for pair in sorted(shared.checkpoint_rename.items())
+            ),
+            checkpoint_exclude=tuple(
+                name for shared in context.shared_layers.values() for name in shared.checkpoint_exclude
+            ),
             shared_layer_groups=tuple(group for shared in context.shared_layers.values() for group in shared.groups),
+            has_dynamic_parameter_targets=has_dynamic_parameter_targets,
             parameter_targets=tuple(
                 target for delta in context.adapters.values() if delta.route is None for target in delta.targets
             ),
@@ -496,6 +513,10 @@ def _read_component(workload: Workload, prefix: str) -> WorkloadContext:
             values[name] = object.__getattribute__(owner, name)
     context.state_definitions = _of_type(values, InstanceState)
     context.adapters = {key: value.delta for key, value in _of_type(values, Adapter).items()}
+    for name, delta in context.adapters.items():
+        if delta.custom_operator is not None:
+            with context.declaring(name):
+                check_dependencies(delta.custom_operator)
     context.activations = _of_type(values, ActivationPatch)
     context.shared_layers = _of_type(values, SharedLayers)
     context.position_definitions = _of_type(values, PositionState)

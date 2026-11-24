@@ -14,6 +14,8 @@ _LinearOutput = torch.Tensor | tuple[torch.Tensor, Parameter | None]
 class LinearMethodBase:
     def apply(self, layer: LinearBase, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor: ...
 
+class UnquantizedLinearMethod(LinearMethodBase): ...
+
 class LinearBase(Module):
     bias: Parameter | None
     input_size_per_partition: int

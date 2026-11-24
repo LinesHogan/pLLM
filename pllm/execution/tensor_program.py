@@ -264,6 +264,9 @@ class FunctionMath:
     model_sites: tuple[ResidualRewrite, ...] = ()
     parameter_overlay: OverlayTransition | None = None
     attention: AttentionProgram | None = None
+    overlay_operators: Mapping[str, Callable[..., torch.Tensor]] = field(
+        default_factory=lambda: dict[str, Callable[..., torch.Tensor]]()
+    )
 
     @property
     def parameter_phases(self) -> tuple[HiddenPhase, ...]:

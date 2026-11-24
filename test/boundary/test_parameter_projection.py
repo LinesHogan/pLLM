@@ -46,7 +46,14 @@ def test_pinned_projection_borrows():
     assert not captured[-1].any()
 
 
-@pytest.mark.parametrize("operator", tuple(ParameterOverlayOperator))
+@pytest.mark.parametrize(
+    "operator",
+    (
+        ParameterOverlayOperator.DENSE_ADD,
+        ParameterOverlayOperator.LOW_RANK_ADD,
+        ParameterOverlayOperator.HEAD_ADD,
+    ),
+)
 @pytest.mark.gpu
 def test_projection_math_budget_and_allocator_peak(operator):
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -128,3 +135,89 @@ def test_row_weight_operand_bypasses_overlay():
         torch.testing.assert_close(module.quant_method.apply(module, torch.eye(2)), module.weight.T + 1)
     finally:
         hook.close()
+
+
+def test_custom_projection_operator_cpu_and_static_budget():
+    """Custom projection operators work unbatched, batched via vmap, and enforce static FakeTensorMode budgets."""
+    from pllm.contracts.tensor_layout import TensorDType
+    from pllm.execution.parameter_projection import (
+        parameter_correction,
+        prepare_static_projection_read,
+        projection_read,
+        validate_custom_projection_operator,
+    )
+
+    def scaled_low_rank(hidden: torch.Tensor, a: torch.Tensor, b: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        mid = torch.matmul(hidden, a.to(hidden.dtype).transpose(-1, -2))
+        return torch.matmul(mid * torch.sigmoid(gate.to(hidden.dtype)), b.to(hidden.dtype).transpose(-1, -2))
+
+    validate_custom_projection_operator(
+        scaled_low_rank,
+        inputs=8,
+        outputs=6,
+        hidden_dtype=TensorDType.FLOAT32,
+        weight_specs=(((3, 8), TensorDType.FLOAT32), ((6, 3), TensorDType.FLOAT32), ((3,), TensorDType.FLOAT32)),
+        projection="q_proj of layer 0",
+    )
+
+    with pytest.raises(ValueError, match="must return shape"):
+        validate_custom_projection_operator(
+            lambda h, a: h @ a.T,
+            inputs=8,
+            outputs=6,
+            hidden_dtype=TensorDType.FLOAT32,
+            weight_specs=(((4, 8), TensorDType.FLOAT32),),
+            projection="q_proj of layer 0",
+        )
+
+    torch.manual_seed(17)
+    hidden = torch.randn(6, 8)
+    a = torch.randn(4, 3, 8)
+    b = torch.randn(4, 6, 3)
+    gate = torch.randn(4, 3)
+    direct = parameter_correction(
+        hidden, (a[1], b[1], gate[1]), ParameterOverlayOperator.CUSTOM, batched=False, custom_operator=scaled_low_rank
+    )
+    torch.testing.assert_close(direct, scaled_low_rank(hidden, a[1], b[1], gate[1]))
+
+    slots = torch.tensor([[1, 1, 1], [2, 2, 2]])
+    rows = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    owners = torch.tensor([0, 1, 2, 3, 4, -1])
+    (batched_out,) = projection_read(
+        hidden,
+        slots,
+        rows,
+        owners,
+        a,
+        b,
+        gate,
+        operator=ParameterOverlayOperator.CUSTOM,
+        custom_operator=scaled_low_rank,
+    )
+    expected = torch.cat(
+        (
+            scaled_low_rank(hidden[:3], a[1], b[1], gate[1]),
+            scaled_low_rank(hidden[3:5], a[2], b[2], gate[2]),
+            torch.zeros(1, 6),
+        )
+    )
+    torch.testing.assert_close(batched_out, expected)
+
+    usage = prepare_static_projection_read(
+        hidden,
+        (a[1], b[1], gate[1]),
+        ParameterOverlayOperator.CUSTOM,
+        budget=1 << 20,
+        blas_workspace_bytes=0,
+        custom_operator=scaled_low_rank,
+    )
+    assert usage > 0
+    with pytest.raises(ValueError, match="budget"):
+        prepare_static_projection_read(
+            hidden,
+            (a[1], b[1], gate[1]),
+            ParameterOverlayOperator.CUSTOM,
+            budget=usage - 1,
+            blas_workspace_bytes=0,
+            custom_operator=scaled_low_rank,
+        )

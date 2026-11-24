@@ -3,6 +3,7 @@
 from pllm.workloads.concertina import (
     ConcertinaConfig as ConcertinaConfig,
     ConcertinaWorkload as ConcertinaWorkload,
+    concertina_gated_low_rank as concertina_gated_low_rank,
     prepare_concertina_checkpoint as prepare_concertina_checkpoint,
 )
 from pllm.workloads.dola import DoLaWorkload as DoLaWorkload
