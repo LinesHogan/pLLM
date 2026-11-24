@@ -162,6 +162,11 @@ external action may run twice on retry. Also get the run constraints: model or c
 typical batch and sequence lengths.
 
 Do not ask the user for things pLLM derives: model widths, memory layout, scheduling order, CUDA streams.
+If the user is designing a new TTT or stateful algorithm (or diagnosing a slow one), read the
+[Co-Design Guide](../../blog/en/12-hitchhikers-guide-to-ttt-codesign.md) first: separate core research
+hypotheses from incidental defaults (dense all-layer state, `chunk=1`, `publish_lag=0`, extra `lm_head`
+passes, `hidden`-keyed host tables, `.item()` syncs), run a quick `pllm.explain(...)` budget check, and
+discuss system-friendly alternatives with the user before locking in a slow implementation.
 If the algorithm needs something pLLM cannot express, name the gap (which capability, which rule) and let
 the user choose: reduce the requirement, change the algorithm, or extend pLLM. Never change the algorithm
 silently; pLLM will faithfully run the changed version.

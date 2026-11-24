@@ -1,8 +1,8 @@
 # 技术随笔与机制拆解 / Engineering Essays & Deep Dives
 
-十一篇面向推理系统社区的平权独立文章（中英双语），不设上下级阅读门槛，也不预设读者了解本仓库。其中三篇聚焦行业趋势、系统复盘与状态层抽象，八篇为单点技术深潜——从反常现象出发，用示意图还原问题建模、算法推导与通用排障思路（另有四篇围绕动态切层开发过程的排障手记整理在 [blog/personal/](personal/README.md)）。
+十二篇面向推理系统社区的平权独立文章（中英双语），不设上下级阅读门槛，也不预设读者了解本仓库。其中四篇聚焦行业趋势、系统复盘、状态层抽象与算法—系统协同设计，八篇为单点技术深潜——从反常现象出发，用示意图还原问题建模、算法推导与通用排障思路（另有四篇围绕动态切层开发过程的排障手记整理在 [blog/personal/](personal/README.md)）。
 
-Eleven peer-independent articles (in Chinese and English) written for the inference-systems community, assuming zero prior familiarity with this repository. Three pieces examine macro economics, engineering postmortems, and unified state architecture; eight are focused deep-dives reconstructing problem modeling, derivations, and reusable debugging habits with diagrams (plus four debugging notes from the dynamic layer-routing build in [blog/personal/](personal/README.md)).
+Twelve peer-independent articles (in Chinese and English) written for the inference-systems community, assuming zero prior familiarity with this repository. Four pieces examine macro economics, engineering postmortems, unified state architecture, and algorithm-system co-design; eight are focused deep-dives reconstructing problem modeling, derivations, and reusable debugging habits with diagrams (plus four debugging notes from the dynamic layer-routing build in [blog/personal/](personal/README.md)).
 
 ## 推理引擎解剖路标 / System Anatomy Map
 
@@ -19,6 +19,8 @@ Eleven peer-independent articles (in Chinese and English) written for the infere
    *复盘引进 45.7 万行 ISL 多面体库却只用来算 `lag >= 1` 的弯路；展示如何将跨步时间线折叠为 8 刻度一致依赖图，以及如何用剖析器定位双卡 All-Reduce 优先级抢占与可分页内存假异步。*
 11. **[`[架构抽象 · 状态底座]` 《PagedAttention 之后：用统一的张量状态层（PTTS）承接推理期算法》](zh/11-ptts-beyond-paged-attention.md)**  
     *对比 PagedAttention 专管的一维序列块表与非 KV 推理期算法的多样状态需求；拆解 PTTS 如何用整字段固定基地址槽池、整数槽号版本根与因果读写划分统一瞬态探针、多租户引导/LoRA、在线学习、分块快权重零拷贝沿用与运行时免重录动态切层。*
+12. **[`[协同设计 · 算法与系统]` 《TTT 漫游指南：参数化记忆算法的硬件协同设计笔记》](zh/12-hitchhikers-guide-to-ttt-codesign.md)**  
+    *以一个“让生成贴近历史记忆”的参数化记忆 TTT 为例，在框架无关的前提下分五步同步权衡表达力、训练稳定性与 GPU 带宽（状态几何与分块、lag=1 多版本重叠、隐空间目标与 5 行保序位变换、宿主机大表与步首有界独立传输、静态图与行隔离），并附供研究者与 Coding Agent 在动手前讨论的 6 问协同设计清单。*
 
 ### 硬核机制拆解与排障方法
 3. **[`[极客拆解 · 带宽与配额]` 《为什么 32 个线程块跑赢 9,600 个，跳过 23% 的词却省不下 1 毫秒？连续批处理的带宽配额分析》](zh/03-bandwidth-and-sm-quotas.md)**  
@@ -53,6 +55,7 @@ Eleven peer-independent articles (in Chinese and English) written for the infere
 1. **[`[Position]` The Second Half of the Bitter Lesson: Why Commercial Inference Is Returning to Dirty Priors, and Why Engine Forks Break the Economics of Search](en/01-after-the-bitter-lesson.md)**
 2. **[`[Postmortem]` Deleting 450,000 Lines of Polyhedral C for 40 Lines of Longest-Path: An Over-Engineering Postmortem](en/02-forty-lines-over-polyhedral-ir.md)**
 11. **[`[Architecture · State Layer]` Beyond PagedAttention: Unifying Stateful Inference Algorithms on One Tensor State Layer (PTTS)](en/11-ptts-beyond-paged-attention.md)**
+12. **[`[Co-Design · Algorithms & Systems]` The Hitchhiker's Guide to Fast TTT: Co-Designing Parametric Memory with the Machine](en/12-hitchhikers-guide-to-ttt-codesign.md)**
 
 ### Technical Deep Dives & Diagnostic Methods
 3. **[`[Deep Dive · Bandwidth & Quotas]` Why 32 Thread Blocks Beat 9,600—and Skipping 23% of Tokens Saves Zero Time: Bandwidth and SM Quotas in Continuous Batching](en/03-bandwidth-and-sm-quotas.md)**

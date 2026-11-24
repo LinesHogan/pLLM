@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="100%" role="img" aria-label="How ~35 Declarative pLLM Lines Compile into the v5 Hardware Pipeline">
+  <defs>
+    <style>
+      .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sec { font: 700 12px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label { font: 600 11.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label-sm { font: 600 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub { font: 400 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub-sm { font: 400 9.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .mono { font: 600 10.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .mono-sm { font: 600 9.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .badge { font: 700 10px "JetBrains Mono", "SF Mono", "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0.03em; }
+    </style>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#b45309"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="1072" height="612" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <rect x="20" y="16" width="114" height="24" rx="4" fill="#0047ab"/>
+  <text x="77" y="32" text-anchor="middle" class="badge" fill="#ffffff">PLLM COMPILE</text>
+  <text x="148" y="33" class="title" fill="#111111">How ~35 Declarative pLLM Lines Compile into the v5 Hardware Pipeline</text>
+  <line x1="20" y1="48" x2="1060" y2="48" stroke="#e4e4e7" stroke-width="1.4"/>
+  <text x="28" y="72" class="sec" fill="#0047ab">Declarative Workload (ParametricMemoryTTT)</text>
+  <text x="536" y="72" class="sec" fill="#065f46">Compiled v5 Memory &amp; Pipeline Machinery</text>
+  <rect x="24" y="86" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="98" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="112" text-anchor="middle" class="badge" fill="#ffffff">1</text>
+  <text x="68" y="113" class="mono" fill="#1e3a8a">Pretrained(path, placement=&quot;host&quot;)</text>
+  <text x="68" y="142" class="mono-sm" fill="#334155">def lookup(ids=pllm.input_tokens(history=1), ...)</text>
+  <line x1="474" y1="128.0" x2="528" y2="128.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="86" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="116" class="label" fill="#065f46">Host Pinned RAM + Step-Start Bounded UVA Kernel</text>
+  <text x="552" y="144" class="sub" fill="#18181b">0 GPU VRAM for archive; ~2% warp slots saturate PCIe behind forward</text>
+  <rect x="24" y="184" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="196" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="210" text-anchor="middle" class="badge" fill="#ffffff">2</text>
+  <text x="68" y="211" class="mono" fill="#1e3a8a">RequestState(FromModule(low_rank_mlp),</text>
+  <text x="68" y="240" class="mono-sm" fill="#334155">             optimizer=pllm.AdamW(1e-3))</text>
+  <line x1="474" y1="226.0" x2="528" y2="226.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="184" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="214" class="label" fill="#065f46">Fixed-Base Field Slot Pools (PTTS) + Auto Precision</text>
+  <text x="552" y="242" class="sub" fill="#18181b">BF16 base / FP32 delta &amp; moments; 0-byte non-boundary reuse</text>
+  <rect x="24" y="282" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="294" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="308" text-anchor="middle" class="badge" fill="#ffffff">3</text>
+  <text x="68" y="309" class="mono" fill="#1e3a8a">@pllm.train(state=&quot;mem&quot;)  # publish_lag=1</text>
+  <text x="68" y="338" class="mono-sm" fill="#334155">return (net(cue.float()) - target.float()).square().mean(-1)</text>
+  <line x1="474" y1="324.0" x2="528" y2="324.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="282" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="312" class="label" fill="#065f46">Side-Stream Hidden MSE + Lock-Free MVCC Redirect</text>
+  <text x="552" y="340" class="sub" fill="#18181b">Main reads v(t-1); Side writes v(t+1) directly; -30% opt RAM</text>
+  <rect x="24" y="380" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="392" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="406" text-anchor="middle" class="badge" fill="#ffffff">4</text>
+  <text x="68" y="407" class="mono" fill="#1e3a8a">@pllm.guide_sampling(beta=-pull_alpha, rows=&quot;ready&quot;)</text>
+  <text x="68" y="436" class="mono-sm" fill="#334155">return net(cue.float())   # -&gt; g [B, d]</text>
+  <line x1="474" y1="422.0" x2="528" y2="422.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="380" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="410" class="label" fill="#065f46">Filter-First (~5 Survivors) + 35 KB Dot + Bit-Hack</text>
+  <text x="552" y="438" class="sub" fill="#18181b">Skips 1.09 GB extra lm_head pass; uint64 fused deterministic draw</text>
+  <rect x="24" y="478" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="490" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="504" text-anchor="middle" class="badge" fill="#ffffff">5</text>
+  <text x="68" y="505" class="mono" fill="#1e3a8a">pllm.explain(w, cfg)  &amp;  pllm.testing.check(w, cfg)</text>
+  <text x="68" y="534" class="mono-sm" fill="#334155">2s CPU check for memory budget, syncs &amp; tenant isolation</text>
+  <line x1="474" y1="520.0" x2="528" y2="520.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="478" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="508" class="label" fill="#065f46">Bindless Static Graphs (S+1 Sink) + Schedule-as-Data</text>
+  <text x="552" y="536" class="sub" fill="#18181b">6 us routing table; catches .item() syncs &amp; dim=0 leaks on CPU</text>
+  <rect x="24" y="582" width="1032" height="24" rx="4" fill="#f4f4f5"/>
+  <text x="540" y="598" text-anchor="middle" class="sub-sm" fill="#52525b">For in-layer chunked fast weights (e.g., In-Place TTT), replace @pllm.train with @pllm.train_in_forward(chunk=...) on the same slot pools and CUDA IF.</text>
+</svg>

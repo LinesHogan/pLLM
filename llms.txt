@@ -3,6 +3,7 @@
 
 ## Coding Agent Entry Points (Read These First)
 - [SKILL.md](doc/agent/SKILL.md): Core workflow, declarations, `explain` -> `testing.check` -> `make_llm` / `make_async_llm`
+- [Hitchhiker's Guide to Fast TTT Co-Design (EN)](blog/en/12-hitchhikers-guide-to-ttt-codesign.md) | [中文](blog/zh/12-hitchhikers-guide-to-ttt-codesign.md): Algorithm-system co-design walkthrough and 6-question pre-flight protocol — read this BEFORE implementing a new TTT or stateful inference algorithm so you can constructively challenge system-hostile defaults (dense all-layer state, `chunk=1`, `lag=0`, extra `lm_head` passes, host-table dependencies, `.item()` syncs, `dim=0` mixing) with the user
 - [migration.md](doc/agent/migration.md): Pre-flight audit and translation from HF hooks / `LogitsProcessor` / PEFT / PyTorch TTT loops to `pllm.Workload`
 - [reference.md](doc/agent/reference.md): Task-indexed API guide + generated signatures for every public symbol
 - [examples.md](doc/agent/examples.md): Nearest maintained example per algorithm family

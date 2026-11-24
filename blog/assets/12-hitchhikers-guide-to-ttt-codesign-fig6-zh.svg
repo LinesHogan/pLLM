@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="100%" role="img" aria-label="约 35 行声明式 pLLM 原语与 v5 硬件流水线的一一对应">
+  <defs>
+    <style>
+      .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sec { font: 700 12px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label { font: 600 11.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label-sm { font: 600 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub { font: 400 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub-sm { font: 400 9.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .mono { font: 600 10.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .mono-sm { font: 600 9.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .badge { font: 700 10px "JetBrains Mono", "SF Mono", "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0.03em; }
+    </style>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#b45309"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="1072" height="612" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <rect x="20" y="16" width="114" height="24" rx="4" fill="#0047ab"/>
+  <text x="77" y="32" text-anchor="middle" class="badge" fill="#ffffff">PLLM COMPILE</text>
+  <text x="148" y="33" class="title" fill="#111111">约 35 行声明式 pLLM 原语与 v5 硬件流水线的一一对应</text>
+  <line x1="20" y1="48" x2="1060" y2="48" stroke="#e4e4e7" stroke-width="1.4"/>
+  <text x="28" y="72" class="sec" fill="#0047ab">声明式算法定义 (ParametricMemoryTTT)</text>
+  <text x="536" y="72" class="sec" fill="#065f46">自动生成的 v5 内存与流水线机制</text>
+  <rect x="24" y="86" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="98" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="112" text-anchor="middle" class="badge" fill="#ffffff">1</text>
+  <text x="68" y="113" class="mono" fill="#1e3a8a">Pretrained(path, placement=&quot;host&quot;)</text>
+  <text x="68" y="142" class="mono-sm" fill="#334155">def lookup(ids=pllm.input_tokens(history=1), ...)</text>
+  <line x1="474" y1="128.0" x2="528" y2="128.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="86" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="116" class="label" fill="#065f46">宿主机锁页内存 + 步首有界 UVA 传输内核</text>
+  <text x="552" y="144" class="sub" fill="#18181b">1.8 GiB 长期表 0 显存占用；仅占 ~2% 驻留槽位，99.1% 耗时藏进前向</text>
+  <rect x="24" y="184" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="196" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="210" text-anchor="middle" class="badge" fill="#ffffff">2</text>
+  <text x="68" y="211" class="mono" fill="#1e3a8a">RequestState(FromModule(low_rank_mlp),</text>
+  <text x="68" y="240" class="mono-sm" fill="#334155">             optimizer=pllm.AdamW(1e-3))</text>
+  <line x1="474" y1="226.0" x2="528" y2="226.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="184" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="214" class="label" fill="#065f46">固定基地址整字段槽池 (PTTS) + 自动混合精度</text>
+  <text x="552" y="242" class="sub" fill="#18181b">基座 BF16 / 累加增量与动量 FP32；分块变体非边界 0 字节复用</text>
+  <rect x="24" y="282" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="294" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="308" text-anchor="middle" class="badge" fill="#ffffff">3</text>
+  <text x="68" y="309" class="mono" fill="#1e3a8a">@pllm.train(state=&quot;mem&quot;)  # publish_lag=1</text>
+  <text x="68" y="338" class="mono-sm" fill="#334155">return (net(cue.float()) - target.float()).square().mean(-1)</text>
+  <line x1="474" y1="324.0" x2="528" y2="324.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="282" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="312" class="label" fill="#065f46">旁路流隐空间局部训练 + 无锁 MVCC / 写时重定向</text>
+  <text x="552" y="340" class="sub" fill="#18181b">主干读快照 v(t-1)，旁路直写新槽 v(t+1)，动量封顶 2 页省 30%</text>
+  <rect x="24" y="380" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="392" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="406" text-anchor="middle" class="badge" fill="#ffffff">4</text>
+  <text x="68" y="407" class="mono" fill="#1e3a8a">@pllm.guide_sampling(beta=-pull_alpha, rows=&quot;ready&quot;)</text>
+  <text x="68" y="436" class="mono-sm" fill="#334155">return net(cue.float())   # -&gt; g [B, d]</text>
+  <line x1="474" y1="422.0" x2="528" y2="422.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="380" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="410" class="label" fill="#065f46">先 top-p 过滤剩 ~5 词 + 35 KB 点积 + IEEE 754 位变换</text>
+  <text x="552" y="438" class="sub" fill="#18181b">省掉 1.09 GB 二次词表矩阵乘，uint64 保序决胜单内核融合抽样</text>
+  <rect x="24" y="478" width="450" height="84" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
+  <rect x="36" y="490" width="22" height="20" rx="4" fill="#0047ab"/>
+  <text x="47" y="504" text-anchor="middle" class="badge" fill="#ffffff">5</text>
+  <text x="68" y="505" class="mono" fill="#1e3a8a">pllm.explain(w, cfg)  &amp;  pllm.testing.check(w, cfg)</text>
+  <text x="68" y="534" class="sub" fill="#334155">CPU 上两秒静态核验显存预算、主机同步与多租户隔离</text>
+  <line x1="474" y1="520.0" x2="528" y2="520.0" stroke="#059669" stroke-width="2" marker-end="url(#arr-green)"/>
+  <rect x="534" y="478" width="522" height="84" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="552" y="508" class="label" fill="#065f46">Bindless 静态图寻址 (S+1 哨兵槽) + 调度即数据核验</text>
+  <text x="552" y="536" class="sub" fill="#18181b">6 us 槽号路由表免重录；上卡前拦截 .item() 同步与 dim=0 串味</text>
+  <rect x="24" y="582" width="1032" height="24" rx="4" fill="#f4f4f5"/>
+  <text x="540" y="598" text-anchor="middle" class="sub-sm" fill="#52525b">若算法需在 Transformer 层内直接改写投影并按块递推（如 In-Place TTT），将 @pllm.train 换为 @pllm.train_in_forward(chunk=...) 即可复用同一套槽池与 CUDA IF。</text>
+</svg>
