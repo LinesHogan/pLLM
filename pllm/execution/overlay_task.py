@@ -175,7 +175,12 @@ class ChunkUpdate:
 
 def overlay_apply(effect: ProjectionDelta, hidden: torch.Tensor, values: Tensors) -> torch.Tensor:
     """Read the declared overlay operator for ordinary and chunk-exclusive projections."""
-    return parameter_correction(hidden, tuple(values[name] for name in effect.applied_fields), effect.operator)
+    return parameter_correction(
+        hidden,
+        tuple(values[name] for name in effect.applied_fields),
+        effect.operator,
+        custom_operator=effect.custom_operator,
+    )
 
 
 def count_updates(results: Sequence[UpdateOutput]) -> torch.Tensor:

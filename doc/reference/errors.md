@@ -129,7 +129,11 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `layer ... is a Gated DeltaNet layer without q/k/v/o projections; choose a full-attention layer (see layer_types in the model config)` | Qwen3.5 的线性 attention 层没有标准的 q/k/v/o 投影 | 改写全注意力层（见模型配置的 `layer_types`） |
 | `gated attention interleaves each head's query rows with its output-gate rows; overlay the value projection instead` | Qwen3.5 的门控 attention 把每个头的 query 行和门控行交错存放，切不出单独的 query 投影 | 改写 `v_proj` |
 | `per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP` | 按头的增量没有按张量并行切分 | 多卡时用 `"dense"` 或 `"low_rank"`，或单卡 |
-| `pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host` | `make_host` 没有模型 | 用 `pllm.make_llm`，或 `make_host` 的负载只保留 `pllm.batch` 训练 |
+| `custom projection operators need tensor_parallel_size=1; use dense or low_rank deltas under TP` | 自定义投影算子未按张量并行切分 | 多卡时用 `"dense"` 或 `"low_rank"`，或改用单卡 `tensor_parallel_size=1` |
+| `custom projection operator for ... must return shape ...; got ...` | 传给 `pllm.model.Adapter(operator=fn)` 的自定义投影算子必须返回 `[rows, out_features]`，精度与输入一致或为 float32，且在输入设备上 | 返回与目标投影输出宽度匹配的 `[rows, out_features]` 张量 |
+| `pllm.model.SharedLayers needs a dense decoder architecture; got ...` | `SharedLayers` 零拷贝线性权重共享目前仅支持未量化的稠密解码器架构 | 改用稠密解码器模型（如 `Qwen2`、`Qwen3`、`Llama`、`Mistral`、`Glm4`、`Gemma2/3`） |
+| `pllm.model.SharedLayers requires unquantized linear layers; ...` | 量化线性层包含打包权重与缩放因子，无法安全跨层绑定共享 | 使用未量化的稠密模型权重 |
+| `pllm.model.Adapter, pllm.model.ActivationPatch, pllm.model.SharedLayers and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host` | `make_host` 没有模型 | 用 `pllm.make_llm`，或 `make_host` 的负载只保留 `pllm.batch` 训练 |
 | `pllm.layer_logits reads the model's LM head; compile this workload with make_llm` | `make_host` 没有模型，也就没有 LM head | 用 `pllm.make_llm` |
 
 ## 自写算子

@@ -716,12 +716,22 @@ def workload_engine_setup(
         LAYOUT_ENV: encode_boundary(requirements.kv_layouts),
     }
     options: GraphOptions = {} if eager_reason else graph_options(config, requirements)
-    # vLLM keys its compiled-model cache by config; hidden taps, position states and layouts enter the digest.
-    forward = sha256((environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV]).encode()).hexdigest()
+    # vLLM keys its compiled-model cache by config; hidden taps, position states, layouts and shared layers enter the digest.
+    shared_digest = encode_boundary(
+        (requirements.shared_layer_groups, requirements.checkpoint_rename, requirements.checkpoint_exclude)
+    )
+    forward = sha256(
+        (environment[TAPS_ENV] + environment[POSITION_ENV] + environment[LAYOUT_ENV] + shared_digest).encode()
+    ).hexdigest()
     options["additional_config"] = {**options.get("additional_config", {}), "pllm_forward": int(forward[:15], 16)}
     engine_options: dict[str, Any] = {
         **options,
-        **load_options(requirements.checkpoint_names, shared_layer_groups=requirements.shared_layer_groups),
+        **load_options(
+            requirements.checkpoint_names,
+            shared_layer_groups=requirements.shared_layer_groups,
+            checkpoint_rename=requirements.checkpoint_rename,
+            checkpoint_exclude=requirements.checkpoint_exclude,
+        ),
         "worker_cls": WORKER_CLASS,
         # The supported uni-process, non-speculative decoder enables async by default.
         "async_scheduling": True,

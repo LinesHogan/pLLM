@@ -179,6 +179,7 @@ class ExplainResult:
     kernels: KernelEstimate
     # Base forward plus every task's matmul and projection FLOPs per row; None when the base is unknown.
     flops_per_token_estimate: float | None
+    shared_layer_groups: tuple[tuple[int, ...], ...] = ()
 
     def __str__(self) -> str:
         forward = f"eager: {self.eager_reason}" if self.eager_reason else "CUDA graphs: no effect needs eager"
@@ -267,6 +268,11 @@ class ExplainResult:
         )
         if self.model.read_only_reason:
             lines.append(f"model    read-only: {self.model.read_only_reason}")
+        if self.shared_layer_groups:
+            tied = sum(len(group) for group in self.shared_layer_groups)
+            lines.append(
+                f"shared   {len(self.shared_layer_groups)} groups ({tied} -> {len(self.shared_layer_groups)} unique linear layers)"
+            )
         lines.extend(f"note     {note}" for note in self.limitations)
         for op in self.custom_ops:
             flops = (
@@ -707,7 +713,12 @@ def explain(workload: Workload, config: ModelConfig) -> ExplainResult:
 
     requirements = workload.backend_requirements()
     reason = admit_workload(config, requirements)
-    shape = ModelShape.of_config(config, requirements.parameter_targets, requirements.routed_targets)
+    shape = ModelShape.of_config(
+        config,
+        requirements.parameter_targets,
+        requirements.routed_targets,
+        requirements.shared_layer_groups,
+    )
     layouts = HiddenTapAnnouncement.declared(requirements, config).resolve(
         shape.layer_count, shape.hidden_size, shape.vocab_size, post_attention_norm_name(shape.architecture)
     )
@@ -805,4 +816,5 @@ def explain_facts(
         layout_capacity(shape, config, workload.backend_requirements().kv_layouts) if binding.attention.methods else (),
         _kernel_sum(tuple(costs.values()), tuple(sites.values())),
         _flops_per_token(shape.base_forward_flops_per_token_estimate, tuple(costs.values())),
+        requirements.shared_layer_groups,
     )

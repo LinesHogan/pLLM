@@ -39,7 +39,12 @@ from pllm.contracts.semantic_graph import (
 )
 from pllm.contracts.state_representation import StateDeviceKind
 from pllm.contracts.tensor_layout import TensorDType, TensorLayoutRequest
-from pllm.execution.parameter_projection import ROWS_PER_BLOCK, projection_blocks, uses_pinned_projection
+from pllm.execution.parameter_projection import (
+    ROWS_PER_BLOCK,
+    is_static_instance,
+    projection_blocks,
+    uses_pinned_projection,
+)
 
 
 def attachment_buffer_bytes(
@@ -69,28 +74,28 @@ def attachment_buffer_bytes(
         buffers += probe.blas_workspace_bytes
     pinned_rows = min(rows, probe.causal_domain.requests) if graph.updates_in_forward and probe.causal_domain else rows
     decode_updates = graph.updates_in_forward and HiddenPhase.DECODE in attachment.overlay_phases
-    static_instances = {
-        state.resource for state in graph.states if state.scope is StateScope.INSTANCE and state.immutable
-    }
+    static_instances = frozenset(
+        str(state.resource) for state in graph.states if state.scope is StateScope.INSTANCE and state.immutable
+    )
+    target_shapes = {target.target: target for target in probe.targets}
     static_scratch = 0
     for binding in attachment.overlay_bindings:
-        is_static_instance = (
-            pinned
-            and not graph.updates_in_forward
-            and graph.custom_forward_task is None
-            and binding.route is None
-            and not attachment.overlay_phases
-            and binding.resource in static_instances
+        static_binding = is_static_instance(
+            binding,
+            pinned=pinned,
+            updates_in_forward=graph.updates_in_forward,
+            overlay_phases=attachment.overlay_phases,
+            static_instances=static_instances,
         )
         if binding.reads_embedding:
             buffers += rows * hidden * width
-        if not is_static_instance:
+        if not static_binding:
             buffers += rows  # Scalar prompt-end operands for the largest request set.
         first = binding.fields[0].shape
         if binding.operator is ParameterOverlayOperator.DENSE_ADD:
             outputs, inputs = first
             operands = rows * (width * (inputs + hidden) + 8)
-            if is_static_instance:
+            if static_binding:
                 static_scratch = max(static_scratch, rows * width * outputs)
             else:
                 buffers += rows * width * outputs
@@ -104,17 +109,21 @@ def attachment_buffer_bytes(
             heads, width_per_head, _ = first
             inputs = outputs = heads * width_per_head
             scratch = rows * (6 * width * heads * width_per_head + 8)
-            if is_static_instance:
+            if static_binding:
                 static_scratch = max(static_scratch, scratch)
             else:
                 # Owned capture, fp32 input/correction, layout copy, cast and addition.
                 buffers += scratch
-        elif binding.operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD:
-            experts, rank, inputs = first
-            outputs = binding.fields[1].shape[-2]
-            gates = binding.fields[2].shape[0]
-            scratch = rows * (width * (inputs + gates + experts * rank + 2 * outputs) + 8)
-            if is_static_instance:
+        elif binding.operator is ParameterOverlayOperator.CUSTOM:
+            target_shape = target_shapes.get(binding.target)
+            inputs = target_shape.input_size if target_shape is not None else hidden
+            outputs = target_shape.output_size if target_shape is not None else hidden
+            mid_width = sum(
+                prod(field.shape[:-1]) if len(field.shape) >= 2 else (field.shape[0] if field.shape else 1)
+                for field in binding.fields
+            )
+            scratch = rows * (width * (inputs + min(mid_width, 4 * max(inputs, outputs)) + 2 * outputs) + 8)
+            if static_binding:
                 static_scratch = max(static_scratch, scratch)
             else:
                 buffers += scratch
@@ -122,11 +131,11 @@ def attachment_buffer_bytes(
             rank, inputs = first
             outputs = binding.fields[1].shape[0]
             scratch = rows * (width * (inputs + rank + 2 * outputs) + 8)
-            if is_static_instance:
+            if static_binding:
                 static_scratch = max(static_scratch, scratch)
             else:
                 buffers += scratch
-        if is_static_instance:
+        if static_binding:
             buffers += 24  # Single-element address token for the captured custom op.
         elif probe.causal_domain is not None and pinned:
             blocks = 1 if decode_updates else projection_blocks(pinned_rows, probe.causal_domain.requests)

@@ -337,21 +337,22 @@ forward.
 | Name | Meaning |
 | --- | --- |
 | `pllm.model.ActivationPatch(state, layers, first_tokens=0, last_tokens=2, operator="low_rank_affine", *, decode=False, refresh="admission", on_missing="stop")` | Edit the output of `layers` (the residual stream after them) from a state, whoever writes it. `operator="add"` adds one vector field per layer; `"low_rank_affine"` reads three fields per layer (ReFT). Applies to the first `first_tokens` and last `last_tokens` prompt tokens, and with `decode=True` to every decode token. `refresh="step"` reads the newest version every decode step. Runs inside the model's CUDA graphs. |
-| `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0)` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `operator="gated_low_rank"` applies a per-token softmax-gated mixture of low-rank experts from `factors=("a", "b", "gate_weight", "gate_bias")`; `"dense"` and `"per_head"` read the field `weight`. A trainable `"low_rank"` state needs a non-zero `init=` (e.g. `pllm.Computed` with random A, zero B): with both factors at zero every gradient is zero, so it is rejected. Both `RequestState` and `InstanceState` adapters run inside the model's CUDA graphs. Inside `@pllm.custom_forward` the delta applies at every projection call, including repeated layers. |
+| `pllm.model.Adapter(state, targets, weight="value", operator="dense", factors=("a", "b"), scale=1.0, *, share={})` | Apply a state as a weight delta at the target projections, whoever trains it (PEFT-style). `operator="low_rank"` applies `scale * b @ a` from fields named by `factors`; `"dense"` and `"per_head"` read `weight`; a callable `operator=fn` (pure PyTorch or `torch.library.custom_op` with `mutates_args=()` and `register_fake`) computes `fn(hidden, *weights) -> delta` from the fields listed in `factors`. `share` maps field names to layer-index groups that share one state field per projection name. A trainable `"low_rank"` state needs a non-zero `init=` (e.g. `pllm.Computed` with random A, zero B). Both `RequestState` and `InstanceState` adapters run inside CUDA graphs; read-only immutable `InstanceState` adapters merge per physical `LinearBase` and run without mutating pools. Inside `@pllm.custom_forward` the delta applies at every projection call, including repeated layers. |
 | `pllm.model.Projection(name, layer=None)` | A linear projection by its Hugging Face module name: `"q_proj"`, `"k_proj"`, `"v_proj"`, `"o_proj"`, `"gate_proj"`, `"up_proj"` or `"down_proj"`; `layer=None` means every layer. |
 | `pllm.model.LayerRoute(state, *, over, field="layer")` | Advanced runtime layer selector over explicit candidate layers `over` without recapturing CUDA graphs. Reads a 0-d `int64` field `state.field` (`pllm.Field((), torch.int64)`) holding an active layer in `over` or `-1` to disable (zeros for reads, identity for edits). Methods: `.hidden(tokens=...)`, `.residual(after=..., tokens=...)`, `.layer_logits()`, `.patch(state="", ..., refresh="step")`, `.adapter(state="", *, targets=(...), ..., refresh="step")`. |
-| `pllm.model.SharedLayers(groups)` | Tie linear projection weights (`qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`) across each tuple of layers in `groups` at model load while keeping per-layer norms and KV cache slots independent (used by folded decoders such as Concertina). |
+| `pllm.model.SharedLayers(groups, *, checkpoint_rename={}, checkpoint_exclude=())` | Tie unquantized dense linear projection weights (`qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`) across each tuple of layers in `groups` at model load while keeping per-layer norms and KV cache slots independent. Optional `checkpoint_rename` (explicit 1-to-1 map) and `checkpoint_exclude` let folded checkpoints load zero-copy while keeping undeclared keys fail-closed. |
 
 Declare both as class attributes or typed properties. A `pllm.Field` shape callable of a state an `Adapter`
 reads receives each target's `(in_features, out_features)`; the state then has one copy of each field per
-target, named `a_0`, `b_0`, `a_1`, ... in target order.
+target, named `a_0`, `b_0`, `a_1`, ... in target order (fields listed in `share=` allocate once per group leader).
 
 With `tensor_parallel_size > 1` (vLLM >= 0.32.0), `"dense"` and `"low_rank"` deltas follow each projection's
-shards: q/k/v and gate/up partition dense weights and B by output rows, down partitions dense weights and A by
-input columns; the other factor is replicated. Initial values come from `pllm.Zeros`, `pllm.Computed`, `pllm.Pretrained`,
-or `pllm.Imported` (sliced per rank automatically); live updates under TP come from shard-local `@pllm.train_in_forward`
-or `StateImport` / `import_state` (`@pllm.train` / `@pllm.write` side-lane updates, `"per_head"` deltas, and reading
-a sharded field outside its projection need `tensor_parallel_size=1`).
+shards: q/k/v and gate/up partition dense weights and B by output rows, o_proj and down_proj partition dense weights
+and A by input columns; the other factor is replicated. Initial values come from `pllm.Zeros`, `pllm.Computed`,
+`pllm.Pretrained`, or `pllm.Imported` (sliced per rank automatically); live updates under TP come from shard-local
+`@pllm.train_in_forward` or `StateImport` / `import_state` (`@pllm.train` / `@pllm.write` side-lane updates,
+`"per_head"` deltas, custom projection operators, and reading a sharded field outside its projection need
+`tensor_parallel_size=1`).
 
 ```python
 class Steering(pllm.Workload):
@@ -822,7 +823,7 @@ pllm.train(*, state: 'str', update_rows: 'str' = '', reduction: 'TrainReduction'
     Minimize the returned loss with `state`'s optimizer; updates publish after sampling by default.
 pllm.differentiate(*, inputs: 'tuple[str, ...]' = (), parameters: 'bool' = False, input_rows: 'str' = '', parameter_rows: 'str' = '') -> 'Callable[[F], F]'
     Keep derivative edges; parameters may stay frozen while inputs differentiate.
-pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]]', weight: 'str' = 'value', operator: 'AdapterOperator | Callable[[Any], AdapterOperator]' = 'dense', factors: 'tuple[str, str] | Callable[[Any], tuple[str, str]]' = ('a', 'b'), scale: 'float | Callable[[Any], float]' = 1.0, tokens: 'Tokens | Callable[[Any], Tokens]' = 'prefill', visibility: 'VisibilityKind | Callable[[Any], VisibilityKind]' = 'forward_pinned', chunk: 'int | Callable[[Any], int] | None' = None, flush: "Literal['prompt_end'] | None" = None) -> 'Callable[[F], F]'
+pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]]', weight: 'str' = 'value', operator: 'BuiltInAdapterOperator | Callable[[Any], BuiltInAdapterOperator]' = 'dense', factors: 'tuple[str, ...] | Callable[[Any], tuple[str, ...]]' = ('a', 'b'), scale: 'float | Callable[[Any], float]' = 1.0, tokens: 'Tokens | Callable[[Any], Tokens]' = 'prefill', visibility: 'VisibilityKind | Callable[[Any], VisibilityKind]' = 'forward_pinned', chunk: 'int | Callable[[Any], int] | None' = None, flush: "Literal['prompt_end'] | None" = None) -> 'Callable[[F], F]'
     Train a request state inside the forward and add its residual at each target projection.
 pllm.hidden(layer: 'int | Callable[[Any], int]' = 0, *, tokens: "Literal['decode', 'prefill', 'all']" = 'decode') -> 'Any'
     The MLP output before the residual add in decoder layer `layer` (negative from the end).
@@ -893,7 +894,7 @@ pllm.UpdateOutput(output: 'torch.Tensor', changed: 'torch.Tensor', update_count:
 ```text
 pllm.model.ActivationPatch(state: 'str', layers: 'tuple[int, ...]', first_tokens: 'int' = 0, last_tokens: 'int' = 2, operator: "Literal['low_rank_affine', 'add']" = 'low_rank_affine', *, decode: 'bool' = False, refresh: "Literal['admission', 'step']" = 'admission', on_missing: "Literal['stop', 'hold']" = 'stop', route: 'LayerRouteSelector | None' = None)
     Edit the hidden state at `layers` from a state, whoever writes it (ReFT-style): the first and last prompt tokens, and with decode=True every decode token.
-pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, ...]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = ())
+pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, ...]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = (), share: 'Mapping[str, tuple[tuple[int, ...], ...]]' = <factory>)
     Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
 pllm.model.CausalModel(forward: 'CausalForward | None', factors: 'tuple[torch.Tensor, ...] | None')
     The method's callable model argument; `base` is the same model without the declared overlay.
@@ -907,7 +908,7 @@ pllm.model.Projection(name: 'ProjectionName', layer: 'int | None' = None)
     One linear projection of the base model by its Hugging Face module name; `layer=None` means every layer.
 pllm.model.PagedKV(key_cache: 'torch.Tensor', value_cache: 'torch.Tensor', block_table: 'torch.Tensor', seq_lens: 'torch.Tensor', query_start: 'torch.Tensor', query_count: 'int', read_attention: 'AttentionRead', storage_window: 'int' = 0, prompt_lens: 'torch.Tensor | None' = None, storage_kind: "Literal['kv', 'mla_latent']" = 'kv', latent_cache: 'torch.Tensor | None' = None, rope_cache: 'torch.Tensor | None' = None, w_uk_t: 'torch.Tensor | None' = None, w_uv: 'torch.Tensor | None' = None)
     Borrowed paged K/V, already including the current tokens; never changes cache storage.
-pllm.model.SharedLayers(groups: 'tuple[tuple[int, ...], ...]')
+pllm.model.SharedLayers(groups: 'tuple[tuple[int, ...], ...]', *, checkpoint_rename: 'Mapping[str, str]' = <factory>, checkpoint_exclude: 'tuple[str, ...]' = ())
     Tie each group's linear projection weights to its first layer at model load.
 ```
 

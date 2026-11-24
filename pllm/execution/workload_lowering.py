@@ -70,6 +70,7 @@ from pllm.execution.method_inputs import (
 )
 from pllm.execution.model_effect_binding import declare_activation_patch, declare_custom_forward
 from pllm.execution.model_sites import StateInput
+from pllm.execution.parameter_projection import custom_operator_id
 from pllm.execution.position_state import PositionState
 from pllm.execution.row_task_binding import declare_logits, declare_parameters, declare_tensor, validate_gradients
 from pllm.execution.shared_tensor import SharedTensor
@@ -332,8 +333,14 @@ class WorkloadContext:
     def adapter_bindings(self, delta: ProjectionDelta) -> tuple[ParameterOverlayFieldBinding, ...]:
         """The field views an adapter applies, shared by inference and differentiable model calls."""
         definition = self.state_definitions[delta.state]
+        operator_id = ""
+        if delta.custom_operator is not None:
+            operator_id = custom_operator_id(delta.custom_operator)
+            self.binding.overlay_operators[operator_id] = delta.custom_operator
         if delta.route is None:
-            return delta.field_bindings(lambda name: self.binding.field_views[delta.state, name])
+            return delta.field_bindings(
+                lambda name: self.binding.field_views[delta.state, name], operator_id=operator_id
+            )
         resolved = self.bind_layer_route(delta.route)
         if delta.refresh == "admission":
             _reject_mutable_request_admission(self, delta.state)
@@ -347,6 +354,7 @@ class WorkloadContext:
             lambda name: self.binding.field_views[delta.state, name],
             layer_bank=bool(definition.layers),
             route=OverlayRoute(resolved.resource, route_view, delta.refresh),
+            operator_id=operator_id,
         )
 
     def bind_layer_route(self, route: LayerRouteSelector) -> LayerRouteSelector:
@@ -445,10 +453,10 @@ class WorkloadContext:
 
     def declare_values(self) -> None:
         """Allocate ordinary state before effects and operations consume its ports."""
-        if self.binding.host and (self.custom_forwards or self.adapters or self.activations):
+        if self.binding.host and (self.custom_forwards or self.adapters or self.activations or self.shared_layers):
             raise ValueError(
-                "pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this "
-                "workload with make_llm, not make_host"
+                "pllm.model.Adapter, pllm.model.ActivationPatch, pllm.model.SharedLayers and @pllm.custom_forward act "
+                "inside a model forward; compile this workload with make_llm, not make_host"
             )
         self.positions = self.position_states()
         for name, state in self.state_definitions.items():
@@ -889,7 +897,14 @@ def declare_patch(context: WorkloadContext, name: str, patch: ActivationPatch) -
 def lower_workload(context: WorkloadContext, b: TensorDeclaration, capabilities: tuple[str, ...] = ()) -> None:
     """Declare a reflected workload's states and operations into `b`, then compose and sign their graph."""
     seen_shared: set[int] = set()
+    shared_groups: list[tuple[int, ...]] = []
     for name, shared in context.shared_layers.items():
+        if b.host:
+            raise ValueError(
+                "pllm.model.Adapter, pllm.model.ActivationPatch, pllm.model.SharedLayers and @pllm.custom_forward act "
+                "inside a model forward; compile this workload with make_llm, not make_host"
+            )
+        b.members[name] = MemberDeclaration("SharedLayers")
         for group in shared.groups:
             for layer in group:
                 if layer >= b.dimensions.layer_count:
@@ -899,6 +914,9 @@ def lower_workload(context: WorkloadContext, b: TensorDeclaration, capabilities:
                 if layer in seen_shared:
                     raise ValueError(f"{name}: SharedLayers index {layer} overlaps another SharedLayers declaration")
                 seen_shared.add(layer)
+            shared_groups.append(group)
+    if shared_groups:
+        b.effects = replace(b.effects, shared_layer_groups=tuple(shared_groups))
     adapters = {key: value.expand(b.dimensions.layer_count) for key, value in context.adapters.items()}
     for component in context.components:
         component.binding = b

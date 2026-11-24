@@ -46,7 +46,10 @@ class BackendRequirements:
     states its own part; `combine` merges the parts."""
 
     checkpoint_names: tuple[str, ...] = field(default=(), kw_only=True)
+    checkpoint_rename: tuple[tuple[str, str], ...] = field(default=(), kw_only=True)
+    checkpoint_exclude: tuple[str, ...] = field(default=(), kw_only=True)
     shared_layer_groups: tuple[tuple[int, ...], ...] = field(default=(), kw_only=True)
+    has_dynamic_parameter_targets: bool = field(default=False, kw_only=True)
     exact_phases: tuple[HiddenPhase, ...] = field(default=(), kw_only=True)
     hidden_inputs: tuple[HiddenInputSource, ...] = ()
     input_token_history: int = -1
@@ -125,7 +128,10 @@ class BackendRequirements:
         parts = tuple(parts)
         return BackendRequirements(
             checkpoint_names=tuple(name for part in parts for name in part.checkpoint_names),
+            checkpoint_rename=tuple(pair for part in parts for pair in part.checkpoint_rename),
+            checkpoint_exclude=tuple(name for part in parts for name in part.checkpoint_exclude),
             shared_layer_groups=tuple(group for part in parts for group in part.shared_layer_groups),
+            has_dynamic_parameter_targets=any(part.has_dynamic_parameter_targets for part in parts),
             exact_phases=tuple(dict.fromkeys(phase for part in parts for phase in part.exact_phases)),
             hidden_inputs=tuple(dict.fromkeys(source for part in parts for source in part.hidden_inputs)),
             input_token_history=max((part.input_token_history for part in parts), default=-1),

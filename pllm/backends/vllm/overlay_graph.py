@@ -73,9 +73,11 @@ def _compiler_backend(config: ModelConfig, requirements: BackendRequirements) ->
     if requirements.custom_residual:
         # All-site LAuReL is 4.8% slower with Inductor on 7B/4090; stateful residuals fail nested FX tracing.
         return "eager"
-    if requirements.has_parameter_targets:
-        # The projection op mutates pools: AOT rejects packed optimizer views with different autograd bases.
+    if requirements.has_dynamic_parameter_targets:
+        # Dynamic projection ops mutate pools: AOT rejects packed optimizer views with different autograd bases.
         # Exact updates also recompile inside conditional graphs ("Generator not registered").
+        # Immutable InstanceState adapters use read-only pllm::static_projection (mutates_args={"output"}), so
+        # Inductor stays enabled for them.
         return "eager"
     if any(layout.keep == "window" for layout in requirements.kv_layouts):
         # LocalGlobal is 4.6% slower with Inductor on 7B/4090; a repeat confirmed the loss with zero preemptions.

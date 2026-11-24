@@ -45,7 +45,7 @@ change satisfies it. The messages pLLM raises when a rule is broken, and their f
 | A fed state (`init=pllm.Fed(...)`) and other states or methods | The fed input group holds only its writer and the model effect reading it: a step without a new value skips the write. | Feed one state; one `@pllm.write` turns it into the state an `ActivationPatch` reads (see `pllm/workloads/video.py`). |
 | `@pllm.custom_attention` reading a `RequestState`, or with `rows=` / `@pllm.on` / `@pllm.differentiate` | Attention runs for every scheduled token inside the forward, with instance-wide inputs only. | Read `InstanceState` parameters or modules, `pllm.depth()` and earlier `pllm.attention(...)` facts; select per request inside the math. |
 | `streams=n` with `pllm.residual`, `pllm.layer_logits` or `@pllm.custom_forward` | Those read one stream. | Read `pllm.residual` inside a custom residual method. |
-| Model-site effects (`Adapter`, `ActivationPatch`, `@pllm.custom_forward`, `@pllm.custom_residual`, `@pllm.train_in_forward`) under `pllm.host.make_host` | `make_host` compiles without a model. | `make_llm`. |
+| Model-site effects (`Adapter`, `ActivationPatch`, `SharedLayers`, `@pllm.custom_forward`, `@pllm.custom_residual`, `@pllm.train_in_forward`) under `pllm.host.make_host` | `make_host` compiles without a model. | `make_llm`. |
 | Two `@pllm.write` (or a `@pllm.train` and a `@pllm.write`) on one state | Two writers from one version. | One writer per state. |
 
 ## Support matrix
@@ -94,10 +94,10 @@ stay 1.
 | Works with TP | Needs `tensor_parallel_size=1` |
 | --- | --- |
 | Hidden reads, exports (delivered from rank 0), sampler effects, request-state training, `@pllm.custom_forward` | `causal_model` training |
-| `Adapter` `"dense"` / `"low_rank"` deltas on `q/k/v`, `gate/up`, `down` (`Zeros`, `Computed`, `Pretrained`, or `Imported`) updated via shard-local `@pllm.train_in_forward` or `StateImport` / `import_state` | `"per_head"` deltas; adapters updated by `@pllm.train` / `@pllm.write` side tasks; reading a sharded adapter field anywhere outside its projection |
+| `Adapter` `"dense"` / `"low_rank"` deltas on `q/k/v/o`, `gate/up`, `down` (`Zeros`, `Computed`, `Pretrained`, or `Imported`) updated via shard-local `@pllm.train_in_forward` or `StateImport` / `import_state` | `"per_head"` deltas and custom projection operators (`operator=fn`); adapters updated by `@pllm.train` / `@pllm.write` side tasks; reading a sharded adapter field anywhere outside its projection |
 | Non-`"value"` `@pllm.custom_residual` (including `pllm.input_tokens` helpers), `keep="all"` `@pllm.custom_attention` (without cross-head `pllm.attention(...)` facts), and `pllm.Fed` streams (`FanoutFeed`) | `@pllm.custom_residual(site="value")`, `@pllm.custom_attention` reading cross-head `pllm.attention(...)` facts, and sliding-window/shared KV layouts |
 
-q/k/v and gate/up shard dense weights and B by output rows; down shards dense weights and A by input
+q/k/v and gate/up shard dense weights and B by output rows; o_proj and down_proj shard dense weights and A by input
 columns; the other factor is replicated. An update that needs other ranks' shards is rejected.
 
 ## Expensive choices you write explicitly

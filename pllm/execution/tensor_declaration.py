@@ -268,6 +268,7 @@ class TensorDeclaration:
         self.causal: CausalBinder | None = None
         self.probe: ModelProbe | None = None
         self.overlay_targets: tuple[Projection, ...] = ()
+        self.overlay_operators: dict[str, Callable[..., torch.Tensor]] = {}
         self.field_views: dict[tuple[str, str], FieldView] = {}
         self.imports: dict[str, tuple[FieldView, ...]] = {}
         self.position_states: tuple[tuple[str, float], ...] = ()
@@ -404,6 +405,7 @@ class TensorDeclaration:
             model_sites=tuple(self.sites.rewrites),
             attention=self.attention,
             parameter_overlay=self.overlay_math,
+            overlay_operators=dict(self.overlay_operators),
         )
 
     @property

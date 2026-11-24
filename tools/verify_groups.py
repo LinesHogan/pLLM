@@ -9,6 +9,7 @@ from pathlib import Path
 # First match wins; shared execution, backend and verification changes reach the fallback.
 PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("pllm/workloads/dola*", ()),
+    ("pllm/workloads/concertina*", ("enginecore",)),
     ("pllm/workloads/dummy*", ("enginecore", "tp")),
     ("examples/huber.py", ("enginecore",)),
     ("tools/benchmark*", ()),
@@ -50,6 +51,7 @@ PATH_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("test/gpu/vllm_override_smoke.py", ("feedback",)),
     ("test/gpu/fttt_cuda_smoke.py", ("feedback",)),
     ("test/gpu/vllm_reft_smoke.py", ("reft",)),
+    ("test/gpu/vllm_concertina_smoke.py", ("enginecore",)),
     ("test/gpu/vllm_tlm_smoke.py", ("tlm",)),
     ("test/gpu/enginecore_smoke.py", ("enginecore",)),
     ("test/gpu/vllm_tp_smoke.py", ("tp",)),

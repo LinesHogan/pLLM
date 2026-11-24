@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import file_digest
 from pathlib import Path
@@ -39,19 +40,26 @@ def checkpoint_files(checkpoint: str, names: tuple[str, ...], *, state: str = ""
     paths = tuple(
         directory if directory.is_file() else directory / shards.get(name, "model.safetensors") for name in names
     )
+    keys_by_path: dict[Path, frozenset[str]] = {}
+    ordered_keys_by_path: dict[Path, tuple[str, ...]] = {}
     for name, path in zip(names, paths, strict=True):
         missing = f"tensor {name!r} is missing from checkpoint {checkpoint!r}; use a checkpoint containing it"
         if not checkpoint or not path.is_file():
             raise ValueError(missing)
-        tensors = safe_open(path, framework="pt", device="cpu")
-        with tensors:
-            if name not in tensors.keys():
-                raise ValueError(
-                    f"{checkpoint} has no tensor {name!r} for state {state!r}; it holds {tuple(tensors.keys())}. "
-                    "Name the fields like the saved tensors, or save the tensors under the field names"
-                    if state
-                    else missing
-                )
+        keys = keys_by_path.get(path)
+        if keys is None:
+            with safe_open(path, framework="pt", device="cpu") as tensors:
+                ordered = tuple(tensors.keys())
+            keys = frozenset(ordered)
+            keys_by_path[path] = keys
+            ordered_keys_by_path[path] = ordered
+        if name not in keys:
+            raise ValueError(
+                f"{checkpoint} has no tensor {name!r} for state {state!r}; it holds {ordered_keys_by_path[path]}. "
+                "Name the fields like the saved tensors, or save the tensors under the field names"
+                if state
+                else missing
+            )
     return paths
 
 
@@ -78,10 +86,14 @@ def checkpoint_tensors(checkpoint: str, names: tuple[str, ...], *, state: str = 
     """Read named tensors from one safetensors file or a sharded model snapshot."""
     from safetensors import safe_open
 
+    paths = checkpoint_files(checkpoint, names, state=state)
     values: dict[str, torch.Tensor] = {}
-    for name, path in zip(names, checkpoint_files(checkpoint, names, state=state), strict=True):
-        with safe_open(path, framework="pt", device="cpu") as tensors:
-            values[name] = tensors.get_tensor(name)
+    with ExitStack() as stack:
+        handles = {
+            path: stack.enter_context(safe_open(path, framework="pt", device="cpu")) for path in dict.fromkeys(paths)
+        }
+        for name, path in zip(names, paths, strict=True):
+            values[name] = handles[path].get_tensor(name)
     return values
 
 

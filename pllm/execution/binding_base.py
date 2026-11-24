@@ -16,6 +16,7 @@ from pllm.contracts.parameter_overlay import (
 )
 from pllm.contracts.tensor_layout import TensorDType
 from pllm.execution.declaration import Dimensions, FieldShard, LayoutField
+from pllm.execution.parameter_projection import validate_custom_projection_operator
 
 
 @dataclass(frozen=True)
@@ -72,39 +73,63 @@ def overlay_fields(
     dtype: Callable[[str, Field], TensorDType],
 ) -> tuple[LayoutField, ...]:
     """One copy of the fields per overlay target, laid out target by target and shaped by that target."""
-    arity = (
-        4
-        if effect.operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD
+    applied = effect.applied_fields
+    custom = effect.operator is ParameterOverlayOperator.CUSTOM
+    expected_arity = (
+        len(applied)
+        if custom and len(applied) >= 1
         else 2
         if effect.operator is ParameterOverlayOperator.LOW_RANK_ADD
         else 1
     )
-    applied = effect.applied_fields
     if (
         not effect.targets
         or tuple(sorted(set(effect.targets))) != effect.targets
-        or len(applied) != arity
-        or len(set(applied)) != arity
+        or not applied
+        or len(applied) != expected_arity
+        or len(set(applied)) != expected_arity
         or any(key not in fields for key in applied)
         or not isfinite(effect.scale)
+        or (custom and effect.custom_operator is None)
     ):
         raise ValueError("an adapter needs sorted unique targets, the fields its operator applies and a finite scale")
     projections = dimensions.projections(effect.targets)
+    leaders = _validate_shared_fields(effect, fields, projections)
+    validated_custom: set[tuple[int, int, tuple[tuple[tuple[int, ...], TensorDType], ...]]] = set()
     for index, projection in enumerate(projections):
-        _check_target_fields(
-            effect,
-            fields,
-            f"{projection.target.name} of layer {projection.target.layer}",
-            *projection.global_shape,
-            dimensions.dtype,
-            {key: dtype(f"{key}_{index}", value) for key, value in fields.items()},
-        )
+        target_dtypes = {
+            key: dtype(f"{key}_{leaders.get((key, index), index)}", value) for key, value in fields.items()
+        }
+        if custom:
+            assert effect.custom_operator is not None
+            inputs, outputs = projection.global_shape
+            weight_specs = tuple((fields[key].size(inputs, outputs), target_dtypes[key]) for key in applied)
+            sig = (inputs, outputs, weight_specs)
+            if sig not in validated_custom:
+                validate_custom_projection_operator(
+                    effect.custom_operator,
+                    inputs,
+                    outputs,
+                    dimensions.dtype,
+                    weight_specs,
+                    f"{projection.target.name} of layer {projection.target.layer}",
+                )
+                validated_custom.add(sig)
+        else:
+            _check_target_fields(
+                effect,
+                fields,
+                f"{projection.target.name} of layer {projection.target.layer}",
+                *projection.global_shape,
+                dimensions.dtype,
+                target_dtypes,
+            )
     if dimensions.tensor_parallel_size > 1:
         if effect.operator is ParameterOverlayOperator.HEAD_ADD:
             raise ValueError("per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP")
-        if effect.operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD:
+        if custom:
             raise ValueError(
-                "gated_low_rank adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP"
+                "custom projection operators need tensor_parallel_size=1; use dense or low_rank deltas under TP"
             )
         for projection in projections:
             _check_target_fields(
@@ -122,7 +147,56 @@ def overlay_fields(
         )
         for index, projection in enumerate(projections)
         for key, field in fields.items()
+        if (key, index) not in leaders
     )
+
+
+def _validate_shared_fields(
+    effect: ProjectionDelta,
+    fields: Mapping[str, Field],
+    projections: tuple[ProjectionShape, ...],
+) -> dict[tuple[str, int], int]:
+    """Validate per-field layer sharing groups and return (field, follower_index) -> leader_index."""
+    if not effect.share:
+        return {}
+    if effect.route is not None:
+        raise ValueError("Adapter(share=...) cannot be combined with LayerRoute.adapter")
+    target_index = {projection.target: i for i, projection in enumerate(projections)}
+    leaders: dict[tuple[str, int], int] = {}
+    for field_name, groups in effect.share:
+        if field_name not in fields:
+            raise ValueError(f"Adapter(share=...): {field_name!r} is not a field of state {effect.state!r}")
+        for group in groups:
+            leader_layer = group[0]
+            for follower_layer in group[1:]:
+                for i, projection in enumerate(projections):
+                    if projection.target.layer != follower_layer:
+                        continue
+                    leader_target = replace(projection.target, layer=leader_layer)
+                    if leader_target not in target_index:
+                        raise ValueError(
+                            f"Adapter(share[{field_name!r}]): follower target {projection.target} has no matching "
+                            f"leader target {leader_target} in Adapter.targets"
+                        )
+                    leader_idx = target_index[leader_target]
+                    leader_proj = projections[leader_idx]
+                    if (
+                        projection.input_size,
+                        projection.output_size,
+                        projection.input_partitions,
+                        projection.output_partitions,
+                    ) != (
+                        leader_proj.input_size,
+                        leader_proj.output_size,
+                        leader_proj.input_partitions,
+                        leader_proj.output_partitions,
+                    ):
+                        raise ValueError(
+                            f"Adapter(share[{field_name!r}]): {projection.target} and {leader_target} have different "
+                            "projection shapes and cannot share a field"
+                        )
+                    leaders[field_name, i] = leader_idx
+    return leaders
 
 
 def routed_overlay_fields(
@@ -205,27 +279,14 @@ def _check_target_fields(
         case ParameterOverlayOperator.LOW_RANK_ADD:
             rank = shapes[0][0] if shapes[0] else 0
             rule, valid = "(rank, inputs) and (outputs, rank)", rank > 0 and shapes == ((rank, inputs), (outputs, rank))
-        case ParameterOverlayOperator.GATED_LOW_RANK_ADD:
-            a_shape, b_shape, wg_shape, gb_shape = shapes
-            experts = a_shape[0] if len(a_shape) == 3 else 0
-            rank = a_shape[1] if len(a_shape) == 3 else 0
-            gates = wg_shape[0] if len(wg_shape) == 2 else 0
-            rule = "(experts, rank, inputs), (experts, outputs, rank), (gates, inputs) and (gates,) with gates in (experts, experts + 1)"
-            valid = (
-                experts > 0
-                and rank > 0
-                and a_shape == (experts, rank, inputs)
-                and b_shape == (experts, outputs, rank)
-                and gates in (experts, experts + 1)
-                and wg_shape == (gates, inputs)
-                and gb_shape == (gates,)
-            )
         case ParameterOverlayOperator.HEAD_ADD:
             (shape,) = shapes
             rule = "(heads, width, width) with heads * width == inputs == outputs"
             valid = (
                 len(shape) == 3 and shape[0] > 0 and shape[1] == shape[2] and shape[0] * shape[1] == inputs == outputs
             )
+        case ParameterOverlayOperator.CUSTOM:
+            return
     if not valid:
         raise ValueError(
             f"fields {keys} must be shaped {rule} for the {projection} (in_features={inputs}, out_features={outputs}); "

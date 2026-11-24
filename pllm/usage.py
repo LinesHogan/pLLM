@@ -90,12 +90,14 @@ F = TypeVar("F", bound=Callable[..., torch.Tensor | tuple[torch.Tensor, ...] | U
 C = TypeVar("C")
 L = TypeVar("L", bound=str)
 # How an adapter's fields change a projection: a dense (out_features, in_features) delta, low-rank factors
-# (rank, in_features) and (out_features, rank), or one (width, width) block per attention head.
-AdapterOperator = Literal["dense", "low_rank", "gated_low_rank", "per_head"]
+# (rank, in_features) and (out_features, rank), one (width, width) block per attention head, or a custom callable
+# `fn(hidden, *weights) -> delta` (pure Python or `torch.library.custom_op` with `mutates_args=()`).
+BuiltInAdapterOperator = Literal["dense", "low_rank", "per_head"]
+ProjectionOperator = Callable[..., torch.Tensor]
+AdapterOperator = BuiltInAdapterOperator | ProjectionOperator
 _OPERATORS: dict[str, ParameterOverlayOperator] = {
     "dense": ParameterOverlayOperator.DENSE_ADD,
     "low_rank": ParameterOverlayOperator.LOW_RANK_ADD,
-    "gated_low_rank": ParameterOverlayOperator.GATED_LOW_RANK_ADD,
     "per_head": ParameterOverlayOperator.HEAD_ADD,
 }
 # The fields that key a request state: the vLLM request, the prompt, the sample of a prompt, a user route.
@@ -401,8 +403,11 @@ class ActivationPatch:
 class Adapter:
     """Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
 
-    `weight` names the field of a "dense" or "per_head" delta, `factors` the two fields of a "low_rank" one; the
-    delta is multiplied by `scale`.
+    `weight` names the field of a "dense" or "per_head" delta, `factors` the fields of a "low_rank" delta or a custom
+    projection operator callable `fn(hidden, *weights) -> delta` (pure PyTorch or `torch.library.custom_op` with
+    `mutates_args=()` and `register_fake`); the delta is multiplied by `scale`. `share` optionally maps field names to
+    layer-index groups whose targets share a single state field per projection name (saving storage and L2
+    bandwidth when adjacent layers reuse factors such as low-rank A/B matrices).
 
     A weight delta applies on every invocation of its projection, including repeated layer calls and replay in
     @pllm.custom_forward. Each call uses its actual input and each row's request state, pinned at forward entry.
@@ -411,15 +416,15 @@ class Adapter:
     This lets custom depth schedules use the same adapted model as the standard forward.
 
     At TP>1 (vLLM 0.32), dense and low_rank deltas follow each projection's shards.
-    Declare fields with Field(lambda inputs, outputs: ...). Down deltas partition dense weights and A
-    by input columns, with replicated B. Attention q/k/v and MLP gate/up deltas partition dense weights and B
-    by output rows, with replicated A; KV head replicas follow vLLM's head placement. Small fields replicate.
-    Initialization runs globally before slicing, and explain reports per-rank storage. vLLM's existing row
-    reduction sums corrected down partials; no extra collective is added. Updates must be shard-local: training
-    replicated A from column-sharded outputs, or B from row-sharded inputs, requires tensor_parallel_size=1.
-    Sharded fields are read only in projection transitions; replicated factors remain available to other methods.
-    TP updates reject captured tensor constants; use Python scalars, new_full/new_ones or replicated state fields.
-    per_head deltas, imported/checkpoint adapters and side-lane adapter training still require TP=1.
+    Declare fields with Field(lambda inputs, outputs: ...). Row-parallel o_proj and down_proj deltas partition dense
+    weights and A by input columns, with replicated B. Column-parallel q/k/v and MLP gate/up deltas partition dense
+    weights and B by output rows, with replicated A; KV head replicas follow vLLM's head placement. Small fields
+    replicate. Initialization runs globally before slicing, and explain reports per-rank storage. vLLM's existing row
+    reduction sums corrected partials; no extra collective is added. Updates must be shard-local: training replicated
+    A from column-sharded outputs, or B from row-sharded inputs, requires tensor_parallel_size=1. Sharded fields are
+    read only in projection transitions; replicated factors remain available to other methods. TP updates reject
+    captured tensor constants; use Python scalars, new_full/new_ones or replicated state fields. per_head deltas,
+    custom projection operators, imported/checkpoint adapters and side-lane adapter training still require TP=1.
     """
 
     state: str
@@ -432,28 +437,60 @@ class Adapter:
     route: LayerRouteSelector | None = None
     refresh: OverlayRefresh = "admission"
     target_names: tuple[ProjectionName, ...] = ()
+    share: Mapping[str, tuple[tuple[int, ...], ...]] = field(
+        default_factory=lambda: dict[str, tuple[tuple[int, ...], ...]]()
+    )
 
     def __post_init__(self) -> None:
-        if self.operator not in _OPERATORS:
-            raise ValueError(
-                f'Adapter(operator={self.operator!r}): use "dense", "low_rank", "gated_low_rank" or "per_head"'
+        if isinstance(self.operator, str):
+            if self.operator not in _OPERATORS:
+                raise ValueError(
+                    f'Adapter(operator={self.operator!r}): use "dense", "low_rank", "per_head" or a callable(hidden, *weights)'
+                )
+        elif not callable(self.operator):
+            raise TypeError(
+                f'Adapter(operator={self.operator!r}): use "dense", "low_rank", "per_head" or a callable(hidden, *weights)'
             )
         if self.refresh not in ("admission", "step"):
             raise ValueError(f'Adapter(refresh={self.refresh!r}): use "admission" or "step"')
+        for name, groups in self.share.items():
+            if type(name) is not str or not name:
+                raise TypeError("Adapter(share=...) keys must be non-empty field name strings")
+            _check_layer_groups(groups, f"Adapter(share[{name!r}])")
 
     @property
     def delta(self) -> ProjectionDelta:
+        custom = None if isinstance(self.operator, str) else self.operator
+        kind = _OPERATORS[self.operator] if isinstance(self.operator, str) else ParameterOverlayOperator.CUSTOM
         return ProjectionDelta(
             self.state,
             self.targets,
             self.weight,
-            _OPERATORS[self.operator],
+            kind,
             self.factors,
             self.scale,
             route=self.route,
             refresh=self.refresh,
             target_names=self.target_names,
+            custom_operator=custom,
+            share=tuple((name, groups) for name, groups in self.share.items()),
         )
+
+
+def _check_layer_groups(groups: tuple[tuple[int, ...], ...], owner: str) -> None:
+    """Validate non-overlapping layer index groups of at least two nonnegative integers."""
+    if type(groups) is not tuple:
+        raise TypeError(f"{owner} requires a tuple of layer-index tuples")
+    seen: set[int] = set()
+    for group in groups:
+        if type(group) is not tuple:
+            raise TypeError(f"{owner} requires each group to be a tuple of layer indices")
+        if len(group) < 2 or any(type(layer) is not int or layer < 0 for layer in group):
+            raise ValueError(f"{owner} groups must each contain at least two nonnegative integer layer indices")
+        for layer in group:
+            if layer in seen:
+                raise ValueError(f"{owner} layer {layer} appears in more than one group")
+            seen.add(layer)
 
 
 @dataclass(frozen=True)
@@ -462,19 +499,30 @@ class SharedLayers:
 
     Each layer keeps its own RMSNorm weights and KV cache slot; only linear projection weights
     (qkv_proj, o_proj, gate_up_proj, down_proj) share GPU storage across the layers in a group.
+    Optionally declares explicit 1-to-1 `checkpoint_rename` and `checkpoint_exclude` lists for
+    non-standard folded checkpoints loaded zero-copy through vLLM's checkpoint loader.
     """
 
     groups: tuple[tuple[int, ...], ...]
+    _: KW_ONLY
+    checkpoint_rename: Mapping[str, str] = field(default_factory=lambda: dict[str, str]())
+    checkpoint_exclude: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        seen: set[int] = set()
-        for group in self.groups:
-            if len(group) < 2 or any(type(layer) is not int or layer < 0 for layer in group):
-                raise ValueError("SharedLayers groups must each contain at least two nonnegative integer layer indices")
-            for layer in group:
-                if layer in seen:
-                    raise ValueError(f"SharedLayers layer {layer} appears in more than one group")
-                seen.add(layer)
+        _check_layer_groups(self.groups, "SharedLayers")
+        if not isinstance(self.checkpoint_rename, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError("SharedLayers(checkpoint_rename=...) requires a mapping of source to target tensor names")
+        targets: set[str] = set()
+        for source, target in self.checkpoint_rename.items():
+            if type(source) is not str or not source or type(target) is not str or not target:
+                raise ValueError("SharedLayers checkpoint_rename keys and values must be non-empty strings")
+            if target in targets:
+                raise ValueError(f"SharedLayers checkpoint_rename maps multiple keys to {target!r}")
+            targets.add(target)
+        if type(self.checkpoint_exclude) is not tuple or any(
+            type(name) is not str or not name for name in self.checkpoint_exclude
+        ):
+            raise TypeError("SharedLayers(checkpoint_exclude=...) requires a tuple of non-empty tensor names")
 
 
 @dataclass(frozen=True)
@@ -563,7 +611,7 @@ class LayerRoute:
         targets: tuple[ProjectionName, ...],
         weight: str = "value",
         operator: AdapterOperator = "dense",
-        factors: tuple[str, str] = ("a", "b"),
+        factors: tuple[str, ...] = ("a", "b"),
         scale: float = 1.0,
         refresh: OverlayRefresh = "step",
     ) -> Adapter:
@@ -751,8 +799,8 @@ def train_in_forward(
     state: str,
     targets: tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]],
     weight: str = "value",
-    operator: AdapterOperator | Callable[[Any], AdapterOperator] = "dense",
-    factors: tuple[str, str] | Callable[[Any], tuple[str, str]] = ("a", "b"),
+    operator: BuiltInAdapterOperator | Callable[[Any], BuiltInAdapterOperator] = "dense",
+    factors: tuple[str, ...] | Callable[[Any], tuple[str, ...]] = ("a", "b"),
     scale: float | Callable[[Any], float] = 1.0,
     tokens: Tokens | Callable[[Any], Tokens] = "prefill",
     visibility: VisibilityKind | Callable[[Any], VisibilityKind] = "forward_pinned",
@@ -780,7 +828,7 @@ def train_in_forward(
             state=state,
             targets=_targets(_setting(targets, owner, tuple)),
             weight=weight,
-            operator=_OPERATORS[_option(operator, owner, get_args(AdapterOperator), "operator")],
+            operator=_OPERATORS[_option(operator, owner, get_args(BuiltInAdapterOperator), "operator")],
             factors=_setting(factors, owner, tuple),
             scale=_setting(scale, owner, float),
             tokens=_option(tokens, owner, get_args(Tokens), "tokens"),

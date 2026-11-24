@@ -536,13 +536,16 @@ says what a step without a new version does ("stop" the request or "hold" the la
 ### `pllm.model.Adapter`
 
 ```text
-pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, ...]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = ())
+pllm.model.Adapter(state: 'str', targets: 'tuple[Projection, ...]', weight: 'str' = 'value', operator: 'AdapterOperator' = 'dense', factors: 'tuple[str, ...]' = ('a', 'b'), scale: 'float' = 1.0, *, route: 'LayerRouteSelector | None' = None, refresh: 'OverlayRefresh' = 'admission', target_names: 'tuple[ProjectionName, ...]' = (), share: 'Mapping[str, tuple[tuple[int, ...], ...]]' = <factory>)
 ```
 
 Apply a state as a weight delta at the target projections, whoever trains it (a PEFT-style adapter).
 
-`weight` names the field of a "dense" or "per_head" delta, `factors` the two fields of a "low_rank" one; the
-delta is multiplied by `scale`.
+`weight` names the field of a "dense" or "per_head" delta, `factors` the fields of a "low_rank" delta or a custom
+projection operator callable `fn(hidden, *weights) -> delta` (pure PyTorch or `torch.library.custom_op` with
+`mutates_args=()` and `register_fake`); the delta is multiplied by `scale`. `share` optionally maps field names to
+layer-index groups whose targets share a single state field per projection name (saving storage and L2
+bandwidth when adjacent layers reuse factors such as low-rank A/B matrices).
 
 A weight delta applies on every invocation of its projection, including repeated layer calls and replay in
 @pllm.custom_forward. Each call uses its actual input and each row's request state, pinned at forward entry.
@@ -551,15 +554,15 @@ receive no correction. Native QKV propagation for skipped layers still applies t
 This lets custom depth schedules use the same adapted model as the standard forward.
 
 At TP>1 (vLLM 0.32), dense and low_rank deltas follow each projection's shards.
-Declare fields with Field(lambda inputs, outputs: ...). Down deltas partition dense weights and A
-by input columns, with replicated B. Attention q/k/v and MLP gate/up deltas partition dense weights and B
-by output rows, with replicated A; KV head replicas follow vLLM's head placement. Small fields replicate.
-Initialization runs globally before slicing, and explain reports per-rank storage. vLLM's existing row
-reduction sums corrected down partials; no extra collective is added. Updates must be shard-local: training
-replicated A from column-sharded outputs, or B from row-sharded inputs, requires tensor_parallel_size=1.
-Sharded fields are read only in projection transitions; replicated factors remain available to other methods.
-TP updates reject captured tensor constants; use Python scalars, new_full/new_ones or replicated state fields.
-per_head deltas, imported/checkpoint adapters and side-lane adapter training still require TP=1.
+Declare fields with Field(lambda inputs, outputs: ...). Row-parallel o_proj and down_proj deltas partition dense
+weights and A by input columns, with replicated B. Column-parallel q/k/v and MLP gate/up deltas partition dense
+weights and B by output rows, with replicated A; KV head replicas follow vLLM's head placement. Small fields
+replicate. Initialization runs globally before slicing, and explain reports per-rank storage. vLLM's existing row
+reduction sums corrected partials; no extra collective is added. Updates must be shard-local: training replicated
+A from column-sharded outputs, or B from row-sharded inputs, requires tensor_parallel_size=1. Sharded fields are
+read only in projection transitions; replicated factors remain available to other methods. TP updates reject
+captured tensor constants; use Python scalars, new_full/new_ones or replicated state fields. per_head deltas,
+custom projection operators, imported/checkpoint adapters and side-lane adapter training still require TP=1.
 
 ### `pllm.model.Projection`
 
@@ -586,18 +589,20 @@ defaults to `refresh="admission"`).
 ### `pllm.model.SharedLayers`
 
 ```text
-pllm.model.SharedLayers(groups: 'tuple[tuple[int, ...], ...]')
+pllm.model.SharedLayers(groups: 'tuple[tuple[int, ...], ...]', *, checkpoint_rename: 'Mapping[str, str]' = <factory>, checkpoint_exclude: 'tuple[str, ...]' = ())
 ```
 
 Tie each group's linear projection weights to its first layer at model load.
 
 Each layer keeps its own RMSNorm weights and KV cache slot; only linear projection weights
 (qkv_proj, o_proj, gate_up_proj, down_proj) share GPU storage across the layers in a group.
+Optionally declares explicit 1-to-1 `checkpoint_rename` and `checkpoint_exclude` lists for
+non-standard folded checkpoints loaded zero-copy through vLLM's checkpoint loader.
 
 ### `pllm.train_in_forward`
 
 ```text
-pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]]', weight: 'str' = 'value', operator: 'AdapterOperator | Callable[[Any], AdapterOperator]' = 'dense', factors: 'tuple[str, str] | Callable[[Any], tuple[str, str]]' = ('a', 'b'), scale: 'float | Callable[[Any], float]' = 1.0, tokens: 'Tokens | Callable[[Any], Tokens]' = 'prefill', visibility: 'VisibilityKind | Callable[[Any], VisibilityKind]' = 'forward_pinned', chunk: 'int | Callable[[Any], int] | None' = None, flush: "Literal['prompt_end'] | None" = None) -> 'Callable[[F], F]'
+pllm.train_in_forward(*, state: 'str', targets: 'tuple[Projection, ...] | Callable[[Any], tuple[Projection, ...]]', weight: 'str' = 'value', operator: 'BuiltInAdapterOperator | Callable[[Any], BuiltInAdapterOperator]' = 'dense', factors: 'tuple[str, ...] | Callable[[Any], tuple[str, ...]]' = ('a', 'b'), scale: 'float | Callable[[Any], float]' = 1.0, tokens: 'Tokens | Callable[[Any], Tokens]' = 'prefill', visibility: 'VisibilityKind | Callable[[Any], VisibilityKind]' = 'forward_pinned', chunk: 'int | Callable[[Any], int] | None' = None, flush: "Literal['prompt_end'] | None" = None) -> 'Callable[[F], F]'
 ```
 
 Train a request state inside the forward and add its residual at each target projection.

@@ -215,7 +215,15 @@ def plain_model(workload: Workload, config: ModelConfig) -> Generator[VllmLlm]:
     options: GraphOptions = {} if report.eager_reason else graph_options(config, requirements)
     llm, hooks = vllm_engine(
         replace(config, execution=ExecutionOptions()),
-        {**options, "worker_cls": "auto", **load_options(requirements.checkpoint_names)},
+        {
+            **options,
+            "worker_cls": "auto",
+            **load_options(
+                requirements.checkpoint_names,
+                checkpoint_rename=requirements.checkpoint_rename,
+                checkpoint_exclude=requirements.checkpoint_exclude,
+            ),
+        },
         {},
         cuda_graphs=not bool(report.eager_reason),
     )
@@ -487,7 +495,10 @@ def run_gpu_checks(workload: Workload, config: ModelConfig, neutral: Workload | 
         try:
             replay = check_contracts(workload, config, device_equivalence=True)
             unexecuted = {"CPU schedules", "adaptive decoder"}
-            if "custom-residual method math / CPU schedules" not in replay.passed:
+            if (
+                "custom-residual method math / CPU schedules" not in replay.passed
+                and "custom projection operator math / CPU schedules" not in replay.passed
+            ):
                 unexecuted.add("model-site execution")
             missing = tuple(skip for skip in replay.skipped if skip.property in unexecuted)
             if missing:
