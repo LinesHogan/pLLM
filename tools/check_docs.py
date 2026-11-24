@@ -154,6 +154,7 @@ API_GROUPS = (
             "model.Adapter",
             "model.Projection",
             "model.LayerRoute",
+            "model.SharedLayers",
             "train_in_forward",
             "custom_residual",
             "custom_attention",

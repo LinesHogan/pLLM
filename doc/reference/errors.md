@@ -126,7 +126,7 @@ pLLM 在构建负载时（`pllm.explain`、`pllm.make_llm`、`pllm.testing.check
 | `... must return the residual for ... as [rows, ...] in the input dtype or float32 on the input's device; got ...` | 没有优化器的 `@pllm.train_in_forward` 返回加到投影输出上的修正，pLLM 在声明时按最大形状检查一次 | 返回 `[rows, out_features]`、输入 dtype 或 float32 的修正 |
 | `... must return changed (bool) and update_count and trained_rows (int64) as 0-d tensors on the input's device` | 计数留在设备上，每步才不和宿主同步 | 用 0 维设备张量（`x.new_ones((), dtype=torch.bool)`），或返回 `pllm.UpdateOutput.unchanged(output)` |
 | `layer ... uses ...; MLP overlays need a dense MLP. Choose q_proj, k_proj or v_proj` | MoE 层把 token 路由给不同专家，没有单一的稠密 MLP 投影 | 改写该层的 `q_proj`、`k_proj` 或 `v_proj` |
-| `layer ... is a Gated DeltaNet layer without q/k/v projections; choose a full-attention layer (see layer_types in the model config)` | Qwen3.5 的线性 attention 层没有标准的 q/k/v 投影 | 改写全注意力层（见模型配置的 `layer_types`） |
+| `layer ... is a Gated DeltaNet layer without q/k/v/o projections; choose a full-attention layer (see layer_types in the model config)` | Qwen3.5 的线性 attention 层没有标准的 q/k/v/o 投影 | 改写全注意力层（见模型配置的 `layer_types`） |
 | `gated attention interleaves each head's query rows with its output-gate rows; overlay the value projection instead` | Qwen3.5 的门控 attention 把每个头的 query 行和门控行交错存放，切不出单独的 query 投影 | 改写 `v_proj` |
 | `per_head adapters need tensor_parallel_size=1; use dense or low_rank deltas under TP` | 按头的增量没有按张量并行切分 | 多卡时用 `"dense"` 或 `"low_rank"`，或单卡 |
 | `pllm.model.Adapter, pllm.model.ActivationPatch and @pllm.custom_forward act inside a model forward; compile this workload with make_llm, not make_host` | `make_host` 没有模型 | 用 `pllm.make_llm`，或 `make_host` 的负载只保留 `pllm.batch` 训练 |

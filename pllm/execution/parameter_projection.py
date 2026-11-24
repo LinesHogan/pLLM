@@ -24,6 +24,30 @@ def parameter_correction(
     if operator is ParameterOverlayOperator.HEAD_ADD:
         return head_correction(hidden, weights[0])
     multiply = torch.bmm if batched else torch.matmul
+    if operator is ParameterOverlayOperator.GATED_LOW_RANK_ADD:
+        a, b, gate_weight, gate_bias = weights
+        dtype = hidden.dtype
+        logits = multiply(hidden, gate_weight.to(dtype).transpose(-1, -2)) + gate_bias.to(dtype).unsqueeze(-2)
+        gates = torch.softmax(logits.float(), dim=-1).to(dtype)
+        experts = a.shape[-3]
+        if gates.shape[-1] == experts + 1:
+            gates = gates[..., 1:]
+        if experts == 1:
+            mid = multiply(hidden, a.squeeze(-3).to(dtype).transpose(-1, -2))
+            return multiply(mid * gates, b.squeeze(-3).to(dtype).transpose(-1, -2))
+        rank = a.shape[-2]
+        out_features = b.shape[-2]
+        if batched:
+            a_flat = a.reshape(a.shape[0], experts * rank, a.shape[-1]).to(dtype)
+            b_flat = b.permute(0, 2, 1, 3).reshape(b.shape[0], out_features, experts * rank).to(dtype)
+        else:
+            a_flat = a.reshape(experts * rank, a.shape[-1]).to(dtype)
+            b_flat = b.permute(1, 0, 2).reshape(out_features, experts * rank).to(dtype)
+        mid = multiply(hidden, a_flat.transpose(-1, -2))
+        mid = (mid.reshape(*hidden.shape[:-1], experts, rank) * gates.unsqueeze(-1)).reshape(
+            *hidden.shape[:-1], experts * rank
+        )
+        return multiply(mid, b_flat.transpose(-1, -2))
     result = multiply(hidden, weights[0].to(hidden.dtype).transpose(-1, -2))
     if operator is ParameterOverlayOperator.LOW_RANK_ADD:
         result = multiply(result, weights[1].to(hidden.dtype).transpose(-1, -2))

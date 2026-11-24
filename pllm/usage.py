@@ -91,10 +91,11 @@ C = TypeVar("C")
 L = TypeVar("L", bound=str)
 # How an adapter's fields change a projection: a dense (out_features, in_features) delta, low-rank factors
 # (rank, in_features) and (out_features, rank), or one (width, width) block per attention head.
-AdapterOperator = Literal["dense", "low_rank", "per_head"]
+AdapterOperator = Literal["dense", "low_rank", "gated_low_rank", "per_head"]
 _OPERATORS: dict[str, ParameterOverlayOperator] = {
     "dense": ParameterOverlayOperator.DENSE_ADD,
     "low_rank": ParameterOverlayOperator.LOW_RANK_ADD,
+    "gated_low_rank": ParameterOverlayOperator.GATED_LOW_RANK_ADD,
     "per_head": ParameterOverlayOperator.HEAD_ADD,
 }
 # The fields that key a request state: the vLLM request, the prompt, the sample of a prompt, a user route.
@@ -425,7 +426,7 @@ class Adapter:
     targets: tuple[Projection, ...]
     weight: str = "value"
     operator: AdapterOperator = "dense"
-    factors: tuple[str, str] = ("a", "b")
+    factors: tuple[str, ...] = ("a", "b")
     scale: float = 1.0
     _: KW_ONLY
     route: LayerRouteSelector | None = None
@@ -434,7 +435,9 @@ class Adapter:
 
     def __post_init__(self) -> None:
         if self.operator not in _OPERATORS:
-            raise ValueError(f'Adapter(operator={self.operator!r}): use "dense", "low_rank" or "per_head"')
+            raise ValueError(
+                f'Adapter(operator={self.operator!r}): use "dense", "low_rank", "gated_low_rank" or "per_head"'
+            )
         if self.refresh not in ("admission", "step"):
             raise ValueError(f'Adapter(refresh={self.refresh!r}): use "admission" or "step"')
 
@@ -451,6 +454,27 @@ class Adapter:
             refresh=self.refresh,
             target_names=self.target_names,
         )
+
+
+@dataclass(frozen=True)
+class SharedLayers:
+    """Tie each group's linear projection weights to its first layer at model load.
+
+    Each layer keeps its own RMSNorm weights and KV cache slot; only linear projection weights
+    (qkv_proj, o_proj, gate_up_proj, down_proj) share GPU storage across the layers in a group.
+    """
+
+    groups: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        seen: set[int] = set()
+        for group in self.groups:
+            if len(group) < 2 or any(type(layer) is not int or layer < 0 for layer in group):
+                raise ValueError("SharedLayers groups must each contain at least two nonnegative integer layer indices")
+            for layer in group:
+                if layer in seen:
+                    raise ValueError(f"SharedLayers layer {layer} appears in more than one group")
+                seen.add(layer)
 
 
 @dataclass(frozen=True)
@@ -1009,5 +1033,6 @@ __all__ = [
     "ActivationPatch",
     "Adapter",
     "LayerRoute",
+    "SharedLayers",
     "SGD",
 ]
