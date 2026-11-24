@@ -7,7 +7,7 @@ can capture. ParameterOverlay owns the readers' per-invocation lifecycle.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 
@@ -36,8 +36,10 @@ from pllm.execution.overlay_batch import DecodeOverlay
 from pllm.execution.overlay_task import OverlayTransition, ProgramOverlay, ProjectionTask
 from pllm.execution.parameter_projection import (
     ROWS_PER_BLOCK,
+    is_static_instance,
     parameter_correction,
     prepare_projection_read,
+    prepare_static_projection_read,
     projection_block_rows,
     projection_blocks,
     uses_pinned_projection,
@@ -180,6 +182,8 @@ def uniform_decode(prefill: bool, counts: tuple[int, ...]) -> bool:
 
 # Pinned readers by the address of their index table; see pinned_projection.
 _READERS: dict[int, "ProjectionReader"] = {}
+# Merged read-only static-instance projection groups by address token; see static_projection.
+_STATIC_GROUPS: dict[int, "_StaticProjectionGroup"] = {}
 
 
 @torch.library.custom_op("pllm::pinned_projection", mutates_args={"output", "captured", "desired_capture", "pools"})
@@ -217,6 +221,81 @@ def _projection_meta(
 pinned_projection.register_fake(_projection_meta)  # pyright: ignore[reportUnknownMemberType]
 
 
+@torch.library.custom_op("pllm::static_projection", mutates_args={"output"})
+def static_projection(
+    hidden: torch.Tensor,
+    pools: list[torch.Tensor],
+    table: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Apply read-only immutable InstanceState adapters sharing one physical LinearBase without mutating pools."""
+    _STATIC_GROUPS[table.data_ptr()].emit(hidden, pools, output)
+
+
+def _static_projection_meta(
+    hidden: torch.Tensor,
+    pools: list[torch.Tensor],
+    table: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
+static_projection.register_fake(_static_projection_meta)  # pyright: ignore[reportUnknownMemberType]
+
+
+_StaticBudgetKey = tuple[str, str, int, int, torch.dtype, tuple[tuple[tuple[int, ...], torch.dtype], ...]]
+
+
+class _StaticProjectionGroup:
+    """Single ProjectionHook merging all static read-only readers that share one physical LinearBase."""
+
+    def __init__(self, module: LinearBase, readers: tuple["ProjectionReader", ...], device: torch.device) -> None:
+        self.module = module
+        self.readers = readers
+        self.hook = ProjectionHook(module)
+        self.forward_base = self.hook.base
+        self.table = torch.zeros(1, device=device, dtype=torch.long)
+        pools: list[torch.Tensor] = []
+        entries: list[tuple[ProjectionReader, int, int]] = []
+        for reader in readers:
+            start = len(pools)
+            pools.extend(reader.pools)
+            entries.append((reader, start, len(pools)))
+        self.pools = pools
+        self.entries = tuple(entries)
+        _STATIC_GROUPS[self.table.data_ptr()] = self
+        self.hook.install(self.forward)
+
+    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
+        base = self.forward_base(hidden)
+        assert isinstance(base, tuple)
+        static_projection(hidden, self.pools, self.table, base[0])
+        return base
+
+    def emit(self, hidden: torch.Tensor, pools: list[torch.Tensor], output: torch.Tensor) -> None:
+        for reader, start, end in self.entries:
+            weights = tuple(pool[0] for pool in pools[start:end])
+            scale = reader.binding.scale
+            operator = reader.binding.operator
+            target = output[:, reader.offset : reader.offset + reader.width]
+            if operator is ParameterOverlayOperator.DENSE_ADD and output.dtype == hidden.dtype:
+                target.addmm_(hidden, weights[0].to(hidden.dtype).transpose(-1, -2), beta=1.0, alpha=scale)
+            elif operator is ParameterOverlayOperator.LOW_RANK_ADD and output.dtype == hidden.dtype:
+                mid = torch.matmul(hidden, weights[0].to(hidden.dtype).transpose(-1, -2))
+                target.addmm_(mid, weights[1].to(hidden.dtype).transpose(-1, -2), beta=1.0, alpha=scale)
+            else:
+                result = parameter_correction(
+                    hidden, weights, operator, batched=False, custom_operator=reader.custom_operator
+                )
+                scaled = result if scale == 1.0 else result * scale
+                target.add_(scaled if scaled.dtype == output.dtype else scaled.to(output.dtype))
+
+    def close(self) -> None:
+        self.hook.close()
+        _STATIC_GROUPS.pop(self.table.data_ptr())
+
+
 @dataclass(frozen=True, slots=True)
 class _Segment:
     """One request's packed rows of one phase in this invocation."""
@@ -248,15 +327,20 @@ class ProjectionReader:
         in_program: bool,
         captures_operands: bool = False,
         static_instance: bool = False,
+        custom_operator: Callable[..., torch.Tensor] | None = None,
+        install_hook: bool = True,
+        budget_cache: set[_StaticBudgetKey] | None = None,
     ) -> None:
         self.module, self.offset, self.width, self.mlp = decoder.projection(binding.target)
-        self.hook = ProjectionHook(self.module)
-        self.forward_base = self.hook.base
+        self._owns_hook = install_hook
+        self.hook = ProjectionHook(self.module) if install_hook else None
+        self.forward_base = self.hook.base if self.hook is not None else self.module.forward
         self.mlp_base = None if self.mlp is None or static_instance else self.mlp.forward
         self.binding, self.rows, self.requests = binding, rows, requests
         self.pinned, self.in_program, self.embedding = pinned, in_program, embedding
         self.captures_operands = captures_operands
         self.static_instance = static_instance
+        self.custom_operator = custom_operator
         self.mlp_input: torch.Tensor | None = None
         self.apply_count = self.updated_apply_count = 0
         # This invocation's exact segments and their consumer: the step's task, or a custom forward's lanes.
@@ -269,7 +353,7 @@ class ProjectionReader:
         ports = (requests if math is not None else rows) if pinned and not static_instance else 0
         self.pools = [view.read(arena.field_pool(binding.resource, view.field), pooled=True) for view in binding.fields]
         if static_instance:
-            self.table = torch.zeros(1, device=embedding.device, dtype=torch.long)
+            self.table = torch.zeros(1 if install_hook else 0, device=embedding.device, dtype=torch.long)
         else:
             self.table = torch.zeros(
                 projection_blocks(rows, requests) * (ROWS_PER_BLOCK + len(binding.fields)) + rows if pinned else 0,
@@ -298,12 +382,44 @@ class ProjectionReader:
         )
         self.host = np.empty(0, dtype=np.int64)
         if pinned:
-            if not static_instance:
+            if static_instance:
+                self._check_static_budget(budget, budget_cache)
+            else:
                 self.prepare_programs(budget, math)
-            _READERS[self.table.data_ptr()] = self
-        self.hook.install(self.forward)
+            if install_hook:
+                _READERS[self.table.data_ptr()] = self
+        if self.hook is not None:
+            self.hook.install(self.forward)
         if self.mlp is not None and not static_instance:
             self.mlp.forward = self.forward_mlp
+
+    def _check_static_budget(self, budget: int, cache: set[_StaticBudgetKey] | None) -> None:
+        """Verify FakeTensorMode workspace budget for a direct static-instance projection operator."""
+        inputs = self.module.input_size_per_partition
+        weight_shapes = tuple((tuple(pool.shape[1:]), pool.dtype) for pool in self.pools)
+        key: _StaticBudgetKey = (
+            self.binding.operator.value,
+            self.binding.operator_id,
+            self.rows,
+            inputs,
+            self.module.params_dtype,
+            weight_shapes,
+        )
+        if cache is not None and key in cache:
+            return
+        with torch.inference_mode(False), FakeTensorMode(allow_non_fake_inputs=True):
+            sample_hidden = self.captured.new_empty((self.rows, inputs))
+            sample_weights = tuple(pool[0] for pool in self.pools)
+        prepare_static_projection_read(
+            sample_hidden,
+            sample_weights,
+            self.binding.operator,
+            budget,
+            blas_workspace_bytes=blas_workspace_bytes(),
+            custom_operator=self.custom_operator,
+        )
+        if cache is not None:
+            cache.add(key)
 
     def prepare_programs(self, budget: int, math: OverlayTransition | None) -> None:
         """Fund and warm every row bucket against the actual readonly pools before graph capture."""
@@ -321,7 +437,11 @@ class ProjectionReader:
                     *self.pools,
                 )
             self.programs[count] = prepare_projection_read(
-                examples, self.binding.operator, budget, blas_workspace_bytes=blas_bytes
+                examples,
+                self.binding.operator,
+                budget,
+                blas_workspace_bytes=blas_bytes,
+                custom_operator=self.custom_operator,
             )
             self.read(self.captured[:count], self.pools, self.table, count)
 
@@ -463,8 +583,20 @@ class ProjectionReader:
             return
         if self.static_instance:
             weights = tuple(pool[0] for pool in pools)
-            result = parameter_correction(hidden, weights, self.binding.operator, batched=False)
-            output[:, self.offset : self.offset + self.width].add_((result * self.binding.scale).to(output.dtype))
+            scale = self.binding.scale
+            operator = self.binding.operator
+            target = output[:, self.offset : self.offset + self.width]
+            if operator is ParameterOverlayOperator.DENSE_ADD and output.dtype == hidden.dtype:
+                target.addmm_(hidden, weights[0].to(hidden.dtype).transpose(-1, -2), beta=1.0, alpha=scale)
+            elif operator is ParameterOverlayOperator.LOW_RANK_ADD and output.dtype == hidden.dtype:
+                mid = torch.matmul(hidden, weights[0].to(hidden.dtype).transpose(-1, -2))
+                target.addmm_(mid, weights[1].to(hidden.dtype).transpose(-1, -2), beta=1.0, alpha=scale)
+            else:
+                result = parameter_correction(
+                    hidden, weights, operator, batched=False, custom_operator=self.custom_operator
+                )
+                scaled = result if scale == 1.0 else result * scale
+                target.add_(scaled if scaled.dtype == output.dtype else scaled.to(output.dtype))
             return
         if self.binding.route is not None and hidden.is_cuda and hidden.dtype != torch.float64:
             count = (
@@ -510,8 +642,10 @@ class ProjectionReader:
             result = self.read(padded, pools, table, count)
         else:
             result = self.read_rows(hidden, pools, table, self.call_rows)
+        sliced = result[: hidden.shape[0]]
+        scaled = sliced if self.binding.scale == 1.0 else sliced * self.binding.scale
         output[:, self.offset : self.offset + self.width].add_(
-            (result[: hidden.shape[0]] * self.binding.scale).to(output.dtype)
+            scaled if scaled.dtype == output.dtype else scaled.to(output.dtype)
         )
 
     def read(self, hidden: torch.Tensor, pools: list[torch.Tensor], table: torch.Tensor, count: int) -> torch.Tensor:
@@ -567,10 +701,11 @@ class ProjectionReader:
         self.segments, self.task, self.row_overlays = (), None, ()
 
     def close(self) -> None:
-        self.hook.close()
+        if self.hook is not None:
+            self.hook.close()
         if self.mlp is not None and self.mlp_base is not None:
             self.mlp.forward = self.mlp_base
-        if self.pinned:
+        if self.pinned and self._owns_hook:
             _READERS.pop(self.table.data_ptr())
 
 
@@ -597,6 +732,7 @@ class ParameterOverlay:
         graphs: bool,
         in_program: bool = False,
         math: OverlayTransition | None = None,
+        overlay_operators: Mapping[str, Callable[..., torch.Tensor]] | None = None,
     ) -> None:
         """Install each projection wrapper once, before compiling or capturing the model."""
         program = in_program and math is not None
@@ -608,13 +744,25 @@ class ParameterOverlay:
         self.embedding = _EmbeddingRows(
             decoder, rows, arena.device, enabled=any(binding.reads_embedding for binding in bindings)
         )
-        static_instances = {
+        static_instances = frozenset(
             str(state.resource)
             for state in arena.plan.semantic_graph.states
             if state.scope is StateScope.INSTANCE and state.immutable
-        }
-        self.readers = tuple(
-            ProjectionReader(
+        )
+        operators = dict(overlay_operators) if overlay_operators is not None else {}
+        budget_cache: set[_StaticBudgetKey] = set()
+        readers: list[ProjectionReader] = []
+        static_by_module: dict[int, tuple[LinearBase, list[ProjectionReader]]] = {}
+        for binding in bindings:
+            static_binding = is_static_instance(
+                binding,
+                pinned=self.pinned,
+                updates_in_forward=in_forward,
+                overlay_phases=self.phases,
+                static_instances=static_instances,
+            )
+            custom_fn = operators[binding.operator_id] if binding.operator is ParameterOverlayOperator.CUSTOM else None
+            reader = ProjectionReader(
                 decoder,
                 binding,
                 arena,
@@ -626,17 +774,25 @@ class ParameterOverlay:
                 math=self.math,
                 in_program=in_program,
                 captures_operands=bool(self.phases),
-                static_instance=(
-                    self.pinned
-                    and not in_program
-                    and self.math is None
-                    and not self.phases
-                    and binding.route is None
-                    and binding.resource in static_instances
-                ),
+                static_instance=static_binding,
+                custom_operator=custom_fn,
+                install_hook=not static_binding,
+                budget_cache=budget_cache,
             )
-            for binding in bindings
+            readers.append(reader)
+            if static_binding:
+                module_id = id(reader.module)
+                if module_id not in static_by_module:
+                    static_by_module[module_id] = (reader.module, [])
+                static_by_module[module_id][1].append(reader)
+        self.readers = tuple(readers)
+        self._static_readers = tuple(reader for reader in self.readers if reader.static_instance)
+        self._dynamic_readers = tuple(reader for reader in self.readers if not reader.static_instance)
+        self._static_groups = tuple(
+            _StaticProjectionGroup(module, tuple(group_readers), arena.device)
+            for module, group_readers in static_by_module.values()
         )
+        self._static_apply_rows = 0
         if self.pinned and self.math is not None and HiddenPhase.DECODE in self.math.phases:
             self.install_decode(arena, self.math, requests)
         self.requests, self.device = requests, arena.device
@@ -690,16 +846,18 @@ class ParameterOverlay:
 
     @property
     def apply_count(self) -> int:
-        return sum(reader.apply_count for reader in self.readers)
+        return sum(reader.apply_count for reader in self._dynamic_readers) + (
+            len(self._static_readers) * self._static_apply_rows
+        )
 
     @property
     def updated_apply_count(self) -> int:
-        return sum(reader.updated_apply_count for reader in self.readers)
+        return sum(reader.updated_apply_count for reader in self._dynamic_readers)
 
     def reserve(self) -> None:
         """Acquire every host table before the invocation issues any GPU work."""
         if self.pinned:
-            for reader in self.readers:
+            for reader in self._dynamic_readers:
                 reader.reserve()
 
     def prepare(
@@ -730,11 +888,15 @@ class ParameterOverlay:
         task: ProjectionTask | None,
     ) -> None:
         """Stage the pinned ports, or the in-graph decode transition, after the previous invocation's reads."""
+        if not self._dynamic_readers:
+            # Immutable InstanceState pools live for the entire session: no staging, events or per-step record_stream.
+            self._static_apply_rows += rows.total_rows
+            return
         self.stream = context.pin.stream
         assert self.stream is not None
         if self.readiness is not None:
             self.readiness.order_on(self.stream)
-        if self.readers[0].decode is None:
+        if self._dynamic_readers[0].decode is None:
             self.prepare_reads(rows, context, directory)
         else:
             assert task is not None
@@ -807,18 +969,14 @@ class ParameterOverlay:
     ) -> None:
         """Pin each request's readable version and upload the readers' block tables."""
         assert self.stream is not None
+        self._static_apply_rows += rows.total_rows
         ordinals = rows.request_ordinals
         self.starts = np.flatnonzero(np.append(True, ordinals[1:] != ordinals[:-1]))
         self.sources = rows.inspect(self.starts)
         self.total_rows = rows.total_rows
         routed_layers: dict[tuple[str, int, bool], torch.Tensor] = {}
         packed_range = np.arange(rows.total_rows, dtype=np.int64)
-        for reader in self.readers:
-            if reader.static_instance:
-                reader.apply_count += rows.total_rows
-                for value in (*reader.pools, reader.table):
-                    value.record_stream(self.stream)
-                continue
+        for reader in self._dynamic_readers:
             route = reader.binding.route
             latest = route is not None and route.refresh == "step"
             versions = context.read_versions(
@@ -927,10 +1085,10 @@ class ParameterOverlay:
         task.complete(tuple(operands), updates)
 
     def clear(self) -> None:
-        for reader in self.readers:
+        for reader in self._dynamic_readers:
             reader.clear()
         self.task = None
-        if self.sources and self.stream is not None:
+        if self._dynamic_readers and self.sources and self.stream is not None:
             self.readiness = CudaStreamReadiness(self.stream)
         self.sources = ()
 
@@ -938,5 +1096,7 @@ class ParameterOverlay:
         """Unwind the wrappers in reverse installation order."""
         self.clear()
         self.embedding.close()
-        for reader in reversed(self.readers):
+        for group in reversed(self._static_groups):
+            group.close()
+        for reader in reversed(self._dynamic_readers):
             reader.close()

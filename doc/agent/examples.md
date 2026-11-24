@@ -80,4 +80,4 @@ All run through the same public path as your code. Every class below is exported
 | `FTTTWorkload` | `fttt/workload.py` | feedback test-time training with a judge | `pllm.host.make_host`, host retry loop |
 | `GatedDeltaWorkload` | `gated_delta.py` | gated delta-rule fast weights per request | `@pllm.train_in_forward`, `pllm.operand` |
 | `VideoWorkload` | `video.py` | video features fed by a producer process | `pllm.Fed`, `@pllm.write`, `pllm.model.ActivationPatch` |
-| `ConcertinaWorkload` | `concertina.py` | Concertina folded layers with shared linear weights and gated step LoRAs | `pllm.model.SharedLayers`, `pllm.model.Adapter(operator="gated_low_rank")`, `pllm.Pretrained` |
+| `ConcertinaWorkload` | `concertina.py` | Concertina folded layers with shared linear weights and fused gated step LoRAs | `pllm.model.SharedLayers`, `pllm.model.Adapter(operator=concertina_gated_low_rank, share=...)`, `pllm.Pretrained` |

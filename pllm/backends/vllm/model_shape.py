@@ -140,7 +140,7 @@ class _ConfigShape:
                 if self.layer_types[target.layer] != "full_attention":
                     full = tuple(i for i, kind in enumerate(self.layer_types) if kind == "full_attention")
                     raise ValueError(
-                        f"layer {target.layer} is a Gated DeltaNet layer; choose a full-attention layer {full} for q/k/v overlays"
+                        f"layer {target.layer} is a Gated DeltaNet layer; choose a full-attention layer {full} for q/k/v/o overlays"
                     )
                 if target.name == "q_proj" and self.attn_output_gate:
                     raise ValueError("gated attention interleaves query and output-gate rows; overlay k_proj or v_proj")
@@ -166,8 +166,8 @@ def _head_partitions(name: str, heads: int, size: int) -> int:
     """How many ranks split an attention projection: whole heads per rank, or fewer KV heads replicated."""
     if heads % size and size % heads:  # neither divides the other
         raise ValueError(f"{name} heads must divide tensor_parallel_size or partition evenly across it")
-    if name == "q_proj" and heads < size:
-        raise ValueError("q_proj needs at least tensor_parallel_size query heads")
+    if name in ("q_proj", "o_proj") and heads < size:
+        raise ValueError(f"{name} needs at least tensor_parallel_size query heads")
     return min(heads, size)
 
 
@@ -231,6 +231,7 @@ class ModelShape:
         config: ModelConfig,
         targets: tuple[Projection, ...] = (),
         routed_targets: tuple[tuple[ProjectionName, tuple[int, ...]], ...] = (),
+        shared_layer_groups: tuple[tuple[int, ...], ...] = (),
     ) -> Self:
         """Read only config.json; dense projection widths follow the decoder's q/v/down layouts."""
         from pllm.backends.vllm.architecture import admit_architecture
@@ -247,7 +248,16 @@ class ModelShape:
         read_only = admit_architecture(info.architecture)
         if (targets or routed_targets) and read_only:
             raise ValueError(f"a parameter overlay {read_only}")
+        if shared_layer_groups:
+            if info.architecture not in _DENSE_NAMES:
+                raise ValueError(f"pllm.model.SharedLayers needs a dense decoder architecture; got {info.architecture}")
+            if model.quantization is not None:
+                raise ValueError(
+                    "pllm.model.SharedLayers requires unquantized linear layers; quantized checkpoints are unsupported"
+                )
         shape = structure({**model.hf_text_config.to_dict(), "architectures": [info.architecture]}, _ConfigShape)
+        if any(layer >= shape.num_hidden_layers for group in shared_layer_groups for layer in group):
+            raise ValueError(f"SharedLayers layer index is outside the model's {shape.num_hidden_layers} layers")
         resolved_routed = tuple(
             Projection(name, layer)
             for name, over in routed_targets

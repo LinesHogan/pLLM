@@ -149,6 +149,8 @@ class BackendAttachmentSpec:
     kv_model_reads: tuple[StateResource, ...] = ()
     # The task that runs the @pllm.custom_forward programs (the in-forward transition when both are declared).
     custom_forward: TaskSymbol | None = None
+    # Layer index groups whose linear projection weights are tied zero-copy at model load.
+    shared_layer_groups: tuple[tuple[int, ...], ...] = ()
 
     @property
     def empty(self) -> bool:

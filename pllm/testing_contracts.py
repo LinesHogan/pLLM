@@ -380,6 +380,8 @@ def contract_step_input(
     perturbed: int | None,
     identities: tuple[RequestIdentity, ...],
     history: int = -1,
+    *,
+    need_operands: bool = True,
 ) -> StepInput:
     """Build deterministic model inputs for one step of a contract-check schedule."""
     dtype = facts.probe.tensor_dtype.torch
@@ -390,32 +392,38 @@ def contract_step_input(
         for resource in facts.probe.hidden_resources
         for channel in (int(boundary_digest(resource.binding.locator_key)[:8], 16),)
     }
-    operands = tuple(
-        ProjectionOperands(
-            identities[i],
-            target.target,
-            phase,
-            _token_values(i, offsets, target.input_size, 30 + channel, perturbed).to(dtype),
-            _token_values(
-                i,
-                offsets,
-                target.target_size,
-                50 + channel,
-                perturbed,
-            ).to(dtype),
-            _random((target.output_size, target.input_size), 80 + channel).to(dtype),
-            torch.tensor(offsets.stop == _PROMPTS[i]),
-            _token_values(i, offsets, shape.hidden_size, 70, perturbed).to(dtype),
+    operands: tuple[ProjectionOperands, ...] = ()
+    if need_operands:
+        base_weights = tuple(
+            _random((target.output_size, target.input_size), 80 + channel).to(dtype)
+            for channel, target in enumerate(shape.targets)
         )
-        for i, n, done in counts
-        for channel, target in enumerate(shape.targets)
-        for phase, start, end in (
-            (HiddenPhase.PREFILL, done, min(done + n, _PROMPTS[i])),
-            (HiddenPhase.DECODE, max(done, _PROMPTS[i]), done + n),
+        operands = tuple(
+            ProjectionOperands(
+                identities[i],
+                target.target,
+                phase,
+                _token_values(i, offsets, target.input_size, 30 + channel, perturbed).to(dtype),
+                _token_values(
+                    i,
+                    offsets,
+                    target.target_size,
+                    50 + channel,
+                    perturbed,
+                ).to(dtype),
+                base_weights[channel],
+                torch.tensor(offsets.stop == _PROMPTS[i]),
+                _token_values(i, offsets, shape.hidden_size, 70, perturbed).to(dtype),
+            )
+            for i, n, done in counts
+            for channel, target in enumerate(shape.targets)
+            for phase, start, end in (
+                (HiddenPhase.PREFILL, done, min(done + n, _PROMPTS[i])),
+                (HiddenPhase.DECODE, max(done, _PROMPTS[i]), done + n),
+            )
+            if start < end
+            for offsets in (range(start, end),)
         )
-        if start < end
-        for offsets in (range(start, end),)
-    )
     value = scheduled_step(
         tuple(identities[i] for i, _, _ in counts),
         [n for _, n, _ in counts],
@@ -673,6 +681,7 @@ def _run(
     preempted: Literal["none", "full", "chunked"] = "none",
     device_equivalence: bool = False,
     neutral: bool = False,
+    attachment: BackendAttachment | None = None,
 ) -> _Run:
     run = _Run(
         device_equivalence=device_equivalence,
@@ -688,9 +697,8 @@ def _run(
         else task
         for symbol, task in tasks.items()
     }
-    deployment = workload.bind_backend(
-        facts, workload.plan_backend(facts, observed), observed, map_host=get_accelerator_view_from_cpu_tensor
-    )
+    planned = attachment if (attachment is not None and not tasks) else workload.plan_backend(facts, observed)
+    deployment = workload.bind_backend(facts, planned, observed, map_host=get_accelerator_view_from_cpu_tensor)
     execution = deployment.execution
     forward = None if declaration.custom_forward_programs is None else CheckForward(execution)
     attention = (
@@ -720,7 +728,14 @@ def _run(
             preempt = (script[1].request_id,) if preempted != "none" and step == 3 else ()
             driver.schedule((), preempt, [script[i].request_id for i, _, _ in counts])
             value = contract_step_input(
-                shape, facts, counts, step * stride, perturbed, script, declaration.graph.input_token_history
+                shape,
+                facts,
+                counts,
+                step * stride,
+                perturbed,
+                script,
+                declaration.graph.input_token_history,
+                need_operands=bool(execution.math.parameter_phases),
             )
             if driver.preemption == "keep":
                 value = retained_rows(driver.labeler, value, counts, script)
@@ -856,7 +871,12 @@ def _compare(
 def contract_facts(workload: Workload, config: ModelConfig) -> tuple[ModelShape, BackendCompileFacts]:
     """Build CPU contract-check facts and model dimensions without loading model weights."""
     requirements = workload.backend_requirements()
-    shape = ModelShape.of_config(config, requirements.parameter_targets, requirements.routed_targets)
+    shape = ModelShape.of_config(
+        config,
+        requirements.parameter_targets,
+        requirements.routed_targets,
+        requirements.shared_layer_groups,
+    )
     facts = compile_facts(
         shape,
         requirements,
@@ -887,8 +907,9 @@ def _variants(
     skipped: list[CheckSkip],
     *,
     device_equivalence: bool = False,
+    attachment: BackendAttachment | None = None,
 ) -> list[str]:
-    _run_checked = partial(_run, device_equivalence=device_equivalence)
+    _run_checked = partial(_run, device_equivalence=device_equivalence, attachment=attachment)
     failures: list[str] = []
     shared = bool(_shared_resources(declaration))
     together = _run_checked(workload, facts, declaration, shape, (0, 1, 2))
@@ -1087,6 +1108,9 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         if failures:
             raise ContractError(tuple(failures))
         passed.append("custom-residual method math / CPU schedules")
+    if declaration.overlay_operators:
+        _check_custom_projection_operators(declaration, facts, device_equivalence=device_equivalence)
+        passed.append("custom projection operator math / CPU schedules")
     if (
         requirements.custom_residual
         and not declaration.model_site_tasks
@@ -1120,11 +1144,64 @@ def check_contracts(workload: Workload, config: ModelConfig, *, device_equivalen
         for prefix in (f"method {task.symbol}.", f"export {task.export.name}", f"export_layer {task.export.name}")
     )
     skipped.extend(_unchecked_effects(requirements, declaration, attachment, programs, exports))
-    failures = _variants(workload, facts, declaration, shape, exports, skipped, device_equivalence=device_equivalence)
+    failures = _variants(
+        workload,
+        facts,
+        declaration,
+        shape,
+        exports,
+        skipped,
+        device_equivalence=device_equivalence,
+        attachment=attachment,
+    )
     passed.extend(_schedule_properties(declaration, skipped))
     if failures:
         raise ContractError(tuple(failures))
     return CheckResult(tuple(passed), tuple(skipped))
+
+
+def _check_custom_projection_operators(
+    declaration: TensorDeclaration,
+    facts: BackendCompileFacts,
+    *,
+    device_equivalence: bool = False,
+) -> None:
+    """Verify row-permutation invariance on CPU and (when requested) CPU/CUDA numerical equivalence."""
+    from pllm.contracts.parameter_overlay import ParameterOverlayOperator
+
+    layouts = {layout.resource: layout.layout for layout in declaration.layouts.layouts}
+    target_shapes = {target.target: target for target in facts.probe.targets}
+    checked: set[tuple[str, int, int, tuple[tuple[tuple[int, ...], torch.dtype], ...]]] = set()
+    dtype = facts.probe.tensor_dtype.torch
+    for binding in declaration.effects.overlay_bindings:
+        if binding.operator is not ParameterOverlayOperator.CUSTOM:
+            continue
+        fn = declaration.overlay_operators[binding.operator_id]
+        shape = target_shapes[binding.target]
+        layout = layouts[binding.resource]
+        weight_specs = tuple((view.shape, layout.fields[view.field].dtype.torch) for view in binding.fields)
+        key = (binding.operator_id, shape.input_size, shape.output_size, weight_specs)
+        if key in checked:
+            continue
+        checked.add(key)
+        gen = torch.Generator().manual_seed(facts.initialization_seed + len(checked))
+        hidden = torch.randn((5, shape.input_size), generator=gen, dtype=dtype) * 0.25
+        weights = tuple(
+            torch.randn(w_shape, generator=gen, dtype=w_dtype) * 0.1
+            if w_dtype.is_floating_point
+            else torch.zeros(w_shape, dtype=w_dtype)
+            for w_shape, w_dtype in weight_specs
+        )
+        out = fn(hidden, *weights)
+        perm = torch.tensor([3, 0, 4, 1, 2])
+        out_perm = fn(hidden[perm], *weights)
+        tol = (2e-2, 2e-2) if dtype in (torch.bfloat16, torch.float16) else (1e-4, 1e-4)
+        torch.testing.assert_close(out_perm, out[perm], rtol=tol[0], atol=tol[1])
+        if device_equivalence:
+            gpu_hidden = hidden.cuda()
+            gpu_weights = tuple(w.cuda() for w in weights)
+            gpu_out = fn(gpu_hidden, *gpu_weights).cpu()
+            torch.testing.assert_close(gpu_out, out, rtol=tol[0], atol=tol[1])
 
 
 def _check_adaptive(

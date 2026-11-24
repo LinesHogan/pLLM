@@ -36,8 +36,8 @@ _OVERLAY_CAPABILITIES = (
     "operand_capture/mlp_down_projection_pair@1",
     "overlay/dense_add@1",
     "overlay/low_rank_add@1",
-    "overlay/gated_low_rank_add@1",
     "overlay/head_add_fp32@1",
+    "overlay/custom@1",
     "operand_capture/projection_input@1",
 )
 
@@ -103,6 +103,7 @@ def compile_facts(
                 *(f"hidden={resource.binding.tap}" for resource in hidden_resources),
                 f"layer_logits={layer_logits}",
                 *(f"activation_layer={layer}" for layer in activation_layers),
+                *(f"shared_layers={group}" for group in requirements.shared_layer_groups),
                 *(f"target={target.target}:{target.input_size}:{target.output_size}" for target in shape.targets),
             )
         ),

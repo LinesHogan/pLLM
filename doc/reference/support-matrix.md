@@ -59,8 +59,8 @@ Kimi K2.x 的 INT4 文本塔可以切成六层的 DeepSeek V3 切片做结构测
 
 | 可以多卡 | 需要 `tensor_parallel_size=1` |
 | --- | --- |
-| hidden 读取与导出（只从 rank 0 交付）、采样引导、请求状态训练（ESamp、输出层 LoRA 一类）、`@pllm.custom_forward`、`ActivationPatch` | per-head 适配器增量、带优化器 / 侧链读写或使用 `FromModule` / `ModelCheckpoint` / `Fed` 初始化的 `Adapter` |
-| `q/k/v`、`gate/up`、`down` 上基于 `Zeros`/`Computed`/`Pretrained`/`Imported` 的 dense/low-rank 增量（含分片 `@pllm.train_in_forward` 更新） | 整模型因果训练（`pllm.causal_model`）、状态 feed（`pllm.Fed`） |
+| hidden 读取与导出（只从 rank 0 交付）、采样引导、请求状态训练（ESamp、输出层 LoRA 一类）、`@pllm.custom_forward`、`ActivationPatch` | per-head 适配器增量、自定义投影算子（`operator=fn`）、带优化器 / 侧链读写或使用 `FromModule` / `ModelCheckpoint` / `Fed` 初始化的 `Adapter` |
+| `q/k/v/o`、`gate/up`、`down` 上基于 `Zeros`/`Computed`/`Pretrained`/`Imported` 的 dense/low-rank 增量（含分片 `@pllm.train_in_forward` 更新） | 整模型因果训练（`pllm.causal_model`）、状态 feed（`pllm.Fed`） |
 | 无 `pllm.value(...)` / `pllm.input_tokens` 依赖的 `@pllm.custom_residual`；直接改读本卡本地头 KV 的 `@pllm.custom_attention` | 给 `@pllm.custom_residual` 喂 `pllm.value(...)` / `pllm.input_tokens`，或使用 `pllm.attention(...)` 事实表 / `window` 缓冲的 `@pllm.custom_attention` |
 
 `pllm.explain` 报告的显存预留是每张卡的数。

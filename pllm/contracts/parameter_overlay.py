@@ -20,8 +20,8 @@ OverlayRefresh = Literal["step", "admission"]
 class ParameterOverlayOperator(StrEnum):
     DENSE_ADD = "dense_add"
     LOW_RANK_ADD = "low_rank_add"
-    GATED_LOW_RANK_ADD = "gated_low_rank_add"
     HEAD_ADD = "head_add"
+    CUSTOM = "custom"
 
 
 # Hugging Face module names of the projections pLLM can adapt, in their order inside one decoder layer.
@@ -123,6 +123,8 @@ class ParameterOverlayFieldBinding:
     reads_weight: bool = False
     reads_embedding: bool = False
     route: OverlayRoute | None = None
+    # Stable identifier for ParameterOverlayOperator.CUSTOM callables; empty for built-in operators.
+    operator_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,15 +154,33 @@ class ProjectionDelta:
     route: LayerRouteSelector | None = None
     refresh: OverlayRefresh = "admission"
     target_names: tuple[ProjectionName, ...] = ()
+    custom_operator: Callable[..., torch.Tensor] | None = None
+    # Per-field layer groups that share one PTTS LayoutField per projection name: ((field, ((l0, l1, ...), ...)), ...).
+    share: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
 
     @property
     def applied_fields(self) -> tuple[str, ...]:
         """The fields consumed by the declared projection operator."""
         return (
             self.factors
-            if self.operator in (ParameterOverlayOperator.LOW_RANK_ADD, ParameterOverlayOperator.GATED_LOW_RANK_ADD)
+            if self.operator in (ParameterOverlayOperator.LOW_RANK_ADD, ParameterOverlayOperator.CUSTOM)
             else (self.weight,)
         )
+
+    def shared_leader_index(self) -> dict[tuple[str, int], int]:
+        """Map (field_name, target_index) to its owning leader target index for shared fields."""
+        if not self.share:
+            return {}
+        target_index = {target: i for i, target in enumerate(self.targets)}
+        leaders: dict[tuple[str, int], int] = {}
+        for field_name, groups in self.share:
+            layer_to_leader = {layer: group[0] for group in groups for layer in group[1:]}
+            for i, target in enumerate(self.targets):
+                if target.layer is not None and target.layer in layer_to_leader:
+                    leader_target = Projection(target.name, layer_to_leader[target.layer])
+                    if leader_target in target_index:
+                        leaders[field_name, i] = target_index[leader_target]
+        return leaders
 
     def expand(self, layers: int) -> Self:
         """The same effect with layer=None or routed targets resolved against a model of `layers` layers."""
@@ -178,6 +198,7 @@ class ProjectionDelta:
         reads_embedding: bool = False,
         layer_bank: bool = False,
         route: OverlayRoute | None = None,
+        operator_id: str = "",
     ) -> tuple[ParameterOverlayFieldBinding, ...]:
         """One binding per target; `view` finds each applied field's copy for target i, named `{field}_{i}`."""
         if self.route is not None and not layer_bank:
@@ -192,6 +213,7 @@ class ProjectionDelta:
                     reads_weight,
                     reads_embedding,
                     route=route,
+                    operator_id=operator_id,
                 )
                 for target in self.targets
             )
@@ -206,19 +228,22 @@ class ProjectionDelta:
                     reads_weight,
                     reads_embedding,
                     route=route,
+                    operator_id=operator_id,
                 )
                 for target in self.targets
             )
+        leaders = self.shared_leader_index()
         return tuple(
             ParameterOverlayFieldBinding(
                 target,
                 self.operator,
-                tuple(view(f"{key}_{i}") for key in self.applied_fields),
+                tuple(view(f"{key}_{leaders.get((key, i), i)}") for key in self.applied_fields),
                 self.state,
                 self.scale,
                 reads_weight,
                 reads_embedding,
                 route=route,
+                operator_id=operator_id,
             )
             for i, target in enumerate(self.targets)
         )
