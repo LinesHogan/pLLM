@@ -87,6 +87,7 @@ Put those three steps on a timeline and the mystery evaporates: **the compiler h
 ![Root Cause: How AOT Functionalization's Clone-Execute-Copyback Wipes the Pool](../../assets/personal-01-fig1-en.svg)
 
 Look again at the two `.copy_()` lines in `LayerHook.run()`:
+
 - `out.copy_(h)` survived because `out` came from the `outputs[0]` parameter—it wrote `[7, 7, 7, 7]` onto `outputs_clone[0]`, which the epilogue copied out;
 - `self.pool.copy_(h)` vanished because `run()` ignored the `writes` parameter entirely and mutated `self.pool` via the global `REGISTRY` dict. From the compiler's point of view, `writes_clone[0]` went in as `[0, 0, 0, 0]` and came out as `[0, 0, 0, 0]`, so the "new value" of `probe_pool` after the op was zero—and `probe_pool.copy_(writes_clone[0])` wiped our write clean.
 

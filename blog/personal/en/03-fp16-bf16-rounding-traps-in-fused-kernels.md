@@ -55,12 +55,14 @@ b = torch.tensor([1.0], dtype=torch.float16, device="cuda")
 In exact arithmetic, $h W^\top = 2048$, $h R = 2048$, the inner coefficient is $2048 + 1 - 2048 = 1$, and adding $[1, 1]$ back onto $h = [2048, 0]$ gives **`[2049, 1]`**.
 
 Running both paths on GPU produced:
+
 - Initial fused Triton kernel: **`[2048., 1.]`** (coordinate 0 rounds to `2048` on final `float16` store; coordinate 1 is `1`);
 - Eager PyTorch reference: **`[2048., 0.]`**—the `1` in coordinate 1 vanished completely!
 
 Where did `+ 1.0` go? Here it helps to recall a hardware detail easy to forget in daily ML work: **floating-point ticks are not evenly spaced—the larger the number, the wider the gap between representable values.**
 
 An IEEE 754 `float16` value has 1 sign bit, 5 exponent bits, and 10 explicit mantissa bits. Between any two consecutive powers of two, those 10 mantissa bits divide the interval into $2^{10} = 1024$ equal steps:
+
 - On $[1, 2)$, the interval width is $1$, so adjacent `float16` values sit $1 / 1024 \approx 0.000977$ apart;
 - On **$[2048, 4096)$ ($[2^{11}, 2^{12})$)**, the interval width is $2048$, so dividing into $1024$ steps makes **the spacing between adjacent `float16` numbers (`1 ULP`) exactly `2.0`!**
 
@@ -69,6 +71,7 @@ An IEEE 754 `float16` value has 1 sign bit, 5 exponent bits, and 10 explicit man
 Think of a kitchen scale whose smallest tick mark above 2,048 grams jumps to 2 grams: in `float16`, `2048.0`, `2050.0`, and `2052.0` exist, **but `2049.0` does not exist at all**.
 
 Tracing PyTorch's four eager steps makes the disappearance obvious:
+
 1. `wh = h @ W.T` writes `float16(2048.0)`;
 2. `wh_b = wh + b` computes `2048.0 + 1.0 = 2049.0`. Forced back into `float16`, `2049.0` lands halfway between `2048.0` and `2050.0`; IEEE 754 round-to-nearest-even picks `2048.0` (whose least significant mantissa bit is `0`), **swallowing `+ 1.0` whole**;
 3. `hr = h @ R` produces `float16(2048.0)`;
@@ -117,6 +120,7 @@ delta = scaled.to(out_ptr.dtype.element_ty) # Cast to output dtype (stays float3
 ```
 
 On a single GPU (`TP = 1`), both paths wrote `3.328125`. Under `TP = 2` (`output` in `float32`) with `result = 27.0` and `scale = 0.123`:
+
 - Initial Triton kernel wrote **`3.3210001`**;
 - Eager PyTorch wrote **`3.3281250`**!
 
@@ -129,6 +133,7 @@ If multiplying `half_tensor * 0.5` promoted the entire tensor to `float32` or `f
 ![Trap 2: Multi-GPU FP32 Partial Sums Meet PyTorch's Weakly-Typed Python float](../../assets/personal-03-fig2-en.svg)
 
 Tracing `(result * self.scale).to(output.dtype)` with that rule in mind:
+
 1. `result * 0.123` multiplies a `bfloat16` tensor by a weak Python `float`, so the product immediately rounds to `bfloat16` (`3.321` snaps to the nearest `bfloat16` grid point, `3.328125`);
 2. `.to(torch.float32)` simply pads zeros onto an already-rounded `3.328125`;
 3. Single-GPU tests hid the discrepancy because `output` was `bfloat16` too, so Triton's `3.3210001` got rounded to `3.328125` on final store anyway!

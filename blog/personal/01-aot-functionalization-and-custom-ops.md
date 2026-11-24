@@ -91,6 +91,7 @@ print(probe_pool)  # tensor([0., 0., 0., 0.])  <- 探针池居然还是全零！
 ![即时模式与 AOT 函数化的克隆回写覆盖对比](../assets/personal-01-fig1-zh.svg)
 
 对照上面的时间线再看一眼那两行 `copy_`：
+
 - `out.copy_(h)` 之所以活了下来，是因为 `out` 取自算子的形参 `outputs[0]`——它改的正是编译器递进来的克隆件 `outputs_clone[0]`，尾声回写时自然把 `[7, 7, 7, 7]` 同步回了外部；
 - `self.pool.copy_(h)` 之所以白干了，是因为它根本没碰形参 `writes[0]`，而是顺着全局字典 `REGISTRY` 里的对象属性，绕过编译器直接改了外面的原池 `probe_pool`。在编译器眼里，递进去的 `writes_clone[0]` 进去是 `[0, 0, 0, 0]`、出来还是 `[0, 0, 0, 0]`，说明算子执行后的“新值”就是全零，最后一步 `probe_pool.copy_(writes_clone[0])` 便尽职尽责地把你刚写的 `7` 冲成了 `0`。
 
