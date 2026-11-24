@@ -1,46 +1,63 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 168" width="100%" role="img" aria-label="FIG 01 · 首步准入快照（admission pin）早于 StateImport 执行导致的旧版本锁定">
-  <style>
-    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
-    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
-    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
-    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
-    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
-    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
-    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
-  </style>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 304" width="100%" role="img" aria-label="问题一：进场快照 (Admission Snapshot) 早于当步状态导入，锁住了旧版本 v0">
   <defs>
-    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+    <style>
+      .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sec { font: 700 12px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label { font: 600 11.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label-sm { font: 600 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub { font: 400 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub-sm { font: 400 9.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .mono { font: 600 10.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .mono-sm { font: 600 9.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .badge { font: 700 10px "JetBrains Mono", "SF Mono", "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0.03em; }
+    </style>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
     </marker>
-    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
-      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
-    </marker>
-    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
     </marker>
-    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
     </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#b45309"/>
+    </marker>
   </defs>
-  <rect x="4" y="4" width="952" height="160" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
-  <text x="28" y="34" class="title">FIG 01 · 首步准入快照（admission pin）早于 StateImport 执行导致的旧版本锁定</text>
-
-  <rect x="28" y="56" width="276" height="92" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
-  <text x="42" y="80" class="label" fill="#b91c1c">1. driver.schedule(new_reqs)</text>
-  <text x="42" y="103" class="sub">过早读取当前全局版本 v0 (layer=0)</text>
-  <text x="42" y="124" class="mono">inference_pin[req] = v0</text>
-
-  <line x1="304" y1="102" x2="334" y2="102" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
-
-  <rect x="338" y="56" width="276" height="92" rx="6" fill="#eef4ff" stroke="#0047ab" stroke-width="1.5"/>
-  <text x="352" y="80" class="label" fill="#0047ab">2. driver.begin -> prepare</text>
-  <text x="352" y="103" class="sub">执行随批传入的 StateImport(layer=6)</text>
-  <text x="352" y="124" class="mono">publishes v1 (layer=6)</text>
-
-  <line x1="614" y1="102" x2="644" y2="102" stroke="#111111" stroke-width="1.8" marker-end="url(#arr-ink)"/>
-
-  <rect x="648" y="56" width="284" height="92" rx="6" fill="#fefce8" stroke="#111111" stroke-width="1.5"/>
-  <text x="662" y="80" class="label">3. model.execute 版本分裂</text>
-  <text x="662" y="103" class="sub">• refresh='step' 读到新版本 v1</text>
-  <text x="662" y="124" class="sub">• refresh='admission' 仍卡在旧 v0</text>
+  <rect x="4" y="4" width="1032" height="296" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <rect x="20" y="16" width="171" height="24" rx="4" fill="#e62b2b"/>
+  <text x="105.5" y="32" text-anchor="middle" class="label-sm" fill="#ffffff">BUG 1 · PIN TIMING</text>
+  <text x="203" y="33" class="title" fill="#111111">问题一：进场快照 (Admission Snapshot) 早于当步状态导入，锁住了旧版本 v0</text>
+  <line x1="20" y1="48" x2="1020" y2="48" stroke="#e4e4e7" stroke-width="1.4"/>
+  <rect x="24" y="62" width="992" height="104" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <rect x="38" y="74" width="240" height="20" rx="4" fill="#e62b2b"/>
+  <text x="158" y="88" text-anchor="middle" class="label-sm" fill="#ffffff">修改前：进场登记与拍快照绑在一起</text>
+  <rect x="38" y="102" width="286" height="48" rx="4" fill="#ffffff" stroke="#e62b2b" stroke-width="1.3"/>
+  <text x="181" y="122" text-anchor="middle" class="label-sm" fill="#991b1b">1. schedule(): 登记请求并立刻拍快照</text>
+  <text x="181" y="140" text-anchor="middle" class="mono-sm" fill="#991b1b">req.pin = current_ver  # v0 (layer=0)!</text>
+  <line x1="324" y1="126" x2="364" y2="126" stroke="#e62b2b" stroke-width="1.6" marker-end="url(#arr-red)"/>
+  <rect x="368" y="102" width="290" height="48" rx="4" fill="#ffffff" stroke="#111111" stroke-width="1.3"/>
+  <text x="513" y="122" text-anchor="middle" class="label-sm" fill="#111111">2. prepare(): 执行随批导入 layer=6</text>
+  <text x="513" y="140" text-anchor="middle" class="mono-sm" fill="#111111">publish v1 (layer=6)</text>
+  <line x1="658" y1="126" x2="698" y2="126" stroke="#e62b2b" stroke-width="1.6" marker-end="url(#arr-red)"/>
+  <rect x="702" y="102" width="296" height="48" rx="4" fill="#ffe4e6" stroke="#e62b2b" stroke-width="1.4"/>
+  <text x="850" y="122" text-anchor="middle" class="label-sm" fill="#991b1b">3. forward(): 请求仍读旧快照 v0 (第 0 层)</text>
+  <text x="850" y="140" text-anchor="middle" class="sub-sm" fill="#991b1b">明明随批传了第 6 层，首步却跑在第 0 层！</text>
+  <rect x="24" y="180" width="992" height="104" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <rect x="38" y="192" width="268" height="20" rx="4" fill="#059669"/>
+  <text x="172" y="206" text-anchor="middle" class="label-sm" fill="#ffffff">修改后：等前置发版结束再统一拍快照</text>
+  <rect x="38" y="220" width="286" height="48" rx="4" fill="#ffffff" stroke="#059669" stroke-width="1.3"/>
+  <text x="181" y="240" text-anchor="middle" class="label-sm" fill="#065f46">1. schedule(): 只登记新请求 ID</text>
+  <text x="181" y="258" text-anchor="middle" class="mono-sm" fill="#065f46">new_reqs.append(req_id)</text>
+  <line x1="324" y1="244" x2="364" y2="244" stroke="#059669" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <rect x="368" y="220" width="290" height="48" rx="4" fill="#ffffff" stroke="#059669" stroke-width="1.3"/>
+  <text x="513" y="240" text-anchor="middle" class="label-sm" fill="#065f46">2. prepare(): 完成导入并发布 v1</text>
+  <text x="513" y="258" text-anchor="middle" class="mono-sm" fill="#065f46">current_ver = v1 (layer=6)</text>
+  <line x1="658" y1="244" x2="698" y2="244" stroke="#059669" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <rect x="702" y="220" width="296" height="48" rx="4" fill="#bbf7d0" stroke="#059669" stroke-width="1.5"/>
+  <text x="850" y="240" text-anchor="middle" class="label-sm" fill="#065f46">3. pin_admitted(): 锁定最新 v1 后进前向</text>
+  <text x="850" y="258" text-anchor="middle" class="sub-sm" fill="#065f46">全生命周期稳定锁定进场那一刻的 v1</text>
 </svg>

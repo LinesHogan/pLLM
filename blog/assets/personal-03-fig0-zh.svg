@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 312" width="100%" role="img" aria-label="系统全景：静态参考路径 vs 融合 Triton 快路径，以及贪婪解码下的误差滚雪球">
+  <defs>
+    <style>
+      .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sec { font: 700 12px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label { font: 600 11.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label-sm { font: 600 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub { font: 400 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub-sm { font: 400 9.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .mono { font: 600 10.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .mono-sm { font: 600 9.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .badge { font: 700 10px "JetBrains Mono", "SF Mono", "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0.03em; }
+    </style>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#b45309"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="1032" height="304" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <rect x="20" y="16" width="114" height="24" rx="4" fill="#0047ab"/>
+  <text x="77.0" y="32" text-anchor="middle" class="badge" fill="#ffffff">BIG PICTURE</text>
+  <text x="146" y="33" class="title" fill="#111111">系统全景：静态参考路径 vs 融合 Triton 快路径，以及贪婪解码下的误差滚雪球</text>
+  <line x1="20" y1="48" x2="1020" y2="48" stroke="#e4e4e7" stroke-width="1.4"/>
+  <rect x="24" y="64" width="490" height="226" rx="6" fill="#f8fafc" stroke="#111111" stroke-width="1.4"/>
+  <text x="42" y="88" class="sec" fill="#111111">同一条干预公式的两套执行路径</text>
+  <rect x="42" y="104" width="454" height="76" rx="5" fill="#ffffff" stroke="#0047ab" stroke-width="1.3"/>
+  <text x="58" y="126" class="label-sm" fill="#1e3a8a">路径 A：PyTorch 原生分步参考实现（静态单层 / 基准对账）</text>
+  <text x="58" y="148" class="mono-sm" fill="#111111">out = (h @ W.T + b - h @ R) @ R.T</text>
+  <text x="58" y="168" class="sub-sm" fill="#52525b">每一步算完都写回 FP16 / BF16 中间张量（发生多次半精度舍入）</text>
+  <rect x="42" y="194" width="454" height="78" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.4"/>
+  <text x="58" y="216" class="label-sm" fill="#065f46">路径 B：手写融合 Triton 内核（动态切层线上快路径）</text>
+  <text x="58" y="238" class="mono-sm" fill="#111111">acc = tl.dot(...) + b - tl.dot(...)  # in tl.float32</text>
+  <text x="58" y="258" class="sub-sm" fill="#065f46">中间值全程留在 FP32 寄存器，直到最后写回显存才转半精度</text>
+  <line x1="514" y1="176" x2="552" y2="176" stroke="#e62b2b" stroke-width="1.8" marker-end="url(#arr-red)"/>
+  <rect x="556" y="64" width="460" height="226" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.5"/>
+  <text x="574" y="88" class="sec" fill="#991b1b">为什么要较真 1 ULP？自回归贪婪解码的分叉效应</text>
+  <rect x="574" y="106" width="424" height="52" rx="5" fill="#ffffff" stroke="#e62b2b" stroke-width="1.3"/>
+  <text x="590" y="128" class="label-sm" fill="#111111">第 t 步：两个候选词的 logit 恰好紧挨在边界上</text>
+  <text x="590" y="146" class="mono-sm" fill="#111111">Path A -> "However"    vs    Path B -> "Therefore"</text>
+  <line x1="786" y1="158" x2="786" y2="180" stroke="#e62b2b" stroke-width="1.6" marker-end="url(#arr-red)"/>
+  <rect x="574" y="184" width="424" height="88" rx="5" fill="#ffe4e6" stroke="#e62b2b" stroke-width="1.4"/>
+  <text x="590" y="208" class="label-sm" fill="#991b1b">第 t+1..T 步：选出的词作为下一步输入喂回模型</text>
+  <text x="590" y="230" class="sub-sm" fill="#991b1b">1 个最小精度单位的微小舍入差异，几十步后滚雪球成两段完全</text>
+  <text x="590" y="250" class="sub-sm" fill="#991b1b">不同的回答——用户切到动态入口时以为权重挂错了！</text>
+</svg>

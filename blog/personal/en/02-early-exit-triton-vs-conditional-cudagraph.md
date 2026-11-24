@@ -1,37 +1,79 @@
 # Dynamic Layer Switching Without Recapturing CUDA Graphs: Conditional Subgraphs, Masked Evaluation, and Early-Exit Triton Kernels
 
-> **TL;DR**: Once an online serving engine has captured CUDA Graphs across batch buckets, dynamically switching the target layer of an activation intervention, tap, or LoRA adapter by re-recording the graphs stalls traffic for seconds, while evaluating every candidate layer and masking with `torch.where` wastes HBM bandwidth on inactive layers. After comparing the private cuBLAS workspace footprint of CUDA conditional subgraphs, we settled on an early-exit Triton kernel gated by an L2-resident scalar and paired with in-place accumulation on the existing inter-layer normalization output port, letting missed candidate layers skip both weight-pool and activation-pool HBM traffic. We close by tracing a CUDA Graph capture failure hidden inside the `rank > 256` fallback branch, triggered by a host-synchronizing `bool(mask.any())`.
+> **TL;DR**: Production LLM serving engines pre-capture static CUDA Graphs across batch-size buckets at startup to eliminate CPU kernel-launch overhead. Once those graphs are frozen, switching an activation steering vector, probe, or LoRA adapter from layer 8 to layer 20 by recompiling and recapturing every bucket stalls live traffic for 5–15 seconds. Starting from how static graph capture works, this note compares three ways to switch candidate layers live without recapturing: CUDA conditional subgraphs multiply stream-private cuBLAS workspaces across buckets and layers; evaluating every layer then masking with `torch.where` wastes HBM memory bandwidth on inactive layers; and an on-chip L2 scalar early-exit Triton kernel paired with in-place port accumulation drops inactive-layer HBM traffic to zero. Finally, we trace a fallback bug where `bool(mask.any())` on `rank > 256` crashed CUDA Graph capture via an unintended host synchronization.
 
-When analyzing internal model representations or running online activation steering, a familiar requirement turns up quickly: the model is already loaded and CUDA Graphs are already warmed up across every batch-size bucket, and now you want to move a residual tap or steering vector from layer 8 to layer 20—or, inside a single continuous-batching step, route Request A through a layer-4 LoRA, Request B through a layer-18 LoRA, and Request C through `-1` to leave the base model untouched.
+When serving LLMs interactively or running mechanistic interpretability sweeps, a natural request comes up all the time: the 7B or 70B model is already warmed up and serving traffic, and now you want to move a steering vector or residual probe from layer 8 to layer 20—or, inside a single continuous-batching step, route Request A through a layer-4 LoRA, Request B through a layer-18 LoRA, and Request C through `-1` (the unmodified base model).
 
-If the target layer ID is baked into the static graph structure, every layer switch forces you to detach the old hook, recompile, and recapture every CUDA Graph bucket (`[1, 2, 4, 8, ..., 256]`). A single switch takes anywhere from a few seconds to over ten seconds—far too slow for interactive experiments or live serving.
+In an eager single-request script, that is a one-line `if layer_idx == target_layer:`. Inside a production inference engine running **CUDA Graphs**, that one-line `if` collides head-on with how static graphs achieve low latency.
 
-To avoid recapturing graphs, the hooks for every candidate layer in `over=(4, 12, 20, ...)` must be wired into the graph at build time, with a `0-d int64` scalar in the state pool controlling which layer takes effect at runtime. That raises an immediate engineering question: when the candidate set is large—say, sweeping every layer of a 28-layer model with `over=tuple(range(28))`—only 1 layer fires on a given step. How do you keep the other 27 missed layers from draining latency and memory?
+Let's start with a quick mental model of why serving engines rely on bucketed CUDA Graphs in the first place:
+
+![Big Picture: Pre-Captured Bucketed CUDA Graphs vs. Live Layer Switching](../../assets/personal-02-fig0-en.svg)
+
+During autoregressive decode, each step processes only one new token per request. A GPU finishes an individual matrix projection in tens of microseconds—often faster than the Python interpreter on the CPU can dispatch the next kernel. Left in eager mode, the GPU spends much of decode sitting idle between kernel launches.
+
+To remove CPU launch gaps, engines like vLLM and SGLang pre-capture static **CUDA Graphs** at startup for a fixed ladder of batch sizes (`B = 1, 2, 4, 8, ..., 256`). At runtime, the CPU issues a single `graph.replay()` and the GPU hardware replays the entire sequence of kernels back-to-back.
+
+The catch is rigidity: **every kernel node and memory pointer inside a captured CUDA Graph is frozen at capture time—there is no Python interpreter in the loop to evaluate `if` branches on live values.** If "layer 8 is active" is baked into the graph topology, switching to layer 20 means tearing down the old hooks, re-running `torch.compile`, and recapturing every batch bucket from scratch, freezing the server for 5 to 15 seconds and ruling out per-request layer routing within a shared batch.
 
 ---
 
-We compared three approaches for skipping inactive-layer work inside an already captured static graph.
+To switch layers with zero graph recapture, we have to **pre-plant lightweight hook ops at a set of candidate layers during graph construction** (say `over = (4, 12, 18, 26)`, or even all 28 layers of a 7B model) and drive which layer actually fires at runtime via a small `int64` routing table in GPU memory.
 
-**Approach 1: Device-side conditional graph nodes (Conditional CUDA Graph / `device_branch`, CUDA 12.4+).**  
-The idea is to place a hardware-level `IF (active_count > 0)` node at each candidate layer, executing the branch subgraph's matrix multiplications only when at least one request in the step hits that layer.
+That shifts the engineering problem onto hardware efficiency: suppose a researcher attaches hooks across all 28 layers for a layer-by-layer sweep, activating just 1 layer at a time. **How do we keep the other 27 inactive layers from bloating VRAM or burning memory bandwidth on every token?**
 
-In practice, memory consumption is the main constraint: when each conditional branch captures its internal operators (such as batched cuBLAS GEMMs), it allocates a private workspace out of its own branch-stream memory pool.
+We evaluated three designs against that constraint.
 
-![Conditional CUDA subgraphs multiplying cuBLAS workspace across batch buckets and candidate layers](../../assets/personal-02-fig1-en.svg)
+---
 
-On top of that, under heterogeneous continuous batching, a single request hitting layer $$l$$ flips the entire layer's `IF` condition to true, so the subgraph still has to perform row-level filtering inside anyway. Layer-level conditional branching consumes VRAM meant for the KV cache while failing to remove row masking for mixed batches.
+### Option 1: Hardware Conditional CUDA Graph Nodes (`CUDA 12.4+`)
 
-**Approach 2: Full evaluation followed by masking (`torch.where(mask, h + delta, h)`).**  
-This is the most straightforward option: every candidate layer gathers parameters by slot and runs the matrix multiplication to compute `delta`, then `torch.where` zeroes out updates for inactive rows. It adds no private workspace and captures cleanly into CUDA Graphs, yet the 27 missed layers still load parameters and hidden states out of HBM and compute through them. While auditing that overhead, we also caught an unconditional `captured[:len(hidden)].copy_(hidden)` in the existing static adapter path—originally there to retain forward inputs for online autograd—and skipping that copy in inference-only mode trimmed per-layer write bandwidth as well.
+The textbook answer on recent GPUs is a device-side conditional graph node (`torch.cond` / `cudaGraphConditionalHandle`): place a hardware `IF (active_count > 0)` gate in front of each candidate layer so the GPU only enters the subgraph when at least one request targets that layer.
 
-**Approach 3: CTA Early-Exit Triton kernels gated by an L2-resident scalar, paired with in-place accumulation on existing output ports.**  
-Before each forward step, the engine builds a few-hundred-byte `int64` ownership table `owners[rows]` on device (`-1` for inactive rows), small enough to stay resident in on-chip L2 cache throughout the pass. Our custom Triton kernel partitions the grid by `(row, col_block)`, and each thread block's very first instruction loads `owner = tl.load(owners_ptr + row)` from L2 and returns immediately if it is below `0`:
+On paper, that sounds ideal. In a multi-bucket serving engine, however, two practical costs show up immediately:
 
-![Full HBM evaluation + torch.where vs. L2 scalar early-exit Triton kernel](../../assets/personal-02-fig2-en.svg)
+![Option 1 Pitfall: Conditional CUDA Graph Workspace Bloat & Mixed-Batch Fallback](../../assets/personal-02-fig1-en.svg)
 
-There is an easy-to-miss detail here: if the activation-patch op is written as an out-of-place function returning a new tensor (`out = masked_patch_add(hidden, table, pool)`), inactive rows skip reading the parameter pool, yet they still have to read the entire `hidden` row from HBM and write it into `out` just to preserve the original activations—effectively adding a full-width memory copy on every missed layer.
+First is **stream-private cuBLAS workspace bloat**. When capturing a conditional body subgraph, CUDA records its internal ops on a dedicated branch capture stream. Whenever that body invokes cuBLAS GEMMs, cuBLAS allocates a stream-private workspace buffer that is not shared with the main stream's memory pool. Multiply that private workspace by a dozen batch-size buckets and twenty-plus candidate layers, and idle conditional branches quietly eat hundreds of megabytes—or gigabytes—of VRAM that would otherwise hold online KV Cache.
 
-Looking at the surrounding inter-layer `RMSNorm` boundary solves this cleanly: the outer wrapper already allocates both output ports `(residual, normed)` before calling the boundary hook and has already copied the branch output into `normed`. Turning the patch op into an in-place accumulation onto `normed` (`masked_patch_add_into(normed, table, pool)`) lets missed rows return without touching `normed` in HBM at all:
+Second is **mixed-request continuous batching**. A layer-wide `IF (active_count > 0)` gate is all-or-nothing: as soon as Request 0 targets layer 4 while Requests 1..31 target layer 18, layer 4's condition evaluates to `True` and the entire subgraph runs anyway. Inside that subgraph, you still need row-level masking to keep Requests 1..31 untouched—paying extra workspace VRAM without even eliminating per-row filtering.
+
+---
+
+### Option 2: Compute Everything, Then Mask with `torch.where`
+
+If conditional subgraphs cost too much VRAM, the simplest graph-safe alternative is to compute the intervention unconditionally at every candidate layer and mask out inactive rows at the end:
+
+```python
+def naive_routed_patch(h: Tensor, weight_pool: Tensor, slots: Tensor, active_mask: Tensor) -> Tensor:
+    # Every candidate layer gathers weights and computes `delta` unconditionally
+    delta = compute_intervention(h, weight_pool[slots])
+    # Keep `h + delta` for matching rows and original `h` for inactive rows
+    return torch.where(active_mask[:, None], h + delta, h)
+```
+
+This adds zero workspace memory and captures cleanly into any CUDA Graph, but it violates the cardinal rule of LLM decode: **never waste High-Bandwidth Memory (HBM) traffic.**
+
+Because decode batches have small row counts, arithmetic units sit mostly underutilized while latency is bottlenecked on streaming bytes to and from off-chip HBM. In the snippet above, all 27 inactive layers still stream their adapter/patch weights and the full hidden state `h` out of HBM, compute `delta`, and throw 27 out of 28 results away inside `torch.where`. (While auditing this HBM traffic, we also spotted an unconditional `captured[:len(h)].copy_(h)` left over in the static adapter path for online backprop; skipping that copy on inference-only workloads saved another full-width HBM write per layer.)
+
+---
+
+### Option 3: On-Chip L2 Scalar Early-Exit Triton Kernels + In-Place Port Accumulation
+
+Can we keep a flat, workspace-free CUDA Graph while driving inactive-layer HBM reads and writes all the way down to **zero bytes**?
+
+Here a quick GPU memory-hierarchy mental model helps: **off-chip HBM bandwidth is scarce, whereas reading a few hundred bytes from on-chip L2 Cache is practically free.** An RTX 4090 carries 72 MB of on-chip L2 Cache. Before each forward step, we materialize a tiny `int64` routing table `table` (a few hundred bytes mapping each batch row to its active slot, or `0` if inactive). Because that table is tiny and touched by every candidate layer, it stays hot in on-chip L2 throughout the forward pass.
+
+We then launch a custom Triton kernel tiled across `(row, col_block)` whose very first instruction loads that single cached flag for its row—and **immediately executes `return` if the row is inactive**, before issuing a single HBM load of weights or activations!
+
+One subtle API detail still stands between early-exit and true zero-HBM skipping:
+
+- If the op returns a **fresh output tensor** `out = routed_patch(h, table, pool)`, even an early-exiting thread block has a problem: downstream layers will read `out`, so somebody still has to copy `h -> out` for inactive rows—burning a full-width HBM read and write on every skipped layer!
+- If instead we mutate the `RMSNorm` boundary's existing `normed` output buffer **in place** via `routed_patch_into(normed, table, pool)`, active rows add their delta into `normed` while **inactive rows do nothing and `return` immediately**, leaving the valid activations already sitting in `normed` untouched:
+
+![Option 2 vs. Option 3: Compute-Then-Mask vs. L2 Scalar Early-Exit + In-Place Add](../../assets/personal-02-fig2-en.svg)
+
+The resulting Triton kernel is barely fifteen lines long:
 
 ```python
 @triton.jit
@@ -40,7 +82,7 @@ def _masked_patch_add_into_kernel(
     table_stride, target_stride, pool_stride, width, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    # Check the L2-resident mask first; return immediately on a miss without touching target_ptr or pool_ptr
+    # First instruction checks the 8-byte flag in on-chip L2; exits with 0 HBM traffic on miss!
     if tl.load(table_ptr + row) == 0:
         return
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -52,42 +94,58 @@ def _masked_patch_add_into_kernel(
     tl.store(dst_ptrs, h + delta.to(target_ptr.dtype.element_ty), mask=col_mask)
 ```
 
-Low-rank LoRA adapters follow the same structure: pre-allocate a `[max_rows, rank]` `float32` scratch buffer `routed_mid`, run a two-stage early-exit kernel, and accumulate straight into `output[:, offset:offset+width]` in stage two. When an outer `@pllm.custom_forward` reorders a sub-batch (`call_rows != None`), a single `index_select(0, call_rows)` on `owners` lets the exact same kernels handle it.
+We applied the same two-stage L2 early-exit pattern to dynamically routed LoRA adapters: a shared `[max_rows, rank]` buffer holds intermediate projections, both stages exit on L2 miss at line 1, and stage 2 accumulates directly into `output[:, offset:offset+width]`. Even when Request A hits layer 4, Request B hits layer 18, and Request C is off in the same batch, each thread block exits independently for its row.
 
 ---
 
-Reviewing the dispatch wrapper around these kernels uncovered a graph-capture bug tucked inside a low-frequency parameter branch.
+### Debugging Detour: The `bool(mask.any())` Time Bomb Hiding in the `rank > 256` Fallback
 
-Because the two-stage low-rank kernel caps its fast path at `rank <= 256`, calls with `rank > 256`, `float64` inputs, or a non-contiguous trailing stride fall back to standard PyTorch ops. To avoid extra work on that fallback path, the initial version reused the CPU branch's short-circuit guard:
+While reviewing the dispatch wrapper around our two-stage LoRA kernel, we caught a classic CUDA Graph capture bug hiding inside a cold fallback branch.
+
+To keep intermediate vectors inside registers, our Triton fast path handles `rank <= 256`. Whenever inputs arrive on CPU, use `float64`, have non-contiguous last-dim strides, or specify an unusually large `rank > 256`, the wrapper falls back to plain PyTorch ops.
+
+To save work when no rows matched in that fallback branch, the initial implementation reused a Python short-circuit check:
 
 ```python
-if target.dtype == torch.float64 or rank > 256 or target.stride(-1) != 1:
+# Initial broken fallback branch:
+if (not target.is_cuda) or target.dtype == torch.float64 or rank > 256 or target.stride(-1) != 1:
     mask = table[0, :rows].bool()
-    if bool(mask.any()):  # Never reached for rank <= 256; breaks graph capture as soon as rank = 260
-        ...
+    if bool(mask.any()):  # <--- Never reached on GPU when rank=8; crashes capture when rank=260!
+        delta = slow_pytorch_lora(hidden, mask, weights)
+        target.add_(delta)
+    return
 ```
 
-Routine tests all ran at `rank = 4` or `8`, so GPU execution always took the Triton fast path and this fallback only ever ran on CPU—where calling `bool(mask.any())` is completely fine. The moment a user declared `rank = 260` on GPU with CUDA Graphs enabled, warmup capture hit `bool(mask.any())`, forcing PyTorch to synchronize the stream and copy the boolean reduction back to the host to construct a Python `bool`. The CUDA driver failed immediately with `cudaErrorStreamCaptureUnsupported`.
+Why did every standard test suite stay green? Because GPU tests all used `rank = 8` or `16`—taking the Triton fast path above—while the fallback branch was only ever exercised by CPU unit tests, where `bool(mask.any())` is completely legal!
 
-The fix separates the CPU short-circuit from the CUDA fallback explicitly: even when taking the slow path, CUDA stays purely on device via `torch.where` without converting any tensor into a Python scalar, backed by a GPU graph-capture test at `rank = 260`:
+The moment a user declares `rank = 260` on GPU with CUDA Graphs enabled, server warmup enters stream capture, hits `if bool(mask.any()):`, and crashes immediately with:
+
+```text
+RuntimeError: CUDA error: operation not permitted when stream is capturing
+(cudaErrorStreamCaptureUnsupported)
+```
+
+Intuitively, **CUDA Graph capture is like recording a macro offline before any real batch runs—yet `bool(mask.any())` demands that the GPU halt recording, synchronize with the host over PCIe, and hand Python a runtime `True/False` scalar right now so Python can decide whether to record the body of the `if` block.** CUDA stream capture forbids any device-to-host synchronization by design.
+
+Separating the CPU short-circuit from the GPU fallback—and adding an explicit `rank = 260` CUDA Graph capture test—closed the hole cleanly:
 
 ```python
-if not target.is_cuda or target.dtype == torch.float64 or rank > 256 or target.stride(-1) != 1:
+if (not target.is_cuda) or target.dtype == torch.float64 or rank > 256 or target.stride(-1) != 1:
     mask = table[0, :rows].bool()
     if not target.is_cuda and not bool(mask.any()):
-        # Use Python bool short-circuit on CPU only
+        # Python bool short-circuit is safe on CPU only
         return
-    # Keep the CUDA fallback strictly on-device via masking so stream sync never breaks CUDA Graph capture
-    ...
+    # On CUDA, stay 100% device-side with torch.where so stream capture never syncs
+    delta = slow_pytorch_lora(hidden, weights)
     target.copy_(torch.where(mask[:, None], target + delta, target))
     return
 ```
 
 ---
 
-Measured on a single RTX 4090 running `Qwen2.5-7B-Instruct` (`bfloat16`, CUDA Graphs enabled), the actual overhead breaks down as follows:
+How much does L2 early-exit cost end-to-end on real hardware? Benchmarking `Qwen2.5-7B-Instruct` (`bfloat16`, full bucketed CUDA Graphs, 128 concurrent decode sequences) on a single RTX 4090:
 
-- With dynamic activation steering and asynchronous residual export attached to 4 candidate layers (`over=(4, 12, 20, 26)`) and live layer switching via `import_state` between turns: decode TPOT at 128 concurrent requests (`batch=8, n=16`) is `24.6 ms`, compared to `24.4 ms` for a static single-layer hook and `23.2 ms` for stock vLLM with no hooks—dynamic gating adds roughly `0.2 ms` over the static single-layer baseline.
-- With low-rank LoRA attached across all 28 layers (`over=tuple(range(28))`, 56 `q_proj` / `v_proj` projection hooks total, 1 layer active per step), the entire set of bucketed CUDA Graphs uses `0.30 GiB` of VRAM, and decode TPOT at 128 concurrency is `24.8 ms` (versus `24.0 ms` for a static single-layer LoRA—roughly `0.8 ms` across all 27 missed layers combined).
+- **4 candidate layers** (`over=(4, 12, 20, 26)`) with live steering + async residual export switched between turns: decode TPOT is `24.6 ms` vs. `24.4 ms` for a static single-layer hook (`23.2 ms` unhooked baseline)—live zero-recapture layer switching adds roughly **`0.2 ms`**;
+- **All 28 layers hooked** (`over=tuple(range(28))`, 56 `q_proj`/`v_proj` LoRA sites, 1 active layer per step): the entire bucketed CUDA Graph pool takes `0.30 GiB` of VRAM, and 27 inactive layers add **`~0.8 ms`** total (`24.8 ms` vs. `24.0 ms` static single-layer LoRA).
 
-The code is merged into `pllm.model.LayerRoute` in **[pLLM](https://github.com/LinesHogan/pLLM)**. Its boundary costs remain worth keeping in mind: early-exit kernels eliminate HBM traffic and GEMMs on missed layers, yet each candidate layer still retains one lightweight kernel launch (on the order of ten-plus microseconds per layer), inter-layer patch boundaries still plumb residual and branch ports, and `per_head`, `rank > 256`, or non-contiguous trailing-stride patch inputs fall back to masked evaluation. That is why the API exposes `LayerRoute(..., over=(...))` as an explicit opt-in requiring callers to declare only the candidate layers they actually intend to switch across, rather than blanketing the full model by default.
+This mechanism ships as `LayerRoute` in **[pLLM](https://github.com/LinesHogan/pLLM)**. Its remaining boundary cost is kernel launch overhead inside the graph: early-exit eliminates HBM traffic on inactive layers, but each candidate site still records a ~10-microsecond kernel node in the static graph, so declaring only the candidate layers you actually intend to switch across remains good practice.

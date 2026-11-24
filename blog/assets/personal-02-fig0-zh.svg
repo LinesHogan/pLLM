@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 332" width="100%" role="img" aria-label="系统全景：分档预录制的静态 CUDA Graph 与“零重录实时切层”的矛盾">
+  <defs>
+    <style>
+      .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sec { font: 700 12px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label { font: 600 11.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label-sm { font: 600 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub { font: 400 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub-sm { font: 400 9.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .mono { font: 600 10.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .mono-sm { font: 600 9.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .badge { font: 700 10px "JetBrains Mono", "SF Mono", "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0.03em; }
+    </style>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#b45309"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="1032" height="324" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <rect x="20" y="16" width="114" height="24" rx="4" fill="#0047ab"/>
+  <text x="77.0" y="32" text-anchor="middle" class="badge" fill="#ffffff">BIG PICTURE</text>
+  <text x="146" y="33" class="title" fill="#111111">系统全景：分档预录制的静态 CUDA Graph 与“零重录实时切层”的矛盾</text>
+  <line x1="20" y1="48" x2="1020" y2="48" stroke="#e4e4e7" stroke-width="1.4"/>
+  <rect x="24" y="64" width="446" height="244" rx="6" fill="#f8fafc" stroke="#111111" stroke-width="1.4"/>
+  <text x="42" y="88" class="sec" fill="#111111">推理引擎启动期：按批次档位预录静态图</text>
+  <rect x="42" y="104" width="72" height="32" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.3"/>
+  <text x="78" y="124" text-anchor="middle" class="mono-sm" fill="#1e3a8a">B = 1</text>
+  <rect x="124" y="104" width="72" height="32" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.3"/>
+  <text x="160" y="124" text-anchor="middle" class="mono-sm" fill="#1e3a8a">B = 2</text>
+  <rect x="206" y="104" width="72" height="32" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.3"/>
+  <text x="242" y="124" text-anchor="middle" class="mono-sm" fill="#1e3a8a">B = 4</text>
+  <rect x="288" y="104" width="72" height="32" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.3"/>
+  <text x="324" y="124" text-anchor="middle" class="mono-sm" fill="#1e3a8a">...</text>
+  <rect x="370" y="104" width="72" height="32" rx="4" fill="#eef4ff" stroke="#0047ab" stroke-width="1.3"/>
+  <text x="406" y="124" text-anchor="middle" class="mono-sm" fill="#1e3a8a">B = 256</text>
+  <text x="42" y="162" class="sub" fill="#3f3f46">· 图内算子序列与显存指针在录制期全部冻死</text>
+  <text x="42" y="186" class="sub" fill="#3f3f46">· 优势：推理解码期 CPU 只需一次图重放，消除发射间隙</text>
+  <rect x="42" y="206" width="410" height="84" rx="5" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.4"/>
+  <text x="58" y="230" class="label" fill="#991b1b">痛点：如果把“哪一层生效”写死在图结构里</text>
+  <text x="58" y="252" class="sub-sm" fill="#991b1b">每次从第 8 层切到第 20 层，都得推倒重编并重录全套档位，</text>
+  <text x="58" y="272" class="sub-sm" fill="#991b1b">线上服务直接卡死 5～15 秒，也没法让同批请求走不同层。</text>
+  <line x1="470" y1="186" x2="512" y2="186" stroke="#059669" stroke-width="1.8" marker-end="url(#arr-green)"/>
+  <rect x="516" y="64" width="500" height="244" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="534" y="88" class="sec" fill="#065f46">目标设计：候选层预埋钩子 + 显存路由表实时控制</text>
+  <rect x="534" y="104" width="206" height="114" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.4"/>
+  <text x="637" y="124" text-anchor="middle" class="label-sm" fill="#065f46">显存路由表 (常驻 L2)</text>
+  <text x="548" y="148" class="mono-sm" fill="#111111">Req A -> target = L4</text>
+  <text x="548" y="170" class="mono-sm" fill="#111111">Req B -> target = L18</text>
+  <text x="548" y="192" class="mono-sm" fill="#111111">Req C -> target = -1 (Off)</text>
+  <line x1="740" y1="160" x2="776" y2="160" stroke="#059669" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <rect x="780" y="104" width="216" height="24" rx="4" fill="#bbf7d0" stroke="#059669" stroke-width="1.2"/>
+  <text x="888" y="120" text-anchor="middle" class="mono-sm" fill="#065f46">Layer 4 (Hit A)</text>
+  <rect x="780" y="134" width="216" height="24" rx="4" fill="#f4f4f5" stroke="#a1a1aa" stroke-width="1.2"/>
+  <text x="888" y="150" text-anchor="middle" class="mono-sm" fill="#52525b">Layer 12 (Skip)</text>
+  <rect x="780" y="164" width="216" height="24" rx="4" fill="#bbf7d0" stroke="#059669" stroke-width="1.2"/>
+  <text x="888" y="180" text-anchor="middle" class="mono-sm" fill="#065f46">Layer 18 (Hit B)</text>
+  <rect x="780" y="194" width="216" height="24" rx="4" fill="#f4f4f5" stroke="#a1a1aa" stroke-width="1.2"/>
+  <text x="888" y="210" text-anchor="middle" class="mono-sm" fill="#52525b">Layer 26 (Skip)</text>
+  <rect x="534" y="232" width="462" height="60" rx="5" fill="#ffffff" stroke="#059669" stroke-width="1.3"/>
+  <text x="550" y="254" class="label-sm" fill="#065f46">核心工程问题：如果挂满 28 层，每步 26～27 层未命中，</text>
+  <text x="550" y="274" class="sub-sm" fill="#065f46">怎样让未命中层既不吃光显存，又不白白读写高带宽显存 (HBM)？</text>
+</svg>

@@ -1,72 +1,193 @@
 # Debugging State Lifecycles Under Continuous Batching: Admission Pins, Preemption Boundaries, and Export Dimensions
 
-> **TL;DR**: Once a continuous-batching inference engine adds mutable runtime state—dynamic layer routing, per-request fast weights, or online parameter imports—bugs tend to surface along cross-step and cross-request lifecycle seams instead of inside individual kernels. Drawing on four debugging sessions from building dynamic layer routing, this note lays out four rules for pairing a Paged Tensor State System (PTTS) with a continuous-batching scheduler: record admission pins only after the step's pre-forward publications settle; separate read-only observation state from KV-mutating state when gating prefix caching and preemption; keep discrete `int64` control fields out of flat floating-point optimizer pages; and record exported layer tags alongside physical tap slots instead of re-querying deduplicated request indices after the fact.
+> **TL;DR**: In a stateless LLM serving engine, model weights never change and a request's KV Cache is a pure function of its past tokens, making batching, prefix caching, and preemption recomputation invisible to model semantics. Once you introduce mutable runtime state—such as live layer switching, same-batch parameter imports, or online fast-weight updates—bugs rarely hide inside a single GPU kernel; they cluster at cross-step and cross-request boundaries. Starting from a four-stage walkthrough of how a stateful continuous-batching step executes, this note reconstructs four bugs we hit in multi-request testing: an admission snapshot taken half a stage too early, KV preemption recomputing old tokens with newly switched layer weights, a flat `AdamW` parameter page inheriting `int64` from field 0 and truncating float weights to `0`, and a ragged prefill export crash (`shape '[12]' is invalid for input of size 3`) hidden during decode.
 
-In a stateless inference engine, as long as the KV-cache block table maps correctly, a request produces the same activations whether it runs solo, rides inside a mixed chunked-prefill-plus-decode batch, or gets evicted under memory pressure and recomputed later.
+If you have worked inside a standard LLM serving engine like vanilla vLLM, one quiet property makes almost every systems optimization easier: **at the parameter level, the engine is completely stateless.**
 
-Introduce mutable runtime state—updating an observed or intervened layer online via `import_state`, or letting each request carry private state that mutates mid-flight—and timing and shape bugs that never appear in isolated single-step tests emerge quickly inside a multi-request scheduling loop.
+No matter how many concurrent requests arrive, the model weights stay frozen. Token 5's hidden states and KV Cache depend solely on tokens 1 through 5 of that request. As a result, whether the scheduler runs a request alone, packs it into a mixed chunked-prefill-plus-decode batch, reuses a prefix cache block, or evicts its KV Cache under memory pressure and recomputes those tokens two seconds later, the resulting numbers are identical.
 
-While implementing dynamic layer routing, we ran into four concrete failures:
+The moment you make an inference engine **stateful**—letting callers switch an active steering layer from layer 2 to layer 4 mid-flight, pass state updates alongside a new batch of requests, or update per-request fast weights with an optimizer—the scheduler, state pool, and KV Cache cease to be orthogonal.
 
-1. **Admission pins captured the pre-import version**: A workload declared `refresh="admission"` (pinning the global layer active when the request enters) and called `generate(..., batch=StateImport(layer=6))` to import layer 6 with the batch. On step 1, a step-refreshed probe saw the newly published version `v1` (layer 6), whereas the admission-pinned patch still read the initial version `v0` (layer 0).
-2. **Preemption recomputed old prefixes with the new layer**: The server started with global steering on layer 2, and request A generated 10 tokens. An online update switched steering to layer 4 right before KV-cache memory pressure preempted request A and freed its blocks. When request A resumed, the engine recomputed KV history for the first 10 tokens using layer 4.
-3. **Attaching an optimizer truncated float initializers to zero**: Placing a routing field `layer: int64` alongside low-rank factors `a, b: float32` in the same state, filling them with `0.5`, and attaching `optimizer=AdamW(lr=1e-3)` caused `a` and `b` to read back as all `0`s immediately after initialization.
-4. **Multi-token prefill export failed with a shape mismatch under `tokens="all"`**: Single-token decode exports worked cleanly, yet running `tokens="all"` on a prefill batch of 3 requests totaling 12 tokens threw `RuntimeError: shape '[12]' is invalid for input of size 3`.
+When we wired dynamic layer routing and mutable states into continuous batching, isolated single-step tests passed right away. Under multi-request concurrent load, four puzzling failures surfaced one after another.
 
-All four traced back to how state versioning meets the continuous-batching scheduler timeline.
+Before looking at any individual bug, let's put **the big picture of a single step inside a stateful continuous-batching engine** on the table:
 
----
+![Big Picture: One Step in a Stateful Continuous-Batching Engine (& All 4 Bug Sites)](../../assets/personal-04-fig0-en.svg)
 
-Inside pLLM, mutable state lives in the Paged Tensor State System (PTTS): each field maps to a fixed-base-address GPU slot pool; every update allocates a fresh slot and publishes an immutable, monotonically increasing version reference (`StateRef`); readers hold a lock-free lease (`PagePin`) and return it asynchronously via a CUDA Event once kernels finish. Walking through one step's timeline exposes all four bugs and their fixes.
+Under the hood, mutable states (such as an active `layer` index or low-rank weights `lora_a`) live in a **versioned GPU state pool**: instead of overwriting memory in place and stalling running kernels, updates allocate a fresh slot and publish a new immutable version (`v0 -> v1`), while active readers hold lightweight reference pins (`Pin`) until their step finishes.
 
-**First: when admission pins get recorded.**
+Every call to `engine.step()` marches through four stages in order:
 
-Why did an admission-pinned reader see `v0` on the very step that carried `StateImport(layer=6)`? The original step-entry call order gives the answer immediately:
+1. **Stage 1 · Schedule & Admit (`schedule`)**: Pick which new and running requests participate in this step, and decide how many tokens each request feeds into the model;
+2. **Stage 2 · Prepare & Publish State (`prepare`)**: Apply any pre-forward state imports or updates attached to this step (for instance, switching the target layer to `6`), publishing version `v1`;
+3. **Stage 3 · Ragged Mixed-Batch Forward (`forward`)**: Flatten all tokens across prefill and decode requests into a single 1D ragged token table (e.g., Request A prefilling 5 tokens + Request B decoding 1 token + Request C prefilling 6 tokens = `[12, hidden_dim]`) and run the GPU forward pass. If GPU KV memory fills up, the scheduler triggers **preemption**, freeing a request's KV blocks and recomputing its prompt + generated tokens once memory clears;
+4. **Stage 4 · Post-Step Export (`export`)**: Package captured probe activations alongside per-row metadata (such as which layer each row came from) and return them to the caller.
 
-![Step lifecycle ordering: pinning admission version before vs. after request.prepare StateImport](../../assets/personal-04-fig1-en.svg)
-
-In our initial implementation, registering a new request's lineage and pinning its snapshot of global `InstanceState` were bundled inside a single `admit()` call during step 1 (`driver.schedule()`). Whenever no batch-attached import existed, the version number never changed during `request.prepare`, so the ordering stayed invisible. Once a call passed `StateImport` or ran a pre-forward write task, however, the new version `v1` was only published later inside `driver.begin()` once the `request.prepare` anchor completed—leaving `refresh="step"` readers on `v1` (layer 6) during `model.execute` while `refresh="admission"` readers still held the stale `inference_pin[req]` captured at `v0` (layer 0).
-
-Splitting those two actions fixes the race: `schedule()` creates the request lineage alone (`pin_instances=False`), and `begin()` calls `pin_admitted()` for newly admitted requests only after all `request.prepare` imports and state publications have settled.
-
-Follow that boundary one layer further. Suppose a user declares `refresh="admission"` on a per-request `RequestState`, yet also attaches a per-step `@pllm.write` task mutating that state—or keys it without `request_id` (such as `key_fields=("sample_index",)`, where a later online request can overwrite the same keyed slot). Because PTTS maintains per-request admission pins only for globally shared `InstanceState` and does not keep multi-version history for `RequestState`, the running request would read the updated value mid-generation and silently drift from `refresh="admission"` semantics. We now catch those combinations at compile-time validation with a clear error steering callers toward `refresh="step"` or a key schema containing `request_id`.
+With that four-stage map in mind, each of the four bugs becomes easy to spot.
 
 ---
 
-**Second: separating read-only observation from KV-mutating state for prefix caching and preemption.**
+### Bug 1: The Caller Passed `layer = 6` With the Batch—Why Did Step 1 Still Run on Layer 0? (Stage 1 vs. Stage 2 Ordering)
 
-The second bug is about causal consistency in an autoregressive KV cache.
+**Motivation & Initial Code**: Suppose the server holds a shared `route_layer` state (initialized at version `v0` with `layer = 0`). Many workloads want **admission pinning (`refresh="admission"`)**: *"whatever layer is active the moment my request enters the engine, lock that version for my entire generation so later switches by other users don't affect me."*
 
-Under its default `refresh="step"` mode, dynamic layer routing follows forward-only KV semantics: tokens 1 through 10 are generated under layer 2 and their keys/values sit in physical blocks; once `import_state` switches routing to layer 4 before token 11, historical KV blocks for tokens 1–10 remain untouched while token 11 onward runs under layer 4. That avoids pinning historical parameter snapshots per in-flight request and keeps state-page overhead constant.
+When writing the first version of `step()`, the most natural place to take an admission snapshot seemed to be right inside Stage 1 when `schedule()` admits the request:
 
-Trouble starts if memory pressure triggers preemption mid-generation. The scheduler evicts request A's KV blocks for tokens 1–10 and later feeds `"prompt + 10 generated tokens"` back through forward to rebuild the cache:
+```python
+# Initial broken step() ordering:
+def step(self, incoming_requests, batch_state_updates):
+    # Stage 1: Select requests for this step and immediately pin the current global state!
+    batch = self.scheduler.schedule(incoming_requests)
+    for req in batch.newly_admitted:
+        req.pinned_version = self.state_pool.current_version  # <--- Still v0 (layer=0)!
 
-![Why KV preemption recomputation under mutated shared routing corrupts historical KV](../../assets/personal-04-fig2-en.svg)
+    # Stage 2: Apply state updates submitted alongside this batch, publishing v1
+    if batch_state_updates:
+        self.state_pool.apply_and_publish(batch_state_updates)  # <--- Publishes v1 (layer=6) here!
 
-Because the engine never recorded which layer each historical token used, recomputation replays all 10 historical tokens through the current layer 4—building a `KV'[1..10]` that contradicts the premises under which those tokens were sampled. Any workload combining mutable shared state with model-layer intervention therefore belongs under `preemption="reset"`: if preemption occurs and the state cannot be replayed from its initial value, the engine raises a runtime error instead of silently serving inconsistent context, advising the caller to raise KV memory headroom or lower max concurrency. (The same applies to online imports targeting shared keys such as `key_fields=("sample_index",)`.)
+    # Stage 3: Run GPU forward
+    self.run_forward(batch)
+```
 
-The converse matters just as much. If a `LayerRoute` only reads hidden states or intermediate logits—for instance, attaching `route.residual()` with `@pllm.export`, with no `patch` or `adapter` modifying model computation—then the trunk's KV cache matches the unmodified base model regardless of which layer is tapped. Our initial implementation put every routed state into one `model_reads` set, needlessly blocking prefix caching on pure observation workloads. Splitting the backend attachment contract into two sets fixed that over-restriction: `model_reads` governs state-page pin lifetimes, while `kv_model_reads` specifically marks states that affect trunk K/V values. Pure observation routes enter only `model_reads`, staying fully compatible with prefix caching and lossless preemption recomputation.
+**Discovery & Symptom**: Whenever we updated the state in a separate call *before* submitting requests, everything worked. Then we tested **same-batch state import**—submitting new requests alongside `StateUpdate(layer=6)` in a single call. Step-refreshed probes immediately saw `layer = 6` (`v1`), yet every admission-pinned request in that exact batch ran its entire life on stale `layer = 0` (`v0`)!
+
+**Intuition & Fix**: As the timeline below shows, **we pressed the camera shutter half a stage too early**:
+
+![Bug 1: Admission Snapshot Taken Before Same-Batch Import Locks Stale Version v0](../../assets/personal-04-fig1-en.svg)
+
+At Stage 1, Stage 2's same-batch import had not published `v1` yet, so `newly_admitted` locked `v0`. Splitting "record who was admitted" from "pin the state snapshot"—waiting until Stage 2 finishes publishing all pre-forward updates before pinning—fixed the race cleanly:
+
+```python
+def step(self, incoming_requests, batch_state_updates):
+    # Stage 1: Record newly admitted request IDs only—do not pin yet
+    batch = self.scheduler.schedule(incoming_requests)
+
+    # Stage 2: Publish all same-batch state imports and pre-forward writes -> v1 (layer=6)
+    if batch_state_updates:
+        self.state_pool.apply_and_publish(batch_state_updates)
+
+    # Fix: Pin admitted requests right after Stage 2 publishes the fresh version v1
+    for req in batch.newly_admitted:
+        req.pinned_version = self.state_pool.current_version
+
+    self.run_forward(batch)
+```
+
+While auditing this boundary, we also added a load-time check rejecting contradictory declarations where a request-private state is marked `refresh="admission"` while also being mutated every step by a write task.
 
 ---
 
-**Third and fourth: the optimizer's flat-page assumption, and request-deduplicated vs. token-expanded indexing.**
+### Bug 2: Why Did Context Turn Incoherent Right After a Live Layer Switch Under High Load? (Stage 3 · KV Preemption Recompute)
 
-The final two bugs came from memory-layout conventions in parameter pools and a granularity mismatch in export indices.
+**How Live Switching Interacts with KV Cache**: Under default per-step refresh (`refresh="step"`), switching a steering hook live follows **forward-only KV semantics**: if Request A generates tokens 1..10 while routed to layer 2, those 10 K/V vectors stay untouched in their physical KV blocks; when you switch to layer 4 at step 11, tokens 11 onward use layer 4 conditioned on the existing KV history. That keeps memory overhead constant without archiving historical weights per request.
 
-In the third bug, placing `layer: Field((), int64)` ahead of `a, b: Field(..., float32)` with `AdamW` turned float initializers into zeros because `declare_parameters` builds pools differently for optimized and unoptimized states. Plain unoptimized states allocate an independent pool per field, so mixed dtypes never interfere. States with `AdamW`, by contrast, pack every field into one flat 1D `parameters` tensor (allocating matching `exp_avg` and `exp_avg_sq` buffers) so a single fused `paged_adamw` kernel can update all trainable weights in one pass—and they take `fields[0].dtype` as the dtype of that entire merged page:
+**Discovery & Symptom**: At low concurrency, live switching behaved smoothly. Once we cranked concurrency high enough to exhaust the KV Cache pool and trigger **preemption**, coherence broke down silently: Request A generated 10 tokens on layer 2, the user switched the global layer to layer 4, memory pressure evicted Request A's KV blocks, and two seconds later the engine resumed Request A by feeding `prompt + 10 generated tokens` back through the forward pass to rebuild its missing KV Cache:
 
-![Per-field unoptimized pools vs. AdamW flat parameter page inheriting fields(0).dtype](../../assets/personal-04-fig3-en.svg)
+```python
+# Standard stateless preemption recovery (silently corrupts stateful KV!):
+def resume_preempted_request(self, req):
+    # Concatenate prompt and the 10 already-generated tokens to rebuild evicted KV blocks
+    recompute_tokens = req.prompt_tokens + req.generated_tokens
+    # Bug: `current_version` is now layer=4, NOT layer=2 that originally produced those 10 tokens!
+    self.run_forward(recompute_tokens, active_state=self.state_pool.current_version)
+```
 
-Because `layer` sat at index 0, the whole merged page was allocated as `int64`; calling `f["a_0"].fill_(0.5)` during initialization wrote into an `int64` view and truncated `0.5` toward zero. A discrete `int64` layer index is neither differentiable nor suited to `AdamW` momentum updates anyway. Rejecting optimizers on `LayerRoute` control states at declaration validation—and prompting users to declare discrete control state separately from trainable weight state—eliminates that truncation trap before any pool is allocated.
+**Those first 10 tokens were chosen under layer-2 steering, yet preemption recovery recomputed all 10 of their K/V vectors using layer-4 weights!**
 
-The fourth bug—`shape '[12]' is invalid for input of size 3` during `tokens="all"` prefill export—came from mixing request-level deduplication with token-level expansion. On a decode step, each request occupies 1 token, so request count equals token row count. On a prefill step, 3 requests can expand into `5 + 1 + 6 = 12` token rows. Our first export post-processor called `_core.select_states` to look up state slots, which returns 3 deduplicated request-state indices that cannot be reshaped to 12 rows:
+![Bug 2: KV Preemption After Live Layer Switch Recomputes Old Tokens with New Weights](../../assets/personal-04-fig2-en.svg)
 
-![Request-deduplicated select_states vs. token-expanded _slot_layers tracking](../../assets/personal-04-fig4-en.svg)
+**Intuition & Two-Way Fix**: Without recording a full per-token parameter log, a request whose backbone activations were altered mid-generation **cannot be losslessly recomputed from a single current state**. For KV-mutating hooks (activation patches or LoRA adapters), the engine must disable cross-request Prefix Caching and fail fast if KV eviction forces a cross-version recompute, instructing the operator to raise KV memory headroom or cap max concurrency.
 
-Since the forward tap pool already allocates per-token physical slots `dst_slots[0..11]`, recording each row's active layer ID into a companion `_slot_layers[dst_slots]` array during the forward copy removes post-hoc pool lookups entirely. Export simply reads `tap.layers[tap.slots[row]]` per packed row index, keeping row counts and sampled layer IDs aligned across single-token decode, multi-token chunked prefill, and automatic chunked exports above 32 KiB.
+Equally important, **we should not penalize read-only probes!** Often a researcher switches `LayerRoute` live purely to *inspect* residuals or per-layer logits without modifying the model's forward activations at all. When no patch or adapter writes back into the backbone, the model's K/V tensors are 100% identical to the base model regardless of which layer the probe reads. Splitting state tracking into `all_bound_states` (for page pin lifetimes) and `kv_mutating_states` (for hooks that actually alter K/V) lets read-only probes keep full Prefix Caching and lossless preemption recompute.
 
 ---
 
-Looking back across all four bugs, one engineering habit paid off well beyond its cost: bringing in an independent cross-review model. An author's own tests naturally follow the intended happy path—validating a single step, habitually listing weight fields before metadata, or checking an import only on the immediately following step. Here, we had a separate review model (`gpt-6.2-astra`) work read-only against the contract boundaries and write minimal CPU probes: declaring `InstanceState` and `RequestState` side by side to check first-step admission versions, placing an `int64` field first inside an `AdamW` state to inspect the memory snapshot, and advancing multiple decode steps after an import to verify state retention. A few dozen lines of CPU probes reproduced and pinned down all four issues before merge.
+### Bug 3: We Initialized Weights to `0.5`—Why Did Attaching `AdamW` Turn Them All Into `0`? (State Pool · Flat Page Dtype)
 
-This state-lifecycle and dynamic layer-routing mechanism is now merged into **[pLLM](https://github.com/LinesHogan/pLLM)**. On the system trade-off: fixed-base-address version pages paired with explicit `admission` and `step` refresh modes give PTTS lock-free in-graph reads and a predictable GPU memory ceiling. The corresponding constraint is straightforward: whenever a workload mutates shared state that alters trunk KV values mid-generation, prefix caching has to stay off and the KV cache needs enough headroom to avoid preemption recomputation.
+**Initial Code & Symptom**: Next, someone defined a single state class holding both the discrete routing index `layer` (`int64`) and trainable low-rank weights `lora_a, lora_b` (`float32`), initialized the weights to `0.5`, and attached `AdamW(lr=1e-3)`:
+
+```python
+class RoutedAdapterState:
+    layer: Field(shape=(), dtype=torch.int64)           # Field 0: active layer index (int64 = 4)
+    lora_a: Field(shape=(8, 4096), dtype=torch.float32) # Field 1: trainable factor (init = 0.5)
+    lora_b: Field(shape=(4096, 8), dtype=torch.float32) # Field 2: trainable factor (init = 0.5)
+```
+
+Without an optimizer, reading `lora_a` right after initialization returned `0.5`. The instant `optimizer=AdamW(lr=1e-3)` was added—before a single training step even ran—every `0.5` in `lora_a` and `lora_b` came back as **`0`**!
+
+**How the Allocator Ran Underneath**: Inspecting the state pool allocator revealed why field ordering suddenly mattered:
+
+```python
+# Initial state-pool allocator (excerpt):
+def allocate_state_pool(fields, optimizer):
+    if optimizer is None:
+        # No optimizer: each field gets its own typed tensor pool—int64 and float32 never mix
+        return [torch.zeros((num_slots, *f.shape), dtype=f.dtype, device="cuda") for f in fields]
+    else:
+        # With AdamW: pack all fields into one flat 1D tensor so a single fused paged_adamw
+        # kernel updates everything—typing the entire page using `fields[0].dtype`!
+        page_dtype = fields[0].dtype  # <--- fields[0] is `layer: int64`!!
+        total_elems = sum(f.numel for f in fields)
+        flat_param_page = torch.zeros((num_slots, total_elems), dtype=page_dtype, device="cuda")
+        ...
+```
+
+![Bug 3: Fused AdamW Flat Page Inherits fields[0].dtype (int64), Truncating 0.5 -> 0](../../assets/personal-04-fig3-en.svg)
+
+To update all trainable parameters and moments (`exp_avg`, `exp_avg_sq`) in one fused kernel launch, the optimizer allocator packed every field into one flat 1D buffer typed as `fields[0].dtype`. Previous tests always listed float weights first; putting `layer: int64` at index 0 turned the entire parameter page into an `int64` tensor, silently truncating `0.5` to `0` on copy!
+
+Since discrete `int64` routing indices are non-differentiable anyway, rejecting gradient optimizers on discrete routing states at declaration time—and keeping discrete control switches separate from trainable float states—eliminated the trap cleanly.
+
+---
+
+### Bug 4: Decode Worked Fine—Why Did Multi-Token Prefill Export Crash With `shape '[12]' is invalid for input of size 3`? (Stage 4 · Token Rows vs. Unique Requests)
+
+**Initial Code & Symptom**: Our fourth bug surfaced in Stage 4 (`export`) when `tokens="all"` was enabled to export hidden states across every prompt token during prefill:
+
+```python
+# Initial broken post-step export packaging:
+def package_export_event(batch, probe_pool):
+    num_tokens = batch.total_tokens  # Total flattened token rows in this step
+    activations = probe_pool[:num_tokens]
+
+    # Bug: queried deduplicated per-request state slots (1 entry per request, not per token!)
+    req_slots = select_unique_request_slots(batch)     # Length = 3 requests, NOT 12 tokens!
+    layers = route_layer_pool[req_slots].reshape(num_tokens)  # <--- Crashes on prefill!
+    return ExportEvent(activations=activations, layers=layers)
+```
+
+Across dozens of concurrent **decode** tests (3, 8, or 32 requests), this ran without a hitch. The moment we fed a 3-request **prefill** batch whose prompts had `5`, `1`, and `6` tokens (`12` flattened token rows total), PyTorch threw:
+
+```text
+RuntimeError: shape '[12]' is invalid for input of size 3
+```
+
+**Intuition & Fix**: Look at why decode tests masked the bug completely:
+
+![Bug 4: Decode (1 Req = 1 Token) Hid a Granularity Mix That Crashes on Prefill](../../assets/personal-04-fig4-en.svg)
+
+During pure decode, every request contributes exactly `1` token, so `num_tokens == num_unique_requests == 3` and `.reshape(3)` succeeded by sheer coincidence! During prefill (or chunked prefill mixed with decode), 3 requests expand to `5 + 1 + 6 = 12` rows in the flattened token table while `select_unique_request_slots` still returns 3 entries.
+
+Better yet, as we saw in Note 01, our forward probe kernel already writes the executed layer index into `slot_layers[dst_slot]` alongside every token row it copies. Reading `slot_layers[:num_tokens]` directly drops the redundant state-pool lookup and works identically across decode, ragged prefill, and chunked exports:
+
+```python
+def package_export_event(batch, probe_pool, slot_layers):
+    num_tokens = batch.total_tokens
+    # Read per-token-slot layer tags recorded during forward—aligned for both decode and prefill
+    return ExportEvent(
+        activations=probe_pool[:num_tokens],
+        layers=slot_layers[:num_tokens],
+    )
+```
+
+---
+
+### Takeaway: Why Authors Miss Cross-Boundary Bugs (& How Tiny Adversarial CPU Probes Catch Them)
+
+None of these four bugs involved subtle math; every single one lived at the seam between two subsystems that worked fine in isolation. Why did hundreds of initial unit tests miss them?
+
+Because **the engineer who just built a feature unconsciously writes "happy-path" tests matching their own mental order of operations**: importing before admitting, listing float weights before integer flags, testing export on single-token decode steps, and keeping KV memory comfortably below eviction.
+
+Before merging this subsystem, we ran an experiment that paid off handsomely: we handed a separate reviewer model read-only access to the codebase and asked it to write tiny, 20-line CPU-only adversarial probes specifically targeting *feature intersections*—combining `refresh="admission"` with same-batch imports, placing an `int64` field first under `AdamW`, and running `tokens="all"` on ragged multi-token prefill batches. All four bugs above were reproduced and fixed in seconds on CPU before touching a GPU cluster.
+
+This versioned state lifecycle (PTTS) and dynamic routing layer now ship in **[pLLM](https://github.com/LinesHogan/pLLM)**. Fixed-base versioned pools paired with explicit `admission` / `step` refresh policies keep in-graph reads lock-free inside CUDA Graphs; the fundamental constraint to remember is that whenever an online intervention mutates backbone KV mid-request, cross-request prefix caching must stay off and KV memory should be sized with enough headroom to avoid preemption recompute.

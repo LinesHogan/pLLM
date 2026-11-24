@@ -1,35 +1,50 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 198" width="100%" role="img" aria-label="FIG 04 · 预填充多词批次下“按请求去重”与“按词展开”的导出索引对齐">
-  <style>
-    .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
-    .hdr { font: 700 13px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
-    .label { font: 700 12.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111111; }
-    .sub { font: 400 11.4px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #3f3f46; }
-    .muted { font: 500 10.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #52525b; }
-    .mono { font: 600 10.8px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #111111; }
-    .badge { font: 700 10.2px "JetBrains Mono", "PingFang SC", monospace; letter-spacing: 0.03em; }
-  </style>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 296" width="100%" role="img" aria-label="问题四：Decode (1 请求=1 词) 掩盖的粒度混用，在 Prefill 多词展开时炸形状错误">
   <defs>
-    <marker id="arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+    <style>
+      .title { font: 700 15.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sec { font: 700 12px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label { font: 600 11.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .label-sm { font: 600 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub { font: 400 10.5px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .sub-sm { font: 400 9.8px "DM Sans", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .mono { font: 600 10.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .mono-sm { font: 600 9.5px "JetBrains Mono", "SF Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace; }
+      .badge { font: 700 10px "JetBrains Mono", "SF Mono", "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: 0.03em; }
+    </style>
+    <marker id="arr-ink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#111111"/>
     </marker>
-    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
-      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
-    </marker>
-    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e62b2b"/>
     </marker>
-    <marker id="arr-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#059669"/>
     </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#0047ab"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#b45309"/>
+    </marker>
   </defs>
-  <rect x="4" y="4" width="952" height="190" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
-  <text x="28" y="34" class="title">FIG 04 · 预填充多词批次下“按请求去重”与“按词展开”的导出索引对齐</text>
-
-  <rect x="28" y="56" width="904" height="54" rx="6" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.4"/>
-  <text x="44" y="79" class="mono">本步展开词行 (12 行): [r0,r0,r0,r0,r0 | r1 | r2,r2,r2,r2,r2,r2]</text>
-  <text x="44" y="99" class="sub">事后调用 select_states 仅返回去重后的 3 个请求槽 [s0, s1, s2]，无法重塑对齐 12 行导出张量</text>
-
-  <rect x="28" y="122" width="904" height="58" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
-  <text x="44" y="146" class="label" fill="#059669">修复：前向探针拷贝时按 12 行槽位同步记录 _slot_layers[dst_slots]</text>
-  <text x="44" y="167" class="sub">导出阶段直接读取 tap.layers[tap.slots[packed_row]]，在解码、分块预填充与分片导出下均与词行严格 1:1 对齐</text>
+  <rect x="4" y="4" width="1032" height="288" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2"/>
+  <rect x="20" y="16" width="188" height="24" rx="4" fill="#0047ab"/>
+  <text x="114.0" y="32" text-anchor="middle" class="label-sm" fill="#ffffff">BUG 4 · TOKEN VS REQ</text>
+  <text x="220" y="33" class="title" fill="#111111">问题四：Decode (1 请求=1 词) 掩盖的粒度混用，在 Prefill 多词展开时炸形状错误</text>
+  <line x1="20" y1="48" x2="1020" y2="48" stroke="#e4e4e7" stroke-width="1.4"/>
+  <rect x="24" y="64" width="456" height="208" rx="6" fill="#f8fafc" stroke="#111111" stroke-width="1.4"/>
+  <text x="42" y="88" class="sec" fill="#111111">为什么常规 Decode 测试一直没报错？</text>
+  <rect x="42" y="108" width="420" height="72" rx="4" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.3"/>
+  <text x="58" y="132" class="mono-sm" fill="#111111">Decode Batch: [Req A (1 tok), Req B (1 tok), Req C (1 tok)]</text>
+  <text x="58" y="156" class="mono-sm" fill="#111111">num_tokens (3) == num_unique_requests (3)</text>
+  <text x="42" y="212" class="sub" fill="#3f3f46">3 行探针恰好对应 3 个请求，拿请求级数组当词级数组重塑，</text>
+  <text x="42" y="236" class="sub" fill="#3f3f46">两边长度巧合相等，Bug 潜伏了下来。</text>
+  <rect x="504" y="64" width="512" height="208" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.6"/>
+  <text x="522" y="88" class="sec" fill="#065f46">Prefill 多词批次：3 个请求展开成 5 + 1 + 6 = 12 行词</text>
+  <rect x="522" y="106" width="476" height="66" rx="4" fill="#fff1f2" stroke="#e62b2b" stroke-width="1.3"/>
+  <text x="538" y="128" class="mono-sm" fill="#991b1b">Bug: query_unique_requests(batch) -> size [3]</text>
+  <text x="538" y="150" class="mono-sm" fill="#991b1b">RuntimeError: shape [12] is invalid for input of size 3</text>
+  <rect x="522" y="184" width="476" height="72" rx="4" fill="#ffffff" stroke="#059669" stroke-width="1.4"/>
+  <text x="538" y="208" class="mono-sm" fill="#065f46">Fix: return slot_layers[:12]  # written per token row!</text>
+  <text x="538" y="234" class="sub-sm" fill="#065f46">直接读取前向探针按词槽位同步记下的层号，Decode 与 Prefill 统一对齐</text>
 </svg>
