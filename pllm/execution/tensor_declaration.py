@@ -92,7 +92,7 @@ from pllm.execution.declaration import (
 from pllm.execution.model_sites import SiteOwners
 from pllm.execution.module_state import copy_initial
 from pllm.execution.overlay_batch import OverlayBatch
-from pllm.execution.overlay_task import OverlayTransition
+from pllm.execution.overlay_task import ChunkUpdate, OverlayTransition
 from pllm.execution.ptts.page_bundle import PagePublication
 from pllm.execution.ptts.request_state import RequestStateSelection
 from pllm.execution.scan import ScanContext
@@ -500,7 +500,12 @@ class TensorDeclaration:
         overlay = OverlayBatch(math, limits.get(symbol) if capture else None)
         batched = replace(math, executor=overlay)
         return replace(
-            operation, body=partial(native_body, batched), trace_body=batched.trace, capture_resident=overlay.resident
+            operation,
+            body=partial(native_body, batched),
+            trace_body=batched.trace,
+            capture_resident=overlay.resident,
+            copy_fields="defer" if isinstance(math.chunk, ChunkUpdate) else operation.copy_fields,
+            select_fields=math.written_fields if isinstance(math.chunk, ChunkUpdate) else operation.select_fields,
         )
 
     def _tensor_operation(

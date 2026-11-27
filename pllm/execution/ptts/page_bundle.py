@@ -5,13 +5,13 @@ A PageBundleArena is owned by the single thread that runs the model step and has
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from math import isfinite, prod
 from multiprocessing.connection import Connection
-from typing import overload
+from typing import Literal, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -30,6 +30,8 @@ from pllm.execution.ptts.slot_pools import PageEvents, PageSlot, SlotPools, Slot
 from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.shared_tensor import CudaIpcStorage, RemoteCompletion
 
+CopyFields = tuple[LayoutFieldId, ...] | Literal["defer"] | None
+
 
 @dataclass(frozen=True, slots=True, eq=False)
 class PageBundle:
@@ -46,12 +48,54 @@ class PageBundle:
         return tuple(PageSlot(int(slot), int(generation)) for slot, generation in zip(self.slots, self.generations))
 
 
+@dataclass(slots=True)
+class DeferredCopies:
+    """An overwrite may consume its incoming page directly; untouched destinations still inherit at publication."""
+
+    resource_ids: Mapping[str, int]
+    fields: dict[tuple[str, int], dict[int, int]]
+
+    @classmethod
+    def of(cls, copies: list[_core.PageCopy], resources: tuple[str, ...]) -> DeferredCopies:
+        return cls(
+            {name: index for index, name in enumerate(resources)},
+            {
+                (resources[resource], field): dict(zip(destinations.tolist(), sources.tolist(), strict=True))
+                for resource, field, sources, destinations in copies
+            },
+        )
+
+    def slots(self, resource: str, field: int, slot: int, writing: bool) -> tuple[int, int]:
+        pages = self.fields.get((resource, field))
+        if pages is None or slot not in pages:
+            return slot, -1
+        source = pages[slot]
+        if writing:
+            pages[slot] = slot
+        return source, slot if writing else -1
+
+    def materialize(self, fill: Callable[[list[_core.PageCopy]], None]) -> None:
+        copies: list[_core.PageCopy] = []
+        pending: list[tuple[dict[int, int], Slots]] = []
+        for (resource, field), pages in self.fields.items():
+            pairs = [(src, dst) for dst, src in pages.items() if src != dst]
+            if pairs:
+                sources, destinations = np.asarray(pairs, dtype=np.int64).T
+                copies.append((self.resource_ids[resource], field, sources, destinations))
+                pending.append((pages, destinations))
+        if copies:
+            fill(copies)
+            for pages, destinations in pending:
+                pages.update((slot, slot) for slot in destinations.tolist())
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class PageWrite:
     operation_id: int
     before_refs: StateRefs
     after_refs: StateRefs
     stream: torch.cuda.Stream | None
+    deferred: DeferredCopies | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -422,9 +466,9 @@ class PageBundleArena:
         stream: torch.cuda.Stream | None = None,
         *,
         fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
-        copy_fields: tuple[LayoutFieldId, ...] | None = None,
+        copy_fields: CopyFields = None,
     ) -> PageWrite:
-        """Allocate private writable fields; unchanged fields share the exact source pages."""
+        """Unwritten fields share the source. Deferred writers claim each destination before overwriting it."""
         self._require_stream(stream)
         field_columns = None
         if fields is not None:
@@ -433,7 +477,7 @@ class PageBundleArena:
         args = (
             _ref_columns(sources),
             field_columns,
-            None if copy_fields is None else np.asarray(copy_fields, dtype=np.int64),
+            None if copy_fields is None or copy_fields == "defer" else np.asarray(copy_fields, dtype=np.int64),
             self._events.completed(),
         )
         try:
@@ -444,19 +488,22 @@ class PageBundleArena:
                 prepared = self._ledger.prepare_transition(*args)
             except _core.PageCapacity as error:
                 raise RuntimeError(str(error)) from error
-        return self._prepare(prepared, sources, stream)
+        return self._prepare(prepared, sources, stream, defer_copies=copy_fields == "defer")
 
     def _prepare(
         self,
         prepared: _core.PagePrepared,
         sources: StateRefs,
         stream: torch.cuda.Stream | None,
+        defer_copies: bool = False,
     ) -> PageWrite:
         operation, columns, copies, waits, retained = prepared
         token = PageWrite(operation, sources, _refs(columns), stream)
         try:
             self._events.order(waits, stream)
             self._events.retain(retained)
+            if defer_copies:
+                return replace(token, deferred=DeferredCopies.of(copies, self.resource_names))
             with self._scope(stream), torch.no_grad():
                 self.fill_versions(copies)
         except Exception:
@@ -474,13 +521,19 @@ class PageBundleArena:
                 pairs = upload(np.stack((source, destination)), self.device)
                 pools.copy_from(field, pools.tensors[field], pairs[0], pairs[1])
 
+    def write_generations(self, token: PageWrite, resource: str) -> Slots:
+        """Return allocation generations of `resource`'s target slots to validate cached page bounds."""
+        return next(pages.generations for pages in self._access_pages(token) if pages.resource == resource)
+
     def write_field(self, token: PageWrite, root_index: int, field: LayoutFieldId) -> torch.Tensor:
         (root,) = self._held_fields(token, token.after_refs.take((root_index,)), (field,))
+        if token.deferred is not None:
+            self.materialize(token)
         return self.pools[root.resource].tensor(field, root.pages[field])
 
     def writable_roots(self, token: PageWrite, *, initialize: bool = False) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Borrow writable fields, completing GPU work before handing storage to a CPU initializer."""
-        self._issued_write(token)
+        self.materialize(token)
         roots = tuple(
             self.pools[root.resource].views(root.slots, root.generations, host=initialize)
             for root, _ in self._held_roots((token,) * len(token.after_refs), token.after_refs)
@@ -494,8 +547,15 @@ class PageBundleArena:
             token.stream.synchronize()
         return roots
 
-    def publish(self, token: PageWrite) -> PagePublication:
+    def materialize(self, token: PageWrite) -> None:
+        """Raw private readers and publication require a value even for unvisited targets."""
         self._issued_write(token)
+        if token.deferred is not None:
+            with self._scope(token.stream), torch.no_grad():
+                token.deferred.materialize(self.fill_versions)
+
+    def publish(self, token: PageWrite) -> PagePublication:
+        self.materialize(token)
         completion = self._record(token.stream)
         completed = self._events.completed()
         retained = self._ledger.publish(token.operation_id, self._events.add(completion), completed, False)
@@ -603,6 +663,9 @@ class PageBundleArena:
     ) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Every field of every ref, read under its pin (read-only views) or write (writable)."""
         self._require_live()
+        for token in access:
+            if isinstance(token, PageWrite) and token.deferred is not None:
+                self.materialize(token)
         return tuple(self._root_views(root, writable) for root, writable in self._held_roots(access, refs))
 
     def field_pool(self, resource: str, field: LayoutFieldId) -> torch.Tensor:

@@ -791,7 +791,7 @@ class ParameterOverlay:
         """Open private pages and stage every decode target before replay starts."""
         assert self.math is not None
         self.task = task
-        prepared, written = task.prepare(self.math)
+        prepared, generations = task.prepare(self.math)
         batch = prepared.for_resource(self.math.resource)
         identities = tuple(dict.fromkeys(rows.identities))
         self.sources = rows.inspect(np.arange(len(identities), dtype=np.int64))
@@ -800,7 +800,7 @@ class ParameterOverlay:
             assert reader.decode is not None
             reader.apply_count += rows.total_rows
             reader.updated_apply_count += updated
-            reader.decode.prepare(batch, identities, written)
+            reader.decode.prepare(batch, identities, generations)
 
     def prepare_reads(
         self, rows: PackedPhaseRowBatch, context: StateTaskContext, directory: RequestStateDirectory

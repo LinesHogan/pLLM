@@ -30,7 +30,7 @@ from pllm.contracts.state_ref import StateRef
 from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.execution.cuda_stream import CudaStreamReadiness, upload
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot, borrowed_root
-from pllm.execution.ptts.page_bundle import PagePin, PagePublication, PageWrite
+from pllm.execution.ptts.page_bundle import CopyFields, DeferredCopies, PagePin, PagePublication, PageWrite
 from pllm.execution.ptts.request_state import RequestStateSelection, StateAddress
 from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.ptts.state_refs import StateRefs
@@ -79,6 +79,13 @@ class TensorBatch:
     local_pin: PagePin | None = None
     resources: Mapping[StateResource, TensorBatch] = field(default_factory=lambda: dict[StateResource, TensorBatch]())
     retain_gradients: bool = True
+    deferred: DeferredCopies | None = None
+
+    def overlay_slots(self, field: int, slot: int, writing: bool) -> tuple[int, int]:
+        """Later encounters read the private result of an earlier overwrite."""
+        if self.deferred is None:
+            return slot, slot if writing else -1
+        return self.deferred.slots(self.selection.groups[0].resource, field, slot, writing)
 
     def for_resource(self, resource: StateResource) -> TensorBatch:
         """Use the operation resource without redirecting reads of other states."""
@@ -214,12 +221,21 @@ def read_batch(
     version: Literal["input", "private", "published"] = "input",
     resource: StateResource = StateResource(""),
     produced: ProducedVersions = (),
+    *,
+    defer_copies: bool = False,
 ) -> TensorBatch:
     """Borrow the invocation's selected version for tensor operations and layer replay: the input version, or the
     pending private write / the publication of `resource` this invocation made. Produced reads are
     selected independently, so a writer can consume another state's new values in the same step."""
     refs, access, owners = _batch_access(context, (*produced, (resource, version)))
     roots = context.arena.lazy_roots(access, owners, refs)
+    deferred = None
+    for token in access:
+        if isinstance(token, PageWrite) and token.deferred is not None:
+            if defer_copies and context.arena.access_resource(token) == resource:
+                deferred = token.deferred
+            else:
+                context.arena.materialize(token)
 
     batch = TensorBatch(
         context.selection,
@@ -231,6 +247,7 @@ def read_batch(
         results=context.results,
         borrowed_roots=context.borrowed_roots,
         local_pin=context.pin,
+        deferred=deferred,
         field_slots=roots.field_slots,
         slot_matrix=roots.slot_matrix,
         retain_gradients=context.retain_gradients or context.trace.observing,
@@ -246,6 +263,7 @@ def read_batch(
             batch,
             selection=selection,
             roots=selected,
+            deferred=deferred if group.resource == resource else None,
             after_refs=refs.take(indices),
             field_slots=selected.field_slots,
             slot_matrix=selected.slot_matrix,
@@ -489,7 +507,7 @@ class TensorOperation:
     publish: bool = False
     version: Literal["input", "private", "published"] = "input"
     produced: ProducedVersions = ()
-    copy_fields: tuple[LayoutFieldId, ...] | None = None
+    copy_fields: CopyFields = None
     select_fields: (
         Callable[[TensorFrame, RequestStateSelection, tuple[int, ...]], tuple[tuple[LayoutFieldId, ...], ...]] | None
     ) = None
@@ -538,7 +556,9 @@ class TensorOperation:
         return batch.for_resource(self.resource) if self.resource else batch
 
     def batch(self, context: StateTaskContext, version: Literal["input", "private", "published"]) -> TensorBatch:
-        return self.scoped(read_batch(context, version, self.resource, self.produced))
+        return self.scoped(
+            read_batch(context, version, self.resource, self.produced, defer_copies=self.copy_fields == "defer")
+        )
 
     def execute(self, context: StateTaskContext) -> ProjectionResiduals:
         data, stream = context.data(), context.pin.stream
@@ -548,11 +568,11 @@ class TensorOperation:
             write: PageWrite | None = None
             if self.mode == "transition" and selected:
                 if self.version == "input" or context.pending_write(self.resource) is None:
-                    fields = (
-                        None if self.select_fields is None else self.select_fields(data, context.selection, selected)
-                    )
+                    fields = None if self.select_fields is None else self.select_fields(data, batch.selection, selected)
                     write = context.prepare_owned_write(
-                        batch.selection.refs.take(selected), fields=fields, copy_fields=self.copy_fields
+                        batch.selection.refs.take(selected),
+                        fields=fields,
+                        copy_fields=self.copy_fields,
                     )
                 batch = self.batch(context, "private")
             output = self.body(data, batch, context)

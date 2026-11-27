@@ -615,7 +615,12 @@ def dense_readout(
         return None
     lhs_val: torch.Tensor = lhs.meta["val"]
     carry_val: torch.Tensor = carry.meta["val"]
-    if lhs_val.ndim != 2 or carry_val.ndim != 2 or carry_val.shape[1] != lhs_val.shape[1]:
+    if (
+        lhs_val.ndim != 2
+        or carry_val.ndim != 2
+        or carry_val.shape[1] != lhs_val.shape[1]
+        or torch.float64 in (lhs_val.dtype, carry_val.dtype)
+    ):
         return None
     cast_input = _transposed_carry(rhs, carry, lhs_val.dtype, visited)
     calls = {node for node in source.graph.nodes if node.op == "call_function"}

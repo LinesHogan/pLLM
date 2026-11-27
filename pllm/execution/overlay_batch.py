@@ -15,11 +15,11 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from pllm.contracts.parameter_overlay import ParameterOverlayOperator, ProjectionOperands
 from pllm.contracts.request_identity import RequestIdentity, RequestKeyField
 from pllm.contracts.semantic_graph import TaskResourceFact
-from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.cuda_graph import device_branch
 from pllm.execution.cuda_stream import PinnedStaging
-from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate, save_tail
+from pllm.execution.overlay_task import ChunkUpdate, GradientUpdate
+from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.scan import execute_scan
 from pllm.execution.scan_analysis import DenseReadout, chunk_step, dense_readout, row_readout
 from pllm.execution.scan_execution import PreparedScan
@@ -27,7 +27,7 @@ from pllm.execution.step_capture import StepCapture
 from pllm.execution.tensor_frame import Tensors, UpdateOutput
 from pllm.execution.tensor_program import TensorBatch
 from pllm.execution.torch_private import measure
-from pllm.kernels.page_copy import copy_pages
+from pllm.kernels.page_copy import append_tail, clear_tail, copy_pages
 from pllm.kernels.paged_projection import paged_dense_mv
 
 if TYPE_CHECKING:
@@ -76,16 +76,22 @@ class OverlayBatch:
         batch: TensorBatch,
     ) -> tuple[UpdateOutput, ...]:
         """Bucket actual rows, then tile states; oversized rows stay eager at native size."""
+        train = operands[0].phase in self.math.phases
+        if train and len(set(indices)) < len(indices):
+            # Bucketing by length could move a later encounter ahead of the same key's earlier write.
+            return tuple(
+                self.run((operand,), target, (index,), batch)[0]
+                for operand, index in zip(operands, indices, strict=True)
+            )
         groups: dict[int, list[int]] = defaultdict(list)
         for i, operand in enumerate(operands):
             rows = len(operand.hidden)
             groups[next((size for size in self.capacities() if rows <= size), rows)].append(i)
-        train = operands[0].phase in self.math.phases
         results: dict[int, UpdateOutput] = {}
         width = len(self.math.buffers)
         fields = tuple(batch.field_slots(target * width + i) for i in range(width))
         pools = tuple(pool for pool, _ in fields)
-        slots = np.array(tuple(slots for _, slots in fields))
+        slots = np.array(tuple(slots for _, slots in fields), dtype=np.int64)
         invariants = self.math.invariant_values(target, batch)
         for rows, members in groups.items():
             for start in range(0, len(members), self.states):
@@ -94,33 +100,58 @@ class OverlayBatch:
                 items = tuple(operands[i] for i in selected)
                 states = tuple(indices[i] for i in selected)
                 if tile.batchable:
-                    values = tile.run(items, slots[:, states], pools, batch.stream)
+                    reads, writes = self.page_slots(target, slots[:, states], batch, train)
+                    values = tile.run(items, reads, writes, pools, batch.stream)
                 else:
-                    values = self.serial(items, target, states, batch, tile.plan)
+                    values = self.serial(items, target, slots[:, states], pools, batch, tile.plan)
                 results.update(zip(selected, values, strict=True))
         return tuple(results[i] for i in range(len(operands)))
+
+    def page_slots(self, target: int, slots: Slots, batch: TensorBatch, train: bool) -> tuple[Slots, Slots]:
+        width = len(self.math.buffers)
+        pairs = np.array(
+            [[batch.overlay_slots(target * width + i, slot, train) for slot in field] for i, field in enumerate(slots)],
+            dtype=np.int64,
+        )
+        return pairs[:, :, 0], pairs[:, :, 1]
 
     def serial(
         self,
         operands: tuple[ProjectionOperands, ...],
         target: int,
-        indices: tuple[int, ...],
+        slots: Slots,
+        pools: tuple[torch.Tensor, ...],
         batch: TensorBatch,
         plan: PreparedScan | None,
     ) -> tuple[UpdateOutput, ...]:
-        """Keep unbatchable implementations on their selected numerical path, one request at a time."""
+        """Resolve slots in encounter order so a shared key observes the preceding update."""
         math, chunk = self.math, self.math.chunk
         rows = {row.identity: row for row in batch.selection.rows}
+        invariants = math.invariant_values(target, batch)
         results: list[UpdateOutput] = []
-        for operand, values in zip(operands, math.private_values(target, indices, batch), strict=True):
+        for i, operand in enumerate(operands):
+            train = operand.phase in math.phases
+            reads, writes = self.page_slots(target, slots[:, i : i + 1], batch, train)
+            values = {name: pool[src] for name, pool, src in zip(math.buffers, pools, reads[:, 0], strict=True)}
+            values.update(invariants)
+            if not train or not isinstance(chunk, ChunkUpdate):
+                results.append(math.result(operand, values))
+                continue
+            assert plan is not None
+            dest = {
+                name: pool[dst] for name, pool, dst in zip(math.buffers, pools, writes[:, 0], strict=True) if dst >= 0
+            }
+            destinations = {key: dest[name] for key, name in math.arguments.items() if name in dest}
+            arguments = math.inputs(operand, values)
             row = rows[operand.identity]
             offset = math.chunk_offset(row, len(operand.hidden)) if row.phase is operand.phase else None
-            if offset is None or plan is None:
+            if offset is None and batch.deferred is None:
                 results.append(math.result(operand, values))
+            elif offset is None:
+                count = values["_pending_length"].new_full((), len(operand.hidden))
+                results.append(chunk.counted(chunk.prepare(arguments), count, arguments, destinations))
             else:
-                # Only a ChunkUpdate has a contiguous training frontier.
-                assert isinstance(chunk, ChunkUpdate)
-                results.append(chunk.contiguous(math.inputs(operand, values), plan, offset))
+                results.append(chunk.contiguous(arguments, plan, offset, destinations))
         return tuple(results)
 
     def tile(
@@ -251,7 +282,7 @@ class OverlayTile:
             for i, (name, pool) in enumerate(zip(self.math.buffers, self.pools, strict=True))
         }
         if self.train:
-            values["_pending_length"].masked_fill_(self.table[width] < 0, 0)
+            values["_pending_length"].masked_fill_(self.table[-1] == 0, 0)
         chunk = self.math.chunk
         if self.train and isinstance(chunk, GradientUpdate):
             result = chunk.advance(
@@ -279,7 +310,8 @@ class OverlayTile:
     def run(
         self,
         operands: tuple[ProjectionOperands, ...],
-        slots: np.ndarray[tuple[int, ...], np.dtype[np.int64]],
+        reads: Slots,
+        writes: Slots,
         pools: tuple[torch.Tensor, ...],
         stream: torch.cuda.Stream | None,
     ) -> tuple[UpdateOutput, ...]:
@@ -290,11 +322,12 @@ class OverlayTile:
             self.capture.order(stream)
         width, count = len(pools), len(operands)
         with self.staging.fill(self.table) as host:
-            host[:width, :count] = slots
+            host[:width, :count] = reads
+            host[:width, count:] = 0
             host[width : 2 * width] = -1
-            if self.train:
-                host[width : 2 * width, :count] = slots
+            host[width : 2 * width, :count] = writes
             host[-1, :count] = tuple(len(o.hidden) for o in operands)
+            host[-1, count:] = 0
         self.hidden.zero_()
         self.desired.zero_()
         self.embedding.zero_()
@@ -334,7 +367,7 @@ class OverlayTile:
 
 
 class DecodeOverlay:
-    """Device-counted one-row transitions over private slots, with one update branch per request bucket."""
+    """Device-counted decode reads each incoming carry and scans only its completing lane."""
 
     def __init__(
         self,
@@ -355,7 +388,19 @@ class DecodeOverlay:
         self.mutable_invariants = frozenset(invariants) if mutable_invariants is None else mutable_invariants
         self.batch_invariant = batch_invariant
         width = len(pools)
-        self.table = torch.zeros((2 * width + 1, requests), device=pools[0].device, dtype=torch.long)
+        self.tail_fields = (
+            tuple(math.buffers.index(f"_pending_rows_{name}") for name in math.chunk.arguments[1:])
+            if isinstance(math.chunk, ChunkUpdate)
+            else ()
+        )
+        self.tail_bounds = {
+            i: torch.zeros((len(pools[i]), 2), device=pools[i].device, dtype=torch.long) for i in self.tail_fields
+        }
+        for bounds in self.tail_bounds.values():
+            bounds[:, 0].fill_(-1)
+        self.table = torch.zeros(
+            (2 * width + len(self.tail_fields) + 1, requests), device=pools[0].device, dtype=torch.long
+        )
         self.table[width : 2 * width].fill_(-1)
         self.source = self.table.new_zeros((1,))
         self.sources = torch.arange(requests, device=pools[0].device, dtype=torch.long)
@@ -371,7 +416,12 @@ class DecodeOverlay:
     @property
     def buffers(self) -> list[torch.Tensor]:
         """All mutable storage passed through the model's opaque projection op."""
-        return [*self.pools, self.table, *(self.invariants[name] for name in self.mutable_invariants)]
+        return [
+            *self.pools,
+            self.table,
+            *self.tail_bounds.values(),
+            *(self.invariants[name] for name in self.mutable_invariants),
+        ]
 
     def reserve(self) -> None:
         """Acquire the staging slot before the invocation opens private pages."""
@@ -381,7 +431,7 @@ class DecodeOverlay:
         self,
         batch: TensorBatch,
         identities: tuple[RequestIdentity, ...],
-        written: tuple[tuple[LayoutFieldId, ...], ...],
+        generations: Slots | None,
     ) -> None:
         """Upload read and writable slots; shared carries and padded lanes get -1 write destinations."""
         width = len(self.math.buffers)
@@ -394,11 +444,14 @@ class DecodeOverlay:
         self.host[width : 2 * width] = -1
         self.host[-1, : len(identities)] = 1
         for i, (_, slots) in enumerate(fields):
-            field_id = LayoutFieldId(self.target * width + i)
-            self.host[i, : len(identities)] = tuple(slots[indices[identity]] for identity in identities)
-            self.host[width + i, : len(identities)] = tuple(
-                slots[indices[identity]] if field_id in written[indices[identity]] else -1 for identity in identities
-            )
+            field_id = self.target * width + i
+            for lane, identity in enumerate(identities):
+                index = indices[identity]
+                self.host[i, lane], self.host[width + i, lane] = batch.overlay_slots(field_id, slots[index], True)
+        if generations is not None:
+            states = [indices[identity] for identity in identities]
+            for j, field in enumerate(self.tail_fields):
+                self.host[2 * width + j, : len(states)] = generations[states, self.target * width + field]
         self.staging.copy_to(self.table)
         if self.mutable_invariants:
             values = self.math.invariant_values(self.target, batch)
@@ -459,6 +512,31 @@ class DecodeOverlay:
             self.table[width : 2 * width, index : index + 1].masked_fill(~active, -1),
         )
 
+    def append(self, field: int, lanes: slice, rows: torch.Tensor, lengths: torch.Tensor) -> None:
+        """Copy only the live prefix, append arriving rows and clear stale rows from recycled slots."""
+        width = len(self.pools)
+        slot = self.tail_fields.index(field)
+        append_tail(
+            self.pools[field],
+            rows,
+            self.tail_bounds[field],
+            self.table[field, lanes],
+            self.table[width + field, lanes],
+            lengths,
+            self.table[2 * width + slot, lanes],
+        )
+
+    def inherit_carry(self, field: int, lanes: slice, complete: torch.Tensor) -> None:
+        """A device-counted lane may own a fresh carry even when it finishes no chunk."""
+        src, dst = self.table[field, lanes], self.table[len(self.pools) + field, lanes]
+        inherit = ~complete & (dst >= 0) & (src != dst)
+        with device_branch(inherit.any()):
+            copy_pages(self.pools[field], self.pools[field], src, dst.masked_fill(~inherit, -1))
+
+    def tail(self, index: int, name: str) -> torch.Tensor:
+        pool, slot = self.write_page(index, f"_pending_rows_{name}")
+        return pool.index_select(0, slot.clamp_min(0))[0]
+
     def decode_batch(
         self, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[UpdateOutput, ...]]:
@@ -484,11 +562,10 @@ class DecodeOverlay:
         sources = self.sources[:count]
         for name in columns:
             tail_field = self.math.buffers.index(f"_pending_rows_{name}")
-            slots = self.table[width + tail_field, :count]
-            destinations = (slots * chunk.chunk + lengths).masked_fill(idle | (slots < 0), -1)
-            copy_pages(bound[name], self.pools[tail_field].flatten(0, 1), sources, destinations)
+            self.append(tail_field, slice(0, count), bound[name], lengths)
         valid = lengths + counts
         complete, remaining = (valid == chunk.chunk) & ~idle, valid % chunk.chunk
+        self.inherit_carry(carry_field, slice(0, count), complete)
         copy_pages(
             remaining, self.pools[len_field], sources, self.table[width + len_field, :count].masked_fill(idle, -1)
         )
@@ -498,7 +575,8 @@ class DecodeOverlay:
             UpdateOutput(output[i : i + 1], complete[i], updates[i], trained[i], {"tail_rows": remaining[i]})
             for i in range(count)
         ]
-        self.complete_bucket(tuple(range(count)), results, hidden[:0], desired[:0], embedding[:0], base)
+        for index, result in enumerate(results):
+            self.complete_row(index, result.changed, tuple(bound[key] for key in chunk.invariants))
         return output, tuple(results)
 
     def run(
@@ -506,7 +584,8 @@ class DecodeOverlay:
     ) -> torch.Tensor:
         """Read incoming carries, append arriving rows, then update the device-selected completion bucket."""
         if isinstance(self.math.chunk, ChunkUpdate) and self.plan is None:
-            arguments = self.arguments(self.values(0), hidden[:1], desired[:1], embedding[:1], base)
+            samples = {name: pool[0] for name, pool in zip(self.math.buffers, self.pools, strict=True)}
+            arguments = self.arguments(samples, hidden[:1], desired[:1], embedding[:1], base)
             self.prepare_scan(arguments)
         local = RequestKeyField.REQUEST_ID in self.key_fields
         if local and self.dense_readout is not None:
@@ -516,33 +595,9 @@ class DecodeOverlay:
         if self.read_full is None:
             results = tuple(self.counted(index, hidden, desired, embedding, base) for index in range(len(hidden)))
         else:
-            results_list: list[UpdateOutput] = []
-            for index in range(len(hidden)):
-                results_list.append(self.decode_row(index, hidden, desired, embedding, base))
-                if not local:
-                    # Shared keys retain read/update order between requests in the same forward.
-                    self.complete_bucket((index,), results_list, hidden[:0], desired[:0], embedding[:0], base)
-            if local:
-                self.complete_bucket(
-                    tuple(range(len(hidden))), results_list, hidden[:0], desired[:0], embedding[:0], base
-                )
-            results = tuple(results_list)
+            results = tuple(self.decode_row(index, hidden, desired, embedding, base) for index in range(len(hidden)))
         self.outputs[len(hidden)] = results
         return torch.cat(tuple(result.output for result in results))
-
-    def complete_bucket(
-        self,
-        indices: tuple[int, ...],
-        results: list[UpdateOutput],
-        hidden: torch.Tensor,
-        desired: torch.Tensor,
-        embedding: torch.Tensor,
-        base: torch.Tensor,
-    ) -> None:
-        """Use the shared CUDA IF machinery once for requests whose updates can share temporary memory."""
-        with device_branch(torch.stack(tuple(results[index].changed for index in indices)).any()):
-            for index in indices:
-                self.complete_row(index, results[index].changed, hidden, desired, embedding, base)
 
     @torch.inference_mode(False)
     def counted(
@@ -566,32 +621,20 @@ class DecodeOverlay:
         self.store(index, values, count > 0)
         return result
 
-    def complete_row(
-        self,
-        index: int,
-        complete: torch.Tensor,
-        hidden: torch.Tensor,
-        desired: torch.Tensor,
-        embedding: torch.Tensor,
-        base: torch.Tensor,
-    ) -> None:
-        """Share one conditional allocator across requests while the scan masks each incomplete carry."""
+    def complete_row(self, index: int, complete: torch.Tensor, invariants: tuple[torch.Tensor, ...]) -> None:
+        """Gate the gathers and scan together; cold execution still needs masked stores."""
         chunk = self.math.chunk
         assert isinstance(chunk, ChunkUpdate) and self.plan is not None
-        values = self.values(index)
-        arguments = self.arguments(values, hidden, desired, embedding, base)
         carry, *columns = chunk.arguments
-        tails = tuple(arguments[f"_pending_rows_{name}"] for name in columns)
-        # The store supplies the per-request mask; a second full-matrix where inside
-        # the scan would retain another dense temporary in every conditional graph.
-        updated, _ = execute_scan(
-            self.plan, arguments[carry], tails, tuple(arguments[name] for name in chunk.invariants), None
-        )
-        values[self.math.arguments[carry]] = updated
-        length = values["_pending_length"]
-        full = length.new_full((), chunk.chunk)
-        save_tail(tails, tails, length, full, full)
-        self.store(index, values, complete)
+        name = self.math.arguments[carry]
+        with device_branch(complete):
+            tails = tuple(self.tail(index, column) for column in columns)
+            updated, _ = execute_scan(self.plan, self.read(index, name), tails, invariants, None)
+            pool, slot = self.write_page(index, name)
+            copy_pages(updated.unsqueeze(0), pool, self.source, slot.masked_fill(~complete, -1))
+            for field in self.tail_fields:
+                slot = self.table[len(self.pools) + field, index : index + 1].masked_fill(~complete, -1)
+                clear_tail(self.pools[field], self.tail_bounds[field], slot)
 
     def decode_row(
         self, index: int, hidden: torch.Tensor, desired: torch.Tensor, embedding: torch.Tensor, base: torch.Tensor
@@ -604,19 +647,16 @@ class DecodeOverlay:
         idle = count == 0
         state = self.read(index, self.math.arguments[carry])
         length = self.read(index, "_pending_length").masked_fill(idle, 0)
-        # The tails stay in place: only the arriving rows and the invariants are bound.
         bound = self.arguments(
             {}, hidden[index : index + 1], desired[index : index + 1], embedding[index : index + 1], base
         )
         rows = tuple(bound[name] for name in columns)
         invariants = tuple(bound[name] for name in chunk.invariants)
         for name, row in zip(columns, rows, strict=True):
-            pool, slot = self.write_page(index, f"_pending_rows_{name}")
-            copy_pages(
-                row, pool.flatten(0, 1), self.source, (slot * chunk.chunk + length).masked_fill(idle | (slot < 0), -1)
-            )
+            field = self.math.buffers.index(f"_pending_rows_{name}")
+            self.append(field, slice(index, index + 1), row, length.reshape(1))
         if self.read_row is None:
-            tails = tuple(self.read(index, f"_pending_rows_{name}") for name in columns)
+            tails = tuple(self.tail(index, name) for name in columns)
             output = self.read_full(state, *tails, *invariants).index_select(0, length.reshape(1))
         else:
             output = self.read_row(state, *rows, *invariants)
@@ -624,5 +664,7 @@ class DecodeOverlay:
         complete, remaining = (valid == chunk.chunk) & ~idle, valid % chunk.chunk
         pool, slot = self.write_page(index, "_pending_length")
         copy_pages(remaining.reshape(1), pool, self.source, slot.masked_fill(idle, -1))
+        self.inherit_carry(self.math.buffers.index(self.math.arguments[carry]), slice(index, index + 1), complete)
+        self.complete_row(index, complete, invariants)
         updates = complete.to(torch.int64)
         return UpdateOutput(output, complete, updates, updates * chunk.chunk, {"tail_rows": remaining})

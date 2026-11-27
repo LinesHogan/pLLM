@@ -31,6 +31,7 @@ from pllm.contracts.tensor_layout import LayoutFieldId
 from pllm.contracts.visibility import VisibilitySource
 from pllm.execution.parameter_projection import parameter_correction
 from pllm.execution.ptts.request_state import RequestStateSelection
+from pllm.execution.ptts.slot_pools import Slots
 from pllm.execution.scan import execute_scan, prepare_scan
 from pllm.execution.scan_analysis import chunk_readout
 from pllm.execution.scan_execution import PreparedScan, Step
@@ -105,7 +106,9 @@ class ChunkUpdate:
             valid_rows=values["_pending_length"],
         )
 
-    def counted(self, plan: PreparedScan, count: torch.Tensor, values: Tensors) -> UpdateOutput:
+    def counted(
+        self, plan: PreparedScan, count: torch.Tensor, values: Tensors, destinations: Tensors | None = None
+    ) -> UpdateOutput:
         """Advance complete chunks only; padded requests and rows contribute no updates."""
         carry, *columns = self.arguments
         rows = tuple(values[name] for name in columns)
@@ -118,8 +121,12 @@ class ChunkUpdate:
         updated, outputs = execute_scan(
             plan, values[carry], joined, tuple(values[name] for name in self.invariants), trained
         )
-        values[carry].copy_(updated)
-        remaining = save_tail(tails, joined, length, valid, trained)
+        dest = values if destinations is None else destinations
+        if carry in dest:
+            dest[carry].copy_(updated)
+        remaining = save_tail(
+            tuple(dest[f"_pending_rows_{name}"] for name in columns), joined, dest["_pending_length"], valid, trained
+        )
         return UpdateOutput(
             torch.cat(outputs).index_select(0, positions),
             trained > 0,
@@ -138,7 +145,9 @@ class ChunkUpdate:
         )
         return chunk_readout(self.step, tuple((t.shape, t.stride(), t.dtype, t.device) for t in samples))
 
-    def contiguous(self, values: Tensors, plan: PreparedScan, offset: int) -> UpdateOutput:
+    def contiguous(
+        self, values: Tensors, plan: PreparedScan, offset: int, destinations: Tensors | None = None
+    ) -> UpdateOutput:
         """Use the scheduler's contiguous token frontier without reading a device counter.
 
         Complete chunks run the authored step in order, keeping its GEMM shapes and rounding. The incomplete
@@ -151,7 +160,8 @@ class ChunkUpdate:
         readout = self.readout(values)
         # A selected (non-serial) scan is specialized for a device-counted capacity shape.
         if readout is None or (full and plan.analysis is not None):
-            return self(**values)
+            count = values["_pending_length"].new_full((), len(values[columns[0]]))
+            return self.counted(self.prepare(values), count, values, destinations)
         tails = tuple(values[f"_pending_rows_{name}"] for name in columns)
         rows = tuple(
             torch.cat((tail[:pending], values[name])) if pending else values[name]
@@ -159,15 +169,23 @@ class ChunkUpdate:
         )
         invariants = tuple(values[name] for name in self.invariants)
         outputs: list[torch.Tensor] = []
+        dest = values if destinations is None else destinations
+        updated = values[carry]
         if full:
             updated, scanned = execute_scan(plan, values[carry], tuple(row[:full] for row in rows), invariants, None)
-            values[carry].copy_(updated)
             outputs.extend(scanned)
-        length = values["_pending_length"]
+        if carry in dest and dest[carry] is not updated:
+            dest[carry].copy_(updated)
+        length = dest["_pending_length"]
         trained = length.new_full((), full)
-        remaining = save_tail(tails, rows, length, length.new_full((), total), trained)
+        remaining = length.new_full((), total - full)
+        tails = tuple(dest[f"_pending_rows_{name}"] for name in columns)
+        for tail, row in zip(tails, rows, strict=True):
+            tail[: total - full].copy_(row[full:])
+            tail[total - full :].zero_()
+        length.copy_(remaining)
         if total > full:
-            outputs.append(readout(values[carry], *tails, *invariants)[: total - full])
+            outputs.append(readout(dest.get(carry, updated), *tails, *invariants)[: total - full])
         return UpdateOutput(
             torch.cat(outputs)[pending:], trained > 0, trained // self.chunk, trained, {"tail_rows": remaining}
         )
@@ -326,14 +344,16 @@ class ProjectionTask:
         self.driver, self.context, self.rows, self.task = driver, context, rows, task
         self.pending = set(targets)
 
-    def prepare(self, math: OverlayTransition) -> tuple[TensorBatch, tuple[tuple[LayoutFieldId, ...], ...]]:
+    def prepare(self, math: OverlayTransition) -> tuple[TensorBatch, Slots | None]:
         """Open the private transition before replay; carries with incomplete chunks stay shared."""
-        selection = self.context.selection.for_resource(math.resource)
-        written = math.row_written_fields(
-            self.rows.row_batch, self.context.selection, tuple(range(len(selection.refs)))
+        selection = self.context.selection.scoped(math.resource)
+        written = math.row_written_fields(self.rows.row_batch, selection, tuple(range(len(selection.refs))))
+        write = self.context.prepare_owned_write(
+            selection.refs, fields=written, copy_fields="defer" if isinstance(math.chunk, ChunkUpdate) else None
         )
-        self.context.prepare_owned_write(selection.refs, fields=written, copy_fields=None)
-        return read_batch(self.context, "private", math.resource), written
+        batch = read_batch(self.context, "private", math.resource, defer_copies=True)
+        generations = self.context.arena.write_generations(write, math.resource) if write.deferred is not None else None
+        return batch, generations
 
     def complete(
         self,
@@ -529,8 +549,10 @@ class OverlayTransition:
         fields = tuple(LayoutFieldId(i) for i in range(len(self.targets) * len(self.buffers)))
         if not isinstance(self.chunk, ChunkUpdate):
             return (fields,) * len(selected)
-        carry = self.buffers.index(self.arguments[self.chunk.arguments[0]])
-        tails = tuple(field for field in fields if field % len(self.buffers) != carry)
+        carry = self.arguments[self.chunk.arguments[0]]
+        names = {carry, "_pending_length", *(f"_pending_rows_{name}" for name in self.chunk.arguments[1:])}
+        fields = tuple(field for field in fields if self.buffers[field % len(self.buffers)] in names)
+        tails = tuple(field for field in fields if self.buffers[field % len(self.buffers)] != carry)
         counts = Counter(row.identity for row in rows.rows if row.phase in self.phases)
         by_state = dict(zip(selection.for_resource(self.resource).state_indices, selection.rows, strict=True))
         writes: list[tuple[LayoutFieldId, ...]] = []

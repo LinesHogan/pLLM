@@ -43,6 +43,7 @@ from pllm.execution.admission import WindowBackpressure
 from pllm.execution.cuda_stream import CudaStreamReadiness, DeviceCounters
 from pllm.execution.ptts.page_borrow import BorrowedStateRoot
 from pllm.execution.ptts.page_bundle import (
+    CopyFields,
     FieldNumericHealth,
     PageBundleArena,
     PageBundleUsage,
@@ -229,7 +230,7 @@ class StateTaskContext:
         sources: StateRefs,
         fields: tuple[tuple[LayoutFieldId, ...], ...] | None = None,
         *,
-        copy_fields: tuple[LayoutFieldId, ...] | None = (),
+        copy_fields: CopyFields = (),
     ) -> PageWrite:
         """Prepare and retain a private transition, returning its explicit write token."""
         self.check_page_execution()

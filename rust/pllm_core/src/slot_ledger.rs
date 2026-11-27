@@ -15,6 +15,7 @@ pub(crate) struct Pool {
     pub width: usize,
     pub capacities: Vec<usize>,
     offsets: Vec<usize>,
+    hands: Vec<usize>,
     holders: Vec<i64>,
     generations: Vec<i64>,
     fences: Vec<(i64, Vec<bool>)>,
@@ -33,6 +34,7 @@ impl Pool {
         let pages = capacities.iter().sum();
         Self {
             width: capacities.len(),
+            hands: vec![0; capacities.len()],
             capacities,
             offsets,
             holders: vec![0; pages],
@@ -66,10 +68,15 @@ impl Pool {
         field: usize,
         count: usize,
     ) -> PyResult<(Vec<i64>, Vec<i64>, Vec<i64>)> {
+        let capacity = self.capacities[field];
+        if count == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let hand = self.hands[field];
         let offset = self.offsets[field];
         let mut ready = Vec::with_capacity(count);
         let mut reuse = Vec::new();
-        for slot in 0..self.capacities[field] {
+        for slot in (hand..capacity).chain(0..hand) {
             if ready.len() == count {
                 break;
             }
@@ -92,6 +99,7 @@ impl Pool {
             ));
         }
         let slots: Vec<_> = ready.into_iter().chain(reuse).take(count).collect();
+        self.hands[field] = (slots[count - 1] + 1) % capacity;
         let mut waits = Vec::new();
         for (event, pending) in &mut self.fences {
             if slots.iter().any(|&slot| pending[offset + slot]) {

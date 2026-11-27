@@ -170,7 +170,9 @@ class CustomForwardTask:
         if self.operation is not None:
             # The program overlay stages and restores whole roots, so every field takes a private page; sharing
             # unchanged chunk carries applies to ordinary forwards only.
-            return replace(self.operation, body=self._overlay_body, select_fields=None).execute(context)
+            return replace(self.operation, body=self._overlay_body, select_fields=None, copy_fields=None).execute(
+                context
+            )
         self.run(context)
         return {}
 

@@ -8,6 +8,7 @@ import warnings
 from dataclasses import replace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -22,6 +23,7 @@ from pllm.contracts.parameter_overlay import (
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.execution.compile_facts import BackendCompileFacts
 from pllm.execution.overlay_task import ChunkUpdate
+from pllm.execution.ptts.state_refs import StateRefs
 from pllm.execution.scan import ScanContext, ScanTemplate
 from pllm.execution.scan_analysis import analyze
 from pllm.testing import RequestIdentity, backend_facts
@@ -90,7 +92,14 @@ def test_bound_scan_matches_original_chunk_math_bitwise(device, dtype, numerics)
             hidden.new_full((), False, dtype=torch.bool),
             embedding=hidden.new_empty((0, 0)),
         )
-        (result,) = execution.step(projection_input((operand,)), stream=stream).entries
+        arena = execution.arena
+        pin = arena.pin_exact(StateRefs.of((ref,)), stream)
+        before = arena.snapshot(pin, ref)
+        with patch.object(arena, "fill_versions", wraps=arena.fill_versions) as fill:
+            (result,) = execution.step(projection_input((operand,)), stream=stream).entries
+        assert not any(copies for (copies,), _ in fill.call_args_list)
+        torch.testing.assert_close(arena.snapshot(pin, ref), before, rtol=0, atol=0)
+        arena.wait_release(arena.release_pin(pin))
         got = result.targets[0].update
         tolerance = {"rtol": 0.02, "atol": 0.001} if numerics else {"rtol": 0, "atol": 0}
         torch.testing.assert_close(got.output, expected.output, **tolerance)
@@ -287,3 +296,174 @@ def test_decode_readout_narrows_only_independent_rows(read):
     assert (selected is not None) == (read == "local")
     if selected is not None:
         torch.testing.assert_close(selected(carry, inputs[-1:]), step(carry, inputs)[1][-1:])
+
+
+@pytest.mark.parametrize("dense", (False, True))
+def test_decode_graph_only_scans_completing_lanes(device_name, dense):
+    """A fresh carry can inherit on one replay and be overwritten on the next."""
+    from pllm.execution.cuda_stream import PinnedStaging
+    from pllm.execution.overlay_batch import DecodeOverlay
+    from pllm.execution.scan_analysis import DenseReadout
+    from pllm.execution.scan_execution import PreparedScan
+    from pllm.execution.step_capture import capture_graph
+
+    device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA conditional graphs")
+    math = (
+        DenseUpdate(DenseUpdateConfig((TARGET,), chunk_size=3, tokens="all", visibility="exact"))
+        .build(backend_facts(1, targets={TARGET: (1, 1)}))
+        .overlay_math
+    )
+    pools = (
+        torch.zeros(4, 1, 1, device=device),
+        torch.zeros(4, 3, 1, device=device),
+        torch.zeros(4, 3, 1, device=device),
+        torch.zeros(4, dtype=torch.long, device=device),
+    )
+    carry, inputs, targets, lengths = pools
+    calls = torch.zeros((), device=device)
+
+    def step(state, x, y):
+        calls.add_(1)
+        return state + y.T @ x, x @ state.T
+
+    # This test supplies the device slot table directly, including a padded third lane.
+    with patch("pllm.execution.overlay_batch.PinnedStaging", return_value=PinnedStaging()):
+        decode = DecodeOverlay(math, 0, pools, {}, 3, TensorPolicy(), math.keys)
+    decode.plan = PreparedScan(step, 3)
+    decode.read_full = lambda state, x, y: x @ state.T
+    if dense:
+        decode.dense_readout = DenseReadout(0, False)
+    decode.table[:4] = torch.tensor([0, 1, 0], device=device)
+    decode.table[4:8] = torch.tensor([2, 3, -1], device=device)
+    decode.table[-1] = torch.tensor([1, 1, 0], device=device)
+    carry[:2, 0, 0] = torch.tensor([2.0, 5.0], device=device)
+    x = torch.tensor([[3.0], [4.0], [0.0]], device=device)
+    y = x + 1
+    empty = x[:0]
+
+    def body():
+        return decode.run(x, y, empty, empty)
+
+    if device.type == "cuda":
+        graph, output, _ = capture_graph(device, body)
+    for i, pending in enumerate(((2, 0), (1, 2), (0, 0))):
+        decode.table[8:10].fill_(10 + i)
+        if i == 0:
+            for pool in pools:
+                pool[2:].fill_(99)
+        lengths[:2] = torch.tensor(pending, device=device)
+        inputs[:2].zero_()
+        targets[:2].zero_()
+        for lane, n in enumerate(pending):
+            inputs[lane, :n].fill_(2)
+            targets[lane, :n].fill_(3)
+        incoming = tuple(pool[:2].clone() for pool in pools)
+        calls.zero_()
+        if device.type == "cuda":
+            graph.replay()
+            assert int(calls) == pending.count(2)
+        else:
+            output = body()
+        torch.testing.assert_close(output[:2], x[:2] * incoming[0][:, 0])
+        for lane, n in enumerate(pending):
+            complete = n + 1 == 3
+            dst = lane + 2
+            expected = incoming[0][lane] + (6 * n + y[lane] * x[lane] if complete else 0)
+            torch.testing.assert_close(carry[dst], expected)
+            assert int(lengths[dst]) == (n + 1) % 3
+            for old, pool, row in ((incoming[1], inputs, x), (incoming[2], targets, y)):
+                tail = torch.zeros_like(pool[dst])
+                if not complete:
+                    tail[:n].copy_(old[lane, :n])
+                    tail[n].copy_(row[lane])
+                torch.testing.assert_close(pool[dst], tail)
+        torch.testing.assert_close(tuple(pool[:2] for pool in pools), incoming)
+
+    # Abort a second visit to this allocation after the row write but before its bound is recorded.
+    from pllm.kernels import page_copy
+
+    original_write = page_copy._write_tail_cpu
+
+    def interrupted_write(*args):
+        original_write(*args)
+        raise RuntimeError("interrupted append")
+
+    lane = slice(0, 1)
+    with (
+        patch("pllm.kernels.page_copy._write_tail_cpu", interrupted_write),
+        pytest.raises(RuntimeError, match="interrupted"),
+    ):
+        decode.append(1, lane, x[:1], torch.ones_like(lengths[:1]))
+    torch.testing.assert_close(inputs[2, 1], x[0])
+    decode.table[8, 0].add_(1)
+    decode.append(1, lane, x[:1], torch.zeros_like(lengths[:1]))
+    torch.testing.assert_close(inputs[2, 1:], torch.zeros_like(inputs[2, 1:]))
+
+
+def test_decode_append_touches_only_prefix_and_stale_rows(device_name):
+    from pllm.kernels.page_copy import append_tail
+
+    device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    # A guard row between pages also catches a flattened copy that ignores the page stride.
+    storage = torch.full((4, 1025, 17), -9.0, device=device)
+    pages = storage[:, :-1]
+    pages[0, :2].fill_(3)
+    original = storage.clone()
+    rows = torch.arange(17 * 3, device=device, dtype=pages.dtype).reshape(17, 3).T
+    bounds = torch.tensor([[-1, 0], [9, 5], [10, 3], [-1, 0]], dtype=torch.long, device=device)
+    src, dst, lengths, gens = torch.tensor([[0, 2, 0], [1, 2, -1], [2, 1, 0], [10, 10, 10]], device=device)
+    append_tail(pages, rows, bounds, src, dst, lengths, gens)
+    expected = original.clone()
+    expected[1, :2] = 3
+    expected[1, 2] = rows[0]
+    expected[1, 3:5] = 0
+    expected[2, 1] = rows[1]
+    expected[2, 2] = 0
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+    assert bounds.tolist() == [[-1, 0], [10, 3], [10, 2], [-1, 0]]
+
+
+def test_overlay_tile_clears_padded_counts_across_staging_rotation():
+    """Shrinking active request counts across PinnedStaging rotation must not leak stale row counts into padding."""
+    from pllm.execution.overlay_batch import OverlayTile
+    from pllm.workloads.gated_delta import GatedDeltaConfig, GatedDeltaWorkload
+
+    q_target = Projection("q_proj", 0)
+    facts = backend_facts(6, device="cpu", pages=6, memory_bytes=65536, max_rows=8, targets={q_target: (6, 6)})
+    math = GatedDeltaWorkload(GatedDeltaConfig((q_target,), head_width=3, chunk_size=3)).build(facts).overlay_math
+    assert math is not None
+    pools = (
+        torch.zeros(6, 2, 3, 3),
+        torch.zeros(6, 2, 6),
+        torch.zeros(6, dtype=torch.long),
+    )
+    pools[2][:2] = torch.tensor([2, 2])
+    base = torch.zeros(6, 6)
+
+    def item(name: str, index: int) -> ProjectionOperands:
+        return ProjectionOperands(
+            RequestIdentity(name, index, 0),
+            q_target,
+            HiddenPhase.PREFILL,
+            torch.ones(1, 6),
+            torch.ones(1, 6),
+            base,
+            torch.tensor(False),
+            torch.empty(0, 0),
+        )
+
+    tile = OverlayTile(math, pools, item("a", 0), states=4, rows=4, train=True, invariants={})
+    assert tile.batchable
+    for _ in range(2):
+        reads = np.array([[0, 1], [0, 1], [0, 1]], dtype=np.int64)
+        writes = np.array([[2, 3], [2, 3], [2, 3]], dtype=np.int64)
+        tile.run((item("a", 0), item("b", 1)), reads, writes, pools, None)
+    # Third call reuses staging slot 0 with only 1 active request; lane 1 must have count 0.
+    pools[2][1] = 2
+    out = tile.run((item("a", 0),), np.zeros((3, 1), dtype=np.int64), np.full((3, 1), 4, dtype=np.int64), pools, None)
+    assert len(out) == 1
+    assert int(tile.table[-1, 1]) == 0

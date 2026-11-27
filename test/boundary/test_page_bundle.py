@@ -162,3 +162,70 @@ def test_multi_resource_update_is_atomic_and_write_handles_are_single_use() -> N
     arena.wait_release(arena.release_pin(pin))
     arena.retire(published.after_refs)
     assert arena.active_states == 0
+
+
+def test_deferred_overwrite_preserves_pins_abort_and_unvisited_fields() -> None:
+    arena = page_arena()
+    refs = _admit(arena, 1)
+    pin = arena.pin_exact(refs)
+    original = arena.snapshot(pin, refs[0])
+    resource, before = arena.slot_matrix(pin, refs)
+    for abort in (True, False):
+        write = arena.prepare_transition(refs, copy_fields="defer")
+        _, after = arena.slot_matrix(write, write.after_refs)
+        deferred = write.deferred
+        assert deferred is not None
+        src, dst = int(before[0, 0]), int(after[0, 0])
+        assert src != dst
+        assert deferred.slots(resource, 0, dst, False) == (src, -1)
+        assert deferred.slots(resource, 0, dst, True) == (src, dst)
+        arena.field_pool(resource, F0)[dst].fill_(23)
+        assert deferred.slots(resource, 0, dst, True) == (dst, dst)
+        # Poison an unvisited destination: publishing a partial projection must inherit its source.
+        arena.field_pool(resource, LayoutFieldId(1))[after[0, 1]].fill_(99)
+        if abort:
+            arena.abort(write)
+            assert arena.latest(refs[0].lineage_id) == refs[0]
+        else:
+            receipt = arena.publish(write)
+            current = arena.pin_exact(receipt.after_refs)
+            actual = arena.snapshot(current, current.refs[0])
+            torch.testing.assert_close(actual[0], torch.full_like(actual[0], 23))
+            torch.testing.assert_close(actual[1:], original[1:])
+            arena.wait_release(arena.release_pin(current))
+            arena.retire(receipt.after_refs)
+        torch.testing.assert_close(arena.snapshot(pin, pin.refs[0]), original)
+    arena.wait_release(arena.release_pin(pin))
+
+
+def test_clock_rotates_across_fenced_slots_and_skips_pins() -> None:
+    from pllm import _core
+
+    ledger = _core.SlotLedger([3])
+    events = np.empty(0, dtype=np.int64)
+
+    def allocate(count):
+        slots, _, waits, _ = ledger.allocate(0, count, events)
+        return slots.tolist(), waits.tolist()
+
+    def release(slot, event):
+        ledger.release(np.array([[slot]], dtype=np.int64), event, events)
+
+    for event, expected in enumerate((0, 1, 2, 0), 1):
+        assert allocate(0) == ([], [])
+        assert allocate(1) == ([expected], [1] if event == 4 else [])
+        release(expected, event)
+    assert allocate(2) == ([1, 2], [2, 3])
+    ledger.hold(np.array([[1]], dtype=np.int64))
+    release(1, 0)
+    release(2, 5)
+    # Slot 1 stays pinned while the hand wraps across it.
+    assert allocate(1) == ([0], [4])
+    release(0, 6)
+    assert allocate(1) == ([2], [5])
+    release(2, 0)
+    # Hand is at 0, fenced. The later ready slot wins even in a mixed batch.
+    assert allocate(2) == ([2, 0], [6])
+    release(0, 0)
+    release(1, 0)
+    assert allocate(1) == ([1], [])

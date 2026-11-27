@@ -19,8 +19,9 @@ from typing import Any, ClassVar, TypeVar
 import torch
 
 from pllm.config import ExecutionOptions
-from pllm.contracts.backend_attachment import BackendAttachment, ModelProbe
+from pllm.contracts.backend_attachment import AttachmentGraphMode, BackendAttachment
 from pllm.contracts.compilation import PlanBundle
+from pllm.contracts.hidden_locator import HiddenPhase
 from pllm.contracts.semantic_graph import AnchorId, SchedulerTimeline, SemanticGraph, TaskId
 from pllm.contracts.tensor_policy import TensorPolicy
 from pllm.contracts.visibility import VisibilitySource
@@ -52,9 +53,10 @@ from pllm.execution.method_inputs import (
     StateVersion,
     Value,
 )
+from pllm.execution.overlay_task import ChunkUpdate
 from pllm.execution.position_state import PositionState
 from pllm.execution.ptts.page_bundle import PageBundleArena
-from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan
+from pllm.execution.ptts.page_bundle_planning import compile_page_bundle_plan, version_capacity
 from pllm.execution.state_execution import MathBinding, StateExecution
 from pllm.execution.state_init import Fed, Imported
 from pllm.execution.task_memory import custom_forward_capture_bytes
@@ -134,7 +136,7 @@ class Workload:
                 external_states={*measured.imports, *(feed.resource for feed in measured.feeds)},
                 custom_attention=bool(measured.attention.methods),
             ).check_prefix_cache()
-        timeline = _fund_attachment(measured, facts.probe, reserve_resources(measured, facts, options), options)
+        timeline = _fund_attachment(measured, facts, reserve_resources(measured, facts, options), options)
         facts = replace(facts, timeline=timeline)
         declaration = self.funded_declaration(facts, causal=causal)
         declaration.gather_bytes = measured.gather_bytes
@@ -399,12 +401,37 @@ def _apply_options(facts: BackendCompileFacts, options: ExecutionOptions) -> Bac
     )
 
 
+def _decode_tail_buffer_bytes(
+    declaration: TensorDeclaration, facts: BackendCompileFacts, graph: SemanticGraph, options: ExecutionOptions
+) -> int:
+    """Fund DecodeOverlay's per-page dirty bounds and per-lane generation staging tables."""
+    math, probe = declaration.overlay_math, facts.probe
+    if (
+        math is None
+        or not isinstance(math.chunk, ChunkUpdate)
+        or not graph.updates_in_forward
+        or math.custom_forward
+        or HiddenPhase.DECODE not in math.phases
+        or probe.graph_mode is not AttachmentGraphMode.CUDA_GRAPH
+    ):
+        return 0
+    pages = max(
+        version_capacity(facts.max_admitted_lineages, options.publish_lag, written=True),
+        max((provider.minimum_pages for provider in facts.providers), default=0),
+    )
+    requests = probe.max_packed_rows if probe.causal_domain is None else probe.causal_domain.requests
+    return len(math.targets) * (len(math.chunk.arguments) - 1) * (16 * pages + 24 * requests)
+
+
 def _fund_attachment(
-    declaration: TensorDeclaration, probe: ModelProbe, timeline: SchedulerTimeline, options: ExecutionOptions
+    declaration: TensorDeclaration, facts: BackendCompileFacts, timeline: SchedulerTimeline, options: ExecutionOptions
 ) -> SchedulerTimeline:
     """Reserve the attachment's effect buffers and fund the custom-forward task."""
     graph, layouts, attachment = declaration.finish()
-    buffers = attachment_buffer_bytes(probe, graph, layouts, attachment)
+    probe = facts.probe
+    buffers = attachment_buffer_bytes(probe, graph, layouts, attachment) + _decode_tail_buffer_bytes(
+        declaration, facts, graph, options
+    )
     if buffers:
         timeline = replace(
             timeline,
